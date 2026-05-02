@@ -1599,7 +1599,14 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
         }
     }
 
-    blocks.push(ContentBlock::Image { media_type, data });
+    blocks.push(ContentBlock::Image {
+        media_type,
+        data,
+        // Preserve the original CDN/source URL so text-only drivers (e.g.
+        // Claude Code) can reference it, and vision-capable drivers retain
+        // it for diagnostics.
+        source_url: Some(url.to_string()),
+    });
 
     blocks
 }
@@ -2379,6 +2386,7 @@ mod tests {
             ContentBlock::Image {
                 media_type: "image/jpeg".to_string(),
                 data: "base64data".to_string(),
+                source_url: None,
             },
         ];
 
@@ -2401,6 +2409,7 @@ mod tests {
         let blocks = vec![ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "base64data".to_string(),
+            source_url: None,
         }];
 
         // Default impl sends empty text when no text blocks
