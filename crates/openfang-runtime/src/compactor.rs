@@ -1277,6 +1277,7 @@ mod tests {
                 content: MessageContent::Blocks(vec![ContentBlock::Image {
                     media_type: "image/png".to_string(),
                     data: "base64data".to_string(),
+                    source_url: None,
                 }]),
                 ..Default::default()
             },
