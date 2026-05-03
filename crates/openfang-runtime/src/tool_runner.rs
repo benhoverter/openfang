@@ -2345,9 +2345,28 @@ async fn tool_channel_send(
             .await;
     }
 
-    // Local file attachment: read from disk and send as FileData
+    // Local file attachment: read from disk and send as FileData.
+    //
+    // Size cap: 25 MB. Discord's free-tier per-attachment limit is 25 MB; many
+    // other channel adapters cap lower. We check `metadata().len()` *before* the
+    // read so an oversized file doesn't balloon agent memory only to be rejected
+    // downstream. Channel-specific tier-aware limits can refine this later.
+    const CHANNEL_SEND_FILE_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
     if let Some(raw_path) = file_path {
         let resolved = resolve_file_path(raw_path, workspace_root)?;
+        let metadata = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| format!("Failed to stat file '{}': {e}", resolved.display()))?;
+        if metadata.len() > CHANNEL_SEND_FILE_MAX_BYTES {
+            return Err(format!(
+                "File '{}' is {} bytes, exceeds channel_send cap of {} bytes ({} MB)",
+                resolved.display(),
+                metadata.len(),
+                CHANNEL_SEND_FILE_MAX_BYTES,
+                CHANNEL_SEND_FILE_MAX_BYTES / (1024 * 1024)
+            ));
+        }
         let data = tokio::fs::read(&resolved)
             .await
             .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;

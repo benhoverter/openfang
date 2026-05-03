@@ -136,6 +136,84 @@ impl DiscordAdapter {
         Ok(())
     }
 
+    /// Send a file attachment to a Discord channel via REST multipart upload.
+    ///
+    /// Mirrors the proven `api_send_document_upload` pattern from the Telegram
+    /// adapter. Uses `multipart/form-data` with two fields: `payload_json` (the
+    /// usual message body) and `files[0]` (raw bytes). `reqwest` sets the
+    /// multipart `Content-Type` boundary; we only set `Authorization`.
+    ///
+    /// On HTTP 429 we honor `Retry-After` once before giving up. Higher-tier
+    /// rate-limit handling can land later if needed.
+    async fn api_send_attachment(
+        &self,
+        channel_id: &str,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+
+        // Discord caps message content at DISCORD_MSG_LIMIT chars; truncate
+        // explicitly so a long caption doesn't silently 400.
+        let payload_json = build_attachment_payload_json(caption);
+
+        // Build the multipart form. Clone bytes for the retry path; the form
+        // consumes the Part on send.
+        let build_form = || -> Result<reqwest::multipart::Form, Box<dyn std::error::Error>> {
+            let file_part = reqwest::multipart::Part::bytes(data.clone())
+                .file_name(filename.to_string())
+                .mime_str(mime_type)?;
+            Ok(reqwest::multipart::Form::new()
+                .text("payload_json", payload_json.clone())
+                .part("files[0]", file_part))
+        };
+
+        let mut attempts = 0u8;
+        loop {
+            attempts += 1;
+            let form = build_form()?;
+            let resp = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bot {}", self.token.as_str()))
+                .multipart(form)
+                .send()
+                .await?;
+
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(());
+            }
+
+            // Honor Retry-After once on 429.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts == 1 {
+                let retry_after_secs = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 30.0);
+                warn!(
+                    "Discord sendAttachment rate-limited; retrying after {retry_after_secs:.2}s"
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    (retry_after_secs * 1000.0) as u64,
+                ))
+                .await;
+                continue;
+            }
+
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord sendAttachment failed ({status}): {body_text}");
+            return Err(
+                format!("Discord sendAttachment failed ({status}): {body_text}").into(),
+            );
+        }
+    }
+
     /// Send typing indicator to a Discord channel.
     async fn api_send_typing(&self, channel_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
@@ -520,6 +598,14 @@ impl ChannelAdapter for DiscordAdapter {
             ChannelContent::Text(text) => {
                 self.api_send_message(channel_id, &text).await?;
             }
+            ChannelContent::FileData {
+                data,
+                filename,
+                mime_type,
+            } => {
+                self.api_send_attachment(channel_id, data, &filename, &mime_type, None)
+                    .await?;
+            }
             _ => {
                 self.api_send_message(channel_id, "(Unsupported content type)")
                     .await?;
@@ -543,6 +629,22 @@ impl ChannelAdapter for DiscordAdapter {
 /// fall through to `File` so the bridge passes the URL as text instead of
 /// attempting an inline image block.
 const VISION_IMAGE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Build the `payload_json` body for an outbound attachment request.
+///
+/// Discord's `POST /channels/{id}/messages` multipart endpoint expects a
+/// `payload_json` part containing the same JSON the JSON-only variant would
+/// take. Captions longer than `DISCORD_MSG_LIMIT` chars must be truncated
+/// explicitly; otherwise the API responds 400 and silently drops the upload.
+fn build_attachment_payload_json(caption: Option<&str>) -> String {
+    match caption {
+        Some(c) if !c.is_empty() => {
+            let truncated: String = c.chars().take(DISCORD_MSG_LIMIT).collect();
+            serde_json::json!({ "content": truncated }).to_string()
+        }
+        _ => serde_json::json!({}).to_string(),
+    }
+}
 
 /// Best-effort MIME inference from a filename extension. Used as a fallback
 /// when Discord's `content_type` field is missing or empty (we've observed
@@ -776,6 +878,63 @@ async fn parse_discord_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_attachment_payload_no_caption() {
+        // No caption → empty JSON object so Discord doesn't reject it.
+        assert_eq!(build_attachment_payload_json(None), "{}");
+        assert_eq!(build_attachment_payload_json(Some("")), "{}");
+    }
+
+    #[test]
+    fn test_attachment_payload_short_caption() {
+        let json = build_attachment_payload_json(Some("hello"));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn test_attachment_payload_truncates_long_caption() {
+        // 3000 chars → must truncate to DISCORD_MSG_LIMIT (2000) so Discord
+        // accepts the request instead of 400-ing on a too-long content field.
+        let long = "a".repeat(3000);
+        let json = build_attachment_payload_json(Some(&long));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["content"].as_str().unwrap().chars().count(), DISCORD_MSG_LIMIT);
+    }
+
+    #[test]
+    fn test_attachment_payload_truncation_is_char_safe() {
+        // Multibyte chars must not be split mid-codepoint.
+        let s: String = "héllo ".repeat(500); // 6 chars per chunk → 3000 chars total
+        let json = build_attachment_payload_json(Some(&s));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Round-trip through serde guarantees we didn't produce invalid UTF-8.
+        assert_eq!(v["content"].as_str().unwrap().chars().count(), DISCORD_MSG_LIMIT);
+    }
+
+    #[test]
+    fn test_multipart_part_accepts_common_mimes() {
+        // Validate that mime_str() doesn't reject the MIME types we map from
+        // tool_runner.rs::channel_send. If any of these started failing we'd
+        // surface as a runtime upload error per file.
+        for mime in [
+            "image/png",
+            "image/jpeg",
+            "image/gif",
+            "image/webp",
+            "application/pdf",
+            "text/plain",
+            "application/json",
+            "application/octet-stream",
+            "video/mp4",
+        ] {
+            let part = reqwest::multipart::Part::bytes(b"x".to_vec())
+                .file_name("f.bin")
+                .mime_str(mime);
+            assert!(part.is_ok(), "mime_str rejected {mime}");
+        }
+    }
 
     #[tokio::test]
     async fn test_parse_discord_message_basic() {
