@@ -32,6 +32,15 @@ const RETRY_AFTER_FLOOR_SECS: f64 = 0.05;
 /// Cap on the rate-limit retry delay so a misbehaving response can't park us
 /// for a long time on a one-shot retry.
 const RETRY_AFTER_CEIL_SECS: f64 = 30.0;
+/// Per-request timeout for outbound URL fetches (File/Image arms). Matches the
+/// adapter's existing 15s budget for other REST calls so a slow remote can't
+/// stall the send pipeline.
+const URL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Hard cap on the size of a fetched URL body, both via Content-Length pre-flight
+/// and via streamed accumulation. Discord itself caps non-Nitro uploads at
+/// 25 MiB; matching that here means we reject before paying for bytes Discord
+/// would refuse anyway.
+const URL_FETCH_MAX_BYTES: usize = 25 * 1024 * 1024;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -158,7 +167,7 @@ impl DiscordAdapter {
     async fn api_send_attachment(
         &self,
         channel_id: &str,
-        data: Vec<u8>,
+        data: impl Into<bytes::Bytes>,
         filename: &str,
         mime_type: &str,
         caption: Option<&str>,
@@ -169,12 +178,11 @@ impl DiscordAdapter {
         // explicitly so a long caption doesn't silently 400.
         let payload_json = build_attachment_payload_json(caption);
 
-        // Convert the attachment bytes into `bytes::Bytes` exactly once.
-        // `Bytes::clone` is a cheap atomic refcount bump, so subsequent form
-        // builds (in the retry path) don't reallocate the payload — the prior
-        // implementation cloned `Vec<u8>` on every iteration including the
-        // happy path, which wasted up to 25 MiB per send.
-        let bytes = bytes::Bytes::from(data);
+        // Accept anything that becomes `Bytes` cheaply. `Bytes::clone` is a
+        // refcount bump, so retry-path form builds don't reallocate the
+        // payload. Callers passing `Vec<u8>` move ownership; callers passing
+        // a `Bytes` from `download_url_to_bytes` reuse the same allocation.
+        let bytes: bytes::Bytes = data.into();
         let body_len = bytes.len() as u64;
         let build_form = || -> Result<reqwest::multipart::Form, Box<dyn std::error::Error>> {
             let body = reqwest::Body::from(bytes.clone());
@@ -236,6 +244,80 @@ impl DiscordAdapter {
                 format!("Discord sendAttachment failed ({status}): {body_text}").into(),
             );
         }
+    }
+
+    /// Fetch a URL into memory with a 15s timeout and a 25 MiB cap.
+    ///
+    /// Two-stage size enforcement:
+    ///   1. If the response carries `Content-Length` and it exceeds the cap,
+    ///      reject before reading the body.
+    ///   2. Stream `chunk()`-by-`chunk()` and abort once accumulated bytes
+    ///      exceed the cap (covers servers that omit/lie about Content-Length).
+    ///
+    /// Returns the body as `Bytes` (so the multipart helper can refcount-clone
+    /// instead of memcpy on retry) plus the response's `Content-Type` with any
+    /// parameters (e.g. `; charset=utf-8`) stripped.
+    async fn download_url_to_bytes(
+        &self,
+        url: &str,
+    ) -> Result<(bytes::Bytes, Option<String>), Box<dyn std::error::Error>> {
+        let resp = self
+            .client
+            .get(url)
+            .timeout(URL_FETCH_TIMEOUT)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Read up to 512B of the body for diagnostics; ignore errors.
+            let snippet: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(512)
+                .collect();
+            return Err(format!(
+                "Discord download_url_to_bytes failed ({status}) for {url}: {snippet}"
+            )
+            .into());
+        }
+
+        // Pre-flight: trust Content-Length when present so we can fail fast
+        // without buffering 26 MiB before erroring.
+        if let Some(len) = resp.content_length() {
+            if len as usize > URL_FETCH_MAX_BYTES {
+                return Err(format!(
+                    "Discord download_url_to_bytes: Content-Length {len} exceeds cap {URL_FETCH_MAX_BYTES} for {url}"
+                )
+                .into());
+            }
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(strip_mime_params)
+            .filter(|s| !s.is_empty());
+
+        // Stream chunks so we can abort if the server lied about/omitted
+        // Content-Length and tries to push past the cap. `chunk()` returns
+        // `Bytes`; we accumulate into a single `BytesMut` and freeze at the end.
+        let mut buf = bytes::BytesMut::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp.chunk().await? {
+            if buf.len() + chunk.len() > URL_FETCH_MAX_BYTES {
+                return Err(format!(
+                    "Discord download_url_to_bytes: streamed body exceeds cap {URL_FETCH_MAX_BYTES} for {url}"
+                )
+                .into());
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok((buf.freeze(), content_type))
     }
 
     /// Send typing indicator to a Discord channel.
@@ -630,6 +712,48 @@ impl ChannelAdapter for DiscordAdapter {
                 self.api_send_attachment(channel_id, data, &filename, &mime_type, None)
                     .await?;
             }
+            ChannelContent::File {
+                url,
+                filename,
+                mime,
+                size: _,
+            } => {
+                // Fetch then route through the existing multipart helper.
+                // `download_url_to_bytes` enforces 15s timeout and 25 MiB cap.
+                let (bytes, response_ct) = self.download_url_to_bytes(&url).await?;
+                let resolved_filename =
+                    resolve_file_filename(Some(filename.as_str()), &url);
+                let resolved_mime = resolve_file_mime(
+                    mime.as_deref(),
+                    response_ct.as_deref(),
+                    &resolved_filename,
+                );
+                // `File` carries no caption field; the upstream router emits a
+                // Multipart([Text, File]) when there's a caption, which is
+                // handled by the parent recursion path (not this arm).
+                self.api_send_attachment(
+                    channel_id,
+                    bytes,
+                    &resolved_filename,
+                    &resolved_mime,
+                    None,
+                )
+                .await?;
+            }
+            ChannelContent::Image { url, caption } => {
+                let (bytes, response_ct) = self.download_url_to_bytes(&url).await?;
+                let resolved_mime = resolve_image_mime(response_ct.as_deref(), &url);
+                let resolved_filename = resolve_image_filename(&url, &resolved_mime);
+                let caption_ref = caption.as_deref().filter(|s| !s.is_empty());
+                self.api_send_attachment(
+                    channel_id,
+                    bytes,
+                    &resolved_filename,
+                    &resolved_mime,
+                    caption_ref,
+                )
+                .await?;
+            }
             _ => {
                 self.api_send_message(channel_id, "(Unsupported content type)")
                     .await?;
@@ -668,6 +792,118 @@ fn build_attachment_payload_json(caption: Option<&str>) -> String {
         }
         _ => serde_json::json!({}).to_string(),
     }
+}
+
+/// Strip MIME parameters (e.g. `; charset=utf-8`) so downstream comparisons
+/// against canonical types like `image/png` work. Lower-cases and trims so
+/// `IMAGE/PNG ; charset=utf-8` and `image/png` both normalize to `image/png`.
+fn strip_mime_params(raw: &str) -> String {
+    raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase()
+}
+
+/// Derive a filename from a URL path: take the segment after the last `/`,
+/// drop any query/fragment, percent-decode best-effort. Returns None if the
+/// URL has no useful path segment (e.g. `https://host/`).
+fn derive_filename_from_url(url: &str) -> Option<String> {
+    // Strip scheme://host. We only care about the path-ish suffix; doing
+    // this without a real URL parser keeps the helper dep-free and total
+    // (a malformed URL still gets a best-effort answer).
+    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = after_scheme.split_once('/').map(|(_, r)| r).unwrap_or("");
+    // Drop query and fragment.
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
+    if last.is_empty() {
+        return None;
+    }
+    // Percent-decode best-effort; fall back to the raw segment on failure.
+    let decoded = percent_decode_lossy(last);
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+/// Tiny percent-decoder. We don't pull in `percent-encoding` for this — the
+/// adapter already avoids new deps and we only need it to prettify Discord
+/// CDN paths like `photo%20final.png` → `photo final.png`.
+fn percent_decode_lossy(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Pick a filename for an outbound `File` arm. Preference order: explicit
+/// `filename` field → URL path tail → `"file"`.
+fn resolve_file_filename(field: Option<&str>, url: &str) -> String {
+    field
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| derive_filename_from_url(url))
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// Pick a MIME for an outbound `File` arm. Preference order: explicit `mime`
+/// field → response Content-Type → extension lookup from filename →
+/// `application/octet-stream`.
+fn resolve_file_mime(
+    field: Option<&str>,
+    response_ct: Option<&str>,
+    filename: &str,
+) -> String {
+    field
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| response_ct.map(str::to_string))
+        .or_else(|| mime_from_extension(filename).map(str::to_string))
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// Pick a filename for an outbound `Image` arm. Preference order: URL path
+/// tail → `"image" + extension` inferred from the resolved MIME (default
+/// `.png`).
+fn resolve_image_filename(url: &str, resolved_mime: &str) -> String {
+    if let Some(name) = derive_filename_from_url(url) {
+        return name;
+    }
+    let ext = match resolved_mime {
+        "image/jpeg" => ".jpg",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/heic" => ".heic",
+        "image/heif" => ".heif",
+        _ => ".png",
+    };
+    format!("image{ext}")
+}
+
+/// Pick a MIME for an outbound `Image` arm. Preference order: response
+/// Content-Type → extension lookup from URL tail → `image/png`.
+fn resolve_image_mime(response_ct: Option<&str>, url: &str) -> String {
+    if let Some(ct) = response_ct.filter(|s| !s.is_empty()) {
+        return ct.to_string();
+    }
+    if let Some(tail) = derive_filename_from_url(url) {
+        if let Some(ext) = mime_from_extension(&tail) {
+            return ext.to_string();
+        }
+    }
+    "image/png".to_string()
 }
 
 /// Best-effort MIME inference from a filename extension. Used as a fallback
@@ -1541,6 +1777,220 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(msg.content, ChannelContent::Image { .. }));
+    }
+
+    // -- Pure helper tests for File/Image arm fallback chains --------------
+
+    #[test]
+    fn test_strip_mime_params_basic() {
+        assert_eq!(strip_mime_params("image/png"), "image/png");
+        assert_eq!(strip_mime_params("image/png; charset=utf-8"), "image/png");
+        assert_eq!(
+            strip_mime_params("  IMAGE/PNG ; charset=utf-8 "),
+            "image/png"
+        );
+        assert_eq!(strip_mime_params(""), "");
+    }
+
+    #[test]
+    fn test_derive_filename_from_url() {
+        assert_eq!(
+            derive_filename_from_url("https://cdn.example.com/a/b/photo.png"),
+            Some("photo.png".to_string())
+        );
+        assert_eq!(
+            derive_filename_from_url("https://cdn.example.com/a/b/photo.png?ex=1&hm=2"),
+            Some("photo.png".to_string())
+        );
+        assert_eq!(
+            derive_filename_from_url("https://cdn.example.com/a/photo%20final.png"),
+            Some("photo final.png".to_string())
+        );
+        // Trailing slash → no filename derivable.
+        assert_eq!(derive_filename_from_url("https://cdn.example.com/"), None);
+        assert_eq!(derive_filename_from_url("https://cdn.example.com"), None);
+    }
+
+    #[test]
+    fn test_resolve_file_filename_chain() {
+        // Field wins over URL.
+        assert_eq!(
+            resolve_file_filename(Some("explicit.bin"), "https://x/y/url.dat"),
+            "explicit.bin"
+        );
+        // Empty field → URL fallback.
+        assert_eq!(
+            resolve_file_filename(Some(""), "https://x/y/url.dat"),
+            "url.dat"
+        );
+        // None → URL fallback.
+        assert_eq!(
+            resolve_file_filename(None, "https://x/y/url.dat"),
+            "url.dat"
+        );
+        // No URL tail → "file".
+        assert_eq!(resolve_file_filename(None, "https://x/"), "file");
+    }
+
+    #[test]
+    fn test_resolve_file_mime_chain() {
+        // Field wins.
+        assert_eq!(
+            resolve_file_mime(Some("application/pdf"), Some("text/plain"), "f.txt"),
+            "application/pdf"
+        );
+        // No field → response Content-Type.
+        assert_eq!(
+            resolve_file_mime(None, Some("text/plain"), "f.txt"),
+            "text/plain"
+        );
+        // No field, no CT → extension lookup.
+        assert_eq!(resolve_file_mime(None, None, "f.pdf"), "application/pdf");
+        // Nothing → default.
+        assert_eq!(
+            resolve_file_mime(None, None, "no-ext"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_filename_chain() {
+        // URL tail wins.
+        assert_eq!(
+            resolve_image_filename("https://x/y/picture.jpg", "image/jpeg"),
+            "picture.jpg"
+        );
+        // No URL tail → image + ext from MIME.
+        assert_eq!(resolve_image_filename("https://x/", "image/jpeg"), "image.jpg");
+        assert_eq!(resolve_image_filename("https://x/", "image/png"), "image.png");
+        assert_eq!(resolve_image_filename("https://x/", "image/webp"), "image.webp");
+        // Unknown MIME → .png default.
+        assert_eq!(
+            resolve_image_filename("https://x/", "application/octet-stream"),
+            "image.png"
+        );
+    }
+
+    #[test]
+    fn test_resolve_image_mime_chain() {
+        // Response CT wins.
+        assert_eq!(
+            resolve_image_mime(Some("image/jpeg"), "https://x/y/foo.png"),
+            "image/jpeg"
+        );
+        // No CT → URL extension.
+        assert_eq!(
+            resolve_image_mime(None, "https://x/y/foo.png"),
+            "image/png"
+        );
+        // No CT, no extension → default.
+        assert_eq!(resolve_image_mime(None, "https://x/y/blob"), "image/png");
+    }
+
+    // -- download_url_to_bytes size-cap tests ------------------------------
+
+    /// Spawn a hand-rolled HTTP server that replies with a fixed status,
+    /// optional Content-Length header (lying or omitted), and a body produced
+    /// by the supplied closure. This intentionally does NOT use axum's
+    /// `Body::from(Vec<u8>)` (which always sends the real Content-Length); we
+    /// need control over the header to exercise both pre-flight and streaming
+    /// rejection paths.
+    async fn spawn_raw_http_server(
+        status_line: &'static str,
+        content_length: Option<&'static str>,
+        body: bytes::Bytes,
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept exactly one connection — sufficient for a single
+            // download_url_to_bytes test invocation.
+            let (mut sock, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            // Drain the request line + headers (best-effort; we don't parse).
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            let mut header = format!("HTTP/1.1 {status_line}\r\n");
+            header.push_str("Content-Type: application/octet-stream\r\n");
+            if let Some(cl) = content_length {
+                header.push_str(&format!("Content-Length: {cl}\r\n"));
+            }
+            header.push_str("Connection: close\r\n\r\n");
+            let _ = sock.write_all(header.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+            let _ = sock.shutdown().await;
+        });
+        format!("http://{addr}/file")
+    }
+
+    fn test_adapter() -> DiscordAdapter {
+        DiscordAdapter::new("test-token".into(), vec![], vec![], true, 0)
+    }
+
+    #[tokio::test]
+    async fn test_download_size_cap_via_content_length() {
+        // Server advertises an oversized Content-Length and sends a tiny body.
+        // The adapter must reject before reading anything significant.
+        let oversized = (URL_FETCH_MAX_BYTES + 1).to_string();
+        // Leak the string so we can hand &'static str to the spawn helper.
+        let cl: &'static str = Box::leak(oversized.into_boxed_str());
+        let url =
+            spawn_raw_http_server("200 OK", Some(cl), bytes::Bytes::from_static(b"x")).await;
+
+        let adapter = test_adapter();
+        let res = adapter.download_url_to_bytes(&url).await;
+        assert!(res.is_err(), "expected Err on oversized Content-Length");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("Content-Length"), "err should mention CL: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_download_size_cap_via_streaming() {
+        // Server omits Content-Length and streams >25 MiB. Adapter must abort
+        // mid-stream rather than buffering the full payload.
+        let big = bytes::Bytes::from(vec![0u8; URL_FETCH_MAX_BYTES + 1024]);
+        let url = spawn_raw_http_server("200 OK", None, big).await;
+
+        let adapter = test_adapter();
+        let res = adapter.download_url_to_bytes(&url).await;
+        assert!(res.is_err(), "expected Err on oversized streamed body");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("streamed body exceeds cap")
+                || err.contains("Content-Length"),
+            "err should mention size cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_under_cap_succeeds_and_returns_bytes_and_ct() {
+        // Sanity check: a normal small payload returns the bytes and the
+        // stripped Content-Type. Uses axum so Content-Length is set correctly.
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/f",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "image/png; charset=utf-8")],
+                    bytes::Bytes::from_static(b"PNGDATA"),
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}/f");
+
+        let adapter = test_adapter();
+        let (bytes, ct) = adapter.download_url_to_bytes(&url).await.unwrap();
+        assert_eq!(&bytes[..], b"PNGDATA");
+        // Content-Type parameters must be stripped.
+        assert_eq!(ct.as_deref(), Some("image/png"));
     }
 
     #[tokio::test]
