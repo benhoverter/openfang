@@ -22,6 +22,16 @@ const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DISCORD_MSG_LIMIT: usize = 2000;
+/// Multipart field name Discord requires for the first attachment payload.
+/// Centralized so a `file[0]` typo at the call site can't slip past review,
+/// and so the unit test below pins the exact wire format.
+const ATTACHMENT_FIELD_NAME: &str = "files[0]";
+/// Floor on the rate-limit retry delay. Discord occasionally returns
+/// `retry_after: 0` (or a missing header), which would busy-loop the retry.
+const RETRY_AFTER_FLOOR_SECS: f64 = 0.05;
+/// Cap on the rate-limit retry delay so a misbehaving response can't park us
+/// for a long time on a one-shot retry.
+const RETRY_AFTER_CEIL_SECS: f64 = 30.0;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -159,15 +169,21 @@ impl DiscordAdapter {
         // explicitly so a long caption doesn't silently 400.
         let payload_json = build_attachment_payload_json(caption);
 
-        // Build the multipart form. Clone bytes for the retry path; the form
-        // consumes the Part on send.
+        // Convert the attachment bytes into `bytes::Bytes` exactly once.
+        // `Bytes::clone` is a cheap atomic refcount bump, so subsequent form
+        // builds (in the retry path) don't reallocate the payload — the prior
+        // implementation cloned `Vec<u8>` on every iteration including the
+        // happy path, which wasted up to 25 MiB per send.
+        let bytes = bytes::Bytes::from(data);
+        let body_len = bytes.len() as u64;
         let build_form = || -> Result<reqwest::multipart::Form, Box<dyn std::error::Error>> {
-            let file_part = reqwest::multipart::Part::bytes(data.clone())
+            let body = reqwest::Body::from(bytes.clone());
+            let file_part = reqwest::multipart::Part::stream_with_length(body, body_len)
                 .file_name(filename.to_string())
                 .mime_str(mime_type)?;
             Ok(reqwest::multipart::Form::new()
                 .text("payload_json", payload_json.clone())
-                .part("files[0]", file_part))
+                .part(ATTACHMENT_FIELD_NAME, file_part))
         };
 
         let mut attempts = 0u8;
@@ -187,15 +203,23 @@ impl DiscordAdapter {
                 return Ok(());
             }
 
-            // Honor Retry-After once on 429.
+            // Honor Retry-After once on 429. Discord puts the canonical
+            // `retry_after` in the JSON body; the HTTP header is a fallback
+            // (and is sometimes absent on per-route limits).
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts == 1 {
-                let retry_after_secs = resp
+                let header_secs = resp
                     .headers()
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<f64>().ok())
+                    .and_then(|s| s.parse::<f64>().ok());
+                let body_text = resp.text().await.unwrap_or_default();
+                let body_secs = serde_json::from_str::<serde_json::Value>(&body_text)
+                    .ok()
+                    .and_then(|v| v.get("retry_after").and_then(|r| r.as_f64()));
+                let retry_after_secs = body_secs
+                    .or(header_secs)
                     .unwrap_or(1.0)
-                    .clamp(0.0, 30.0);
+                    .clamp(RETRY_AFTER_FLOOR_SECS, RETRY_AFTER_CEIL_SECS);
                 warn!(
                     "Discord sendAttachment rate-limited; retrying after {retry_after_secs:.2}s"
                 );
@@ -911,6 +935,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // Round-trip through serde guarantees we didn't produce invalid UTF-8.
         assert_eq!(v["content"].as_str().unwrap().chars().count(), DISCORD_MSG_LIMIT);
+    }
+
+    #[test]
+    fn test_attachment_field_name_pinned() {
+        // Discord rejects the upload silently if the multipart field isn't
+        // exactly `files[0]` (a `file[0]` typo would fail at runtime, per
+        // attachment, with no useful error). Pin the wire format here so a
+        // typo at the call site is impossible without also changing this test.
+        assert_eq!(ATTACHMENT_FIELD_NAME, "files[0]");
     }
 
     #[test]
