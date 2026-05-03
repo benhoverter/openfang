@@ -1021,6 +1021,13 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
+        // Grant the CLI's Read tool access to our image tmp dir, which lives
+        // outside the agent's workspace cwd. Without --add-dir the CLI would
+        // refuse Read on `$HOME/.openfang/tmp/images/*` (unless
+        // --dangerously-skip-permissions is set) and the materialization would
+        // be a dead-end. Cheap and idempotent — the dir is per-user and
+        // content-addressed.
+        cmd.arg("--add-dir").arg(image_tmp_dir());
 
         Self::apply_env_filter(&mut cmd);
 
@@ -1266,6 +1273,8 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
+        // Same image-tmp-dir grant as the non-streaming path; see complete().
+        cmd.arg("--add-dir").arg(image_tmp_dir());
 
         Self::apply_env_filter(&mut cmd);
 
