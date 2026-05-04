@@ -140,9 +140,26 @@ impl ClaudeCodeDriver {
     }
 
     /// Build a text prompt from the completion request messages.
+    ///
+    /// The Claude Code CLI is text-only (`-p <prompt>`), so non-text content
+    /// blocks (images, etc.) cannot be sent natively. Rather than dropping
+    /// them silently — which causes the model to hallucinate about content
+    /// it can't see — we render each non-text block as a synthetic
+    /// `[attachment: ...]` marker via `render_content`. The model still
+    /// can't *view* the attachment, but it knows the attachment exists and
+    /// can acknowledge it coherently instead of confabulating.
+    ///
+    /// The per-block accounting below emits a `cc.bridge.build_prompt`
+    /// diagnostic event so we can confirm what content actually reaches
+    /// the bridge and whether `render_content` materialized it.
     fn build_prompt(request: &CompletionRequest) -> String {
         let tmp_dir = image_tmp_dir();
         let mut parts = Vec::new();
+        // Per-message block-kind accounting for diagnostics.
+        let mut msg_block_kinds: Vec<Vec<&'static str>> = Vec::with_capacity(request.messages.len());
+        let mut total_image_blocks: usize = 0;
+        let mut total_text_blocks: usize = 0;
+        let mut total_other_blocks: usize = 0;
 
         for msg in &request.messages {
             let role_label = match msg.role {
@@ -150,13 +167,54 @@ impl ClaudeCodeDriver {
                 Role::Assistant => "Assistant",
                 Role::System => "System",
             };
+            let kinds: Vec<&'static str> = match &msg.content {
+                MessageContent::Text(_) => vec!["text"],
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { .. } => "text",
+                        ContentBlock::Image { .. } => "image",
+                        ContentBlock::ToolUse { .. } => "tool_use",
+                        ContentBlock::ToolResult { .. } => "tool_result",
+                        ContentBlock::Thinking { .. } => "thinking",
+                        ContentBlock::Unknown => "unknown",
+                    })
+                    .collect(),
+            };
+            for k in &kinds {
+                match *k {
+                    "text" => total_text_blocks += 1,
+                    "image" => total_image_blocks += 1,
+                    _ => total_other_blocks += 1,
+                }
+            }
+            msg_block_kinds.push(kinds);
+
             let rendered = Self::render_content(&msg.content, Some(&tmp_dir));
             if !rendered.is_empty() {
                 parts.push(format!("[{role_label}]\n{rendered}"));
             }
         }
 
-        parts.join("\n\n")
+        let prompt = parts.join("\n\n");
+
+        // Bridge diagnostic log — single structured event per request.
+        // Tag with `event = "cc.bridge.build_prompt"` for grep-friendly
+        // filtering. If `total_image_blocks > 0` and the prompt does not
+        // contain materialized-image directives, the bridge is dropping
+        // images on the floor (this is the suspected bug).
+        debug!(
+            event = "cc.bridge.build_prompt",
+            message_count = request.messages.len(),
+            total_text_blocks = total_text_blocks,
+            total_image_blocks = total_image_blocks,
+            total_other_blocks = total_other_blocks,
+            per_message_block_kinds = ?msg_block_kinds,
+            prompt_chars = prompt.len(),
+            "claude-code bridge: assembled CLI prompt"
+        );
+
+        prompt
     }
 
     /// Render message content for the text-only CLI prompt.
