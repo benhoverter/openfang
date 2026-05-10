@@ -1299,6 +1299,23 @@ impl OpenFangKernel {
                         }
                     }
 
+                    // ANAI-32: validate manifest tool names against the
+                    // runtime's known builtin set. Unknown names don't
+                    // block boot — the bridge dispatcher rejects calls
+                    // for them anyway — but logging them at boot turns a
+                    // silent typo into an obvious operator signal.
+                    let unknown = openfang_runtime::tool_runner::unknown_builtin_tools(
+                        entry.manifest.capabilities.tools.iter(),
+                    );
+                    if !unknown.is_empty() {
+                        warn!(
+                            agent = %name,
+                            unknown_tools = ?unknown,
+                            "agent.toml capabilities.tools contains unknown tool names; \
+                             these will be rejected at dispatch time. Check spelling."
+                        );
+                    }
+
                     // Re-grant capabilities
                     let caps = manifest_to_capabilities(&entry.manifest);
                     kernel.capabilities.grant(agent_id, caps);
@@ -1550,6 +1567,21 @@ impl OpenFangKernel {
             generate_identity_files(&workspace_dir, &manifest);
         }
         manifest.workspace = Some(workspace_dir);
+
+        // ANAI-32: validate manifest tool names against the runtime's
+        // known builtin set. See the boot-time twin for rationale; same
+        // log-and-continue policy at spawn time.
+        let unknown = openfang_runtime::tool_runner::unknown_builtin_tools(
+            manifest.capabilities.tools.iter(),
+        );
+        if !unknown.is_empty() {
+            warn!(
+                agent = %name,
+                unknown_tools = ?unknown,
+                "agent.toml capabilities.tools contains unknown tool names; \
+                 these will be rejected at dispatch time. Check spelling."
+            );
+        }
 
         // Register capabilities
         let caps = manifest_to_capabilities(&manifest);
@@ -2707,6 +2739,8 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                caller_agent_id: None,
+                caller_allowed_tools: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -6679,6 +6713,13 @@ async fn cron_fan_out_targets(
 
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
+    fn global_file_policy(&self) -> openfang_types::file_policy::FilePolicy {
+        // ANAI-40 fixup: surface the kernel's `[file_policy]` block so the
+        // runtime can layer per-agent overrides over it. Previously
+        // unwired — `KernelConfig.file_policy` was dead code.
+        self.config.file_policy.clone()
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,
@@ -7467,6 +7508,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            file_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,
@@ -7509,6 +7551,7 @@ mod tests {
             workspace: Some(std::path::PathBuf::from("/var/lib/openfang/agents/demo")),
             generate_identity_files: true,
             exec_policy: Some(ExecPolicy::default()),
+            file_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,
@@ -7559,6 +7602,7 @@ mod tests {
             workspace: Some(std::path::PathBuf::from("/old")),
             generate_identity_files: true,
             exec_policy: None,
+            file_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,
@@ -7614,6 +7658,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: Some(cached_policy.clone()),
+            file_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,
@@ -7726,6 +7771,7 @@ mod tests {
             workspace: None,
             generate_identity_files: true,
             exec_policy: None,
+            file_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
             cache_context: false,

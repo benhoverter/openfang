@@ -7,8 +7,9 @@ use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
+use openfang_types::file_policy::{CompiledFilePolicy, FileDecision, FileOp};
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
-use openfang_types::tool::{ToolDefinition, ToolResult};
+use openfang_types::tool::ToolResult;
 use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -124,6 +125,7 @@ pub async fn execute_tool(
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    file_policy: Option<&CompiledFilePolicy>,
 ) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
@@ -140,6 +142,51 @@ pub async fn execute_tool(
                 ),
                 is_error: true,
             };
+        }
+    }
+
+    // Shell pre-gate: run purely-syntactic shell validators BEFORE the approval gate.
+    //
+    // Without this, a command like `echo foo; whoami` would be sent to the human for
+    // approval, approved, and only then rejected by the metacharacter denylist inside
+    // the per-tool match arm below. That wastes the operator's attention on commands
+    // that are guaranteed to be denied. Lift the pure-syntactic checks here so denial
+    // happens before any approval surfacer push.
+    //
+    // Scoped to "shell_exec" specifically (not all is_shell_tool() entries) because
+    // process_start has a different input shape and its own validators; widening this
+    // gate is a separate change.
+    //
+    // The same checks remain inside the "shell_exec" arm as defense-in-depth against
+    // future refactors that might bypass this pre-gate.
+    if tool_name == "shell_exec" {
+        let command = input["command"].as_str().unwrap_or("");
+
+        if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
+            return ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!(
+                    "shell_exec blocked: command contains {reason}. \
+                     Shell metacharacters are never allowed."
+                ),
+                is_error: true,
+            };
+        }
+
+        if let Some(policy) = exec_policy {
+            if let Err(reason) =
+                crate::subprocess_sandbox::validate_command_allowlist(command, policy)
+            {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "shell_exec blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                         To allow shell commands, set exec_policy.mode = 'full' in the agent manifest or config.toml.",
+                        policy.mode
+                    ),
+                    is_error: true,
+                };
+            }
         }
     }
 
@@ -202,10 +249,46 @@ pub async fn execute_tool(
     debug!(tool_name, "Executing tool");
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, workspace_root).await,
-        "file_write" => tool_file_write(input, workspace_root).await,
-        "file_list" => tool_file_list(input, workspace_root).await,
-        "apply_patch" => tool_apply_patch(input, workspace_root).await,
+        "file_read" => {
+            tool_file_read(
+                input,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
+        "file_write" => {
+            tool_file_write(
+                input,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
+        "file_list" => {
+            tool_file_list(
+                input,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
+        "apply_patch" => {
+            tool_apply_patch(
+                input,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
@@ -290,6 +373,9 @@ pub async fn execute_tool(
                 allowed_env_vars.unwrap_or(&[]),
                 workspace_root,
                 exec_policy,
+                file_policy,
+                kernel,
+                caller_agent_id,
             )
             .await
         }
@@ -323,18 +409,57 @@ pub async fn execute_tool(
         "knowledge_query" => tool_knowledge_query(input, kernel).await,
 
         // Image analysis tool
-        "image_analyze" => tool_image_analyze(input).await,
+        "image_analyze" => {
+            tool_image_analyze(
+                input,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
 
         // Media understanding tools
-        "media_describe" => tool_media_describe(input, media_engine).await,
-        "media_transcribe" => tool_media_transcribe(input, media_engine).await,
+        "media_describe" => {
+            tool_media_describe(
+                input,
+                media_engine,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
+        "media_transcribe" => {
+            tool_media_transcribe(
+                input,
+                media_engine,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
 
         // Image generation tool
         "image_generate" => tool_image_generate(input, workspace_root).await,
 
         // TTS/STT tools
         "text_to_speech" => tool_text_to_speech(input, tts_engine, workspace_root).await,
-        "speech_to_text" => tool_speech_to_text(input, media_engine, workspace_root).await,
+        "speech_to_text" => {
+            tool_speech_to_text(
+                input,
+                media_engine,
+                workspace_root,
+                file_policy,
+                kernel,
+                caller_agent_id,
+            )
+            .await
+        }
 
         // Docker sandbox tool
         "docker_exec" => {
@@ -353,11 +478,22 @@ pub async fn execute_tool(
         "cron_cancel" => tool_cron_cancel(input, kernel).await,
 
         // Channel send tool (proactive outbound messaging)
-        "channel_send" => tool_channel_send(input, kernel, workspace_root).await,
+        "channel_send" => {
+            tool_channel_send(input, kernel, workspace_root, file_policy, caller_agent_id).await
+        }
 
         // Persistent process tools
         "process_start" => {
-            tool_process_start(input, process_manager, caller_agent_id, exec_policy).await
+            tool_process_start(
+                input,
+                process_manager,
+                caller_agent_id,
+                exec_policy,
+                workspace_root,
+                file_policy,
+                kernel,
+            )
+            .await
         }
         "process_poll" => tool_process_poll(input, process_manager).await,
         "process_write" => tool_process_write(input, process_manager).await,
@@ -556,729 +692,41 @@ pub async fn execute_tool(
     }
 }
 
-/// Get definitions for all built-in tools.
-pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        // --- Filesystem tools ---
-        ToolDefinition {
-            name: "file_read".to_string(),
-            description: "Read the contents of a file. Paths are relative to the agent workspace.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The file path to read" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "file_write".to_string(),
-            description: "Write content to a file. Paths are relative to the agent workspace.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The file path to write to" },
-                    "content": { "type": "string", "description": "The content to write" }
-                },
-                "required": ["path", "content"]
-            }),
-        },
-        ToolDefinition {
-            name: "file_list".to_string(),
-            description: "List files in a directory. Paths are relative to the agent workspace.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The directory path to list" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "apply_patch".to_string(),
-            description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "patch": {
-                        "type": "string",
-                        "description": "The patch in *** Begin Patch / *** End Patch format. Use *** Add File:, *** Update File:, *** Delete File: markers. Hunks use @@ headers with space (context), - (remove), + (add) prefixed lines."
-                    }
-                },
-                "required": ["patch"]
-            }),
-        },
-        // --- Web tools ---
-        ToolDefinition {
-            name: "web_fetch".to_string(),
-            description: "Fetch a URL with SSRF protection. Supports GET/POST/PUT/PATCH/DELETE. For GET, HTML is converted to Markdown. For other methods, returns raw response body.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "The URL to fetch (http/https only)" },
-                    "method": { "type": "string", "enum": ["GET","POST","PUT","PATCH","DELETE"], "description": "HTTP method (default: GET)" },
-                    "headers": { "type": "object", "description": "Custom HTTP headers as key-value pairs" },
-                    "body": { "type": "string", "description": "Request body for POST/PUT/PATCH" }
-                },
-                "required": ["url"]
-            }),
-        },
-        ToolDefinition {
-            name: "web_search".to_string(),
-            description: "Search the web using multiple providers (Tavily, Brave, Perplexity, DuckDuckGo) with automatic fallback. Returns structured results with titles, URLs, and snippets.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "The search query" },
-                    "max_results": { "type": "integer", "description": "Maximum number of results to return (default: 5, max: 20)" }
-                },
-                "required": ["query"]
-            }),
-        },
-        // --- Shell tool ---
-        ToolDefinition {
-            name: "shell_exec".to_string(),
-            description: "Execute a shell command and return its output.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The command to execute" },
-                    "timeout_seconds": { "type": "integer", "description": "Timeout in seconds (default: 30)" }
-                },
-                "required": ["command"]
-            }),
-        },
-        // --- Inter-agent tools ---
-        ToolDefinition {
-            name: "agent_send".to_string(),
-            description: "Send a message to another agent and receive their response. Accepts UUID or agent name. Use agent_find first to discover agents.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
-                    "message": { "type": "string", "description": "The message to send to the agent" }
-                },
-                "required": ["agent_id", "message"]
-            }),
-        },
-        ToolDefinition {
-            name: "agent_spawn".to_string(),
-            description: "Spawn a new agent from a TOML manifest. Returns the new agent's ID and name.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "manifest_toml": {
-                        "type": "string",
-                        "description": "The agent manifest in TOML format (must include name, module, [model], and [capabilities])"
-                    }
-                },
-                "required": ["manifest_toml"]
-            }),
-        },
-        ToolDefinition {
-            name: "agent_list".to_string(),
-            description: "List all currently running agents with their IDs, names, states, and models.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "agent_kill".to_string(),
-            description: "Kill (terminate) another agent by its ID.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "agent_id": { "type": "string", "description": "The agent's UUID to kill" }
-                },
-                "required": ["agent_id"]
-            }),
-        },
-        // --- Shared memory tools ---
-        ToolDefinition {
-            name: "memory_store".to_string(),
-            description: "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string", "description": "The storage key" },
-                    "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
-                },
-                "required": ["key", "value"]
-            }),
-        },
-        ToolDefinition {
-            name: "memory_recall".to_string(),
-            description: "Recall a value from shared memory by key.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
-                },
-                "required": ["key"]
-            }),
-        },
-        // --- Collaboration tools ---
-        ToolDefinition {
-            name: "agent_find".to_string(),
-            description: "Discover agents by name, tag, tool, or description. Use to find specialists before delegating work.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search query (matches agent name, tags, tools, description)" }
-                },
-                "required": ["query"]
-            }),
-        },
-        ToolDefinition {
-            name: "task_post".to_string(),
-            description: "Post a task to the shared task queue for another agent to pick up.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string", "description": "Short task title" },
-                    "description": { "type": "string", "description": "Detailed task description" },
-                    "assigned_to": { "type": "string", "description": "Agent name or ID to assign the task to (optional)" }
-                },
-                "required": ["title", "description"]
-            }),
-        },
-        ToolDefinition {
-            name: "task_claim".to_string(),
-            description: "Claim the next available task from the task queue assigned to you or unassigned.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "task_complete".to_string(),
-            description: "Mark a previously claimed task as completed with a result.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "task_id": { "type": "string", "description": "The task ID to complete" },
-                    "result": { "type": "string", "description": "The result or outcome of the task" }
-                },
-                "required": ["task_id", "result"]
-            }),
-        },
-        ToolDefinition {
-            name: "task_list".to_string(),
-            description: "List tasks in the shared queue, optionally filtered by status (pending, in_progress, completed).".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed (optional)" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "event_publish".to_string(),
-            description: "Publish a custom event that can trigger proactive agents. Use to broadcast signals to the agent fleet.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "event_type": { "type": "string", "description": "Type identifier for the event (e.g., 'code_review_requested')" },
-                    "payload": { "type": "object", "description": "JSON payload data for the event" }
-                },
-                "required": ["event_type"]
-            }),
-        },
-        // --- Scheduling tools ---
-        ToolDefinition {
-            name: "schedule_create".to_string(),
-            description: "Schedule a recurring task using natural language or cron syntax. Examples: 'every 5 minutes', 'daily at 9am', 'weekdays at 6pm', '0 */5 * * *'.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "description": { "type": "string", "description": "What this schedule does (e.g., 'Check for new emails')" },
-                    "schedule": { "type": "string", "description": "Natural language or cron expression (e.g., 'every 5 minutes', 'daily at 9am', '0 */5 * * *')" },
-                    "agent": { "type": "string", "description": "Agent name or ID to run this task (optional, defaults to self)" }
-                },
-                "required": ["description", "schedule"]
-            }),
-        },
-        ToolDefinition {
-            name: "schedule_list".to_string(),
-            description: "List all scheduled tasks with their IDs, descriptions, schedules, and next run times.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "schedule_delete".to_string(),
-            description: "Remove a scheduled task by its ID.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "The schedule ID to remove" }
-                },
-                "required": ["id"]
-            }),
-        },
-        // --- Knowledge graph tools ---
-        ToolDefinition {
-            name: "knowledge_add_entity".to_string(),
-            description: "Add an entity to the knowledge graph. Entities represent people, organizations, projects, concepts, locations, tools, etc.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Display name of the entity" },
-                    "entity_type": { "type": "string", "description": "Type: person, organization, project, concept, event, location, document, tool, or a custom type" },
-                    "properties": { "type": "object", "description": "Arbitrary key-value properties (optional)" }
-                },
-                "required": ["name", "entity_type"]
-            }),
-        },
-        ToolDefinition {
-            name: "knowledge_add_relation".to_string(),
-            description: "Add a relation between two entities in the knowledge graph.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "Source entity ID or name" },
-                    "relation": { "type": "string", "description": "Relation type: works_at, knows_about, related_to, depends_on, owned_by, created_by, located_in, part_of, uses, produces, or a custom type" },
-                    "target": { "type": "string", "description": "Target entity ID or name" },
-                    "confidence": { "type": "number", "description": "Confidence score 0.0-1.0 (default: 1.0)" },
-                    "properties": { "type": "object", "description": "Arbitrary key-value properties (optional)" }
-                },
-                "required": ["source", "relation", "target"]
-            }),
-        },
-        ToolDefinition {
-            name: "knowledge_query".to_string(),
-            description: "Query the knowledge graph. Filter by source entity, relation type, and/or target entity. Returns matching entity-relation-entity triples.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "Filter by source entity name or ID (optional)" },
-                    "relation": { "type": "string", "description": "Filter by relation type (optional)" },
-                    "target": { "type": "string", "description": "Filter by target entity name or ID (optional)" },
-                    "max_depth": { "type": "integer", "description": "Maximum traversal depth (default: 1)" }
-                }
-            }),
-        },
-        // --- Image analysis tool ---
-        ToolDefinition {
-            name: "image_analyze".to_string(),
-            description: "Analyze an image file — returns format, dimensions, file size, and a base64 preview. For vision-model analysis, include a prompt.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the image file" },
-                    "prompt": { "type": "string", "description": "Optional prompt for vision analysis (e.g., 'Describe what you see')" }
-                },
-                "required": ["path"]
-            }),
-        },
-        // --- Location tool ---
-        ToolDefinition {
-            name: "location_get".to_string(),
-            description: "Get approximate geographic location based on IP address. Returns city, country, coordinates, and timezone.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        // --- Browser automation tools ---
-        ToolDefinition {
-            name: "browser_navigate".to_string(),
-            description: "Navigate a browser to a URL. Returns the page title and readable content as markdown. Opens a persistent browser session.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "The URL to navigate to (http/https only)" }
-                },
-                "required": ["url"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_click".to_string(),
-            description: "Click an element on the current browser page by CSS selector or visible text. Returns the resulting page state.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string", "description": "CSS selector (e.g., '#submit-btn', '.add-to-cart') or visible text to click" }
-                },
-                "required": ["selector"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_type".to_string(),
-            description: "Type text into an input field on the current browser page.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string", "description": "CSS selector for the input field (e.g., 'input[name=\"email\"]', '#search-box')" },
-                    "text": { "type": "string", "description": "The text to type into the field" }
-                },
-                "required": ["selector", "text"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_screenshot".to_string(),
-            description: "Take a screenshot of the current browser page. Returns a base64-encoded PNG image.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "browser_read_page".to_string(),
-            description: "Read the current browser page content as structured markdown. Use after clicking or navigating to see the updated page.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "browser_close".to_string(),
-            description: "Close the browser session. The browser will also auto-close when the agent loop ends.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "browser_scroll".to_string(),
-            description: "Scroll the browser page. Use this to see content below the fold or navigate long pages.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "direction": { "type": "string", "description": "Scroll direction: 'up', 'down', 'left', 'right' (default: 'down')" },
-                    "amount": { "type": "integer", "description": "Pixels to scroll (default: 600)" }
-                }
-            }),
-        },
-        ToolDefinition {
-            name: "browser_wait".to_string(),
-            description: "Wait for a CSS selector to appear on the page. Useful for dynamic content that loads asynchronously.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string", "description": "CSS selector to wait for" },
-                    "timeout_ms": { "type": "integer", "description": "Max wait time in milliseconds (default: 5000, max: 30000)" }
-                },
-                "required": ["selector"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_run_js".to_string(),
-            description: "Run JavaScript on the current browser page and return the result. For advanced interactions that other browser tools cannot handle.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "expression": { "type": "string", "description": "JavaScript expression to run in the page context" }
-                },
-                "required": ["expression"]
-            }),
-        },
-        ToolDefinition {
-            name: "browser_back".to_string(),
-            description: "Go back to the previous page in browser history.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        // --- Media understanding tools ---
-        ToolDefinition {
-            name: "media_describe".to_string(),
-            description: "Describe an image using a vision-capable LLM. Auto-selects the best available provider (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the image file (relative to workspace)" },
-                    "prompt": { "type": "string", "description": "Optional prompt to guide the description (e.g., 'Extract all text from this image')" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolDefinition {
-            name: "media_transcribe".to_string(),
-            description: "Transcribe audio to text using speech-to-text. Auto-selects the best available provider (Groq Whisper or OpenAI Whisper). Returns the transcript.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the audio file (relative to workspace). Supported: mp3, wav, ogg, flac, m4a, webm." },
-                    "language": { "type": "string", "description": "Optional ISO-639-1 language code (e.g., 'en', 'es', 'ja')" }
-                },
-                "required": ["path"]
-            }),
-        },
-        // --- Image generation tool ---
-        ToolDefinition {
-            name: "image_generate".to_string(),
-            description: "Generate images from a text prompt using DALL-E 3, DALL-E 2, or GPT-Image-1. Requires OPENAI_API_KEY. Generated images are saved to the workspace output/ directory.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompt": { "type": "string", "description": "Text description of the image to generate (max 4000 chars)" },
-                    "model": { "type": "string", "description": "Model to use: 'dall-e-3' (default), 'dall-e-2', or 'gpt-image-1'" },
-                    "size": { "type": "string", "description": "Image size: '1024x1024' (default), '1024x1792', '1792x1024', '256x256', '512x512'" },
-                    "quality": { "type": "string", "description": "Quality: 'hd' (default for dall-e-3) or 'standard'" },
-                    "count": { "type": "integer", "description": "Number of images to generate (1-4, default: 1). DALL-E 3 only supports 1." }
-                },
-                "required": ["prompt"]
-            }),
-        },
-        // --- Cron scheduling tools ---
-        ToolDefinition {
-            name: "cron_create".to_string(),
-            description: "Create a scheduled/cron job. Supports one-shot (at), recurring (every N seconds), and cron expressions. Max 50 jobs per agent.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string", "description": "Job name (max 128 chars, alphanumeric + spaces/hyphens/underscores)" },
-                    "schedule": {
-                        "type": "object",
-                        "description": "Schedule: {\"kind\":\"at\",\"at\":\"2025-01-01T00:00:00Z\"} or {\"kind\":\"every\",\"every_secs\":300} or {\"kind\":\"cron\",\"expr\":\"0 */6 * * *\"}"
-                    },
-                    "action": {
-                        "type": "object",
-                        "description": "Action: {\"kind\":\"system_event\",\"text\":\"...\"} or {\"kind\":\"agent_turn\",\"message\":\"...\",\"timeout_secs\":300}"
-                    },
-                    "delivery": {
-                        "type": "object",
-                        "description": "Delivery target: {\"kind\":\"none\"} or {\"kind\":\"channel\",\"channel\":\"telegram\"} or {\"kind\":\"last_channel\"}"
-                    },
-                    "one_shot": { "type": "boolean", "description": "If true, auto-delete after execution. Default: false" }
-                },
-                "required": ["name", "schedule", "action"]
-            }),
-        },
-        ToolDefinition {
-            name: "cron_list".to_string(),
-            description: "List all scheduled/cron jobs for the current agent.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "cron_cancel".to_string(),
-            description: "Cancel a scheduled/cron job by its ID.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "job_id": { "type": "string", "description": "The UUID of the cron job to cancel" }
-                },
-                "required": ["job_id"]
-            }),
-        },
-        // --- Channel send tool (proactive outbound messaging) ---
-        ToolDefinition {
-            name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
-                    "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
-                    "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
-                    "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
-                    "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
-                    "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
-                    "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
-                    "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
-                },
-                "required": ["channel", "recipient"]
-            }),
-        },
-        // --- Hand tools (curated autonomous capability packages) ---
-        ToolDefinition {
-            name: "hand_list".to_string(),
-            description: "List available Hands (curated autonomous packages) and their activation status.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        ToolDefinition {
-            name: "hand_activate".to_string(),
-            description: "Activate a Hand — spawns a specialized autonomous agent with curated tools and skills.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "hand_id": { "type": "string", "description": "The ID of the hand to activate (e.g. 'researcher', 'clip', 'browser')" },
-                    "config": { "type": "object", "description": "Optional configuration overrides for the hand's settings" }
-                },
-                "required": ["hand_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "hand_status".to_string(),
-            description: "Check the status and metrics of an active Hand.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "hand_id": { "type": "string", "description": "The ID of the hand to check status for" }
-                },
-                "required": ["hand_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "hand_deactivate".to_string(),
-            description: "Deactivate a running Hand and stop its agent.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "instance_id": { "type": "string", "description": "The UUID of the hand instance to deactivate" }
-                },
-                "required": ["instance_id"]
-            }),
-        },
-        // --- A2A outbound tools ---
-        ToolDefinition {
-            name: "a2a_discover".to_string(),
-            description: "Discover an external A2A agent by fetching its agent card from a URL. Returns the agent's name, description, skills, and supported protocols.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "Base URL of the remote OpenFang/A2A-compatible agent (e.g., 'https://agent.example.com')" }
-                },
-                "required": ["url"]
-            }),
-        },
-        ToolDefinition {
-            name: "a2a_send".to_string(),
-            description: "Send a task/message to an external A2A agent and get the response. Use agent_name to send to a previously discovered agent, or agent_url for direct addressing.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "message": { "type": "string", "description": "The task/message to send to the remote agent" },
-                    "agent_url": { "type": "string", "description": "Direct URL of the remote agent's A2A endpoint" },
-                    "agent_name": { "type": "string", "description": "Name of a previously discovered A2A agent (looked up from kernel)" },
-                    "session_id": { "type": "string", "description": "Optional session ID for multi-turn conversations" }
-                },
-                "required": ["message"]
-            }),
-        },
-        // --- TTS/STT tools ---
-        ToolDefinition {
-            name: "text_to_speech".to_string(),
-            description: "Convert text to speech audio. Auto-selects OpenAI or ElevenLabs. Saves audio to workspace output/ directory.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string", "description": "The text to convert to speech (max 4096 chars)" },
-                    "voice": { "type": "string", "description": "Voice name: 'alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer' (default: 'alloy')" },
-                    "format": { "type": "string", "description": "Output format: 'mp3', 'opus', 'aac', 'flac' (default: 'mp3')" }
-                },
-                "required": ["text"]
-            }),
-        },
-        ToolDefinition {
-            name: "speech_to_text".to_string(),
-            description: "Transcribe audio to text using speech-to-text. Auto-selects Groq Whisper or OpenAI Whisper. Supported formats: mp3, wav, ogg, flac, m4a, webm.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the audio file (relative to workspace)" },
-                    "language": { "type": "string", "description": "Optional ISO-639-1 language code (e.g., 'en', 'es', 'ja')" }
-                },
-                "required": ["path"]
-            }),
-        },
-        // --- Docker sandbox tool ---
-        ToolDefinition {
-            name: "docker_exec".to_string(),
-            description: "Execute a command inside a Docker container sandbox. Provides OS-level isolation with resource limits, network isolation, and capability dropping. Requires Docker to be installed and docker.enabled=true.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The command to execute inside the container" }
-                },
-                "required": ["command"]
-            }),
-        },
-        // --- Persistent process tools ---
-        ToolDefinition {
-            name: "process_start".to_string(),
-            description: "Start a long-running process (REPL, server, watcher). Returns a process_id for subsequent poll/write/kill operations. Max 5 processes per agent.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The executable to run (e.g. 'python', 'node', 'npm')" },
-                    "args": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Command-line arguments (e.g. ['-i'] for interactive Python)"
-                    }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "process_poll".to_string(),
-            description: "Read accumulated stdout/stderr from a running process. Non-blocking: returns whatever output has buffered since the last poll.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "process_id": { "type": "string", "description": "The process ID returned by process_start" }
-                },
-                "required": ["process_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "process_write".to_string(),
-            description: "Write data to a running process's stdin. A newline is appended automatically if not present.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "process_id": { "type": "string", "description": "The process ID returned by process_start" },
-                    "data": { "type": "string", "description": "The data to write to stdin" }
-                },
-                "required": ["process_id", "data"]
-            }),
-        },
-        ToolDefinition {
-            name: "process_kill".to_string(),
-            description: "Terminate a running process and clean up its resources.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "process_id": { "type": "string", "description": "The process ID returned by process_start" }
-                },
-                "required": ["process_id"]
-            }),
-        },
-        ToolDefinition {
-            name: "process_list".to_string(),
-            description: "List all running processes for the current agent, including their IDs, commands, uptime, and alive status.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        },
-        // --- System time tool ---
-        ToolDefinition {
-            name: "system_time".to_string(),
-            description: "Get the current date, time, and timezone. Returns ISO 8601 timestamp, Unix epoch seconds, and timezone info.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        },
-        // --- Canvas / A2UI tool ---
-        ToolDefinition {
-            name: "canvas_present".to_string(),
-            description: "Present an interactive HTML canvas to the user. The HTML is sanitized (no scripts, no event handlers) and saved to the workspace. The dashboard will render it in a panel. Use for rich data visualizations, formatted reports, or interactive UI.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "html": { "type": "string", "description": "The HTML content to present. Must not contain <script> tags, event handlers, or javascript: URLs." },
-                    "title": { "type": "string", "description": "Optional title for the canvas panel" }
-                },
-                "required": ["html"]
-            }),
-        },
-    ]
+/// Returns true iff `name` is a built-in tool the runtime can dispatch.
+/// Drives boot-time validation in `OpenFangKernel` for `agent.toml`'s
+/// `[capabilities] tools` array — typos there would otherwise only
+/// surface at first call attempt as a confusing "tool not in agent
+/// manifest capabilities" rejection (since the manifest *does* contain
+/// the typo, the dispatch_call gate trivially passes; the real failure
+/// is downstream in `execute_tool`'s `match`). Catching at boot lets
+/// us log a `warn!` per unknown name with the agent still up, so the
+/// operator notices and the agent isn't bricked by a wrong glyph.
+pub fn is_known_builtin_tool(name: &str) -> bool {
+    builtin_tool_definitions().iter().any(|d| d.name == name)
 }
+
+/// Filter a manifest's `capabilities.tools` list, returning every entry
+/// that is *not* a known built-in tool name. Caller decides whether to
+/// warn, error, or strip — kernel currently warns (see `OpenFangKernel`).
+pub fn unknown_builtin_tools<'a, I, S>(tools: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a S>,
+    S: AsRef<str> + 'a + ?Sized,
+{
+    tools
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .filter(|name| !is_known_builtin_tool(name))
+        .collect()
+}
+
+/// Get definitions for all built-in tools.
+///
+/// Single source of truth: `openfang_types::tool::registry::builtin_tool_definitions`.
+/// Re-exported here so existing call sites keep compiling. The bridge crate
+/// (`openfang-mcp-bridge`) consumes the same registry directly via its types-crate
+/// dependency, so the runtime and the bridge can never disagree about the schema.
+pub use openfang_types::tool::registry::builtin_tool_definitions;
 
 // ---------------------------------------------------------------------------
 // Filesystem tools
@@ -1294,8 +742,42 @@ fn validate_path(path: &str) -> Result<&str, String> {
     Ok(path)
 }
 
-/// Resolve a file path through the workspace sandbox (if available) or legacy validation.
-fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<PathBuf, String> {
+/// Resolve a file path for one of the MCP file tools.
+///
+/// Two modes:
+///
+/// - **`file_policy = Some(_)`** (ANAI-40): the policy is the authoritative
+///   gate. The path is canonicalized (or its parent canonicalized for new
+///   files), then passed to [`CompiledFilePolicy::evaluate`] with `op`. The
+///   workspace hard-lock is no longer applied — workspace remains an
+///   *implicit* allow tier inside the evaluator, so behavior is a strict
+///   superset of the legacy lock.
+/// - **`file_policy = None`**: legacy behavior — workspace sandbox if a
+///   workspace root is available, naive `..`-rejecting validation otherwise.
+///
+/// `..` components are rejected outright in both modes as defense-in-depth;
+/// canonicalization handles target traversal but not author intent.
+async fn resolve_file_path(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    op: FileOp,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    tool_label: &str,
+) -> Result<PathBuf, String> {
+    if let Some(policy) = file_policy {
+        return resolve_with_policy(
+            raw_path,
+            workspace_root,
+            policy,
+            op,
+            kernel,
+            caller_agent_id,
+            tool_label,
+        )
+        .await;
+    }
     if let Some(root) = workspace_root {
         crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
     } else {
@@ -1304,12 +786,165 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
     }
 }
 
+/// ANAI-40 policy-gated path resolution. Canonicalizes the path (or its
+/// parent for new files), then evaluates against `policy`.
+///
+/// On `FileDecision::Prompt`, surfaces a human approval request through the
+/// kernel's `ApprovalManager` (ANAI-40 step 5). Approved → returns the
+/// canonical path; denied/timed out → returns Err. If no kernel handle is
+/// available (e.g. unit-test contexts), Prompt fails closed with an
+/// explanatory error — same posture as a denied approval.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_with_policy(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+    policy: &CompiledFilePolicy,
+    op: FileOp,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    tool_label: &str,
+) -> Result<PathBuf, String> {
+    // Shared with the apply_patch gate so the two vectors don't drift.
+    let canon = canonicalize_for_policy(raw_path, workspace_root)?;
+
+    match policy.evaluate(&canon, op) {
+        FileDecision::Allow => Ok(canon),
+        FileDecision::Deny { reason } => {
+            Err(format!("Access denied by file_policy: {reason}"))
+        }
+        FileDecision::Prompt { reason } => {
+            let item = FilePolicyPromptItem {
+                op,
+                raw: raw_path,
+                resolved: &canon,
+                reason: &reason,
+            };
+            request_file_policy_approval(kernel, caller_agent_id, tool_label, &[item]).await?;
+            Ok(canon)
+        }
+    }
+}
+
+/// One Prompt-tier path awaiting approval. Borrowed inputs so callers can
+/// keep ownership of their resolved/raw/reason buffers across the await.
+struct FilePolicyPromptItem<'a> {
+    op: FileOp,
+    raw: &'a str,
+    resolved: &'a Path,
+    reason: &'a str,
+}
+
+fn render_prompt_line(it: &FilePolicyPromptItem<'_>) -> String {
+    format!(
+        "{:?} {} (raw {:?}) — {}",
+        it.op,
+        it.resolved.display(),
+        it.raw,
+        it.reason
+    )
+}
+
+fn render_prompt_lines(items: &[FilePolicyPromptItem<'_>]) -> String {
+    items
+        .iter()
+        .map(render_prompt_line)
+        .collect::<Vec<_>>()
+        .join("\n  - ")
+}
+
+/// ANAI-40 step 5: surface one or more `FileDecision::Prompt` outcomes
+/// through the kernel's approval manager and translate the human decision
+/// back into Ok/Err. The shell gate batches all Prompt-tier paths from a
+/// single argv into one call so a multi-path command (`cp a b c`) costs
+/// one prompt, not N.
+///
+/// `tool_label` is the surface tool name (e.g. `"file_read"`,
+/// `"shell_exec"`); it is passed to `request_approval` directly so the UI
+/// can render it next to the summary, and is therefore *not* duplicated
+/// inside the summary body. The summary includes the operation, resolved
+/// path, raw token, and policy reason so the approver has the context
+/// they need without inspecting the original tool input.
+///
+/// Fails closed in two cases:
+///   1. No kernel handle (unit-test path or any caller that forgot to
+///      thread one) — error loudly rather than silently skip the gate.
+///   2. `caller_agent_id` is `None` — without attribution we'd log a
+///      fake-looking `"unknown"` agent in the audit trail. Refuse.
+async fn request_file_policy_approval(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    tool_label: &str,
+    items: &[FilePolicyPromptItem<'_>],
+) -> Result<(), String> {
+    debug_assert!(
+        !items.is_empty(),
+        "request_file_policy_approval called with no items"
+    );
+    let Some(kh) = kernel else {
+        return Err(format!(
+            "{tool_label} requires approval (file_policy prompt path):\n  - {}\n\
+             Approval surfacer unavailable (no kernel handle in this context); \
+             promote these path(s) to read_paths/write_paths or remove them from \
+             prompt_paths to proceed.",
+            render_prompt_lines(items)
+        ));
+    };
+    let Some(agent_id) = caller_agent_id else {
+        return Err(format!(
+            "{tool_label} blocked by file_policy: approval surfacer requires \
+             caller_agent_id for audit attribution, but none was threaded to \
+             the gate. This is a fail-closed safeguard — refusing to surface a \
+             prompt without attribution.\n  - {}",
+            render_prompt_lines(items)
+        ));
+    };
+    let summary = if items.len() == 1 {
+        format!("file_policy prompt: {}", render_prompt_line(&items[0]))
+    } else {
+        format!(
+            "file_policy prompt: {} paths require approval:\n  - {}",
+            items.len(),
+            render_prompt_lines(items)
+        )
+    };
+    debug!(
+        tool_label,
+        item_count = items.len(),
+        agent_id,
+        "Surfacing file_policy approval request"
+    );
+    match kh.request_approval(agent_id, tool_label, &summary).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "{tool_label} denied by approver (file_policy prompt path):\n  - {}",
+            render_prompt_lines(items)
+        )),
+        Err(e) => Err(format!(
+            "{tool_label} approval system error while gating file_policy prompt: \
+             {e}\n  - {}",
+            render_prompt_lines(items)
+        )),
+    }
+}
+
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "file_read",
+    )
+    .await?;
     tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))
@@ -1318,9 +953,21 @@ async fn tool_file_read(
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Write,
+        kernel,
+        caller_agent_id,
+        "file_write",
+    )
+    .await?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1342,9 +989,21 @@ async fn tool_file_write(
 async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "file_list",
+    )
+    .await?;
     let mut entries = tokio::fs::read_dir(&resolved)
         .await
         .map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -1373,10 +1032,35 @@ async fn tool_file_list(
 async fn tool_apply_patch(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
+
+    // ANAI-40 fixup (review 6, must-fix #2): gate every touched path against
+    // file_policy BEFORE handing the parsed ops to apply_patch. This is the
+    // highest-fidelity write tool in the surface — leaving it ungated meant
+    // `prompt_paths`/`deny_paths` carve-outs were silently bypassed.
+    //
+    // Two-pass like the shell gate:
+    //   1. Resolve+canonicalize each path, classify into Allow/Deny/Prompt.
+    //   2. Hard-Deny short-circuits *before* surfacing any approval.
+    //   3. All Prompt-tier paths go through one batched approval call so a
+    //      multi-file patch costs one prompt, not N.
+    if let Some(policy) = file_policy {
+        gate_apply_patch_against_file_policy(
+            &ops,
+            root,
+            policy,
+            kernel,
+            caller_agent_id,
+        )
+        .await?;
+    }
+
     let result = crate::apply_patch::apply_patch(&ops, root).await;
     if result.is_ok() {
         Ok(result.summary())
@@ -1386,6 +1070,123 @@ async fn tool_apply_patch(
             result.summary(),
             result.errors.join("; ")
         ))
+    }
+}
+
+/// ANAI-40 fixup: enumerate every path touched by a parsed patch and gate
+/// each through `file_policy`. AddFile, UpdateFile (incl. `move_to`
+/// destination), and DeleteFile all count as `FileOp::Write`.
+///
+/// Mirrors `gate_shell_argv_against_file_policy`: scan first, deny shorts
+/// before any approval is surfaced, and a single batched approval covers
+/// all Prompt-tier paths.
+async fn gate_apply_patch_against_file_policy(
+    ops: &[crate::apply_patch::PatchOp],
+    workspace_root: &Path,
+    policy: &CompiledFilePolicy,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<(), String> {
+    let mut targets: Vec<&str> = Vec::new();
+    for op in ops {
+        match op {
+            crate::apply_patch::PatchOp::AddFile { path, .. } => targets.push(path),
+            crate::apply_patch::PatchOp::UpdateFile { path, move_to, .. } => {
+                targets.push(path);
+                if let Some(dest) = move_to.as_deref() {
+                    targets.push(dest);
+                }
+            }
+            crate::apply_patch::PatchOp::DeleteFile { path } => targets.push(path),
+        }
+    }
+
+    // (raw, resolved, reason) for every Prompt-tier hit, kept across the
+    // approval await. Owned so borrows into FilePolicyPromptItem live long
+    // enough.
+    struct PendingPrompt {
+        raw: String,
+        resolved: PathBuf,
+        reason: String,
+    }
+    let mut prompts: Vec<PendingPrompt> = Vec::new();
+
+    for raw in targets {
+        let canon = canonicalize_for_policy(raw, Some(workspace_root))?;
+        match policy.evaluate(&canon, FileOp::Write) {
+            FileDecision::Allow => {}
+            FileDecision::Deny { reason } => {
+                return Err(format!(
+                    "apply_patch blocked by file_policy: {} (raw {:?})",
+                    reason, raw
+                ));
+            }
+            FileDecision::Prompt { reason } => {
+                prompts.push(PendingPrompt {
+                    raw: raw.to_string(),
+                    resolved: canon,
+                    reason,
+                });
+            }
+        }
+    }
+
+    if prompts.is_empty() {
+        return Ok(());
+    }
+    let items: Vec<FilePolicyPromptItem> = prompts
+        .iter()
+        .map(|p| FilePolicyPromptItem {
+            op: FileOp::Write,
+            raw: &p.raw,
+            resolved: &p.resolved,
+            reason: &p.reason,
+        })
+        .collect();
+    request_file_policy_approval(kernel, caller_agent_id, "apply_patch", &items).await
+}
+
+/// Resolve a raw path string to its canonical absolute form for policy
+/// evaluation. Rejects `..` components defensively, joins relative paths
+/// against the workspace root, and canonicalizes the parent for non-existent
+/// targets (so newly-created files still get a real-disk-rooted path).
+///
+/// Shared by `resolve_with_policy` (MCP file tools) and the apply_patch
+/// gate so the two don't drift.
+fn canonicalize_for_policy(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let path = Path::new(raw_path);
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("Path traversal denied: '..' components are forbidden".to_string());
+        }
+    }
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(root) = workspace_root {
+        root.join(path)
+    } else {
+        return Err(format!(
+            "Cannot resolve relative path '{raw_path}' without a workspace root"
+        ));
+    };
+    if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve path: {e}"))
+    } else {
+        let parent = candidate
+            .parent()
+            .ok_or_else(|| "Invalid path: no parent directory".to_string())?;
+        let filename = candidate
+            .file_name()
+            .ok_or_else(|| "Invalid path: no filename".to_string())?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve parent directory: {e}"))?;
+        Ok(canon_parent.join(filename))
     }
 }
 
@@ -1479,11 +1280,145 @@ async fn tool_web_search_legacy(input: &serde_json::Value) -> Result<String, Str
 // Shell tool
 // ---------------------------------------------------------------------------
 
+/// Resolve a shell-vector path against the agent CWD (workspace) and lexically
+/// normalize it. Used before handing the path to `CompiledFilePolicy::evaluate`,
+/// which requires an absolute path.
+///
+/// We do **not** call `canonicalize` — that would require the path to exist on
+/// disk, which is wrong for write ops creating new files. Symlink-following is
+/// listed as an open question on the ANAI-40 brief; v1 evaluates the lexical
+/// path. (See `projects/openfang-fork/issues/anai-40-file-policy.md`,
+/// "Open questions: symlinks".)
+fn resolve_shell_path(raw: &Path, workspace_root: Option<&Path>) -> PathBuf {
+    let joined = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else if let Some(ws) = workspace_root {
+        ws.join(raw)
+    } else {
+        // No workspace anchor — best-effort. Policy will likely default-deny.
+        raw.to_path_buf()
+    };
+    lexically_normalize(&joined)
+}
+
+/// Lexically collapse `.` and `..` components. Does not touch the filesystem.
+///
+/// POSIX semantics: `/..` is `/`. When the last accumulated component is a
+/// root or Windows prefix, a `ParentDir` token is dropped on the floor — it
+/// must never escape the root. (Pre-fixup, this leaked `..` past the root
+/// and produced paths like `/../etc/passwd` that bypassed `deny_paths` glob
+/// matching. See ANAI-40 code-review fixup.)
+fn lexically_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                match out.components().next_back() {
+                    // Pop a regular directory.
+                    Some(Component::Normal(_)) => {
+                        out.pop();
+                    }
+                    // POSIX: `/..` is `/`. Same for Windows root + prefix.
+                    // Dropping the ParentDir is correct — never escape root.
+                    Some(Component::RootDir)
+                    | Some(Component::Prefix(_)) => {}
+                    // Empty out, or trailing `..`/`.` already in a relative
+                    // path — preserve the `..` for the caller.
+                    _ => out.push(".."),
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Gate a parsed shell argv against `file_policy` (ANAI-40 step 4).
+///
+/// Returns `Ok(())` if every recognized path resolves to `Allow`, OR the
+/// command is not in the extractor table (unrecognized commands fall back
+/// to `exec_policy` only — `file_policy` does not gate them in v1; see brief).
+///
+/// Returns `Err(reason)` if any extracted path resolves to `Deny`, or if a
+/// `Prompt` decision is denied/timed-out by the human approver. On `Prompt`,
+/// the gate surfaces an approval request through the kernel's
+/// `ApprovalManager` (ANAI-40 step 5); approved paths are admitted, others
+/// fall through to a denial error. With no kernel handle available, Prompt
+/// fails closed (same posture as a denied approval).
+async fn gate_shell_argv_against_file_policy(
+    argv: &[String],
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    tool_label: &str,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(policy) = file_policy else {
+        return Ok(());
+    };
+    let extraction = crate::shell_path_extractor::extract(argv);
+    let pairs = match extraction {
+        crate::shell_path_extractor::Extraction::Known(v) => v,
+        crate::shell_path_extractor::Extraction::Unknown => return Ok(()),
+    };
+    // Two-pass: scan all paths first so a hard Deny short-circuits *before*
+    // we burn the operator's attention on a Prompt sibling. Then issue a
+    // single batched approval covering every Prompt-tier path at once —
+    // `cp a b c` with three prompt-tier targets becomes one prompt, not
+    // three sequential ones.
+    let mut prompts: Vec<(String, FileOp, PathBuf, String)> = Vec::new();
+    for (raw, op) in pairs {
+        let resolved = resolve_shell_path(&raw, workspace_root);
+        // The evaluator `debug_assert!`s on absolute paths. If we can't
+        // anchor a relative path (no workspace_root provided), fail closed
+        // when a policy is configured: a future caller forgetting to thread
+        // the anchor must not silently bypass the gate.
+        if !resolved.is_absolute() {
+            return Err(format!(
+                "{tool_label} blocked by file_policy: cannot anchor relative path \
+                 {raw:?} (workspace_root not provided to the gate, op = {op:?}). \
+                 This is a fail-closed safeguard."
+            ));
+        }
+        match policy.evaluate(&resolved, op) {
+            FileDecision::Allow => {}
+            FileDecision::Deny { reason } => {
+                return Err(format!(
+                    "{tool_label} blocked by file_policy: {reason} \
+                     (op = {op:?}, raw = {raw:?}, resolved = {resolved:?})"
+                ));
+            }
+            FileDecision::Prompt { reason } => {
+                prompts.push((raw.to_string_lossy().into_owned(), op, resolved, reason));
+            }
+        }
+    }
+    if !prompts.is_empty() {
+        let items: Vec<FilePolicyPromptItem<'_>> = prompts
+            .iter()
+            .map(|(raw, op, resolved, reason)| FilePolicyPromptItem {
+                op: *op,
+                raw: raw.as_str(),
+                resolved: resolved.as_path(),
+                reason: reason.as_str(),
+            })
+            .collect();
+        request_file_policy_approval(kernel, caller_agent_id, tool_label, &items).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn tool_shell_exec(
     input: &serde_json::Value,
     allowed_env: &[String],
     workspace_root: Option<&Path>,
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let command = input["command"]
         .as_str()
@@ -1503,6 +1438,23 @@ async fn tool_shell_exec(
     let use_direct_exec = exec_policy
         .map(|p| p.mode == openfang_types::config::ExecSecurityMode::Allowlist)
         .unwrap_or(true); // Default to safe mode
+
+    // ANAI-40 step 4: gate filesystem-touching commands against file_policy
+    // before spawn. Best-effort parse via shlex; the upstream metacharacter
+    // gate has already rejected anything shlex couldn't reasonably split.
+    // Applied to both Allowlist and Full modes — file_policy is orthogonal
+    // to exec_policy and must hold even when shell access is unrestricted.
+    if let Some(parsed_argv) = shlex::split(command) {
+        gate_shell_argv_against_file_policy(
+            &parsed_argv,
+            workspace_root,
+            file_policy,
+            "shell_exec",
+            kernel,
+            caller_agent_id,
+        )
+        .await?;
+    }
 
     let mut cmd = if use_direct_exec {
         // SAFE PATH: Split command into argv using POSIX shell lexer rules,
@@ -2291,6 +2243,8 @@ async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
@@ -2347,7 +2301,16 @@ async fn tool_channel_send(
 
     // Local file attachment: read from disk and send as FileData
     if let Some(raw_path) = file_path {
-        let resolved = resolve_file_path(raw_path, workspace_root)?;
+        let resolved = resolve_file_path(
+            raw_path,
+            workspace_root,
+            file_policy,
+            FileOp::Read,
+            kernel,
+            caller_agent_id,
+            "channel_send",
+        )
+        .await?;
         let data = tokio::fs::read(&resolved)
             .await
             .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;
@@ -2589,13 +2552,35 @@ async fn tool_a2a_send(
 // Image analysis tool
 // ---------------------------------------------------------------------------
 
-async fn tool_image_analyze(input: &serde_json::Value) -> Result<String, String> {
-    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+async fn tool_image_analyze(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"].as_str().unwrap_or("");
 
-    let data = tokio::fs::read(path)
+    // ANAI-40 fixup (review 7, must-fix #1): gate through file_policy before
+    // touching disk. Sibling tools `media_describe`/`media_transcribe` were
+    // wired in the review-6 fixup; `image_analyze` was missed because it had
+    // no `validate_path` call to grep for — the bypass was total.
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "image_analyze",
+    )
+    .await?;
+
+    let data = tokio::fs::read(&resolved)
         .await
-        .map_err(|e| format!("Failed to read image '{path}': {e}"))?;
+        .map_err(|e| format!("Failed to read image '{raw_path}': {e}"))?;
+    let path = raw_path;
 
     let file_size = data.len();
 
@@ -2817,22 +2802,45 @@ fn tool_system_time() -> String {
 // ---------------------------------------------------------------------------
 
 /// Describe an image using a vision-capable LLM provider.
+#[allow(clippy::too_many_arguments)]
 async fn tool_media_describe(
     input: &serde_json::Value,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     use base64::Engine;
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+
+    // ANAI-40 fixup (review 6, must-fix #3): gate through file_policy before
+    // touching disk. Sibling tool `speech_to_text` was wired in step 3;
+    // describe/transcribe were missed and silently bypassed prompt/deny
+    // policies via the `validate_path`-only path.
+    //
+    // Gate runs *before* the engine availability check so a deny path is
+    // surfaced as a policy error, not a "media engine not available" error.
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "media_describe",
+    )
+    .await?;
+
     let engine = media_engine.ok_or("Media engine not available. Check media configuration.")?;
-    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let _ = validate_path(path)?;
 
     // Read image file
-    let data = tokio::fs::read(path)
+    let data = tokio::fs::read(&resolved)
         .await
         .map_err(|e| format!("Failed to read image file: {e}"))?;
 
     // Detect MIME type from extension
-    let ext = std::path::Path::new(path)
+    let ext = resolved
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -2862,22 +2870,39 @@ async fn tool_media_describe(
 }
 
 /// Transcribe audio to text using speech-to-text.
+#[allow(clippy::too_many_arguments)]
 async fn tool_media_transcribe(
     input: &serde_json::Value,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     use base64::Engine;
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+
+    // ANAI-40 fixup (review 6, must-fix #3): see tool_media_describe.
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "media_transcribe",
+    )
+    .await?;
+
     let engine = media_engine.ok_or("Media engine not available. Check media configuration.")?;
-    let path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let _ = validate_path(path)?;
 
     // Read audio file
-    let data = tokio::fs::read(path)
+    let data = tokio::fs::read(&resolved)
         .await
         .map_err(|e| format!("Failed to read audio file: {e}"))?;
 
     // Detect MIME type from extension
-    let ext = std::path::Path::new(path)
+    let ext = resolved
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -3037,16 +3062,29 @@ async fn tool_text_to_speech(
     serde_json::to_string_pretty(&response).map_err(|e| format!("Serialize error: {e}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_speech_to_text(
     input: &serde_json::Value,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let engine = media_engine.ok_or("Media engine not available for speech-to-text")?;
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let _language = input["language"].as_str();
 
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(
+        raw_path,
+        workspace_root,
+        file_policy,
+        FileOp::Read,
+        kernel,
+        caller_agent_id,
+        "speech_to_text",
+    )
+    .await?;
 
     // Read the audio file
     let data = tokio::fs::read(&resolved)
@@ -3159,11 +3197,15 @@ async fn tool_docker_exec(
 /// args=["/some/file"] would delete the file even though "rm" was not
 /// in the allowlist. This function now performs the same checks as
 /// shell_exec: metacharacter rejection plus exec_policy validation.
+#[allow(clippy::too_many_arguments)]
 async fn tool_process_start(
     input: &serde_json::Value,
     pm: Option<&crate::process_manager::ProcessManager>,
     caller_agent_id: Option<&str>,
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&CompiledFilePolicy>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
 ) -> Result<String, String> {
     let pm = pm.ok_or("Process manager not available")?;
     let agent_id = caller_agent_id.unwrap_or("default");
@@ -3212,6 +3254,23 @@ async fn tool_process_start(
                 policy.mode
             ));
         }
+    }
+
+    // ANAI-40 step 4: gate filesystem-touching commands against file_policy.
+    // process_start receives argv pre-split, so no shlex parse is needed.
+    {
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(command.to_string());
+        argv.extend(args.iter().cloned());
+        gate_shell_argv_against_file_policy(
+            &argv,
+            workspace_root,
+            file_policy,
+            "process_start",
+            kernel,
+            caller_agent_id,
+        )
+        .await?;
     }
 
     let proc_id = pm.start(agent_id, command, &args).await?;
@@ -3404,6 +3463,43 @@ async fn tool_canvas_present(
 mod tests {
     use super::*;
 
+    /// ANAI-32: `is_known_builtin_tool` is the boot-time gate for
+    /// `agent.toml` typo detection. Recognized names return true;
+    /// anything else (including a near-miss spelling) returns false.
+    #[test]
+    fn test_is_known_builtin_tool() {
+        assert!(is_known_builtin_tool("file_read"));
+        assert!(is_known_builtin_tool("shell_exec"));
+        assert!(is_known_builtin_tool("channel_send"));
+        // Common typo classes operators actually make:
+        assert!(!is_known_builtin_tool("file_reed"));
+        assert!(!is_known_builtin_tool("shellexec"));
+        assert!(!is_known_builtin_tool(""));
+    }
+
+    /// ANAI-32: `unknown_builtin_tools` returns only the entries that
+    /// are NOT recognized — the kernel uses this to log per-agent
+    /// warnings at boot/spawn without failing the agent outright.
+    #[test]
+    fn test_unknown_builtin_tools_filters_correctly() {
+        let tools = vec![
+            "file_read".to_string(),
+            "typo_tool".to_string(),
+            "shell_exec".to_string(),
+            "another_typo".to_string(),
+        ];
+        let unknown = unknown_builtin_tools(tools.iter());
+        assert_eq!(unknown, vec!["typo_tool", "another_typo"]);
+
+        // All-known input → empty result.
+        let all_good: Vec<String> = vec!["file_read".into(), "file_list".into()];
+        assert!(unknown_builtin_tools(all_good.iter()).is_empty());
+
+        // Empty input → empty output (no spurious entries).
+        let empty: Vec<String> = vec![];
+        assert!(unknown_builtin_tools(empty.iter()).is_empty());
+    }
+
     #[test]
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
@@ -3523,6 +3619,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(
@@ -3552,6 +3649,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3578,6 +3676,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3604,6 +3703,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3630,6 +3730,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -3656,6 +3757,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3682,6 +3784,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3709,6 +3812,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3740,6 +3844,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
@@ -3785,6 +3890,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         // Should NOT be the capability-enforcement "Permission denied" — it should
@@ -3820,6 +3926,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -3989,6 +4096,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -4034,6 +4142,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // file_policy
         )
         .await;
         assert!(result.is_error);
@@ -4158,7 +4267,7 @@ mod tests {
             "args": ["/tmp/openfang_test_should_not_be_deleted.txt"],
         });
 
-        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy), None, None, None).await;
 
         assert!(
             result.is_err(),
@@ -4196,7 +4305,7 @@ mod tests {
             "command": "rm; cat /etc/passwd",
             "args": [],
         });
-        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy), None, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("metacharacter") || pm.count() == 0);
     }
@@ -4216,7 +4325,7 @@ mod tests {
             "command": "echo",
             "args": ["$(rm -rf /)"],
         });
-        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy), None, None, None).await;
         assert!(
             result.is_err(),
             "process_start must reject metacharacters in args"
@@ -4237,7 +4346,7 @@ mod tests {
             "command": "echo",
             "args": ["hello"],
         });
-        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy)).await;
+        let result = tool_process_start(&input, Some(&pm), Some("test-agent"), Some(&policy), None, None, None).await;
         assert!(result.is_err(), "Deny mode must block process_start");
         assert!(result.unwrap_err().to_lowercase().contains("disabled"));
         assert_eq!(pm.count(), 0);
@@ -4516,5 +4625,1346 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_lowercase().contains("kernel"));
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-40: file_policy gating of MCP file tools
+    //
+    // Verifies that when a CompiledFilePolicy is supplied, the workspace
+    // hard-lock is replaced by policy evaluation: paths outside the
+    // workspace become reachable when explicitly allowed by the policy,
+    // and remain blocked otherwise. Step 5 wires `Prompt` decisions
+    // through the kernel's ApprovalManager — without a kernel handle,
+    // Prompt fails closed (see test_file_read_policy_prompt_path_no_kernel
+    // and test_file_read_policy_prompt_path_approved/_denied).
+    // -----------------------------------------------------------------
+
+    fn build_compiled_policy(
+        workspace: &std::path::Path,
+        read_paths: Vec<String>,
+        write_paths: Vec<String>,
+        prompt_paths: Vec<String>,
+        deny_paths: Vec<String>,
+    ) -> openfang_types::file_policy::CompiledFilePolicy {
+        openfang_types::file_policy::FilePolicy {
+            read_paths,
+            write_paths,
+            prompt_paths,
+            deny_paths,
+            default: Some(openfang_types::file_policy::DefaultTier::Deny),
+        }
+        .compile(workspace.to_path_buf())
+        .expect("test policy must compile")
+    }
+
+    #[tokio::test]
+    async fn test_file_read_policy_allows_path_outside_workspace() {
+        // Outside-workspace path is normally workspace-locked; with an
+        // explicit `read_paths` entry the policy seam must let it through.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello from outside").unwrap();
+
+        // Canonicalize the outside dir so the glob matches the resolved path.
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![pattern],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let result = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            None,
+            None,
+        )
+        .await
+        .expect("read must succeed under file_policy");
+        assert_eq!(result, "hello from outside");
+    }
+
+    #[tokio::test]
+    async fn test_file_write_policy_denies_read_only_path() {
+        // A path matching `read_paths` must reject writes — the must-fix
+        // landed in ea9896d's fixup, re-pinned at the tool surface.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("ro.txt");
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![pattern],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let result = tool_file_write(
+            &serde_json::json!({"path": target.to_str().unwrap(), "content": "nope"}),
+            Some(workspace.path()),
+            Some(&policy),
+            None,
+            None,
+        )
+        .await;
+        let err = result.expect_err("write must be denied for read_paths target");
+        assert!(
+            err.contains("Access denied by file_policy"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_read_policy_prompt_path_no_kernel() {
+        // Step 5: when no kernel handle is available (e.g. unit-test path,
+        // or a future caller forgot to thread it), a `prompt_paths` hit
+        // must fail closed with an explanatory error — never silently allow.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("secret");
+        std::fs::write(&target, "tbd").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![pattern],
+            vec![],
+        );
+
+        let err = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            None,
+            None,
+        )
+        .await
+        .expect_err("prompt path must fail closed without a kernel handle");
+        assert!(
+            err.contains("requires approval"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("Approval surfacer unavailable"),
+            "error must explain why approval was unreachable: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-40 step 4: file_policy gating of the shell vector
+    //
+    // gate_shell_argv_against_file_policy is the seam used by both
+    // tool_shell_exec and tool_process_start. These tests pin its
+    // contract directly — same policy, parsed argv, expected verdict.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_shell_gate_allows_unknown_command() {
+        // Commands not in the extractor table fall through to exec_policy.
+        // file_policy does not gate them in v1 (per the brief).
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec!["/etc/**".to_string()],
+        );
+        let argv = vec!["python".to_string(), "/etc/passwd".to_string()];
+        let res = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(workspace.path()),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await;
+        assert!(res.is_ok(), "unknown commands must pass the gate");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_blocks_cat_on_denied_path() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec!["/etc/**".to_string()],
+        );
+        let argv = vec!["cat".to_string(), "/etc/passwd".to_string()];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(workspace.path()),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await
+        .expect_err("denied read path must trip the gate");
+        assert!(err.contains("blocked by file_policy"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_blocks_rm_on_default_deny() {
+        // Outside-workspace write with default = deny must be rejected.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let argv = vec!["rm".to_string(), "/tmp/some-file".to_string()];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(workspace.path()),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await
+        .expect_err("default-deny write must trip the gate");
+        assert!(err.contains("blocked by file_policy"), "got: {err}");
+        assert!(err.contains("Write"), "op must surface in error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_allows_writes_inside_workspace() {
+        // Workspace is implicit read+write — `cp` into it must pass.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let src = ws.join("src.txt");
+        let dst = ws.join("dst.txt");
+        let policy = build_compiled_policy(&ws, vec![], vec![], vec![], vec![]);
+        let argv = vec![
+            "cp".to_string(),
+            src.to_string_lossy().into_owned(),
+            dst.to_string_lossy().into_owned(),
+        ];
+        let res = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await;
+        assert!(res.is_ok(), "workspace-internal cp must pass: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_resolves_relative_path_against_workspace() {
+        // Relative paths from `cat notes.txt` must be anchored to the
+        // workspace before evaluation, not left ambiguous.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(&ws, vec![], vec![], vec![], vec![]);
+        let argv = vec!["cat".to_string(), "notes.txt".to_string()];
+        let res = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await;
+        // Resolves to <ws>/notes.txt → workspace implicit allow → ok.
+        assert!(res.is_ok(), "relative path inside workspace must pass: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_prompt_path_no_kernel() {
+        // Step 5: with no kernel handle the gate cannot surface an
+        // approval; prompt-tier shell hits must fail closed.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(
+            &ws,
+            vec![],
+            vec![],
+            vec!["/var/log/**".to_string()],
+            vec![],
+        );
+        let argv = vec!["tee".to_string(), "/var/log/app.log".to_string()];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await
+        .expect_err("prompt path must fail closed without a kernel handle");
+        assert!(err.contains("requires approval"), "got: {err}");
+        assert!(
+            err.contains("Approval surfacer unavailable"),
+            "error must explain why approval was unreachable: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_no_policy_is_passthrough() {
+        // Without a policy, the gate must not block anything — preserves
+        // pre-ANAI-40 behavior for agents that ship no [file_policy] block.
+        let argv = vec!["rm".to_string(), "/etc/hosts".to_string()];
+        let res = gate_shell_argv_against_file_policy(&argv, None, None, "shell_exec", None, None)
+            .await;
+        assert!(res.is_ok(), "no-policy gate must be a no-op");
+    }
+
+    #[test]
+    fn test_lexically_normalize_collapses_dot_dot() {
+        let p = std::path::PathBuf::from("/ws/sub/../other/./file.txt");
+        let norm = lexically_normalize(&p);
+        assert_eq!(norm, std::path::PathBuf::from("/ws/other/file.txt"));
+    }
+
+    #[test]
+    fn test_lexically_normalize_does_not_escape_root() {
+        // Regression: pre-fixup, /ws/sub/../../../etc/passwd collapsed to
+        // /../etc/passwd (literal `..` pushed when last component was
+        // RootDir), which then string-bypassed `deny_paths = ["/etc/**"]`
+        // glob matching. Now `/..` is a no-op and we get /etc/passwd —
+        // which DOES match the deny rule.
+        assert_eq!(
+            lexically_normalize(&std::path::PathBuf::from("/..")),
+            std::path::PathBuf::from("/")
+        );
+        assert_eq!(
+            lexically_normalize(&std::path::PathBuf::from("/../../etc/passwd")),
+            std::path::PathBuf::from("/etc/passwd")
+        );
+        assert_eq!(
+            lexically_normalize(&std::path::PathBuf::from(
+                "/ws/sub/../../../etc/passwd"
+            )),
+            std::path::PathBuf::from("/etc/passwd")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_blocks_dot_dot_escape_to_denied_path() {
+        // End-to-end regression for the must-fix: argv with `..` traversal
+        // past root must still be caught by `deny_paths` after lexical
+        // normalization.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec!["/etc/**".to_string()],
+        );
+        let argv = vec![
+            "cat".to_string(),
+            "/ws/sub/../../../etc/passwd".to_string(),
+        ];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(workspace.path()),
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await
+        .expect_err("dot-dot escape must hit deny_paths");
+        assert!(err.contains("blocked by file_policy"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_fails_closed_without_workspace_anchor() {
+        // Fail-closed: relative path + policy configured + no workspace_root
+        // must Err, not silently pass. (Pre-fixup, this was a `continue`.)
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        let argv = vec!["cat".to_string(), "notes.txt".to_string()];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            None,
+            Some(&policy),
+            "shell_exec",
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing workspace_root with active policy must fail closed");
+        assert!(
+            err.contains("cannot anchor relative path"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_uses_tool_label_in_error() {
+        // process_start vs shell_exec: the error must reflect the calling
+        // tool, not be patched up via string replace.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec!["/etc/**".to_string()],
+        );
+        let argv = vec!["cat".to_string(), "/etc/passwd".to_string()];
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(workspace.path()),
+            Some(&policy),
+            "process_start",
+            None,
+            None,
+        )
+        .await
+        .expect_err("denied path");
+        assert!(
+            err.starts_with("process_start blocked by file_policy"),
+            "label must lead the error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_read_policy_allows_workspace_implicit() {
+        // A policy with no rules at all still grants workspace read+write
+        // via the implicit-allow tier — preserves today's behavior for
+        // agents that ship a [file_policy] block but don't extend it.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let target = workspace.path().join("hello.txt");
+        std::fs::write(&target, "wsp").unwrap();
+
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+
+        let result = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            None,
+            None,
+        )
+        .await
+        .expect("workspace read must succeed under empty policy");
+        assert_eq!(result, "wsp");
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-40 step 5: file_policy `Prompt` decisions surface through
+    // KernelHandle::request_approval. Approved → access proceeds;
+    // denied → tool returns Err. Tested via a tiny KernelHandle stub
+    // that records the request and returns a canned decision.
+    // -----------------------------------------------------------------
+
+    use crate::kernel_handle::{AgentInfo, KernelHandle};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    /// Minimal KernelHandle stub for approval surfacing tests. Records every
+    /// `request_approval` call and returns a canned decision. The
+    /// `requires_approval` flag controls whether the up-front dispatch gate
+    /// in `execute_tool` fires too — defaults to false so step-5 unit tests
+    /// observe only the in-tool file_policy surfacer; flip to true to pin
+    /// the combined behavior (both gates active) end-to-end.
+    struct ApprovalStubKernel {
+        decision: bool,
+        requires_approval: bool,
+        calls: StdMutex<Vec<(String, String, String)>>, // (agent_id, tool, summary)
+    }
+
+    impl ApprovalStubKernel {
+        fn new(decision: bool) -> Self {
+            Self {
+                decision,
+                requires_approval: false,
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn with_requires_approval(decision: bool, requires: bool) -> Self {
+            Self {
+                decision,
+                requires_approval: requires,
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+        fn last(&self) -> Option<(String, String, String)> {
+            self.calls.lock().unwrap().last().cloned()
+        }
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    // The unimplemented!() arms below are intentional: KernelHandle is the
+    // full kernel surface, but step-5 approval tests only exercise
+    // `requires_approval` and `request_approval`. Forcing a panic on every
+    // other method ensures the stub fails loudly if a future test starts
+    // depending on additional kernel behavior — better than returning silent
+    // defaults that drift from production semantics.
+    #[async_trait]
+    impl KernelHandle for ApprovalStubKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            unimplemented!("stub")
+        }
+        async fn send_to_agent(&self, _id: &str, _msg: &str) -> Result<String, String> {
+            unimplemented!("stub")
+        }
+        fn list_agents(&self) -> Vec<AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _id: &str) -> Result<(), String> {
+            unimplemented!("stub")
+        }
+        fn memory_store(&self, _k: &str, _v: serde_json::Value) -> Result<(), String> {
+            unimplemented!("stub")
+        }
+        fn memory_recall(&self, _k: &str) -> Result<Option<serde_json::Value>, String> {
+            unimplemented!("stub")
+        }
+        fn find_agents(&self, _q: &str) -> Vec<AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _t: &str,
+            _d: &str,
+            _a: Option<&str>,
+            _c: Option<&str>,
+        ) -> Result<String, String> {
+            unimplemented!("stub")
+        }
+        async fn task_claim(
+            &self,
+            _a: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            unimplemented!("stub")
+        }
+        async fn task_complete(&self, _t: &str, _r: &str) -> Result<(), String> {
+            unimplemented!("stub")
+        }
+        async fn task_list(
+            &self,
+            _s: Option<&str>,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            unimplemented!("stub")
+        }
+        async fn publish_event(
+            &self,
+            _t: &str,
+            _p: serde_json::Value,
+        ) -> Result<(), String> {
+            unimplemented!("stub")
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _e: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            unimplemented!("stub")
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _r: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            unimplemented!("stub")
+        }
+        async fn knowledge_query(
+            &self,
+            _p: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            unimplemented!("stub")
+        }
+
+        fn requires_approval(&self, _tool_name: &str) -> bool {
+            self.requires_approval
+        }
+
+        async fn request_approval(
+            &self,
+            agent_id: &str,
+            tool_name: &str,
+            action_summary: &str,
+        ) -> Result<bool, String> {
+            self.calls.lock().unwrap().push((
+                agent_id.to_string(),
+                tool_name.to_string(),
+                action_summary.to_string(),
+            ));
+            Ok(self.decision)
+        }
+    }
+
+    fn stub_kernel(decision: bool) -> Arc<dyn KernelHandle> {
+        Arc::new(ApprovalStubKernel::new(decision))
+    }
+
+    #[tokio::test]
+    async fn test_file_read_prompt_path_approved_proceeds() {
+        // Step 5: a `prompt_paths` hit with an approving kernel must
+        // surface an approval request, then complete the read normally.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "approved!").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![pattern],
+            vec![],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let result = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect("approved prompt-path read must succeed");
+        assert_eq!(result, "approved!");
+
+        // Verify the approval request carried useful context.
+        let last = stub.last().expect("approval must have been requested");
+        assert_eq!(last.0, "agent-test");
+        assert_eq!(last.1, "file_read");
+        assert!(last.2.contains("file_policy prompt"), "summary: {}", last.2);
+        assert!(last.2.contains("Read"), "summary: {}", last.2);
+        // Step-5 fixup: raw token must appear in summary so the operator
+        // sees what the agent actually requested, not just the resolved path.
+        let raw = target.to_str().unwrap();
+        assert!(
+            last.2.contains(raw),
+            "summary must include raw token {raw:?}: {}",
+            last.2
+        );
+        // Step-5 fixup: tool_label must NOT be duplicated inside the summary
+        // — it is already passed to the kernel as the second arg and the UI
+        // renders both. Search outside the trailing `_label` accidents.
+        assert!(
+            !last.2.contains("file_read "),
+            "summary must not duplicate tool_label: {}",
+            last.2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_write_prompt_path_denied_blocks() {
+        // Step 5: a `prompt_paths` hit with a denying kernel must surface
+        // the request and then fail closed with a clear error.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("denied.txt");
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![pattern],
+            vec![],
+        );
+
+        let kh = stub_kernel(false);
+
+        let err = tool_file_write(
+            &serde_json::json!({"path": target.to_str().unwrap(), "content": "nope"}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("denied prompt-path write must fail");
+        assert!(
+            err.contains("denied by approver"),
+            "error must surface human denial: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "target must not have been written when approval was denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_prompt_path_approved_passes() {
+        // Step 5: shell-vector prompt-tier hit with approving kernel must
+        // pass the gate without raising an error.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(
+            &ws,
+            vec![],
+            vec![],
+            vec!["/var/log/**".to_string()],
+            vec![],
+        );
+        let argv = vec!["tee".to_string(), "/var/log/app.log".to_string()];
+        let kh = stub_kernel(true);
+
+        let res = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await;
+        assert!(res.is_ok(), "approved prompt path must pass: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_prompt_path_denied_blocks() {
+        // Step 5: shell-vector prompt-tier hit with denying kernel must
+        // fail with the human-denial error shape.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(
+            &ws,
+            vec![],
+            vec![],
+            vec!["/var/log/**".to_string()],
+            vec![],
+        );
+        let argv = vec!["tee".to_string(), "/var/log/app.log".to_string()];
+        let kh = stub_kernel(false);
+
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("denied prompt-path shell call must fail");
+        assert!(
+            err.contains("denied by approver"),
+            "error must surface human denial: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_policy_deny_does_not_invoke_approver() {
+        // Sanity: a hard `deny_paths` hit must short-circuit before the
+        // approval surfacer is ever called. The stub records the last
+        // request_approval call; we expect None.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("nope");
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![pattern],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let _ = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny must short-circuit");
+
+        assert!(
+            stub.last().is_none(),
+            "deny must not surface an approval request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_batches_multipath_prompt_into_one_request() {
+        // Step-5 fixup #3: a multi-path argv with two Prompt-tier targets
+        // must surface ONE batched approval, not two sequential ones.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(
+            &ws,
+            vec![],
+            vec![],
+            vec!["/var/log/**".to_string()],
+            vec![],
+        );
+        // `cp` splits args as Read(src) + Write(dst); both prompt-tier.
+        let argv = vec![
+            "cp".to_string(),
+            "/var/log/src.log".to_string(),
+            "/var/log/dst.log".to_string(),
+        ];
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect("batched approval must succeed");
+
+        assert_eq!(
+            stub.call_count(),
+            1,
+            "multi-path prompt must collapse to a single approval call; got {} calls: {:?}",
+            stub.call_count(),
+            stub.calls()
+        );
+        let last = stub.last().expect("call recorded");
+        assert!(
+            last.2.contains("/var/log/src.log") && last.2.contains("/var/log/dst.log"),
+            "batched summary must mention both paths: {}",
+            last.2
+        );
+        assert!(
+            last.2.contains("2 paths require approval"),
+            "batched summary must announce the count: {}",
+            last.2
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_gate_deny_short_circuits_before_prompt_batch() {
+        // Step-5 fixup #3 corollary: if any path hard-Denies, the gate must
+        // return Err *without* surfacing approvals for the Prompt siblings.
+        // Don't burn the operator's attention on a request that's doomed.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws = workspace.path().canonicalize().unwrap();
+        let policy = build_compiled_policy(
+            &ws,
+            vec![],
+            vec![],
+            vec!["/var/log/**".to_string()],
+            vec!["/etc/**".to_string()],
+        );
+        let argv = vec![
+            "cp".to_string(),
+            "/var/log/ok.log".to_string(), // Prompt
+            "/etc/passwd".to_string(),     // Deny
+        ];
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = gate_shell_argv_against_file_policy(
+            &argv,
+            Some(&ws),
+            Some(&policy),
+            "shell_exec",
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny sibling must fail the call");
+        assert!(err.contains("blocked by file_policy"), "{err}");
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "deny must short-circuit before approval surfacer fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_policy_prompt_fails_closed_when_agent_id_missing() {
+        // Step-5 fixup #1: a Prompt path with kernel attached but
+        // caller_agent_id = None must fail closed rather than log a
+        // fake-looking "unknown" attribution into the audit trail.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "x").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![pattern],
+            vec![],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_file_read(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            None, // <-- no caller_agent_id
+        )
+        .await
+        .expect_err("missing caller_agent_id must fail closed on Prompt");
+        assert!(
+            err.contains("caller_agent_id"),
+            "error must name the missing attribution: {err}"
+        );
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "must not surface approval without attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_combined_gates_double_prompt_under_requires_approval() {
+        // Step-5 fixup #2: pin v1 behavior when BOTH gates fire — the
+        // up-front `requires_approval` gate AND the in-tool file_policy
+        // surfacer. Currently expect TWO approval calls per user action
+        // (one per gate). If a future change adds dedup, this test should
+        // be updated to assert one call; until then, this test documents
+        // the double-prompt cost so it cannot regress silently.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "data").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![pattern],
+            vec![],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::with_requires_approval(true, true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let result = execute_tool(
+            "test-id",
+            "file_read",
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(&kh),
+            None, // allowed_tools
+            Some("agent-combined"),
+            None, // skill_registry
+            None, // mcp_connections
+            None, // web_ctx
+            None, // browser_ctx
+            None, // allowed_env_vars
+            Some(workspace.path()),
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+            Some(&policy),
+        )
+        .await;
+        assert!(!result.is_error, "combined-approved read must succeed: {}", result.content);
+
+        // v1 documented behavior: two prompts (up-front gate + file_policy
+        // surfacer). If you add dedup, change the assertion to 1 and
+        // remove this comment.
+        assert_eq!(
+            stub.call_count(),
+            2,
+            "v1 expects double-prompt; got calls: {:?}",
+            stub.calls()
+        );
+        // The up-front gate uses tool_name as label; the file_policy
+        // surfacer uses tool_label="file_read" too. Both must be attributed
+        // to the right agent.
+        for call in stub.calls() {
+            assert_eq!(call.0, "agent-combined", "agent_id must propagate to both gates");
+            assert_eq!(call.1, "file_read");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Review-6 fixup tests: cross-component bypasses.
+    //
+    //   #1 KernelConfig.file_policy was dead code (covered by
+    //      compile_effective_file_policy unit tests in agent_loop).
+    //   #2 tool_apply_patch was unhooked from file_policy.
+    //   #3 tool_media_describe / tool_media_transcribe were unhooked.
+    // -----------------------------------------------------------------
+
+    /// Build a minimal `*** Add File:` patch targeting `target`. Used by the
+    /// apply_patch gate tests below.
+    fn add_file_patch(target: &str, content: &str) -> String {
+        let mut s = String::from("*** Begin Patch\n");
+        s.push_str(&format!("*** Add File: {target}\n"));
+        for line in content.lines() {
+            s.push_str(&format!("+{line}\n"));
+        }
+        s.push_str("*** End Patch\n");
+        s
+    }
+
+    /// `Add File: a` + `Add File: b`. For the multi-path batched-prompt test.
+    fn add_two_files_patch(a: &str, b: &str) -> String {
+        let mut s = String::from("*** Begin Patch\n");
+        s.push_str(&format!("*** Add File: {a}\n+x\n"));
+        s.push_str(&format!("*** Add File: {b}\n+y\n"));
+        s.push_str("*** End Patch\n");
+        s
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_deny_path_blocks_before_disk_touch() {
+        // Review-6 fixup #2: previously apply_patch ran with no policy
+        // gate, so a `deny_paths` glob covering /etc/** would not stop a
+        // patch that adds `/etc/passwd-clone`. Pin that it does now.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("forbidden.txt");
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let deny_pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![deny_pattern],
+        );
+
+        let patch = add_file_patch(target.to_str().unwrap(), "should not land");
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_apply_patch(
+            &serde_json::json!({"patch": patch}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny path must block apply_patch");
+        assert!(
+            err.contains("apply_patch blocked by file_policy"),
+            "error must name the file_policy block: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "target must not have been written when policy denied the patch"
+        );
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "deny must short-circuit before approval surfacer fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_batches_multipath_prompt_into_one_request() {
+        // Review-6 fixup #2: a multi-file patch with two Prompt-tier targets
+        // must surface ONE batched approval, not N. Mirrors the shell-gate
+        // batching invariant so apply_patch doesn't burn N approvals on
+        // every multi-file write.
+        //
+        // We use targets *inside* the workspace under a `prompt_paths` glob
+        // because apply_patch::apply_patch enforces its own workspace
+        // sandbox at the bottom of the stack. file_policy precedence puts
+        // prompt_paths above the workspace implicit-allow, so a workspace
+        // path matching prompt_paths still hits the surfacer.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let ws_canon = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir_all(ws_canon.join("review")).unwrap();
+        let a_rel = "review/a.txt";
+        let b_rel = "review/b.txt";
+
+        let prompt_pattern = format!("{}/review/**", ws_canon.display());
+        let policy = build_compiled_policy(
+            &ws_canon,
+            vec![],
+            vec![],
+            vec![prompt_pattern],
+            vec![],
+        );
+
+        let patch = add_two_files_patch(a_rel, b_rel);
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        tool_apply_patch(
+            &serde_json::json!({"patch": patch}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect("approved batched prompt must succeed");
+
+        assert_eq!(
+            stub.call_count(),
+            1,
+            "two prompt-tier targets must collapse to one approval; got {}: {:?}",
+            stub.call_count(),
+            stub.calls()
+        );
+        let last = stub.last().expect("approval recorded");
+        assert_eq!(last.1, "apply_patch", "tool_label must be apply_patch");
+        assert!(
+            last.2.contains("a.txt") && last.2.contains("b.txt"),
+            "batched summary must mention both targets: {}",
+            last.2
+        );
+        assert!(
+            ws_canon.join(a_rel).exists() && ws_canon.join(b_rel).exists(),
+            "approved patch must apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_deny_short_circuits_before_prompt_batch() {
+        // Mirror of the shell-gate corollary: if any path hard-Denies,
+        // apply_patch must fail without surfacing approvals for the Prompt
+        // siblings — don't waste operator attention on a doomed patch.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let prompt_dir = tempfile::TempDir::new().unwrap();
+        let deny_dir = tempfile::TempDir::new().unwrap();
+        let prompt_target = prompt_dir.path().join("prompt.txt");
+        let deny_target = deny_dir.path().join("deny.txt");
+
+        let prompt_pattern =
+            format!("{}/**", prompt_dir.path().canonicalize().unwrap().display());
+        let deny_pattern = format!("{}/**", deny_dir.path().canonicalize().unwrap().display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![prompt_pattern],
+            vec![deny_pattern],
+        );
+
+        let patch = add_two_files_patch(
+            prompt_target.to_str().unwrap(),
+            deny_target.to_str().unwrap(),
+        );
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_apply_patch(
+            &serde_json::json!({"patch": patch}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny sibling must fail the whole patch");
+        assert!(err.contains("apply_patch blocked by file_policy"), "{err}");
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "deny must short-circuit before approval surfacer fires"
+        );
+        assert!(!prompt_target.exists() && !deny_target.exists());
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_inside_workspace_no_policy_passes() {
+        // Regression: with no file_policy, apply_patch behaves exactly as
+        // before the gate was added — workspace-relative writes succeed
+        // without any approval calls. (Pin: review-6 fix did not change
+        // legacy semantics.)
+        let workspace = tempfile::TempDir::new().unwrap();
+        let target_rel = "inside.txt";
+        let patch = add_file_patch(target_rel, "ok");
+
+        let result = tool_apply_patch(
+            &serde_json::json!({"patch": patch}),
+            Some(workspace.path()),
+            None, // no file_policy
+            None,
+            None,
+        )
+        .await
+        .expect("legacy path must succeed without a policy");
+        assert!(result.contains("added"), "summary: {result}");
+        assert!(workspace.path().join(target_rel).exists());
+    }
+
+    #[tokio::test]
+    async fn test_media_describe_deny_path_blocks_before_engine_check() {
+        // Review-6 fixup #3: media_describe was previously gated only by
+        // `validate_path` (..-rejection). A `deny_paths` glob outside the
+        // workspace was silently bypassed. Pin that the gate now fires
+        // before any other check — so we can observe the file_policy error
+        // even without a real MediaEngine.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("img.png");
+        std::fs::write(&target, b"\x89PNG\r\n").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let deny_pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![deny_pattern],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_media_describe(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            None, // media_engine — gate must fire first regardless
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny path must block media_describe");
+        assert!(
+            err.contains("denied by file_policy"),
+            "error must surface as a file_policy denial, not an engine error: {err}"
+        );
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "deny must short-circuit before approval surfacer fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_image_analyze_deny_path_blocks_before_read() {
+        // Review-7 fixup #1: image_analyze previously called `tokio::fs::read`
+        // with no policy gate (and no `validate_path` either — the bypass was
+        // total). A `deny_paths` glob outside the workspace was silently
+        // bypassed. Pin that the gate now fires before the file is read.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("img.png");
+        // Real PNG magic so a successful read would otherwise format-detect
+        // and produce a non-empty result. The deny must short-circuit before.
+        std::fs::write(&target, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let deny_pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![deny_pattern],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_image_analyze(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny path must block image_analyze");
+        assert!(
+            err.contains("denied by file_policy"),
+            "error must surface as a file_policy denial, not a read error: {err}"
+        );
+        assert_eq!(
+            stub.call_count(),
+            0,
+            "deny must short-circuit before approval surfacer fires"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_media_transcribe_deny_path_blocks_before_engine_check() {
+        // Review-6 fixup #3: same as media_describe, for the audio sibling.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("clip.mp3");
+        std::fs::write(&target, b"id3").unwrap();
+
+        let outside_canon = outside.path().canonicalize().unwrap();
+        let deny_pattern = format!("{}/**", outside_canon.display());
+        let policy = build_compiled_policy(
+            &workspace.path().canonicalize().unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            vec![deny_pattern],
+        );
+
+        let stub = Arc::new(ApprovalStubKernel::new(true));
+        let kh: Arc<dyn KernelHandle> = stub.clone();
+
+        let err = tool_media_transcribe(
+            &serde_json::json!({"path": target.to_str().unwrap()}),
+            None,
+            Some(workspace.path()),
+            Some(&policy),
+            Some(&kh),
+            Some("agent-test"),
+        )
+        .await
+        .expect_err("deny path must block media_transcribe");
+        assert!(
+            err.contains("denied by file_policy"),
+            "error must surface as a file_policy denial, not an engine error: {err}"
+        );
+        assert_eq!(stub.call_count(), 0);
     }
 }

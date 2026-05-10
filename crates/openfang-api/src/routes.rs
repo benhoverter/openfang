@@ -6878,6 +6878,7 @@ pub async fn mcp_http(
                 None
             },
             Some(&*state.kernel.process_manager),
+            None, // file_policy — HTTP MCP endpoint has no per-agent manifest binding (ANAI-40)
         )
         .await;
 
@@ -7715,6 +7716,8 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                caller_agent_id: None,
+                caller_allowed_tools: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {

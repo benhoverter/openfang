@@ -14,6 +14,7 @@ members = [
     "crates/openfang-desktop",
     "crates/openfang-hands",
     "crates/openfang-extensions",
+    "crates/openfang-mcp-bridge",
     "xtask",
 ]
 
@@ -101,6 +102,9 @@ json5 = "0.4"
 
 # Directory walking
 walkdir = "2"
+
+# Glob matching (file_policy path matching)
+globset = "0.4"
 
 # Security
 sha2 = "0.10"
