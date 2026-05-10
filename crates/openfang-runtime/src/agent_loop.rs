@@ -253,6 +253,35 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
     }
 }
 
+/// Short, log-friendly tag for a content block variant.
+///
+/// Used by debug logging to characterize message contents without
+/// dumping image bytes or full text. Stable strings — log consumers
+/// (grep, dashboards) can rely on these.
+pub(crate) fn block_kind(b: &ContentBlock) -> &'static str {
+    match b {
+        ContentBlock::Text { .. } => "text",
+        ContentBlock::Image { .. } => "image",
+        ContentBlock::ToolUse { .. } => "tool_use",
+        ContentBlock::ToolResult { .. } => "tool_result",
+        ContentBlock::Thinking { .. } => "thinking",
+        ContentBlock::Unknown => "unknown",
+    }
+}
+
+/// Collect the ordered list of block kinds for a message, for log output.
+pub(crate) fn message_block_kinds(m: &Message) -> Vec<&'static str> {
+    match &m.content {
+        MessageContent::Text(_) => vec!["text"],
+        MessageContent::Blocks(blocks) => blocks.iter().map(block_kind).collect(),
+    }
+}
+
+/// Whether a message contains at least one Image content block.
+pub(crate) fn message_has_image(m: &Message) -> bool {
+    matches!(&m.content, MessageContent::Blocks(blocks) if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })))
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -367,9 +396,15 @@ pub async fn run_agent_loop(
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
-    session
-        .messages
-        .push(build_user_turn_message(user_message, user_content_blocks));
+    let user_turn = build_user_turn_message(user_message, user_content_blocks);
+    debug!(
+        agent = %manifest.name,
+        appended_block_kinds = ?message_block_kinds(&user_turn),
+        appended_has_image = message_has_image(&user_turn),
+        event = "history.append.user_turn",
+        "history: appended user message"
+    );
+    session.messages.push(user_turn);
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field.
@@ -428,10 +463,35 @@ pub async fn run_agent_loop(
     // the catastrophic case where 200+ messages cause instant context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
         let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+        let dropped_roles: Vec<&'static str> = messages[..trim_count]
+            .iter()
+            .map(|m| match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            })
+            .collect();
+        let dropped_has_images: Vec<bool> =
+            messages[..trim_count].iter().map(message_has_image).collect();
+        let dropped_block_kinds: Vec<Vec<&'static str>> = messages[..trim_count]
+            .iter()
+            .map(message_block_kinds)
+            .collect();
+        let dropped_total_chars: usize = messages[..trim_count]
+            .iter()
+            .map(|m| m.content.text_length())
+            .sum();
+        let dropped_image_count = dropped_has_images.iter().filter(|b| **b).count();
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
+            dropped_roles = ?dropped_roles,
+            dropped_has_images = ?dropped_has_images,
+            dropped_block_kinds = ?dropped_block_kinds,
+            dropped_total_chars = dropped_total_chars,
+            dropped_image_count = dropped_image_count,
+            event = "history.trim",
             "Trimming old messages to prevent context overflow"
         );
         messages.drain(..trim_count);
@@ -1577,9 +1637,15 @@ pub async fn run_agent_loop_streaming(
     // Add the user message to session history.
     // When content blocks are provided (e.g. text + image from a channel),
     // combine them with the user text so the LLM sees the full multimodal turn.
-    session
-        .messages
-        .push(build_user_turn_message(user_message, user_content_blocks));
+    let user_turn = build_user_turn_message(user_message, user_content_blocks);
+    debug!(
+        agent = %manifest.name,
+        appended_block_kinds = ?message_block_kinds(&user_turn),
+        appended_has_image = message_has_image(&user_turn),
+        event = "history.append.user_turn.streaming",
+        "history: appended user message (streaming)"
+    );
+    session.messages.push(user_turn);
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -1629,10 +1695,35 @@ pub async fn run_agent_loop_streaming(
     // Safety valve: trim excessively long message histories to prevent context overflow.
     if messages.len() > MAX_HISTORY_MESSAGES {
         let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+        let dropped_roles: Vec<&'static str> = messages[..trim_count]
+            .iter()
+            .map(|m| match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            })
+            .collect();
+        let dropped_has_images: Vec<bool> =
+            messages[..trim_count].iter().map(message_has_image).collect();
+        let dropped_block_kinds: Vec<Vec<&'static str>> = messages[..trim_count]
+            .iter()
+            .map(message_block_kinds)
+            .collect();
+        let dropped_total_chars: usize = messages[..trim_count]
+            .iter()
+            .map(|m| m.content.text_length())
+            .sum();
+        let dropped_image_count = dropped_has_images.iter().filter(|b| **b).count();
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
+            dropped_roles = ?dropped_roles,
+            dropped_has_images = ?dropped_has_images,
+            dropped_block_kinds = ?dropped_block_kinds,
+            dropped_total_chars = dropped_total_chars,
+            dropped_image_count = dropped_image_count,
+            event = "history.trim.streaming",
             "Trimming old messages to prevent context overflow (streaming)"
         );
         messages.drain(..trim_count);
@@ -3327,6 +3418,7 @@ mod tests {
         ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "aGVsbG8=".to_string(),
+            source_url: None,
         }
     }
 

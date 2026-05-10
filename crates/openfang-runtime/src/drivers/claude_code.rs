@@ -8,11 +8,13 @@
 //! Tracks active subprocess PIDs and enforces message timeouts to prevent
 //! hung CLI processes from blocking agents indefinitely.
 
+use crate::image_cache::{image_tmp_dir, materialize_image, spawn_sweep_once};
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use async_trait::async_trait;
 use dashmap::DashMap;
-use openfang_types::message::{ContentBlock, Role, StopReason, TokenUsage};
+use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
 use serde::Deserialize;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tracing::{debug, info, warn};
@@ -52,6 +54,11 @@ const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
 /// Default subprocess timeout in seconds (5 minutes).
 const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 300;
 
+// Image materialization helpers (image_tmp_dir, ext_for_mime,
+// materialize_image, sweep_old_image_tmpfiles, TTL constants, sweep guard)
+// live in crate::image_cache so the outbound file-sharing path can reuse
+// the same content-addressed cache without a circular dep on this driver.
+
 /// LLM driver that delegates to the Claude Code CLI.
 pub struct ClaudeCodeDriver {
     cli_path: String,
@@ -77,6 +84,9 @@ impl ClaudeCodeDriver {
                  OpenFang's own capability/RBAC system enforces access control."
             );
         }
+
+        // Best-effort sweep of stale image tmpfiles, once per process.
+        spawn_sweep_once();
 
         Self {
             cli_path: cli_path
@@ -130,8 +140,26 @@ impl ClaudeCodeDriver {
     }
 
     /// Build a text prompt from the completion request messages.
+    ///
+    /// The Claude Code CLI is text-only (`-p <prompt>`), so non-text content
+    /// blocks (images, etc.) cannot be sent natively. Rather than dropping
+    /// them silently — which causes the model to hallucinate about content
+    /// it can't see — we render each non-text block as a synthetic
+    /// `[attachment: ...]` marker via `render_content`. The model still
+    /// can't *view* the attachment, but it knows the attachment exists and
+    /// can acknowledge it coherently instead of confabulating.
+    ///
+    /// The per-block accounting below emits a `cc.bridge.build_prompt`
+    /// diagnostic event so we can confirm what content actually reaches
+    /// the bridge and whether `render_content` materialized it.
     fn build_prompt(request: &CompletionRequest) -> String {
+        let tmp_dir = image_tmp_dir();
         let mut parts = Vec::new();
+        // Per-message block-kind accounting for diagnostics.
+        let mut msg_block_kinds: Vec<Vec<&'static str>> = Vec::with_capacity(request.messages.len());
+        let mut total_image_blocks: usize = 0;
+        let mut total_text_blocks: usize = 0;
+        let mut total_other_blocks: usize = 0;
 
         for msg in &request.messages {
             let role_label = match msg.role {
@@ -139,13 +167,113 @@ impl ClaudeCodeDriver {
                 Role::Assistant => "Assistant",
                 Role::System => "System",
             };
-            let text = msg.content.text_content();
-            if !text.is_empty() {
-                parts.push(format!("[{role_label}]\n{text}"));
+            let kinds: Vec<&'static str> = match &msg.content {
+                MessageContent::Text(_) => vec!["text"],
+                MessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { .. } => "text",
+                        ContentBlock::Image { .. } => "image",
+                        ContentBlock::ToolUse { .. } => "tool_use",
+                        ContentBlock::ToolResult { .. } => "tool_result",
+                        ContentBlock::Thinking { .. } => "thinking",
+                        ContentBlock::Unknown => "unknown",
+                    })
+                    .collect(),
+            };
+            for k in &kinds {
+                match *k {
+                    "text" => total_text_blocks += 1,
+                    "image" => total_image_blocks += 1,
+                    _ => total_other_blocks += 1,
+                }
+            }
+            msg_block_kinds.push(kinds);
+
+            let rendered = Self::render_content(&msg.content, Some(&tmp_dir));
+            if !rendered.is_empty() {
+                parts.push(format!("[{role_label}]\n{rendered}"));
             }
         }
 
-        parts.join("\n\n")
+        let prompt = parts.join("\n\n");
+
+        // Bridge diagnostic log — single structured event per request.
+        // Tag with `event = "cc.bridge.build_prompt"` for grep-friendly
+        // filtering. If `total_image_blocks > 0` and the prompt does not
+        // contain materialized-image directives, the bridge is dropping
+        // images on the floor (this is the suspected bug).
+        debug!(
+            event = "cc.bridge.build_prompt",
+            message_count = request.messages.len(),
+            total_text_blocks = total_text_blocks,
+            total_image_blocks = total_image_blocks,
+            total_other_blocks = total_other_blocks,
+            per_message_block_kinds = ?msg_block_kinds,
+            prompt_chars = prompt.len(),
+            "claude-code bridge: assembled CLI prompt"
+        );
+
+        prompt
+    }
+
+    /// Render message content for the text-only CLI prompt.
+    ///
+    /// Text blocks pass through verbatim. Image blocks are materialized to
+    /// an on-disk tmpfile (when `image_dir` is provided) so the model can
+    /// view them via the CLI's `Read` tool — Claude Code is multimodal and
+    /// will load the file as native image content. We render a directive
+    /// telling the model exactly which path to read, plus the original
+    /// `source_url` (e.g. Discord CDN) when known. If materialization
+    /// fails or `image_dir` is `None` (test path), we fall back to the
+    /// legacy textual placeholder so the model at least knows an
+    /// attachment arrived. ToolUse/ToolResult/Thinking are omitted —
+    /// the CLI manages its own tool loop.
+    fn render_content(content: &MessageContent, image_dir: Option<&Path>) -> String {
+        match content {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => {
+                        if text.is_empty() {
+                            None
+                        } else {
+                            Some(text.clone())
+                        }
+                    }
+                    ContentBlock::Image {
+                        media_type,
+                        data,
+                        source_url,
+                    } => {
+                        // base64 → ~3/4 the length in decoded bytes.
+                        let approx_kb = (data.len().saturating_mul(3) / 4) / 1024;
+                        let url_suffix = match source_url {
+                            Some(u) => format!(" (original: {u})"),
+                            None => String::new(),
+                        };
+                        if let Some(dir) = image_dir {
+                            if let Some(path) = materialize_image(media_type, data, dir) {
+                                return Some(format!(
+                                    "[attachment: {media_type} image, ~{approx_kb} KB — view with the Read tool at {path}{url_suffix}]",
+                                    path = path.display()
+                                ));
+                            }
+                        }
+                        // Fallback: at least surface the URL if we have one.
+                        Some(format!(
+                            "[attachment: {media_type} image, ~{approx_kb} KB — not viewable on this provider{url_suffix}]"
+                        ))
+                    }
+                    ContentBlock::ToolUse { .. }
+                    | ContentBlock::ToolResult { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::Unknown => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
     }
 
     /// Map a model ID like "claude-code/opus" to CLI --model flag value.
@@ -279,6 +407,14 @@ impl LlmDriver for ClaudeCodeDriver {
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
         }
+
+        // Grant the CLI's Read tool access to our image tmp dir, which lives
+        // outside the agent's workspace cwd. Without --add-dir the CLI would
+        // refuse Read on `$HOME/.openfang/tmp/images/*` (unless
+        // --dangerously-skip-permissions is set) and the materialization would
+        // be a dead-end. Cheap and idempotent — the dir is per-user and
+        // content-addressed.
+        cmd.arg("--add-dir").arg(image_tmp_dir());
 
         Self::apply_env_filter(&mut cmd);
 
@@ -475,6 +611,9 @@ impl LlmDriver for ClaudeCodeDriver {
         if let Some(ref model) = model_flag {
             cmd.arg("--model").arg(model);
         }
+
+        // Same image-tmp-dir grant as the non-streaming path; see complete().
+        cmd.arg("--add-dir").arg(image_tmp_dir());
 
         Self::apply_env_filter(&mut cmd);
 
@@ -724,6 +863,83 @@ mod tests {
         assert!(!prompt.contains("You are helpful."));
         assert!(prompt.contains("[User]"));
         assert!(prompt.contains("Hello"));
+    }
+
+    #[test]
+    fn test_build_prompt_renders_image_attachment_marker() {
+        use openfang_types::message::{ContentBlock, Message, MessageContent};
+
+        // ~12 KB of base64 — decoded ~9 KB.
+        let fake_b64 = "A".repeat(12 * 1024);
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "what's in this?".to_string(),
+                        provider_metadata: None,
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: fake_b64,
+                        source_url: None,
+                    },
+                ]),
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.7,
+            system: None,
+            thinking: None,
+        };
+
+        let prompt = ClaudeCodeDriver::build_prompt(&request);
+        assert!(prompt.contains("what's in this?"), "text preserved");
+        assert!(
+            prompt.contains("[attachment: image/png image"),
+            "image rendered as synthetic attachment marker, got: {prompt}"
+        );
+        // Either materialized to a tmpfile (preferred) or fell back to
+        // the legacy "not viewable" placeholder. Both are acceptable
+        // outcomes for this test; we just need the marker to be emitted.
+        assert!(
+            prompt.contains("view with the Read tool at")
+                || prompt.contains("not viewable on this provider"),
+            "marker either points at a tmpfile or explains the limitation, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_image_only_still_emits_marker() {
+        use openfang_types::message::{ContentBlock, Message, MessageContent};
+
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    media_type: "image/jpeg".to_string(),
+                    data: "Zm9v".to_string(),
+                    source_url: Some("https://cdn.example/foo.jpg".to_string()),
+                }]),
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.7,
+            system: None,
+            thinking: None,
+        };
+
+        let prompt = ClaudeCodeDriver::build_prompt(&request);
+        assert!(
+            prompt.contains("[User]"),
+            "user role label emitted even with image-only content, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("[attachment: image/jpeg image"),
+            "bare image renders marker, got: {prompt}"
+        );
     }
 
     #[test]
