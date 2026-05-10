@@ -21,6 +21,8 @@ See Linear: **OpenFang Fork: Branch Topology & Workflow (handoff)** for the full
 | `topic/lenient-binding-parse` *(adopted)* | `upstream/main`             | `origin/lenient-binding-parse`           | #1146  | open, awaiting review        |
 | `topic/harden-channel-id-binding` *(adopted)* | `upstream/main`         | `origin/harden-channel-id-binding`       | #1147  | open, awaiting review        |
 | `topic/discord-file-sharing` *(adopted)*| `upstream/main`               | `origin/discord-file-sharing`            | #1143  | open, awaiting review        |
+| `feat/anai-32` *(adopted)*              | `upstream/main`               | `origin/feat/anai-32`                    | #1182  | open, awaiting review — shell capability gate + bridge tool registry |
+| `feat/anai-40-file-policy` *(adopted)*  | `feat/anai-32`                | `origin/feat/anai-40-file-policy`        | #1183  | open, awaiting review — file policy schema/loader/evaluator + cross-component gates |
 | `topic/branch-docs`                     | `upstream/main`               | *(local)*                                | —      | this file                    |
 
 ### "Adopted" branches
@@ -47,6 +49,8 @@ upstream/main
   ├── topic/lenient-binding-parse             (= origin/lenient-binding-parse)
   ├── topic/harden-channel-id-binding         (= origin/harden-channel-id-binding)
   ├── topic/discord-file-sharing              (= origin/discord-file-sharing)
+  ├── feat/anai-32                            (= origin/feat/anai-32; PR #1182)
+  │     └── feat/anai-40-file-policy          (= origin/feat/anai-40-file-policy; PR #1183 — merges anai-32 at cbb1105)
   └── topic/branch-docs                       (this file)
 ```
 
@@ -56,7 +60,8 @@ The reroll script octopus-merges the **leaf** of each chain into `local-main` (s
 2. `topic/discord-outbound-attachments` (pulls in `topic/runtime-image-cache`; supersedes claude_code portion of `topic/discord-file-sharing` so that branch is **not** a separate leaf — see "Cross-PR dependency")
 3. `topic/lenient-binding-parse`
 4. `topic/harden-channel-id-binding`
-5. `topic/branch-docs`
+5. `origin/feat/anai-40-file-policy` (pulls in `feat/anai-32` via merge `cbb1105`; PR #1183 stacks on PR #1182)
+6. `topic/branch-docs`
 
 ## Adding a topic
 
