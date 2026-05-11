@@ -452,4 +452,56 @@ timeout_secs = 60
         let result = toml::from_str::<TestExecPolicy>(toml_str);
         assert!(result.is_err());
     }
+
+    // ── ANAI-44: trusted_commands schema round-trip ─────────────────────
+
+    #[test]
+    fn exec_policy_parses_trusted_commands() {
+        let toml_str = r#"
+[exec_policy]
+mode = "allowlist"
+trusted_commands = ["mkdir", "cargo"]
+"#;
+        let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
+        let policy = parsed.exec_policy.unwrap();
+        assert_eq!(policy.mode, crate::config::ExecSecurityMode::Allowlist);
+        assert_eq!(
+            policy.trusted_commands,
+            vec!["mkdir".to_string(), "cargo".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_policy_omits_trusted_commands_defaults_empty() {
+        let toml_str = r#"
+[exec_policy]
+mode = "allowlist"
+"#;
+        let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
+        let policy = parsed.exec_policy.unwrap();
+        assert!(
+            policy.trusted_commands.is_empty(),
+            "missing trusted_commands must default to empty Vec for backward compat"
+        );
+    }
+
+    #[test]
+    fn exec_security_mode_accepts_camelcase_alias() {
+        // ANAI-32 papercut: operators have typed "allowList" (camelCase) and
+        // hit a confusing rejection. The alias absorbs that form.
+        let toml_str = r#"exec_policy = "allowList""#;
+        let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
+        let policy = parsed.exec_policy.unwrap();
+        assert_eq!(policy.mode, crate::config::ExecSecurityMode::Allowlist);
+    }
+
+    #[test]
+    fn exec_security_mode_display_is_lowercase() {
+        // Display must match the canonical TOML tag (lowercase) so diagnostics
+        // show the value the user types into config.
+        use crate::config::ExecSecurityMode;
+        assert_eq!(format!("{}", ExecSecurityMode::Allowlist), "allowlist");
+        assert_eq!(format!("{}", ExecSecurityMode::Full), "full");
+        assert_eq!(format!("{}", ExecSecurityMode::Deny), "deny");
+    }
 }

@@ -879,13 +879,28 @@ pub enum ExecSecurityMode {
     /// Block all shell execution.
     #[serde(alias = "none", alias = "disabled")]
     Deny,
-    /// Only allow commands in safe_bins or allowed_commands.
+    /// Only allow commands in safe_bins, trusted_commands, or allowed_commands.
+    /// safe_bins and trusted_commands bypass approval (silent); allowed_commands prompts.
     #[default]
-    #[serde(alias = "restricted")]
+    #[serde(alias = "restricted", alias = "allowList")]
     Allowlist,
     /// Allow all commands (unsafe, dev only).
     #[serde(alias = "allow", alias = "all", alias = "unrestricted")]
     Full,
+}
+
+impl std::fmt::Display for ExecSecurityMode {
+    /// Render the canonical lowercase TOML tag (e.g. `"allowlist"`), matching
+    /// `#[serde(rename_all = "lowercase")]`. Diagnostics should prefer `{}` over
+    /// `{:?}` so error messages name the value the user types into config.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ExecSecurityMode::Deny => "deny",
+            ExecSecurityMode::Allowlist => "allowlist",
+            ExecSecurityMode::Full => "full",
+        };
+        f.write_str(s)
+    }
 }
 
 /// Shell/exec security policy.
@@ -895,9 +910,17 @@ pub struct ExecPolicy {
     /// Security mode: "deny" blocks all, "allowlist" only allows listed,
     /// "full" allows all (unsafe, dev only).
     pub mode: ExecSecurityMode,
-    /// Commands that bypass allowlist (stdin-only utilities).
+    /// Commands that bypass approval entirely (silent allow). Stdin-only
+    /// utilities OpenFang ships as a conservative default. Base-binary match.
     pub safe_bins: Vec<String>,
-    /// Global command allowlist (when mode = allowlist).
+    /// User-extended silent-allow list. Commands here pass the validator *and*
+    /// bypass approval (a stronger trust tier than `allowed_commands`).
+    /// Base-binary match. `"*"` wildcard means trust everything that passes
+    /// the validator — effectively `mode = "full"` with deny-by-validator off.
+    #[serde(default)]
+    pub trusted_commands: Vec<String>,
+    /// Global command allowlist (when mode = allowlist). Commands here pass
+    /// the validator but still trigger an approval prompt.
     pub allowed_commands: Vec<String>,
     /// Max execution timeout in seconds. Default: 30.
     pub timeout_secs: u64,
@@ -924,6 +947,7 @@ impl Default for ExecPolicy {
             .into_iter()
             .map(String::from)
             .collect(),
+            trusted_commands: Vec::new(),
             allowed_commands: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
