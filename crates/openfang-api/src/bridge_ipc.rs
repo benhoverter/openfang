@@ -1667,4 +1667,26 @@ mod tests {
             "legacy path has no fingerprint"
         );
     }
+
+    /// Drift detection: `RESERVED_BUILTIN_NAMES` (the collision-check list
+    /// used at MCP discovery in `openfang-runtime`) MUST equal
+    /// `ALLOWED_TOOLS` (this crate). If a new built-in tool is added to
+    /// `ALLOWED_TOOLS` and `built_in_tools()` but the reservation list
+    /// drifts, an upstream MCP server could shadow the new built-in.
+    ///
+    /// Owner contract: any addition to `ALLOWED_TOOLS` must also be added
+    /// to `openfang_runtime::mcp::RESERVED_BUILTIN_NAMES`.
+    #[test]
+    fn reserved_builtin_names_matches_allowed_tools() {
+        use openfang_runtime::mcp::RESERVED_BUILTIN_NAMES;
+        use std::collections::BTreeSet;
+        let allowed: BTreeSet<&str> = ALLOWED_TOOLS.iter().copied().collect();
+        let reserved: BTreeSet<&str> = RESERVED_BUILTIN_NAMES.iter().copied().collect();
+        assert_eq!(
+            allowed, reserved,
+            "drift: openfang_runtime::mcp::RESERVED_BUILTIN_NAMES ≠ ALLOWED_TOOLS. \
+            Built-ins added to ALLOWED_TOOLS must also be added to \
+            RESERVED_BUILTIN_NAMES so upstream MCP servers cannot shadow them."
+        );
+    }
 }
