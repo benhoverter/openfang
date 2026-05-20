@@ -57,8 +57,8 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(unix)]
 use openfang_mcp_bridge::{
     protocol::{
-        codec, CallRequest, CallResult, Frame, Hello, HelloAck, PROTOCOL_VERSION, SOCKET_ENV_VAR,
-        TOKEN_ENV_VAR,
+        codec, CallRequest, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
+        UpstreamListResult, UpstreamToolDef, PROTOCOL_VERSION, SOCKET_ENV_VAR, TOKEN_ENV_VAR,
     },
     Bridge, DispatchOk, ToolDispatchError, ToolDispatcher, DEFAULT_ALLOWED,
 };
@@ -126,8 +126,27 @@ async fn main() -> Result<()> {
 
     handshake(&mut stream, &token).await?;
 
+    // --- List upstream MCP tools (best-effort) ---
+    //
+    // Round-trip happens here, with sole ownership of the stream, so
+    // it is sequenced before the actor takes the read/write halves.
+    // A protocol-level error from the daemon (agent identity not
+    // resolvable, registry unavailable) is logged but does NOT abort
+    // the bridge: built-in tools still work; the agent simply sees
+    // no `mcp_*` surface this session.
+    let upstream_tools = list_upstream(&mut stream).await.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "list_upstream failed; bridge continues without upstream MCP surface");
+        Vec::new()
+    });
+    tracing::info!(count = upstream_tools.len(), "upstream MCP tools advertised");
+
     // --- Spawn IPC actor ---
-    let dispatcher = spawn_ipc_actor(stream, agent_id.clone(), allowed_tools.clone());
+    let dispatcher = spawn_ipc_actor(
+        stream,
+        agent_id.clone(),
+        allowed_tools.clone(),
+        upstream_tools,
+    );
 
     // --- Run MCP server over stdio ---
     let service = Bridge::new(Arc::new(dispatcher))
@@ -169,6 +188,36 @@ async fn handshake(stream: &mut UnixStream, token: &str) -> Result<()> {
     }
 }
 
+/// Bridge → daemon: ask for the per-agent upstream MCP tool list.
+///
+/// Sent once, immediately after a successful handshake while the
+/// caller still owns the stream end-to-end. Returns the advertised
+/// upstream tools (possibly empty) on success, or an error that the
+/// caller may downgrade to "no upstream surface this session".
+#[cfg(unix)]
+async fn list_upstream(stream: &mut UnixStream) -> Result<Vec<UpstreamToolDef>> {
+    let (read_half, mut write_half) = stream.split();
+    let mut read_half = BufReader::new(read_half);
+
+    let req = Frame::ListUpstream(ListUpstreamRequest { request_id: 0 });
+    codec::write_frame(&mut write_half, &req)
+        .await
+        .context("write ListUpstream")?;
+
+    match codec::read_frame(&mut read_half)
+        .await
+        .context("read UpstreamList")?
+    {
+        Frame::UpstreamList(resp) => match resp.result {
+            UpstreamListResult::Ok { tools } => Ok(tools),
+            UpstreamListResult::Error { message } => {
+                Err(anyhow!("daemon refused list_upstream: {message}"))
+            }
+        },
+        other => Err(anyhow!("expected UpstreamList, got {other:?}")),
+    }
+}
+
 /// One pending request: the slot the actor will fill when its response frame
 /// arrives over the wire.
 #[cfg(unix)]
@@ -188,6 +237,11 @@ struct IpcRequest {
 pub struct IpcDispatcher {
     agent_id: String,
     allowed: Vec<String>,
+    /// Cached snapshot of upstream MCP tools advertised by the daemon
+    /// at session start (one-shot `ListUpstream` round-trip). Refreshes
+    /// require restarting the bridge — by design for now, since the
+    /// daemon also restarts agents on `agent.toml mcp_servers` changes.
+    upstream: Vec<UpstreamToolDef>,
     tx: mpsc::Sender<IpcRequest>,
     next_id: AtomicU64,
 }
@@ -203,12 +257,27 @@ impl ToolDispatcher for IpcDispatcher {
         self.allowed.clone()
     }
 
+    fn upstream_tools(&self) -> Vec<UpstreamToolDef> {
+        self.upstream.clone()
+    }
+
     async fn call(
         &self,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<DispatchOk, ToolDispatchError> {
-        if !self.allowed.iter().any(|a| a == tool_name) {
+        // Two gates here:
+        // - Built-in tools must be in `OPENFANG_BRIDGE_ALLOWED` /
+        //   `DEFAULT_ALLOWED`.
+        // - `mcp_*` upstream tools must have been advertised by the
+        //   daemon at list-upstream time. Server-side `mcp_servers`
+        //   gating in the daemon is the source of truth; this is
+        //   just an early-exit hygiene check so we never ship a
+        //   bogus `mcp_*` name across the wire.
+        let is_builtin_allowed = self.allowed.iter().any(|a| a == tool_name);
+        let is_advertised_upstream = tool_name.starts_with("mcp_")
+            && self.upstream.iter().any(|t| t.name == tool_name);
+        if !is_builtin_allowed && !is_advertised_upstream {
             return Err(ToolDispatchError::NotPermitted(tool_name.to_string()));
         }
 
@@ -256,6 +325,7 @@ pub fn spawn_ipc_actor(
     stream: UnixStream,
     agent_id: String,
     allowed: Vec<String>,
+    upstream: Vec<UpstreamToolDef>,
 ) -> IpcDispatcher {
     let (tx, mut rx) = mpsc::channel::<IpcRequest>(32);
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -343,6 +413,7 @@ pub fn spawn_ipc_actor(
     IpcDispatcher {
         agent_id,
         allowed,
+        upstream,
         tx,
         next_id: AtomicU64::new(1),
     }
@@ -445,6 +516,7 @@ mod tests {
             client,
             "agent-x".into(),
             vec!["file_read".into(), "file_list".into()],
+            Vec::new(),
         );
 
         // Concurrent calls — exercise the correlation map.
@@ -468,6 +540,180 @@ mod tests {
             other => panic!("expected NotPermitted, got {other:?}"),
         }
 
+        let _ = server.await;
+    }
+
+    /// End-to-end list_upstream + mcp_* dispatch:
+    /// - fake daemon answers Hello/HelloAck,
+    /// - then responds to ListUpstream with a one-tool catalog,
+    /// - bridge dispatcher gets that cache,
+    /// - a `mcp_linear_getteams` call passes the bridge-side gate
+    ///   (NOT in `allowed`) and round-trips back with the tool name.
+    /// - a `mcp_unknown_tool` call (not in upstream cache) is
+    ///   rejected client-side with NotPermitted.
+    #[tokio::test]
+    async fn list_upstream_handshake_and_mcp_dispatch() {
+        use openfang_mcp_bridge::protocol::{
+            CallResponse, UpstreamListResponse, UpstreamListResult,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (rh, mut wh) = stream.split();
+            let mut rh = BufReader::new(rh);
+            // Hello.
+            match codec::read_frame(&mut rh).await.unwrap() {
+                Frame::Hello(_) => {}
+                _ => panic!("expected Hello"),
+            }
+            codec::write_frame(
+                &mut wh,
+                &Frame::HelloAck(HelloAck::Ok {
+                    daemon_version: "test".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            // ListUpstream.
+            let req = match codec::read_frame(&mut rh).await.unwrap() {
+                Frame::ListUpstream(r) => r,
+                other => panic!("expected ListUpstream, got {other:?}"),
+            };
+            codec::write_frame(
+                &mut wh,
+                &Frame::UpstreamList(UpstreamListResponse {
+                    request_id: req.request_id,
+                    result: UpstreamListResult::Ok {
+                        tools: vec![UpstreamToolDef {
+                            name: "mcp_linear_getteams".into(),
+                            server: "linear".into(),
+                            description: Some("List Linear teams".into()),
+                            input_schema: serde_json::json!({"type":"object"}),
+                        }],
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+            // One mcp_* Call → echo tool_name back as Ok content.
+            let call = match codec::read_frame(&mut rh).await.unwrap() {
+                Frame::Call(c) => c,
+                other => panic!("expected Call, got {other:?}"),
+            };
+            codec::write_frame(
+                &mut wh,
+                &Frame::Response(CallResponse {
+                    request_id: call.request_id,
+                    result: CallResult::Ok {
+                        content: call.tool_name,
+                        is_error: false,
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+
+        // Inline handshake.
+        {
+            let (rh, mut wh) = client.split();
+            let mut rh = BufReader::new(rh);
+            codec::write_frame(
+                &mut wh,
+                &Frame::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    token: "t".into(),
+                    bridge_version: "test".into(),
+                }),
+            )
+            .await
+            .unwrap();
+            match codec::read_frame(&mut rh).await.unwrap() {
+                Frame::HelloAck(HelloAck::Ok { .. }) => {}
+                other => panic!("bad ack: {other:?}"),
+            }
+        }
+
+        // list_upstream round-trip via the production helper.
+        let upstream = list_upstream(&mut client).await.expect("list_upstream ok");
+        assert_eq!(upstream.len(), 1);
+        assert_eq!(upstream[0].name, "mcp_linear_getteams");
+
+        let dispatcher = spawn_ipc_actor(
+            client,
+            "agent-x".into(),
+            // mcp_* is NOT in the built-in allowlist — only the
+            // upstream cache should grant it.
+            vec!["file_read".into()],
+            upstream,
+        );
+
+        // Allowed via upstream cache.
+        let ok = dispatcher
+            .call("mcp_linear_getteams", serde_json::json!({}))
+            .await
+            .expect("mcp dispatch ok");
+        assert_eq!(ok.content, "mcp_linear_getteams");
+        assert!(!ok.is_error);
+
+        // Not in upstream cache, not in allowed — must be denied locally.
+        let denied = dispatcher
+            .call("mcp_linear_notallowed", serde_json::json!({}))
+            .await
+            .expect_err("unadvertised mcp_* tool must be denied");
+        match denied {
+            ToolDispatchError::NotPermitted(t) => assert_eq!(t, "mcp_linear_notallowed"),
+            other => panic!("expected NotPermitted, got {other:?}"),
+        }
+
+        let _ = server.await;
+    }
+
+    /// list_upstream() surfaces protocol-layer errors as Err — the
+    /// production caller in main() downgrades these to "no upstream
+    /// surface this session" via unwrap_or_else.
+    #[tokio::test]
+    async fn list_upstream_propagates_error_result() {
+        use openfang_mcp_bridge::protocol::{UpstreamListResponse, UpstreamListResult};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (rh, mut wh) = stream.split();
+            let mut rh = BufReader::new(rh);
+            // Skip Hello (the test doesn't perform it; client below
+            // sends ListUpstream directly).
+            let req = match codec::read_frame(&mut rh).await.unwrap() {
+                Frame::ListUpstream(r) => r,
+                other => panic!("expected ListUpstream, got {other:?}"),
+            };
+            codec::write_frame(
+                &mut wh,
+                &Frame::UpstreamList(UpstreamListResponse {
+                    request_id: req.request_id,
+                    result: UpstreamListResult::Error {
+                        message: "agent identity not resolvable".into(),
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = UnixStream::connect(&sock).await.unwrap();
+        let err = list_upstream(&mut client)
+            .await
+            .expect_err("Error result must propagate");
+        assert!(err.to_string().contains("not resolvable"));
         let _ = server.await;
     }
 }
