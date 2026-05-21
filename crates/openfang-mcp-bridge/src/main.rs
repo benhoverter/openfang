@@ -191,14 +191,32 @@ async fn handshake(stream: &mut UnixStream, token: &str) -> Result<()> {
     }
 }
 
+/// Maximum time to wait for the per-agent upstream MCP tool list from
+/// the daemon. Bounds bridge startup so a wedged daemon or a slow
+/// upstream MCP server (`mcp_connections` lock held during a slow
+/// `tools/list`) cannot stall every new bridge session indefinitely.
+/// On timeout the caller downgrades to "no upstream surface this
+/// session" — same failure mode as a protocol-level refusal.
+#[cfg(unix)]
+const LIST_UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Bridge → daemon: ask for the per-agent upstream MCP tool list.
 ///
 /// Sent once, immediately after a successful handshake while the
 /// caller still owns the stream end-to-end. Returns the advertised
 /// upstream tools (possibly empty) on success, or an error that the
 /// caller may downgrade to "no upstream surface this session".
+///
+/// Bounded by [`LIST_UPSTREAM_TIMEOUT`].
 #[cfg(unix)]
 async fn list_upstream(stream: &mut UnixStream) -> Result<Vec<UpstreamToolDef>> {
+    tokio::time::timeout(LIST_UPSTREAM_TIMEOUT, list_upstream_inner(stream))
+        .await
+        .map_err(|_| anyhow!("list_upstream timed out after {:?}", LIST_UPSTREAM_TIMEOUT))?
+}
+
+#[cfg(unix)]
+async fn list_upstream_inner(stream: &mut UnixStream) -> Result<Vec<UpstreamToolDef>> {
     let (read_half, mut write_half) = stream.split();
     let mut read_half = BufReader::new(read_half);
 

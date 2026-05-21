@@ -797,6 +797,10 @@ async fn dispatch_upstream_mcp_call(
                     budget = CONTENT_BUDGET,
                     "bridge IPC (upstream MCP): truncating oversized result"
                 );
+                // UTF-8 invariant: each `char` encodes to ≤ 4 bytes, so
+                // `chars().take(N)` produces a `String` of ≤ 4N bytes.
+                // Taking `CONTENT_BUDGET / 4` chars therefore yields a
+                // string of ≤ CONTENT_BUDGET bytes, fitting the frame.
                 let mut truncated: String = content.chars().take(CONTENT_BUDGET / 4).collect();
                 truncated.push_str(
                     "
@@ -1689,5 +1693,24 @@ mod tests {
             Built-ins added to ALLOWED_TOOLS must also be added to \
             RESERVED_BUILTIN_NAMES so upstream MCP servers cannot shadow them."
         );
+    }
+    /// Drift catcher: no built-in tool may use the `mcp_` prefix.
+    ///
+    /// The dispatch gate `is_mcp_tool(name) = name.starts_with("mcp_")`
+    /// in `openfang_runtime::mcp` short-circuits BEFORE the static
+    /// `ALLOWED_TOOLS` check at the top of `dispatch_tool_call`. If a
+    /// future built-in were named `mcp_*`, calls to it would route to
+    /// `dispatch_upstream_mcp_call` instead of the built-in's real
+    /// handler. Structurally impossible today; this test locks the
+    /// invariant so a future addition doesn't silently subvert dispatch.
+    #[test]
+    fn no_builtin_uses_mcp_prefix() {
+        for name in ALLOWED_TOOLS {
+            assert!(
+                !name.starts_with("mcp_"),
+                "built-in '{name}' uses 'mcp_' prefix; conflicts with \
+                 is_mcp_tool dispatch gate in openfang_runtime::mcp"
+            );
+        }
     }
 }
