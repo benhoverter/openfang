@@ -651,7 +651,10 @@ mod tests {
         // server+tool normalize there. Easiest: assert the gate function
         // directly, since the namespaced form is what's gated.
         for reserved in RESERVED_BUILTIN_NAMES {
-            assert!(is_reserved_builtin(reserved), "{reserved} should be reserved");
+            assert!(
+                is_reserved_builtin(reserved),
+                "{reserved} should be reserved"
+            );
         }
 
         // Realistic register call against a non-colliding name succeeds.
@@ -665,7 +668,10 @@ mod tests {
         );
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp_linear_getteams");
-        assert_eq!(names.get("mcp_linear_getteams").map(String::as_str), Some("getteams"));
+        assert_eq!(
+            names.get("mcp_linear_getteams").map(String::as_str),
+            Some("getteams")
+        );
     }
 
     #[test]

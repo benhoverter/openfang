@@ -138,7 +138,10 @@ async fn main() -> Result<()> {
         tracing::warn!(error = %e, "list_upstream failed; bridge continues without upstream MCP surface");
         Vec::new()
     });
-    tracing::info!(count = upstream_tools.len(), "upstream MCP tools advertised");
+    tracing::info!(
+        count = upstream_tools.len(),
+        "upstream MCP tools advertised"
+    );
 
     // --- Spawn IPC actor ---
     let dispatcher = spawn_ipc_actor(
@@ -275,8 +278,8 @@ impl ToolDispatcher for IpcDispatcher {
         //   just an early-exit hygiene check so we never ship a
         //   bogus `mcp_*` name across the wire.
         let is_builtin_allowed = self.allowed.iter().any(|a| a == tool_name);
-        let is_advertised_upstream = tool_name.starts_with("mcp_")
-            && self.upstream.iter().any(|t| t.name == tool_name);
+        let is_advertised_upstream =
+            tool_name.starts_with("mcp_") && self.upstream.iter().any(|t| t.name == tool_name);
         if !is_builtin_allowed && !is_advertised_upstream {
             return Err(ToolDispatchError::NotPermitted(tool_name.to_string()));
         }

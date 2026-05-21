@@ -41,8 +41,8 @@ use crate::bridge_auth::BridgeAuthority;
 use openfang_kernel::OpenFangKernel;
 use openfang_mcp_bridge::protocol::{
     codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
-    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, SOCKET_RELATIVE_PATH,
+    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    SOCKET_RELATIVE_PATH,
 };
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
@@ -760,9 +760,7 @@ async fn dispatch_upstream_mcp_call(
     // arrive.
     let result_text = {
         let mut conns = kernel.mcp_connections.lock().await;
-        let conn = conns
-            .iter_mut()
-            .find(|c| c.name() == server_name);
+        let conn = conns.iter_mut().find(|c| c.name() == server_name);
         let conn = match conn {
             Some(c) => c,
             None => {
@@ -883,9 +881,7 @@ async fn handle_list_upstream(
             return UpstreamListResponse {
                 request_id: req.request_id,
                 result: UpstreamListResult::Error {
-                    message: format!(
-                        "agent '{resolved_agent_id_string}' has no registry entry"
-                    ),
+                    message: format!("agent '{resolved_agent_id_string}' has no registry entry"),
                 },
             };
         }
@@ -1162,7 +1158,10 @@ mod tests {
                         // Twin can't reach real mcp_connections; canned
                         // upstream-style ok lets list+invoke round-trip in tests.
                         CallResult::Ok {
-                            content: format!("[test-twin canned upstream ok for {}]", call.tool_name),
+                            content: format!(
+                                "[test-twin canned upstream ok for {}]",
+                                call.tool_name
+                            ),
                             is_error: false,
                         }
                     } else if !ALLOWED_TOOLS.iter().any(|t| *t == call.tool_name) {
@@ -1205,11 +1204,7 @@ mod tests {
                             }],
                         },
                     };
-                    codec::write_frame(
-                        &mut write_half,
-                        &Frame::UpstreamList(response),
-                    )
-                    .await?;
+                    codec::write_frame(&mut write_half, &Frame::UpstreamList(response)).await?;
                 }
                 _ => continue,
             }
@@ -1288,7 +1283,9 @@ mod tests {
         match codec::read_frame(&mut cr).await.unwrap() {
             Frame::Response(CallResponse {
                 request_id: 43,
-                result: CallResult::Ok { is_error: false, .. },
+                result: CallResult::Ok {
+                    is_error: false, ..
+                },
             }) => {}
             other => panic!("unexpected response after ListUpstream: {other:?}"),
         }
@@ -1350,7 +1347,11 @@ mod tests {
         match codec::read_frame(&mut cr).await.unwrap() {
             Frame::Response(CallResponse {
                 request_id: 7,
-                result: CallResult::Ok { content, is_error: false },
+                result:
+                    CallResult::Ok {
+                        content,
+                        is_error: false,
+                    },
             }) => {
                 assert!(content.contains("mcp_linear_getteams"));
             }
