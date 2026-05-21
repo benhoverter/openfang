@@ -10,6 +10,12 @@
 //! misconfigured agent manifest (e.g. `workspace_root = "~/.openfang"`) or a
 //! future tool surface that bypasses workspace confinement cannot exfiltrate
 //! these files.
+//!
+//! A second deny region covers sensitive paths under the user's `$HOME` but
+//! outside `$OPENFANG_HOME` — notably `~/.mcp-auth/`, which holds OAuth
+//! tokens for `mcp-remote` and other MCP clients. Same threat model: a
+//! misconfigured `workspace_root` (e.g. `~`) or a bypass of workspace
+//! confinement must not be able to read those tokens.
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +72,31 @@ pub(crate) fn is_sensitive_openfang_path(path: &Path) -> Option<&'static str> {
         s if s.starts_with("daemon.stderr.log.") || s.starts_with("daemon.stdout.log.") => {
             Some("daemon-log")
         }
+        _ => None,
+    }
+}
+
+/// Returns `Some(reason)` if `path` resolves to a sensitive directory under
+/// the user's `$HOME` but outside `$OPENFANG_HOME` that must never be read
+/// or written by an agent, regardless of `workspace_root`.
+///
+/// Companion to [`is_sensitive_openfang_path`] for credentials that live
+/// outside `$OPENFANG_HOME`. As of writing the only entry is `~/.mcp-auth/`
+/// (OAuth tokens used by `mcp-remote` and similar MCP clients). Add new
+/// first-component patterns conservatively: this fires for *any* agent on
+/// *any* workspace, including misconfigured ones, so over-denial here costs
+/// more than under-denial elsewhere.
+///
+/// `path` should be canonicalized before this check.
+pub(crate) fn is_sensitive_home_path(path: &Path) -> Option<&'static str> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let canon_home = home.canonicalize().ok()?;
+    let rel = path.strip_prefix(&canon_home).ok()?;
+    let first = rel.components().next()?.as_os_str().to_str()?;
+
+    match first {
+        // OAuth tokens for mcp-remote and similar MCP clients.
+        ".mcp-auth" => Some("oauth-tokens"),
         _ => None,
     }
 }
@@ -132,6 +163,24 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
         );
         return Err(format!(
             "Access denied: path '{}' resolves to a protected OpenFang \
+             resource ({}). These paths are never accessible to agents.",
+            user_path, reason
+        ));
+    }
+
+    // Defense in depth (continued): hard-deny sensitive `$HOME` paths outside
+    // `$OPENFANG_HOME` — e.g. `~/.mcp-auth/` OAuth tokens. Same rationale as
+    // above; the check is independent of `workspace_root`.
+    if let Some(reason) = is_sensitive_home_path(&canon_candidate) {
+        tracing::warn!(
+            target: "openfang_runtime::sandbox",
+            user_path = %user_path,
+            resolved = %canon_candidate.display(),
+            reason = reason,
+            "Access denied: sensitive home path"
+        );
+        return Err(format!(
+            "Access denied: path '{}' resolves to a protected user-home \
              resource ({}). These paths are never accessible to agents.",
             user_path, reason
         ));
@@ -387,6 +436,29 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("protected OpenFang resource"), "got: {}", err);
         assert!(err.contains("config"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_sensitive_mcp_auth_blocked() {
+        // ~/.mcp-auth/ holds OAuth tokens for mcp-remote and similar; must
+        // be denied regardless of where the workspace sits.
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|h| h.canonicalize().ok());
+        let Some(home) = home else {
+            return; // $HOME unset or unreadable on this host; skip.
+        };
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".mcp-auth").join("mcp-remote-0.1.37")),
+            Some("oauth-tokens")
+        );
+        // Sibling dotdirs must not be over-denied.
+        assert_eq!(is_sensitive_home_path(&home.join(".cache")), None);
+        // Paths outside $HOME must not be classified.
+        assert_eq!(
+            is_sensitive_home_path(std::path::Path::new("/tmp/foo")),
+            None
+        );
     }
 
     #[test]
