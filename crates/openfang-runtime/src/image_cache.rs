@@ -130,12 +130,13 @@ pub fn materialize_image(media_type: &str, data: &str, dir: &Path) -> Option<Pat
 }
 
 /// Refresh the mtime of `path` to "now" so it survives the next TTL
-/// sweep. Uses `File::set_modified`, which on Unix calls `futimens(2)`.
-/// Opening read-only is sufficient — `futimens` does not require the fd
-/// to be writable, only that the caller own the file (which we do, since
-/// the daemon writes them).
+/// sweep. Uses `File::set_modified`, which calls `futimens(2)` on Unix
+/// and `SetFileTime` on Windows. The handle must be opened with write
+/// access on Windows (NTFS `SetFileTime` requires `FILE_WRITE_ATTRIBUTES`);
+/// Unix `futimens` is happy with a read-only fd as long as the caller owns
+/// the file, but `OpenOptions::write(true)` is correct on both platforms.
 fn touch_mtime(path: &Path) -> std::io::Result<()> {
-    let f = std::fs::File::open(path)?;
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
     f.set_modified(std::time::SystemTime::now())
 }
 
@@ -158,7 +159,9 @@ pub fn sweep_old_image_tmpfiles(dir: &Path) {
         if !meta.is_file() {
             continue;
         }
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if let Ok(age) = now.duration_since(modified) {
             if age > ttl {
                 if let Err(e) = std::fs::remove_file(&path) {
@@ -205,7 +208,9 @@ mod tests {
 
         // Backdate mtime to ~25 hours ago — past IMAGE_TMP_TTL_SECS.
         let stale = SystemTime::now() - Duration::from_secs(IMAGE_TMP_TTL_SECS + 3600);
-        let f = std::fs::File::open(&path).unwrap();
+        // Open with write access — `File::set_modified` requires a write-capable
+        // handle on Windows (NTFS `SetFileTime` needs `FILE_WRITE_ATTRIBUTES`).
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_modified(stale).unwrap();
         drop(f);
         let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -238,7 +243,8 @@ mod tests {
         let path = materialize_image("image/png", TINY_PNG_B64, dir).unwrap();
 
         let stale = SystemTime::now() - Duration::from_secs(IMAGE_TMP_TTL_SECS + 3600);
-        let f = std::fs::File::open(&path).unwrap();
+        // Open with write access — see note in `materialize_image_refreshes_mtime_on_cache_hit`.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_modified(stale).unwrap();
         drop(f);
 
