@@ -17,6 +17,7 @@ use openfang_types::approval::ApprovalRequest;
 use openfang_types::commands::{self as slash_commands, Surfaces};
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle};
 use openfang_types::message::ContentBlock;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -593,7 +594,27 @@ async fn maybe_prefix_response(
     }
 }
 
+/// Caller-supplied context for an outbound send.
+///
+/// Currently carries the per-agent workspace root used to scope outbound
+/// `<openfang:attach .../>` marker resolution. `None` means "use the
+/// parser's default allow-roots" — today that's `$HOME/.openfang/`, but
+/// commit 2 of this series flips it to `[]` (fail-closed) so callers must
+/// explicitly opt a workspace in.
+#[derive(Clone, Debug, Default)]
+pub struct SendOptions {
+    /// Per-agent workspace root (typically `~/.openfang/workspaces/<agent>/`).
+    /// When `Some`, the outbound attachment parser is restricted to paths
+    /// under this root.
+    pub workspace_root: Option<PathBuf>,
+}
+
 /// Send a response, applying output formatting and optional threading.
+///
+/// Bridge reply-path entrypoint. Delegates to [`send_parsed`] with default
+/// [`SendOptions`] — kept for source-compatibility with the many call sites
+/// inside this module; new code (kernel proactive-send) should call
+/// [`send_parsed`] directly with an explicit `workspace_root`.
 async fn send_response(
     adapter: &dyn ChannelAdapter,
     user: &ChannelUser,
@@ -601,11 +622,39 @@ async fn send_response(
     thread_id: Option<&str>,
     output_format: OutputFormat,
 ) {
+    send_parsed(
+        adapter,
+        user,
+        text,
+        thread_id,
+        output_format,
+        SendOptions::default(),
+    )
+    .await
+}
+
+/// Parse outbound `<openfang:attach .../>` markers, apply channel
+/// formatting, and dispatch to the adapter.
+///
+/// Shared by the bridge reply-path ([`send_response`]) and the kernel
+/// proactive-send path (commit 3). The `options.workspace_root`, when
+/// set, is forwarded to [`outbound_attach::parse`] as the sole allow-root,
+/// scoping attachment resolution to that agent's workspace.
+pub async fn send_parsed(
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    text: String,
+    thread_id: Option<&str>,
+    output_format: OutputFormat,
+    options: SendOptions,
+) {
     // Parse `<openfang:attach .../>` markers BEFORE formatting — channel
     // formatters (telegram HTML, slack mrkdwn) escape `<` and would break
     // marker detection downstream.
+    let allow_roots_override: Option<Vec<PathBuf>> =
+        options.workspace_root.map(|p| vec![p]);
     let (text_to_format, attachment_blocks): (String, Vec<ChannelContent>) =
-        match crate::outbound_attach::parse(&text, None).await {
+        match crate::outbound_attach::parse(&text, allow_roots_override.as_deref()).await {
             crate::outbound_attach::Parsed::NoMarkers => (text, Vec::new()),
             crate::outbound_attach::Parsed::WithAttachments {
                 stripped_text,
