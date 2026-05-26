@@ -179,6 +179,19 @@ fn openfang_home() -> Option<PathBuf> {
     std::fs::canonicalize(&p).ok()
 }
 
+/// Returns `true` if `canon` is inside `home` (= `~/.openfang/`) but not
+/// under `home/workspaces/`. The hard-deny rule keyed by this predicate
+/// rejects access to OpenFang-internal state (secrets, daemon files,
+/// other agents' workspaces' siblings) regardless of caller-supplied
+/// allow-roots. Pure path logic — no I/O — so trivially testable.
+fn is_hard_denied(canon: &Path, home: &Path) -> bool {
+    if !canon.starts_with(home) {
+        return false;
+    }
+    let workspaces = home.join("workspaces");
+    !canon.starts_with(&workspaces)
+}
+
 async fn resolve_directive(
     d: &AttachDirective,
     allow_roots: &[PathBuf],
@@ -200,14 +213,11 @@ async fn resolve_directive(
     // configs, and other agents' workspaces remain unreachable regardless of
     // caller misconfiguration.
     if let Some(home) = openfang_home() {
-        if canon.starts_with(&home) {
-            let workspaces = home.join("workspaces");
-            if !canon.starts_with(&workspaces) {
-                return Err(format!(
-                    "path {} is inside ~/.openfang/ but outside workspaces/ (hard-deny)",
-                    canon.display()
-                ));
-            }
+        if is_hard_denied(&canon, &home) {
+            return Err(format!(
+                "path {} is inside ~/.openfang/ but outside workspaces/ (hard-deny)",
+                canon.display()
+            ));
         }
     }
     let metadata = tokio::fs::metadata(&canon)
@@ -568,5 +578,102 @@ mod tests {
         assert_eq!(mime_from_extension(Path::new("x.PNG")), "image/png");
         assert_eq!(mime_from_extension(Path::new("x.unknown")), "application/octet-stream");
         assert_eq!(mime_from_extension(Path::new("noext")), "application/octet-stream");
+    }
+
+    #[test]
+    fn default_allow_roots_is_empty() {
+        // Fail-closed: callers MUST plumb their per-agent workspace root.
+        // A caller that forgets and passes None receives no allow-roots
+        // and every directive is rejected.
+        assert!(default_allow_roots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parse_with_none_drops_all_attachments() {
+        // Default allow-roots is now empty, so even a real absolute path
+        // pointing at an existing file is rejected when the caller passes
+        // None for `allow_roots_override`. The text portion still comes
+        // through; only the attachment is dropped.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("oops.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        let text = format!(
+            "before <openfang:attach path=\"{}\"/> after",
+            canon.display()
+        );
+        let result = parse(&text, None).await;
+        match result {
+            Parsed::WithAttachments {
+                stripped_text,
+                files,
+            } => {
+                assert_eq!(stripped_text, "before  after");
+                assert!(
+                    files.is_empty(),
+                    "default allow-roots is empty; attachment must be rejected"
+                );
+            }
+            _ => panic!("expected WithAttachments (with empty files)"),
+        }
+    }
+
+    #[test]
+    fn hard_deny_inside_openfang_outside_workspaces() {
+        // Synthetic paths — no I/O, pure policy check.
+        let home = Path::new("/Users/x/.openfang");
+        assert!(is_hard_denied(
+            Path::new("/Users/x/.openfang/secrets/discord.toml"),
+            home
+        ));
+        assert!(is_hard_denied(
+            Path::new("/Users/x/.openfang/daemon/cron.db"),
+            home
+        ));
+        assert!(is_hard_denied(Path::new("/Users/x/.openfang/tmp/x"), home));
+    }
+
+    #[test]
+    fn hard_deny_inside_workspaces_is_allowed() {
+        // Paths under ~/.openfang/workspaces/ pass the hard-deny rule;
+        // the per-agent allow-roots check (in resolve_directive) further
+        // narrows to a single agent.
+        let home = Path::new("/Users/x/.openfang");
+        assert!(!is_hard_denied(
+            Path::new("/Users/x/.openfang/workspaces/debra/audio.wav"),
+            home
+        ));
+        assert!(!is_hard_denied(
+            Path::new("/Users/x/.openfang/workspaces/coder-openfang/note.md"),
+            home
+        ));
+    }
+
+    #[test]
+    fn hard_deny_outside_openfang_is_not_triggered() {
+        // The hard-deny rule only fires inside ~/.openfang/. Other
+        // locations are governed solely by the caller-supplied
+        // allow-roots check.
+        let home = Path::new("/Users/x/.openfang");
+        assert!(!is_hard_denied(Path::new("/tmp/x.txt"), home));
+        assert!(!is_hard_denied(Path::new("/Users/x/Documents/x.pdf"), home));
+        assert!(!is_hard_denied(Path::new("/etc/passwd"), home));
+    }
+
+    #[tokio::test]
+    async fn parse_with_empty_explicit_roots_drops_attachments() {
+        // Caller explicitly passes Some(&[]) — same fail-closed outcome
+        // as None, but exercises the override branch.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("a.txt");
+        std::fs::write(&path, b"x").unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        let text = format!("<openfang:attach path=\"{}\"/>", canon.display());
+        let empty: &[PathBuf] = &[];
+        let result = parse(&text, Some(empty)).await;
+        match result {
+            Parsed::WithAttachments { files, .. } => assert!(files.is_empty()),
+            _ => panic!("expected WithAttachments"),
+        }
     }
 }
