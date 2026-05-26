@@ -254,7 +254,9 @@ pub fn sweep_old_image_tmpfiles(dir: &Path) {
         if !meta.is_file() {
             continue;
         }
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if let Ok(age) = now.duration_since(modified) {
             if age > ttl {
                 if let Err(e) = std::fs::remove_file(&path) {
@@ -353,9 +355,7 @@ mod tests {
     #[test]
     fn materialize_image_rejects_invalid_base64() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(
-            materialize_image("image/png", "!!!not-base64!!!", tmp.path(), None).is_none()
-        );
+        assert!(materialize_image("image/png", "!!!not-base64!!!", tmp.path(), None).is_none());
     }
 
     #[test]
@@ -363,9 +363,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        let path =
-            materialize_image("image/png", TINY_PNG_B64, dir, Some("My Vacation Photo.PNG"))
-                .expect("first materialization");
+        let path = materialize_image(
+            "image/png",
+            TINY_PNG_B64,
+            dir,
+            Some("My Vacation Photo.PNG"),
+        )
+        .expect("first materialization");
         let name = path.file_name().unwrap().to_str().unwrap();
         assert!(
             name.contains("__my_vacation_photo.png"),
@@ -386,8 +390,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        let first =
-            materialize_image("image/png", TINY_PNG_B64, dir, Some("hello.png")).unwrap();
+        let first = materialize_image("image/png", TINY_PNG_B64, dir, Some("hello.png")).unwrap();
         let second = materialize_image("image/png", TINY_PNG_B64, dir, None).unwrap();
         assert_eq!(first, second, "cache lookup should find the named file");
 
