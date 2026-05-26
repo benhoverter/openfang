@@ -16,8 +16,8 @@ use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
 use serde::Deserialize;
-use std::str::FromStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tracing::{debug, info, warn};
@@ -146,8 +146,15 @@ const CC_NATIVE_DENY: &[&str] = &[
     "KillShell",
     "KillBash",
     "Monitor",
-    // Filesystem read/write
-    "Read",
+    // Filesystem read/write.
+    //
+    // `Read` is intentionally NOT in this list. It's gated by a per-spawn
+    // PreToolUse hook (`CC_READ_GUARD_SCRIPT`) that scopes it to the image
+    // tmpfile dir only — required for vision (drivers materialize image
+    // bytes to disk and the directive points the model at the native Read
+    // tool). See `projects/openfang-fork/vision-cc-read-deny.md` for why
+    // a path-scoped allow rule can't substitute (CC deny precedence is
+    // absolute; an allow can never rescue a denied tool).
     "Write",
     "Edit",
     "MultiEdit",
@@ -172,6 +179,96 @@ const CC_NATIVE_DENY: &[&str] = &[
     // Comms routing
     "PushNotification",
 ];
+
+/// PreToolUse hook matcher string for the native `Read` tool. Emitted in
+/// the per-spawn `settings.json` under `hooks.PreToolUse[].matcher`. Bare
+/// tool-name matchers are the canonical CC hook-spec form (per the
+/// `code.claude.com/docs/en/hooks` reference); the hook fires on every
+/// invocation of the named tool, regardless of arguments.
+const CC_READ_GUARD_HOOK_MATCHER: &str = "Read";
+
+/// PreToolUse hook script for the native `Read` tool. Materialized
+/// alongside `settings.json` at spawn time (`0700`) and referenced from
+/// `hooks.PreToolUse[].hooks[].command` so CC invokes it before every
+/// `Read` call. The script extracts `tool_input.file_path` from the hook
+/// payload on stdin, canonicalizes it through `os.path.realpath` (which
+/// resolves symlinks and `..` segments without requiring the target to
+/// exist), and exits `0` iff the canonical target falls under the
+/// canonical `ALLOWED_PREFIX` passed as `argv[1]`. Otherwise it exits `2`
+/// with a reason on stderr — per CC's hook contract, exit `2` blocks the
+/// tool call and surfaces stderr to the model.
+///
+/// Why a hook and not a path-scoped allow rule: CC deny precedence is
+/// absolute (deny -> ask -> allow; first match wins; an allow can never
+/// rescue a denied tool). Once bare `"Read"` is no longer in the deny
+/// list, native Read is open in the default permission mode — so the
+/// hook is the only mechanism that can express "Read this one path and
+/// nothing else" without a brittle, ever-growing scoped-denylist of
+/// secret-bearing paths across `~/.aws`, `~/.ssh`, `~/.openfang/data`,
+/// `~/Library/...`, every project's `.env`, browser profiles, message
+/// stores, etc. See `projects/openfang-fork/vision-cc-read-deny.md` for
+/// the full failure-mode survey.
+///
+/// Python (not bash) because: stdin is a JSON document we have to parse,
+/// and `os.path.realpath` is consistent across macOS / Linux. The host
+/// `realpath(1)` differs in subtle ways (BSD `/bin/realpath` lacks `-m`,
+/// GNU has it) and shelling out for JSON parsing is fiddly. Python 3 is
+/// already a hard dependency of the bridge tooling.
+///
+/// Stays in-source as a `&str` const so it ships with the binary; the
+/// materialization site writes a fresh copy per spawn under the bridge
+/// socket dir and the [`CcSettingsFile`] RAII handle cleans it up on
+/// drop together with the settings file.
+const CC_READ_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+"""OpenFang CC PreToolUse guard for the native Read tool.
+
+Invoked per `Read` call by Claude Code. Reads the hook JSON payload from
+stdin, pulls `tool_input.file_path`, canonicalizes both it and the
+`ALLOWED_PREFIX` arg via `os.path.realpath`, and exits 0 iff the target
+resolves under the prefix. Exit 2 (with stderr) on anything else — CC's
+hook contract treats exit 2 as a hard block and surfaces stderr to the
+model so the denial has a reason attached.
+"""
+import json
+import os
+import sys
+
+
+def _die(msg):
+    print("cc-read-guard: " + msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        _die("missing ALLOWED_PREFIX arg")
+    allowed = sys.argv[1]
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception as exc:
+        _die("stdin JSON parse failed: " + repr(exc))
+
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or ""
+    if not file_path:
+        _die("tool_input.file_path missing or empty")
+
+    canon_allowed = os.path.realpath(os.path.expanduser(allowed))
+    canon_target = os.path.realpath(os.path.expanduser(file_path))
+
+    # Trailing-sep test so /tmp/images doesn't accidentally accept
+    # /tmp/images-evil/foo. Equality also accepted so a Read of the dir
+    # itself (rare, but valid) doesn't false-negative.
+    if canon_target == canon_allowed or canon_target.startswith(canon_allowed + os.sep):
+        sys.exit(0)
+
+    _die("Read denied: " + canon_target + " not under " + canon_allowed)
+
+
+if __name__ == "__main__":
+    main()
+"#;
 
 /// Environment variable names (and suffixes) to strip from the subprocess
 /// to prevent leaking API keys from other providers. We keep the full env
@@ -569,6 +666,12 @@ fn generate_legacy_bridge_token() -> String {
 /// zero concurrency concerns when an agent spawns multiple CC subprocesses.
 struct CcSettingsFile {
     path: PathBuf,
+    /// Sibling artifacts materialized alongside `path` and removed together
+    /// on drop. Currently holds the per-spawn `cc-read-guard-*.py` script
+    /// referenced by the settings file's `hooks.PreToolUse[].hooks[].command`.
+    /// Vec rather than a fixed field so future hook scripts (or other CC
+    /// sidecars) slot in without another RAII rewrite.
+    extras: Vec<PathBuf>,
 }
 
 impl CcSettingsFile {
@@ -579,22 +682,33 @@ impl CcSettingsFile {
 
 impl Drop for CcSettingsFile {
     fn drop(&mut self) {
-        // Best-effort cleanup; the file contains no secrets — only a static
-        // deny set — so staleness is harmless if removal fails.
+        // Best-effort cleanup; neither the settings file nor the guard
+        // script carry secrets — only static policy — so staleness is
+        // harmless if removal fails.
         let _ = std::fs::remove_file(&self.path);
+        for p in &self.extras {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
 /// Build the per-spawn CC `settings.json` JSON document. Pure — no env
 /// reads, no filesystem writes — so it's tractable to test in isolation.
 ///
-/// Wire shape matches what `claude --settings <file>` accepts: a top-level
-/// `permissions` object with a `deny` array of tool-name patterns. We emit
-/// nothing else; merging precedence in CC is additive for permissions
-/// arrays, so this layers cleanly over any user/managed settings without
-/// clobbering them. Deny is monotone — adding entries can only further
-/// restrict the surface — so it's safe to merge.
-fn build_cc_settings_value(deny: &[&str]) -> serde_json::Value {
+/// Wire shape:
+/// - Top-level `permissions.deny` is a bare-tool-name array. Merging
+///   precedence in CC is additive for permissions arrays, so this layers
+///   cleanly over any user/managed settings without clobbering them.
+///   Deny is monotone — adding entries can only further restrict the
+///   surface — so it's safe to merge.
+/// - When `read_hook_cmd` is `Some(cmd)`, a top-level `hooks.PreToolUse`
+///   entry is emitted matching the native `Read` tool and running the
+///   given command. The command is responsible for path scoping; this
+///   builder does not interpret it. When `None`, no `hooks` key is
+///   emitted at all (the builder stays minimal so the settings file
+///   merges as a pure subtraction of capability rather than introducing
+///   sidecar process surface that wasn't there before).
+fn build_cc_settings_value(deny: &[&str], read_hook_cmd: Option<&str>) -> serde_json::Value {
     let deny_arr = serde_json::Value::Array(
         deny.iter()
             .map(|s| serde_json::Value::String((*s).into()))
@@ -602,8 +716,38 @@ fn build_cc_settings_value(deny: &[&str]) -> serde_json::Value {
     );
     let mut perms = serde_json::Map::new();
     perms.insert("deny".into(), deny_arr);
+
     let mut root = serde_json::Map::new();
     root.insert("permissions".into(), serde_json::Value::Object(perms));
+
+    if let Some(cmd) = read_hook_cmd {
+        // CC hook schema: hooks.<EventName> is an array of matcher groups,
+        // each with a `matcher` (tool-name string) and a `hooks` array of
+        // `{ type: "command", command: "..." }` entries. We emit a single
+        // matcher group targeting `Read` with a single command entry. See
+        // code.claude.com/docs/en/hooks for the spec.
+        let mut hook_entry = serde_json::Map::new();
+        hook_entry.insert("type".into(), serde_json::Value::String("command".into()));
+        hook_entry.insert("command".into(), serde_json::Value::String(cmd.into()));
+
+        let mut matcher_group = serde_json::Map::new();
+        matcher_group.insert(
+            "matcher".into(),
+            serde_json::Value::String(CC_READ_GUARD_HOOK_MATCHER.into()),
+        );
+        matcher_group.insert(
+            "hooks".into(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(hook_entry)]),
+        );
+
+        let pre_tool_use = serde_json::Value::Array(vec![serde_json::Value::Object(matcher_group)]);
+
+        let mut hooks = serde_json::Map::new();
+        hooks.insert("PreToolUse".into(), pre_tool_use);
+
+        root.insert("hooks".into(), serde_json::Value::Object(hooks));
+    }
+
     serde_json::Value::Object(root)
 }
 
@@ -633,12 +777,52 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
 
     let socket = std::env::var(BRIDGE_SOCKET_ENV).ok()?;
     let socket_dir = std::path::Path::new(&socket).parent()?.to_path_buf();
-    let path = socket_dir.join(format!("cc-settings-{}.json", uuid::Uuid::new_v4()));
+    let spawn_uuid = uuid::Uuid::new_v4();
+    let path = socket_dir.join(format!("cc-settings-{spawn_uuid}.json"));
+    let guard_path = socket_dir.join(format!("cc-read-guard-{spawn_uuid}.py"));
 
-    let cfg = build_cc_settings_value(CC_NATIVE_DENY);
+    // Write the guard script first; if this fails we don't want a
+    // settings file pointing at a non-existent hook command. 0700 on
+    // unix: executable by us only. Hook script path + image-dir arg are
+    // both quoted with the python interpreter explicit so the command
+    // works whether or not the script ends up `+x` on the host fs
+    // (belt + suspenders: chmod below sets the bit; the explicit
+    // `python3` here makes the deps obvious in audits and decouples the
+    // command from fs-mode races).
+    let allowed_prefix = image_tmp_dir();
+    if let Err(e) = std::fs::write(&guard_path, CC_READ_GUARD_SCRIPT) {
+        warn!(error = %e, path = %guard_path.display(), "failed to write CC read-guard script");
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&guard_path) {
+            let mut perms = meta.permissions();
+            // 0700: executable + readable by owner only. Owner is the
+            // daemon user; CC subprocess runs as same uid so it can
+            // both read (interpreter loads source) and execute.
+            perms.set_mode(0o700);
+            let _ = std::fs::set_permissions(&guard_path, perms);
+        }
+    }
+
+    // Build the hook command. Single-line shell-style invocation; CC
+    // executes hook commands through a shell, so quoting matters. We
+    // single-quote both args to neutralize any unlikely metacharacters
+    // in the socket-dir path (it lives under `~/.openfang/run` by
+    // convention; no spaces today, but we don't want to depend on that).
+    let read_hook_cmd = format!(
+        "python3 '{}' '{}'",
+        guard_path.display(),
+        allowed_prefix.display(),
+    );
+
+    let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(&read_hook_cmd));
     let serialized = serde_json::to_string(&cfg).ok()?;
     if let Err(e) = std::fs::write(&path, serialized) {
         warn!(error = %e, path = %path.display(), "failed to write CC --settings file");
+        let _ = std::fs::remove_file(&guard_path);
         return None;
     }
 
@@ -658,11 +842,16 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     debug!(
         agent_id = %caller_agent_id.unwrap_or("<none>"),
         settings = %path.display(),
+        guard = %guard_path.display(),
+        allowed_prefix = %allowed_prefix.display(),
         deny_count = CC_NATIVE_DENY.len(),
-        "materialized CC --settings deny set"
+        "materialized CC --settings deny set + Read guard hook"
     );
 
-    Some(CcSettingsFile { path })
+    Some(CcSettingsFile {
+        path,
+        extras: vec![guard_path],
+    })
 }
 
 impl ClaudeCodeDriver {
@@ -1733,12 +1922,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cc_settings_shape() {
-        // The wire shape CC's `--settings` accepts: top-level `permissions`
-        // object with a `deny` array of bare tool-name strings. No other
-        // keys are emitted — we want minimal surface that merges cleanly
-        // with any user/managed settings without subtracting from them.
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY);
+    fn test_build_cc_settings_shape_no_hook() {
+        // Without a read_hook_cmd, the settings doc carries only the
+        // `permissions.deny` block — no `hooks` key, no other top-level
+        // surface. This is the minimum-merge shape that subtracts
+        // capability cleanly from any user/managed settings.
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None);
         let root = cfg.as_object().expect("root must be a JSON object");
         assert_eq!(root.len(), 1, "root must contain only `permissions`");
 
@@ -1762,6 +1951,61 @@ mod tests {
                 "{s:?} must be a bare tool name, not a specifier pattern"
             );
         }
+
+        assert!(
+            cfg.pointer("/hooks").is_none(),
+            "no hooks key must be emitted when read_hook_cmd is None"
+        );
+    }
+
+    #[test]
+    fn test_build_cc_settings_shape_with_read_hook() {
+        // With a read_hook_cmd, the settings doc gains a top-level `hooks`
+        // key carrying a single PreToolUse matcher group for `Read`, with
+        // one command entry. This is the wire shape consumed by CC; if it
+        // drifts, the hook silently no-ops at spawn and vision regresses
+        // without a loud failure mode.
+        let cmd = "python3 /tmp/guard.py /tmp/images";
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(cmd));
+
+        let root = cfg.as_object().expect("root must be a JSON object");
+        assert_eq!(
+            root.len(),
+            2,
+            "root must contain exactly `permissions` and `hooks` when read_hook_cmd is set"
+        );
+
+        // PreToolUse matcher group must target `Read` and only `Read`.
+        let groups = cfg
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .expect("PreToolUse array missing");
+        assert_eq!(groups.len(), 1, "exactly one matcher group");
+
+        let group = groups[0].as_object().expect("matcher group must be object");
+        assert_eq!(
+            group.get("matcher").and_then(|v| v.as_str()),
+            Some("Read"),
+            "matcher must be bare `Read`"
+        );
+
+        let hooks = group
+            .get("hooks")
+            .and_then(|v| v.as_array())
+            .expect("hooks array missing");
+        assert_eq!(hooks.len(), 1, "exactly one hook entry");
+
+        let entry = hooks[0].as_object().expect("hook entry must be object");
+        assert_eq!(
+            entry.get("type").and_then(|v| v.as_str()),
+            Some("command"),
+            "hook type must be `command`"
+        );
+        assert_eq!(
+            entry.get("command").and_then(|v| v.as_str()),
+            Some(cmd),
+            "command string must round-trip unchanged"
+        );
     }
 
     #[test]
@@ -1772,11 +2016,22 @@ mod tests {
         // future refactor that drops them needs a deliberate change.
         assert!(CC_NATIVE_DENY.contains(&"Glob"), "Glob must be denied");
         assert!(CC_NATIVE_DENY.contains(&"Grep"), "Grep must be denied");
+        // Read is the load-bearing exception: deliberately NOT denied,
+        // because the PreToolUse hook scopes it to the image tmpfile dir.
+        // If Read sneaks back into the deny list, vision breaks again
+        // (deny precedence is absolute; the hook can't un-deny).
+        assert!(
+            !CC_NATIVE_DENY.contains(&"Read"),
+            "Read must NOT be in CC_NATIVE_DENY — gated by PreToolUse hook instead"
+        );
 
         // Core dangerous tools — the load-bearing reason for this commit.
+        // Note: `Read` is intentionally absent. It's gated by a PreToolUse
+        // hook (`CC_READ_GUARD_SCRIPT`) scoped to the image tmpfile dir,
+        // not by deny — see vision-cc-read-deny.md for why deny-then-allow
+        // can't scope `Read`.
         for must_deny in [
             "Bash",
-            "Read",
             "Write",
             "Edit",
             "MultiEdit",
@@ -1867,21 +2122,60 @@ mod tests {
     }
 
     #[test]
-    fn test_cc_settings_file_drop_removes_file() {
-        // CcSettingsFile is a per-spawn artifact; on drop, the file must
-        // vanish so successive runs don't accumulate stale settings
-        // sidecars under the socket dir.
+    fn test_cc_settings_file_drop_removes_file_and_extras() {
+        // CcSettingsFile is a per-spawn artifact; on drop, the settings
+        // file AND every extras path must vanish so successive runs don't
+        // accumulate stale sidecars under the socket dir. The extras
+        // contract is load-bearing: the guard.py script lives there, and
+        // if it leaks, we accumulate executable hook scripts forever.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("cc-settings-test.json");
-        std::fs::write(&path, "{}").expect("seed file");
+        let guard = dir.path().join("cc-read-guard-test.py");
+        std::fs::write(&path, "{}").expect("seed settings");
+        std::fs::write(&guard, "#!/usr/bin/env python3\n").expect("seed guard");
         assert!(path.exists());
+        assert!(guard.exists());
 
         {
-            let _guard = CcSettingsFile { path: path.clone() };
-            assert!(path.exists(), "file present while guard held");
+            let _g = CcSettingsFile {
+                path: path.clone(),
+                extras: vec![guard.clone()],
+            };
+            assert!(path.exists(), "settings present while guard held");
+            assert!(guard.exists(), "extras present while guard held");
         }
 
-        assert!(!path.exists(), "file must be removed when guard drops");
+        assert!(!path.exists(), "settings must be removed when guard drops");
+        assert!(!guard.exists(), "extras must be removed when guard drops");
+    }
+
+    #[test]
+    fn test_read_guard_script_is_valid_python_shebang() {
+        // Cheap content sanity. If someone edits the embedded script and
+        // breaks the shebang or drops the `ALLOWED_PREFIX` usage, the
+        // hook will materialize but no-op (or worse, accept everything).
+        // We don't run Python here — just assert the script carries the
+        // load-bearing surface markers.
+        assert!(
+            CC_READ_GUARD_SCRIPT.starts_with("#!/usr/bin/env python3\n"),
+            "guard script must lead with a python3 shebang"
+        );
+        assert!(
+            CC_READ_GUARD_SCRIPT.contains("sys.argv[1]"),
+            "guard script must read ALLOWED_PREFIX from argv[1]"
+        );
+        assert!(
+            CC_READ_GUARD_SCRIPT.contains("json.load(sys.stdin)"),
+            "guard script must parse hook payload from stdin"
+        );
+        assert!(
+            CC_READ_GUARD_SCRIPT.contains("os.path.realpath"),
+            "guard script must canonicalize via realpath (symlink-safe)"
+        );
+        assert!(
+            CC_READ_GUARD_SCRIPT.contains("sys.exit(2)") || CC_READ_GUARD_SCRIPT.contains("_die"),
+            "guard script must exit 2 on denial (CC contract for blocking PreToolUse)"
+        );
     }
 
     #[test]
