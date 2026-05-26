@@ -712,10 +712,8 @@ pub async fn send_parsed(
     //     process CWD (see outbound_attach module docs).
     // Bridge currently passes the same workspace for both; that's a
     // caller convention, not a parser invariant.
-    let allow_roots_override: Option<Vec<PathBuf>> = options
-        .workspace_root
-        .as_ref()
-        .map(|p| vec![p.clone()]);
+    let allow_roots_override: Option<Vec<PathBuf>> =
+        options.workspace_root.as_ref().map(|p| vec![p.clone()]);
     let parse_opts = crate::outbound_attach::ParseOptions {
         allow_roots: allow_roots_override.as_deref(),
         base: options.workspace_root.as_deref(),
@@ -1419,7 +1417,16 @@ async fn dispatch_message(
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
         let reply = maybe_prefix_response(handle, overrides.as_ref(), agent_id, reply).await;
-        send_agent_response(handle, agent_id, adapter, &message.sender, reply, thread_id, output_format).await;
+        send_agent_response(
+            handle,
+            agent_id,
+            adapter,
+            &message.sender,
+            reply,
+            thread_id,
+            output_format,
+        )
+        .await;
         handle
             .record_delivery(
                 agent_id,
@@ -1485,7 +1492,16 @@ async fn dispatch_message(
             }
             let response =
                 maybe_prefix_response(handle, overrides.as_ref(), agent_id, response).await;
-            send_agent_response(handle, agent_id, adapter, &message.sender, response, thread_id, output_format).await;
+            send_agent_response(
+                handle,
+                agent_id,
+                adapter,
+                &message.sender,
+                response,
+                thread_id,
+                output_format,
+            )
+            .await;
             handle
                 .record_delivery(
                     agent_id,
@@ -1517,8 +1533,16 @@ async fn dispatch_message(
                         let response =
                             maybe_prefix_response(handle, overrides.as_ref(), new_id, response)
                                 .await;
-                        send_agent_response(handle, new_id, adapter, &message.sender, response, thread_id, output_format)
-                            .await;
+                        send_agent_response(
+                            handle,
+                            new_id,
+                            adapter,
+                            &message.sender,
+                            response,
+                            thread_id,
+                            output_format,
+                        )
+                        .await;
                         handle
                             .record_delivery(
                                 new_id,
@@ -1956,7 +1980,16 @@ async fn dispatch_with_blocks(
                 Some(name) => apply_agent_prefix(prefix_style, name, &response),
                 None => response,
             };
-            send_agent_response(handle, agent_id, adapter, &message.sender, response, thread_id, output_format).await;
+            send_agent_response(
+                handle,
+                agent_id,
+                adapter,
+                &message.sender,
+                response,
+                thread_id,
+                output_format,
+            )
+            .await;
             handle
                 .record_delivery(
                     agent_id,
@@ -1994,8 +2027,16 @@ async fn dispatch_with_blocks(
                             Some(name) => apply_agent_prefix(prefix_style, name, &response),
                             None => response,
                         };
-                        send_agent_response(handle, new_id, adapter, &message.sender, response, thread_id, output_format)
-                            .await;
+                        send_agent_response(
+                            handle,
+                            new_id,
+                            adapter,
+                            &message.sender,
+                            response,
+                            thread_id,
+                            output_format,
+                        )
+                        .await;
                         handle
                             .record_delivery(
                                 new_id,
