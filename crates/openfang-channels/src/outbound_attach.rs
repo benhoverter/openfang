@@ -21,10 +21,18 @@
 //! ## Security
 //!
 //! Paths are canonicalised (so symlinks are resolved) and must lie under
-//! one of the allow-roots — by default `$HOME/.openfang/`. This covers the
-//! ephemeral `~/.openfang/tmp/` scratch area and per-agent
-//! `~/.openfang/workspaces/<agent>/` directories without leaking access to
-//! the rest of the filesystem in the face of a prompt-injected agent.
+//! one of the caller-supplied allow-roots. The default allow-roots are
+//! **empty** — callers MUST pass their per-agent `workspace_root`
+//! explicitly via [`parse`]'s `allow_roots_override`. Bridge and kernel
+//! both compute `workspace_root = ~/.openfang/workspaces/<agent>/` from
+//! the agent identity and pass it through.
+//!
+//! A secondary hard-deny rule rejects any canonical path under
+//! `$HOME/.openfang/` that is not also under `$HOME/.openfang/workspaces/`,
+//! regardless of caller-supplied allow-roots. Belt-and-suspenders against a
+//! caller that mistakenly opens too wide a root: secrets, daemon state,
+//! channel configs, and other agents' workspaces remain unreachable even
+//! if `allow_roots` accidentally includes `~/.openfang/` itself.
 //!
 //! ## Failure mode
 //!
@@ -145,19 +153,30 @@ fn mime_from_extension(path: &Path) -> &'static str {
     }
 }
 
-/// Default allow-root: canonicalised `$HOME/.openfang/`. Returns an empty
-/// vec if `HOME` is unset or the directory does not exist (in which case
-/// every directive will be rejected — fail-closed).
+/// Default allow-roots: **empty**. Callers MUST pass `workspace_root`
+/// explicitly (via `Some(&[…])`) to grant any access. A caller that forgets
+/// to plumb its per-agent workspace receives zero allow-roots and every
+/// directive is rejected — fail-closed against context loss.
+///
+/// Historically this returned `$HOME/.openfang/` as a default, which gave a
+/// caller-forgetting-to-plumb-context the union of every agent's workspace
+/// *plus* the daemon's secrets directory. The wide default is the bug; the
+/// `workspace_root` plumbing in `bridge.rs::send_agent_response` and the
+/// kernel proactive-send path is the fix.
 fn default_allow_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push(".openfang");
-        if let Ok(canon) = std::fs::canonicalize(&p) {
-            roots.push(canon);
-        }
-    }
-    roots
+    Vec::new()
+}
+
+/// Canonicalised `$HOME/.openfang/` if it exists. Used by the hard-deny rule
+/// in [`resolve_directive`] to reject any path inside OpenFang's home that
+/// is not also inside `~/.openfang/workspaces/`, regardless of what
+/// `allow_roots` the caller passed. Belt-and-suspenders against a caller
+/// that mistakenly opens up too wide an allow-root.
+fn openfang_home() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut p = PathBuf::from(home);
+    p.push(".openfang");
+    std::fs::canonicalize(&p).ok()
 }
 
 async fn resolve_directive(
@@ -173,6 +192,23 @@ async fn resolve_directive(
         .map_err(|e| format!("canonicalize {}: {e}", raw.display()))?;
     if !allow_roots.iter().any(|r| canon.starts_with(r)) {
         return Err(format!("path {} outside allow-roots", canon.display()));
+    }
+    // Hard-deny anything under ~/.openfang/ that isn't a per-agent workspace,
+    // even if the caller's allow_roots somehow included a parent directory.
+    // The only OpenFang-internal area we expose to outbound attachments is
+    // `~/.openfang/workspaces/<agent>/` — secrets, daemon state, channel
+    // configs, and other agents' workspaces remain unreachable regardless of
+    // caller misconfiguration.
+    if let Some(home) = openfang_home() {
+        if canon.starts_with(&home) {
+            let workspaces = home.join("workspaces");
+            if !canon.starts_with(&workspaces) {
+                return Err(format!(
+                    "path {} is inside ~/.openfang/ but outside workspaces/ (hard-deny)",
+                    canon.display()
+                ));
+            }
+        }
     }
     let metadata = tokio::fs::metadata(&canon)
         .await

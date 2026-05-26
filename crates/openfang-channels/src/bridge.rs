@@ -594,18 +594,70 @@ async fn maybe_prefix_response(
     }
 }
 
+/// Compute the per-agent workspace root for outbound attachment scoping.
+///
+/// Returns the canonical path to `~/.openfang/workspaces/<agent_name>/` if
+/// the agent name can be resolved and the directory exists; `None`
+/// otherwise. A `None` result causes the attachment parser to fall back to
+/// its (empty) default allow-roots — i.e. attachments are dropped fail-
+/// closed rather than escalated. The text portion of the message is still
+/// delivered.
+async fn agent_workspace_root(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    agent_id: AgentId,
+) -> Option<PathBuf> {
+    let name = resolve_agent_name(handle, agent_id).await?;
+    let home = std::env::var_os("HOME")?;
+    let mut p = PathBuf::from(home);
+    p.push(".openfang");
+    p.push("workspaces");
+    p.push(&name);
+    std::fs::canonicalize(&p).ok()
+}
+
+/// Send an *agent-authored* response: resolves the agent's workspace root,
+/// parses outbound `<openfang:attach .../>` markers scoped to that root,
+/// then formats and dispatches.
+///
+/// This is the only send path on which agent-generated text reaches the
+/// adapter; system-authored text (rate-limit notices, help, errors) goes
+/// through [`send_response`], which uses empty allow-roots and therefore
+/// silently strips any markers (system text never contains them, but
+/// defense-in-depth).
+async fn send_agent_response(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    agent_id: AgentId,
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    text: String,
+    thread_id: Option<&str>,
+    output_format: OutputFormat,
+) {
+    let workspace_root = agent_workspace_root(handle, agent_id).await;
+    send_parsed(
+        adapter,
+        user,
+        text,
+        thread_id,
+        output_format,
+        SendOptions { workspace_root },
+    )
+    .await
+}
+
 /// Caller-supplied context for an outbound send.
 ///
-/// Currently carries the per-agent workspace root used to scope outbound
-/// `<openfang:attach .../>` marker resolution. `None` means "use the
-/// parser's default allow-roots" — today that's `$HOME/.openfang/`, but
-/// commit 2 of this series flips it to `[]` (fail-closed) so callers must
-/// explicitly opt a workspace in.
+/// Carries the per-agent workspace root used to scope outbound
+/// `<openfang:attach .../>` marker resolution. `None` means "no allow-roots"
+/// — the parser is fail-closed against missing context, so attachments are
+/// silently dropped while text still goes through. Callers that want
+/// attachments to work MUST set `workspace_root` (typically
+/// `~/.openfang/workspaces/<agent>/`).
 #[derive(Clone, Debug, Default)]
 pub struct SendOptions {
-    /// Per-agent workspace root (typically `~/.openfang/workspaces/<agent>/`).
-    /// When `Some`, the outbound attachment parser is restricted to paths
-    /// under this root.
+    /// Per-agent workspace root. When `Some`, the outbound attachment
+    /// parser is restricted to paths under this root. When `None`,
+    /// attachments are dropped fail-closed.
     pub workspace_root: Option<PathBuf>,
 }
 
@@ -1352,7 +1404,7 @@ async fn dispatch_message(
     // If auto-reply is enabled but suppressed for this message, skip agent call entirely.
     if let Some(reply) = handle.check_auto_reply(agent_id, &text).await {
         let reply = maybe_prefix_response(handle, overrides.as_ref(), agent_id, reply).await;
-        send_response(adapter, &message.sender, reply, thread_id, output_format).await;
+        send_agent_response(handle, agent_id, adapter, &message.sender, reply, thread_id, output_format).await;
         handle
             .record_delivery(
                 agent_id,
@@ -1418,7 +1470,7 @@ async fn dispatch_message(
             }
             let response =
                 maybe_prefix_response(handle, overrides.as_ref(), agent_id, response).await;
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            send_agent_response(handle, agent_id, adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(
                     agent_id,
@@ -1450,7 +1502,7 @@ async fn dispatch_message(
                         let response =
                             maybe_prefix_response(handle, overrides.as_ref(), new_id, response)
                                 .await;
-                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                        send_agent_response(handle, new_id, adapter, &message.sender, response, thread_id, output_format)
                             .await;
                         handle
                             .record_delivery(
@@ -1889,7 +1941,7 @@ async fn dispatch_with_blocks(
                 Some(name) => apply_agent_prefix(prefix_style, name, &response),
                 None => response,
             };
-            send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            send_agent_response(handle, agent_id, adapter, &message.sender, response, thread_id, output_format).await;
             handle
                 .record_delivery(
                     agent_id,
@@ -1927,7 +1979,7 @@ async fn dispatch_with_blocks(
                             Some(name) => apply_agent_prefix(prefix_style, name, &response),
                             None => response,
                         };
-                        send_response(adapter, &message.sender, response, thread_id, output_format)
+                        send_agent_response(handle, new_id, adapter, &message.sender, response, thread_id, output_format)
                             .await;
                         handle
                             .record_delivery(
