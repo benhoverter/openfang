@@ -294,9 +294,34 @@ async fn resolve_directive(
             metadata.len()
         ));
     }
-    let data = tokio::fs::read(&canon)
-        .await
-        .map_err(|e| format!("read {}: {e}", canon.display()))?;
+    // Bounded read closes the TOCTOU window between the metadata size
+    // check above and the actual read. Even if an attacker (or a concurrent
+    // writer) swaps or grows the file after stat, tokio's File + take()
+    // caps the bytes copied into memory at MAX_FILE_BYTES, so we cannot be
+    // tricked into loading an unbounded payload. We use `MAX_FILE_BYTES + 1`
+    // as the take-limit so we can distinguish "file fit exactly" from
+    // "file grew past the cap" and return a clear error in the latter case.
+    let data = {
+        use tokio::io::AsyncReadExt;
+        let f = tokio::fs::File::open(&canon)
+            .await
+            .map_err(|e| format!("open {}: {e}", canon.display()))?;
+        let cap_hint = std::cmp::min(metadata.len(), MAX_FILE_BYTES) as usize;
+        let mut buf = Vec::with_capacity(cap_hint);
+        f.take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("read {}: {e}", canon.display()))?;
+        if buf.len() as u64 > MAX_FILE_BYTES {
+            return Err(format!(
+                "{} grew past {} byte cap during read (read {} bytes)",
+                canon.display(),
+                MAX_FILE_BYTES,
+                buf.len()
+            ));
+        }
+        buf
+    };
     let basename = canon
         .file_name()
         .and_then(|n| n.to_str())
@@ -514,14 +539,12 @@ mod tests {
 
         let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
-            Parsed::WithAttachments { files, .. } => {
-                match &files[0] {
-                    ChannelContent::FileData { filename, .. } => {
-                        assert_eq!(filename, "SPOILER_secret.png");
-                    }
-                    _ => panic!("expected FileData"),
+            Parsed::WithAttachments { files, .. } => match &files[0] {
+                ChannelContent::FileData { filename, .. } => {
+                    assert_eq!(filename, "SPOILER_secret.png");
                 }
-            }
+                _ => panic!("expected FileData"),
+            },
             _ => panic!("expected WithAttachments"),
         }
     }
@@ -771,8 +794,14 @@ mod tests {
     fn mime_table_covers_common_extensions() {
         assert_eq!(mime_from_extension(Path::new("x.pdf")), "application/pdf");
         assert_eq!(mime_from_extension(Path::new("x.PNG")), "image/png");
-        assert_eq!(mime_from_extension(Path::new("x.unknown")), "application/octet-stream");
-        assert_eq!(mime_from_extension(Path::new("noext")), "application/octet-stream");
+        assert_eq!(
+            mime_from_extension(Path::new("x.unknown")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("noext")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
@@ -872,6 +901,38 @@ mod tests {
         let result = parse(&text, opts).await;
         match result {
             Parsed::WithAttachments { files, .. } => assert!(files.is_empty()),
+            _ => panic!("expected WithAttachments"),
+        }
+    }
+    #[tokio::test]
+    async fn bounded_read_round_trips_multi_kib_file() {
+        // Regression guard for the TOCTOU bounded-read refactor: confirm a
+        // file larger than the default Vec capacity hint still reads to
+        // completion when its size is well under MAX_FILE_BYTES. If the
+        // take() limit were misconfigured (e.g. capped at metadata.len()
+        // instead of the hard ceiling) a file that grew slightly between
+        // stat and read would be truncated silently — this test pins the
+        // happy path so the cap-vs-truncate distinction stays visible in
+        // coverage.
+        let (tmp, roots) = fixture_root();
+        let path = tmp.path().join("big.bin");
+        let payload: Vec<u8> = (0..(256u32 * 1024)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &payload).unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        let text = format!("<openfang:attach path=\"{}\"/>", canon.display());
+
+        let result = parse(&text, opts_with_roots(&roots)).await;
+        match result {
+            Parsed::WithAttachments { files, .. } => {
+                assert_eq!(files.len(), 1);
+                match &files[0] {
+                    ChannelContent::FileData { data, .. } => {
+                        assert_eq!(data.len(), payload.len());
+                        assert_eq!(data, &payload);
+                    }
+                    _ => panic!("expected FileData"),
+                }
+            }
             _ => panic!("expected WithAttachments"),
         }
     }
