@@ -7072,7 +7072,7 @@ async fn cron_deliver_response(
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
             // Deliver via the registered channel adapter
             kernel
-                .send_channel_message(channel, to, response, None)
+                .send_channel_message(channel, to, response, None, None)
                 .await
                 .map(|_| {
                     tracing::info!(channel = %channel, to = %to, "Cron: delivered to channel");
@@ -7092,7 +7092,7 @@ async fn cron_deliver_response(
                     let recipient = val["recipient"].as_str().unwrap_or("");
                     if !channel.is_empty() && !recipient.is_empty() {
                         kernel
-                            .send_channel_message(channel, recipient, response, None)
+                            .send_channel_message(channel, recipient, response, None, None)
                             .await
                             .map(|_| {
                                 tracing::info!(channel = %channel, recipient = %recipient, "Cron: delivered to last channel");
@@ -7169,7 +7169,7 @@ impl openfang_channels::bridge::ChannelBridgeHandle for KernelCronBridge {
         message: &str,
     ) -> Result<(), String> {
         self.kernel
-            .send_channel_message(channel_type, recipient, message, None)
+            .send_channel_message(channel_type, recipient, message, None, None)
             .await
             .map(|_| ())
     }
@@ -7722,6 +7722,7 @@ impl KernelHandle for OpenFangKernel {
         recipient: &str,
         message: &str,
         thread_id: Option<&str>,
+        workspace_root: Option<&std::path::Path>,
     ) -> Result<String, String> {
         let adapter = self
             .channel_adapters
@@ -7745,32 +7746,35 @@ impl KernelHandle for OpenFangKernel {
             openfang_user: None,
         };
 
-        let formatted = if channel == "wecom" {
-            let output_format = self
-                .config
+        // Pick the same default OutputFormat the bridge reply-path uses for
+        // this channel, with the wecom-specific config override applied.
+        let output_format = if channel == "wecom" {
+            self.config
                 .channels
                 .wecom
                 .as_ref()
                 .and_then(|c| c.overrides.output_format)
-                .unwrap_or(OutputFormat::PlainText);
-            openfang_channels::formatter::format_for_wecom(message, output_format)
+                .unwrap_or(OutputFormat::PlainText)
         } else {
-            message.to_string()
+            openfang_channels::bridge::default_output_format_for_channel(channel)
         };
 
-        let content = openfang_channels::types::ChannelContent::Text(formatted);
-
-        if let Some(tid) = thread_id {
-            adapter
-                .send_in_thread(&user, content, tid)
-                .await
-                .map_err(|e| format!("Channel send failed: {e}"))?;
-        } else {
-            adapter
-                .send(&user, content)
-                .await
-                .map_err(|e| format!("Channel send failed: {e}"))?;
-        }
+        // Delegate to the shared parse+format+dispatch helper so that
+        // `<openfang:attach .../>` markers in proactive sends are handled
+        // identically to bridge reply-path responses. The workspace_root
+        // (when supplied by the caller — typically the channel_send tool)
+        // scopes outbound attachments to the calling agent's workspace.
+        openfang_channels::bridge::send_parsed(
+            adapter.as_ref(),
+            &user,
+            message.to_string(),
+            thread_id,
+            output_format,
+            openfang_channels::bridge::SendOptions {
+                workspace_root: workspace_root.map(|p| p.to_path_buf()),
+            },
+        )
+        .await;
 
         Ok(format!("Message sent to {} via {}", recipient, channel))
     }

@@ -746,7 +746,7 @@ pub async fn send_parsed(
     }
 }
 
-fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
+pub fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
     match channel_type {
         "telegram" => OutputFormat::TelegramHtml,
         "slack" => OutputFormat::SlackMrkdwn,

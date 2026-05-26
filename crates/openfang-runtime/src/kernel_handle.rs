@@ -210,8 +210,9 @@ pub trait KernelHandle: Send + Sync {
         recipient: &str,
         message: &str,
         thread_id: Option<&str>,
+        workspace_root: Option<&std::path::Path>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, message, thread_id);
+        let _ = (channel, recipient, message, thread_id, workspace_root);
         Err("Channel send not available".to_string())
     }
 

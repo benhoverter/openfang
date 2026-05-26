@@ -907,6 +907,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             recipient,
             message,
             None,
+            None,
         )
         .await
         .map(|_| ())

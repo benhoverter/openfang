@@ -2626,8 +2626,14 @@ async fn tool_channel_send(
         message.to_string()
     };
 
-    kh.send_channel_message(&channel, recipient, &final_message, thread_id)
-        .await
+    kh.send_channel_message(
+        &channel,
+        recipient,
+        &final_message,
+        thread_id,
+        workspace_root,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
