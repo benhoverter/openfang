@@ -703,10 +703,25 @@ pub async fn send_parsed(
     // Parse `<openfang:attach .../>` markers BEFORE formatting — channel
     // formatters (telegram HTML, slack mrkdwn) escape `<` and would break
     // marker detection downstream.
-    let allow_roots_override: Option<Vec<PathBuf>> =
-        options.workspace_root.map(|p| vec![p]);
+    //
+    // `workspace_root` plays two distinct roles in the parser:
+    //   - `allow_roots`: authorisation. The canonicalised target must
+    //     live under this root.
+    //   - `base`: resolution context for *relative* directive paths.
+    //     Without an explicit base the parser refuses to fall back to
+    //     process CWD (see outbound_attach module docs).
+    // Bridge currently passes the same workspace for both; that's a
+    // caller convention, not a parser invariant.
+    let allow_roots_override: Option<Vec<PathBuf>> = options
+        .workspace_root
+        .as_ref()
+        .map(|p| vec![p.clone()]);
+    let parse_opts = crate::outbound_attach::ParseOptions {
+        allow_roots: allow_roots_override.as_deref(),
+        base: options.workspace_root.as_deref(),
+    };
     let (text_to_format, attachment_blocks): (String, Vec<ChannelContent>) =
-        match crate::outbound_attach::parse(&text, allow_roots_override.as_deref()).await {
+        match crate::outbound_attach::parse(&text, parse_opts).await {
             crate::outbound_attach::Parsed::NoMarkers => (text, Vec::new()),
             crate::outbound_attach::Parsed::WithAttachments {
                 stripped_text,

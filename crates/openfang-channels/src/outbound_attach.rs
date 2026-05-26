@@ -23,9 +23,28 @@
 //! Paths are canonicalised (so symlinks are resolved) and must lie under
 //! one of the caller-supplied allow-roots. The default allow-roots are
 //! **empty** — callers MUST pass their per-agent `workspace_root`
-//! explicitly via [`parse`]'s `allow_roots_override`. Bridge and kernel
-//! both compute `workspace_root = ~/.openfang/workspaces/<agent>/` from
-//! the agent identity and pass it through.
+//! explicitly via [`ParseOptions::allow_roots`]. Bridge and kernel both
+//! compute `workspace_root = ~/.openfang/workspaces/<agent>/` from the
+//! agent identity and pass it through.
+//!
+//! ### Why relative paths require an explicit `base`
+//!
+//! `tokio::fs::canonicalize` resolves relative paths against the
+//! **process CWD** — whatever launchd handed the daemon at spawn (likely
+//! `/` or `~/.openfang`, definitely *not* the calling agent's workspace).
+//! If we naively accepted relative paths, a directive like
+//! `path="../etc/passwd"` would resolve against ambient process state and
+//! could land inside an `allow_roots` entry purely by accident of how the
+//! daemon was started. That's the same wide-default failure mode that
+//! motivated `default_allow_roots() -> Vec::new()`, one layer down.
+//!
+//! Invariant: **path-resolution context must be explicit, never inherited
+//! from ambient process state.** Relative directive paths resolve against
+//! the caller-supplied [`ParseOptions::base`] only; if no base was
+//! provided the directive is rejected. The resolved absolute path is
+//! still subject to canonicalisation, the `allow_roots` `starts_with`
+//! check, and the hard-deny rule below — so `base` is a *resolution*
+//! input, not an *authorisation* input.
 //!
 //! A secondary hard-deny rule rejects any canonical path under
 //! `$HOME/.openfang/` that is not also under `$HOME/.openfang/workspaces/`,
@@ -72,6 +91,33 @@ pub enum Parsed {
         stripped_text: String,
         files: Vec<ChannelContent>,
     },
+}
+
+/// Options controlling outbound-attachment parsing and path resolution.
+///
+/// Grouped into a struct so callers can extend the resolution context
+/// without churning every call site. Today there are two knobs:
+///
+/// - [`allow_roots`](Self::allow_roots): canonical roots a resolved
+///   absolute path must lie under. `None` defers to
+///   [`default_allow_roots`] (which is empty — fail-closed).
+/// - [`base`](Self::base): explicit base directory used to resolve
+///   *relative* directive paths. `None` rejects all relative paths; we
+///   never fall back to process CWD (see the module-level "Why relative
+///   paths require an explicit base" note).
+///
+/// The two fields are independent: `allow_roots` governs authorisation,
+/// `base` governs resolution. Bridge currently passes the same
+/// `workspace_root` for both, but that's a caller convention — the parser
+/// treats them separately.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParseOptions<'a> {
+    /// Override for the per-agent allow-roots. `None` uses
+    /// [`default_allow_roots`] (empty / fail-closed).
+    pub allow_roots: Option<&'a [PathBuf]>,
+    /// Explicit base directory for resolving relative directive paths.
+    /// `None` rejects all relative paths (no CWD fallback).
+    pub base: Option<&'a Path>,
 }
 
 fn marker_regex() -> &'static Regex {
@@ -195,11 +241,25 @@ fn is_hard_denied(canon: &Path, home: &Path) -> bool {
 async fn resolve_directive(
     d: &AttachDirective,
     allow_roots: &[PathBuf],
+    base: Option<&Path>,
 ) -> Result<ChannelContent, String> {
     let raw = PathBuf::from(&d.path);
-    if !raw.is_absolute() {
-        return Err(format!("path must be absolute: {}", d.path));
-    }
+    // Relative paths are resolved against the caller-supplied `base`
+    // only — never against process CWD. See module docs for the
+    // threat model.
+    let raw = if raw.is_absolute() {
+        raw
+    } else {
+        match base {
+            Some(b) => b.join(&raw),
+            None => {
+                return Err(format!(
+                    "relative path {} requires explicit base (no CWD fallback)",
+                    d.path
+                ));
+            }
+        }
+    };
     let canon = tokio::fs::canonicalize(&raw)
         .await
         .map_err(|e| format!("canonicalize {}: {e}", raw.display()))?;
@@ -257,21 +317,26 @@ async fn resolve_directive(
 }
 
 /// Parse `text`, resolve every `<openfang:attach .../>` marker against
-/// `allow_roots_override` (or the default `$HOME/.openfang/` root if
-/// `None`), and return either `NoMarkers` or `WithAttachments`.
+/// `opts.allow_roots` (or the default empty allow-roots if `None`), and
+/// return either `NoMarkers` or `WithAttachments`.
+///
+/// Relative directive paths are resolved against `opts.base`. If `base`
+/// is `None`, relative paths are rejected — process CWD is never used as
+/// a fallback. See the module-level "Why relative paths require an
+/// explicit base" note.
 ///
 /// The returned `stripped_text` is the original with markers removed and
 /// `caption` attribute values appended (each on its own line, in
 /// document order). The caller is responsible for running the channel
 /// formatter over `stripped_text` — formatting *before* parsing would
 /// HTML-escape `<` in markers and break detection.
-pub async fn parse(text: &str, allow_roots_override: Option<&[PathBuf]>) -> Parsed {
+pub async fn parse(text: &str, opts: ParseOptions<'_>) -> Parsed {
     let re = marker_regex();
     if !re.is_match(text) {
         return Parsed::NoMarkers;
     }
     let owned_default;
-    let allow_roots: &[PathBuf] = match allow_roots_override {
+    let allow_roots: &[PathBuf] = match opts.allow_roots {
         Some(r) => r,
         None => {
             owned_default = default_allow_roots();
@@ -325,7 +390,7 @@ pub async fn parse(text: &str, allow_roots_override: Option<&[PathBuf]>) -> Pars
 
     let mut files: Vec<ChannelContent> = Vec::with_capacity(directives.len());
     for d in &directives {
-        match resolve_directive(d, allow_roots).await {
+        match resolve_directive(d, allow_roots, opts.base).await {
             Ok(block) => files.push(block),
             Err(e) => {
                 warn!("outbound_attach: skipping {}: {}", d.path, e);
@@ -350,9 +415,18 @@ mod tests {
         (tmp, vec![root])
     }
 
+    /// Build [`ParseOptions`] with allow_roots set and base unset.
+    /// Used by legacy tests that exercise the absolute-path code path.
+    fn opts_with_roots<'a>(roots: &'a [PathBuf]) -> ParseOptions<'a> {
+        ParseOptions {
+            allow_roots: Some(roots),
+            base: None,
+        }
+    }
+
     #[tokio::test]
     async fn no_markers_returns_no_markers() {
-        let result = parse("just some prose, no markers here", None).await;
+        let result = parse("just some prose, no markers here", ParseOptions::default()).await;
         assert!(matches!(result, Parsed::NoMarkers));
     }
 
@@ -367,7 +441,7 @@ mod tests {
             canon.display()
         );
 
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments {
                 stripped_text,
@@ -403,7 +477,7 @@ mod tests {
             canon.display()
         );
 
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments {
                 stripped_text,
@@ -438,7 +512,7 @@ mod tests {
             canon.display()
         );
 
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments { files, .. } => {
                 match &files[0] {
@@ -463,7 +537,7 @@ mod tests {
             canon.display()
         );
 
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments { files, .. } => match &files[0] {
                 ChannelContent::FileData { filename, .. } => {
@@ -488,7 +562,7 @@ mod tests {
         assert!(!canon.starts_with(&roots[0]));
 
         let text = format!("<openfang:attach path=\"{}\"/>", canon.display());
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments {
                 stripped_text,
@@ -506,19 +580,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relative_path_is_rejected() {
+    async fn relative_path_without_base_is_rejected() {
+        // base=None ⇒ relative paths cannot resolve. Even with an
+        // allow-root set, the directive is dropped before any CWD
+        // fallback could kick in.
         let (_keep, roots) = fixture_root();
         let result = parse(
             "<openfang:attach path=\"relative/path.txt\"/>",
-            Some(&roots),
+            opts_with_roots(&roots),
         )
         .await;
         match result {
             Parsed::WithAttachments { files, .. } => {
-                assert!(files.is_empty(), "relative path must be rejected");
+                assert!(
+                    files.is_empty(),
+                    "relative path with no base must be rejected"
+                );
             }
             _ => panic!("expected WithAttachments"),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_path_resolves_against_explicit_base() {
+        // base=Some(workspace) ⇒ relative path joins under the base,
+        // canonicalises, passes the allow_roots check, and resolves.
+        let (tmp, roots) = fixture_root();
+        let base = roots[0].clone();
+        let path = tmp.path().join("inside.txt");
+        std::fs::write(&path, b"yo").unwrap();
+
+        let text = "<openfang:attach path=\"inside.txt\"/>";
+        let opts = ParseOptions {
+            allow_roots: Some(&roots),
+            base: Some(&base),
+        };
+        let result = parse(text, opts).await;
+        match result {
+            Parsed::WithAttachments { files, .. } => {
+                assert_eq!(files.len(), 1, "relative path with base must resolve");
+                match &files[0] {
+                    ChannelContent::FileData { data, filename, .. } => {
+                        assert_eq!(data, b"yo");
+                        assert_eq!(filename, "inside.txt");
+                    }
+                    _ => panic!("expected FileData"),
+                }
+            }
+            _ => panic!("expected WithAttachments"),
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_path_with_dotdot_escape_is_rejected() {
+        // base.join("../escape.txt") canonicalises out of the workspace.
+        // The allow_roots `starts_with` check then rejects it. This proves
+        // the base is a *resolution* input, not an *authorisation* input —
+        // canonicalize + allow_roots still catch traversal.
+        let (_tmp, roots) = fixture_root();
+        let base = roots[0].clone();
+        // Create an "escape" file OUTSIDE the workspace.
+        let outside = std::env::temp_dir().join("openfang-outbound-attach-dotdot-escape.txt");
+        std::fs::write(&outside, b"nope").unwrap();
+        let outside_canon = std::fs::canonicalize(&outside).unwrap();
+        // Build a relative path from `base` to `outside_canon`. We don't
+        // know the depth of `base` ahead of time, so walk up from base
+        // until we share a prefix with `outside_canon`'s parent.
+        let mut up = PathBuf::new();
+        let mut cursor: &Path = &base;
+        while !outside_canon.starts_with(cursor) {
+            up.push("..");
+            cursor = match cursor.parent() {
+                Some(p) => p,
+                None => break,
+            };
+        }
+        // Suffix after the shared prefix.
+        let suffix = outside_canon.strip_prefix(cursor).unwrap_or(&outside_canon);
+        let rel = up.join(suffix);
+        let rel_str = rel.to_string_lossy().to_string();
+
+        let text = format!("<openfang:attach path=\"{}\"/>", rel_str);
+        let opts = ParseOptions {
+            allow_roots: Some(&roots),
+            base: Some(&base),
+        };
+        let result = parse(&text, opts).await;
+        match result {
+            Parsed::WithAttachments { files, .. } => {
+                assert!(
+                    files.is_empty(),
+                    "relative `..` escape must be caught by allow_roots after canonicalize"
+                );
+            }
+            _ => panic!("expected WithAttachments"),
+        }
+        let _ = std::fs::remove_file(&outside);
+    }
+
+    #[tokio::test]
+    async fn symlink_escape_inside_workspace_is_rejected() {
+        // A symlink inside the workspace pointing outside it must be
+        // rejected after canonicalize follows the link and the
+        // allow_roots check sees the target's location.
+        use std::os::unix::fs::symlink;
+        let (tmp, roots) = fixture_root();
+        let base = roots[0].clone();
+
+        // Target lives outside the workspace.
+        let target = std::env::temp_dir().join("openfang-outbound-attach-symlink-target.txt");
+        std::fs::write(&target, b"escape").unwrap();
+        let target_canon = std::fs::canonicalize(&target).unwrap();
+        // Sanity: target is outside our allow-root.
+        assert!(!target_canon.starts_with(&base));
+
+        // Symlink inside the workspace pointing at the outside target.
+        let link = tmp.path().join("escape_link.txt");
+        symlink(&target_canon, &link).expect("symlink");
+
+        let text = "<openfang:attach path=\"escape_link.txt\"/>";
+        let opts = ParseOptions {
+            allow_roots: Some(&roots),
+            base: Some(&base),
+        };
+        let result = parse(text, opts).await;
+        match result {
+            Parsed::WithAttachments { files, .. } => {
+                assert!(
+                    files.is_empty(),
+                    "symlink escaping the workspace must be rejected"
+                );
+            }
+            _ => panic!("expected WithAttachments"),
+        }
+        let _ = std::fs::remove_file(&target);
     }
 
     #[tokio::test]
@@ -536,7 +731,7 @@ mod tests {
             c2.display()
         );
 
-        let result = parse(&text, Some(&roots)).await;
+        let result = parse(&text, opts_with_roots(&roots)).await;
         match result {
             Parsed::WithAttachments {
                 stripped_text,
@@ -554,7 +749,7 @@ mod tests {
         // No `path=` attribute → directive is invalid.
         let result = parse(
             "before <openfang:attach foo=\"bar\"/> after",
-            None,
+            ParseOptions::default(),
         )
         .await;
         match result {
@@ -589,11 +784,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_with_none_drops_all_attachments() {
-        // Default allow-roots is now empty, so even a real absolute path
-        // pointing at an existing file is rejected when the caller passes
-        // None for `allow_roots_override`. The text portion still comes
-        // through; only the attachment is dropped.
+    async fn parse_with_default_opts_drops_all_attachments() {
+        // Default ParseOptions has allow_roots=None (→ empty) and
+        // base=None. Even an absolute path pointing at an existing file
+        // is rejected because no allow-root contains it. Text portion
+        // still comes through.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("oops.txt");
         std::fs::write(&path, b"x").unwrap();
@@ -602,7 +797,7 @@ mod tests {
             "before <openfang:attach path=\"{}\"/> after",
             canon.display()
         );
-        let result = parse(&text, None).await;
+        let result = parse(&text, ParseOptions::default()).await;
         match result {
             Parsed::WithAttachments {
                 stripped_text,
@@ -670,7 +865,11 @@ mod tests {
         let canon = std::fs::canonicalize(&path).unwrap();
         let text = format!("<openfang:attach path=\"{}\"/>", canon.display());
         let empty: &[PathBuf] = &[];
-        let result = parse(&text, Some(empty)).await;
+        let opts = ParseOptions {
+            allow_roots: Some(empty),
+            base: None,
+        };
+        let result = parse(&text, opts).await;
         match result {
             Parsed::WithAttachments { files, .. } => assert!(files.is_empty()),
             _ => panic!("expected WithAttachments"),
