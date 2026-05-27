@@ -268,7 +268,11 @@ pub fn built_in_tools() -> Vec<Tool> {
             "channel_send",
             "Send a message to a user on a configured channel (email, telegram, slack, \
              discord, etc). For email: recipient is the email address; optionally set \
-             subject. Use thread_id to reply in a specific thread/topic.",
+             subject. Use thread_id to reply in a specific thread/topic. Use \
+             `attachments` (array of file paths, workspace-relative preferred) to \
+             attach files alongside the message; paths resolve against the agent \
+             workspace and the same allow-root rules apply as for inline \
+             `<openfang:attach path=\"...\"/>` directives.",
             obj(json!({
                 "type": "object",
                 "properties": {
@@ -276,6 +280,11 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths to attach. Workspace-relative paths are preferred (resolved against the agent's workspace root); absolute paths are also accepted. Same security gating as inline `<openfang:attach path=\"...\"/>` directives."
+                    },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in" }
                 },
                 "required": ["channel", "recipient"]
