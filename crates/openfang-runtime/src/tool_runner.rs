@@ -1133,7 +1133,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use `attachments` to send one or more local files alongside the message (workspace-relative paths preferred). Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1145,6 +1145,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
                     "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of file paths to attach alongside the message. Workspace-relative paths are preferred (resolved against the agent's workspace root); absolute paths are also accepted. Routes through the outbound attachment parser with the same `allow_roots` security gating as inline `<openfang:attach path=\"...\"/>` directives. Composes with inline directives in `message`."
+                    },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
                 "required": ["channel", "recipient"]
@@ -2599,13 +2604,26 @@ async fn tool_channel_send(
             .await;
     }
 
-    // Text-only message
-    let message = input["message"]
-        .as_str()
-        .ok_or("Missing 'message' parameter (required for text messages)")?;
+    // Text + optional `attachments: string[]` (ANAI-53). The attachments
+    // array is sugar over the inline `<openfang:attach .../>` directive
+    // mechanism — we synthesize directives here, prepend them to the
+    // message body, and let `kernel::send_channel_message` →
+    // `bridge::send_parsed` → `outbound_attach::parse` handle resolution,
+    // workspace allow-root gating, and multipart construction. Composes
+    // with any inline directives the agent already wrote into `message`.
+    let message_raw = input["message"].as_str().unwrap_or("");
+    let attachments_raw = input.get("attachments");
+    let has_attachments = attachments_raw
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
 
-    if message.is_empty() {
-        return Err("Message cannot be empty".to_string());
+    if message_raw.is_empty() && !has_attachments {
+        return Err(
+            "Missing 'message' parameter (required for text-only sends; \
+             pass non-empty 'attachments' to send files without a body)"
+                .to_string(),
+        );
     }
 
     // For email channels, validate email format and prepend subject
@@ -2615,16 +2633,18 @@ async fn tool_channel_send(
         }
         if let Some(subject) = input["subject"].as_str() {
             if !subject.is_empty() {
-                format!("Subject: {subject}\n\n{message}")
+                format!("Subject: {subject}\n\n{message_raw}")
             } else {
-                message.to_string()
+                message_raw.to_string()
             }
         } else {
-            message.to_string()
+            message_raw.to_string()
         }
     } else {
-        message.to_string()
+        message_raw.to_string()
     };
+
+    let final_message = synthesize_attach_directives(&final_message, attachments_raw)?;
 
     kh.send_channel_message(
         &channel,
@@ -2634,6 +2654,80 @@ async fn tool_channel_send(
         workspace_root,
     )
     .await
+}
+
+/// Prepend synthesized `<openfang:attach path="…"/>` directives from an
+/// `attachments` JSON array to the message body.
+///
+/// The outbound parser downstream extracts the directives, resolves each
+/// path against the calling agent's `workspace_root`, applies the same
+/// `allow_roots` security gating used by inline directives, and dispatches
+/// multipart payloads on the wire. This helper is pure sugar over that
+/// mechanism — no security policy here, just text synthesis.
+///
+/// Behavior:
+/// - `None` or `Null` `attachments` → returns `message` unchanged.
+/// - `attachments` present but not a JSON array → error (caller passed
+///   wrong shape).
+/// - Empty array → returns `message` unchanged (explicit no-op).
+/// - Each element must be a non-empty string. Path characters that would
+///   break the directive boundary (`"`, `<`, `>`, `\n`, `\r`) are
+///   rejected outright rather than silently escaped — these are
+///   pathological in filenames and silent escaping would obscure the
+///   failure mode.
+/// - Synthesized directives are prepended to `message` (one per line,
+///   followed by the original body). Composes additively with any inline
+///   directives the caller already embedded in `message`.
+///
+/// Path resolution and authorisation happen entirely downstream in
+/// `outbound_attach::resolve_directive` — this helper does not touch the
+/// filesystem.
+fn synthesize_attach_directives(
+    message: &str,
+    attachments: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let arr = match attachments {
+        Some(v) if v.is_null() => return Ok(message.to_string()),
+        Some(v) => v
+            .as_array()
+            .ok_or("'attachments' must be an array of file path strings")?,
+        None => return Ok(message.to_string()),
+    };
+    if arr.is_empty() {
+        return Ok(message.to_string());
+    }
+
+    let mut directives = String::new();
+    for (i, item) in arr.iter().enumerate() {
+        let path = item
+            .as_str()
+            .ok_or_else(|| format!("'attachments[{i}]' must be a string"))?;
+        if path.is_empty() {
+            return Err(format!("'attachments[{i}]' is an empty string"));
+        }
+        if let Some(bad) = path
+            .chars()
+            .find(|c| matches!(c, '"' | '<' | '>' | '\n' | '\r'))
+        {
+            return Err(format!(
+                "'attachments[{i}]' contains character {bad:?} which would break \
+                 the directive boundary; use an inline `<openfang:attach .../>` \
+                 directive or the `file_path` parameter instead"
+            ));
+        }
+        directives.push_str("<openfang:attach path=\"");
+        directives.push_str(path);
+        directives.push_str("\"/>\n");
+    }
+
+    if message.is_empty() {
+        // Trim the trailing newline so an attachments-only send doesn't
+        // emit a phantom blank line through the formatter.
+        Ok(directives.trim_end().to_string())
+    } else {
+        directives.push_str(message);
+        Ok(directives)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5044,4 +5138,131 @@ mod tests {
             .unwrap_err();
         assert!(err.to_lowercase().contains("kernel"));
     }
+
+    // -----------------------------------------------------------------
+    // ANAI-53: synthesize_attach_directives — pure helper tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn synth_attach_none_is_noop() {
+        let out = super::synthesize_attach_directives("hello", None).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_null_is_noop() {
+        let v = serde_json::Value::Null;
+        let out = super::synthesize_attach_directives("hello", Some(&v)).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_empty_array_is_noop() {
+        let v = serde_json::json!([]);
+        let out = super::synthesize_attach_directives("hello", Some(&v)).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_single_relative_path() {
+        let v = serde_json::json!(["report.pdf"]);
+        let out = super::synthesize_attach_directives("see attached", Some(&v)).unwrap();
+        assert_eq!(
+            out,
+            "<openfang:attach path=\"report.pdf\"/>\nsee attached"
+        );
+    }
+
+    #[test]
+    fn synth_attach_single_absolute_path() {
+        let v = serde_json::json!(["/tmp/file.png"]);
+        let out = super::synthesize_attach_directives("", Some(&v)).unwrap();
+        // Empty message → trailing newline trimmed.
+        assert_eq!(out, "<openfang:attach path=\"/tmp/file.png\"/>");
+    }
+
+    #[test]
+    fn synth_attach_multiple_paths_preserve_order() {
+        let v = serde_json::json!(["a.pdf", "b.png", "c.opus"]);
+        let out = super::synthesize_attach_directives("caption", Some(&v)).unwrap();
+        assert_eq!(
+            out,
+            "<openfang:attach path=\"a.pdf\"/>\n<openfang:attach path=\"b.png\"/>\n<openfang:attach path=\"c.opus\"/>\ncaption"
+        );
+    }
+
+    #[test]
+    fn synth_attach_composes_with_inline_directive() {
+        // Caller wrote one inline directive, then also passed an
+        // attachments param. Both must survive; downstream parser sees
+        // two directives in the final message.
+        let v = serde_json::json!(["b.pdf"]);
+        let msg = "<openfang:attach path=\"a.pdf\"/>\nhere are two files";
+        let out = super::synthesize_attach_directives(msg, Some(&v)).unwrap();
+        assert_eq!(
+            out,
+            "<openfang:attach path=\"b.pdf\"/>\n<openfang:attach path=\"a.pdf\"/>\nhere are two files"
+        );
+        // And the parser regex finds both.
+        let re = regex_lite::Regex::new(r#"<openfang:attach\s+([^>]*?)/>"#).unwrap();
+        assert_eq!(re.find_iter(&out).count(), 2);
+    }
+
+    #[test]
+    fn synth_attach_rejects_non_array() {
+        let v = serde_json::json!("not-an-array");
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("must be an array"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_non_string_element() {
+        let v = serde_json::json!(["ok.pdf", 42]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("attachments[1]"), "err = {err}");
+        assert!(err.contains("must be a string"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_empty_path_element() {
+        let v = serde_json::json!(["ok.pdf", ""]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("attachments[1]"), "err = {err}");
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_quote_in_path() {
+        let v = serde_json::json!(["weird\".pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_newline_in_path() {
+        let v = serde_json::json!(["line1\nline2.pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_angle_bracket_in_path() {
+        let v = serde_json::json!(["foo<bar>.pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_traversal_path_still_synthesized() {
+        // Synthesis is pure — no path policy here. The downstream
+        // outbound_attach parser is what rejects traversal/escape paths
+        // (covered by its own test suite). This test pins down that the
+        // helper does NOT pre-filter — security is downstream.
+        let v = serde_json::json!(["../../../etc/hosts"]);
+        let out = super::synthesize_attach_directives("hi", Some(&v)).unwrap();
+        assert!(out.contains("<openfang:attach path=\"../../../etc/hosts\"/>"));
+        // Defence in depth lives in outbound_attach::resolve_directive,
+        // which canonicalises and applies allow_roots — see its tests.
+    }
+
 }
