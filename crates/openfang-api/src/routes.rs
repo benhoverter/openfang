@@ -445,6 +445,7 @@ pub async fn send_message(
             // these are None/empty; pass None explicitly to be defensive.
             None,
             None,
+            false,
         )
         .await
     {
