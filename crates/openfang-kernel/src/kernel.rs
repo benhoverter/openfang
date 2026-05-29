@@ -7748,7 +7748,7 @@ impl KernelHandle for OpenFangKernel {
         let user = adapter
             .resolve_recipient(recipient)
             .await
-            .map_err(|e| format!("recipient resolution failed: {e}"))?;
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
         // Pick the same default OutputFormat the bridge reply-path uses for
         // this channel, with the wecom-specific config override applied.
@@ -7813,7 +7813,7 @@ impl KernelHandle for OpenFangKernel {
         let user = adapter
             .resolve_recipient(recipient)
             .await
-            .map_err(|e| format!("recipient resolution failed: {e}"))?;
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
         let content = match media_type {
             "image" => openfang_channels::types::ChannelContent::Image {
@@ -7880,7 +7880,7 @@ impl KernelHandle for OpenFangKernel {
         let user = adapter
             .resolve_recipient(recipient)
             .await
-            .map_err(|e| format!("recipient resolution failed: {e}"))?;
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
         let content = openfang_channels::types::ChannelContent::FileData {
             data,
