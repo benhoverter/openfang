@@ -1046,9 +1046,16 @@ impl ChannelAdapter for DiscordAdapter {
     async fn resolve_recipient(&self, recipient: &str) -> Result<ChannelUser, ResolutionError> {
         match self.resolve_recipient_inner(recipient).await {
             Ok((platform_id, via)) => {
-                info!(
+                // Dedicated audit sink: bypasses tracing entirely so a log
+                // scrape on stderr/tui.log cannot correlate this event with
+                // adjacent payload logs by timestamp (ANAI-55 security ask).
+                crate::resolver_audit::record_resolution("discord", recipient, &platform_id, via);
+                // Demoted from info! to debug! — production EnvFilter (info)
+                // emits zero correlatable event to the main log; dev mode
+                // opts in via RUST_LOG=...resolver_audit=debug.
+                debug!(
                     target: RESOLVER_AUDIT_TARGET,
-                    "recipient_resolved adapter=discord input={:?}                      resolved_platform_id={} via={}",
+                    "recipient_resolved adapter=discord input={:?} resolved_platform_id={} via={}",
                     recipient, platform_id, via
                 );
                 Ok(ChannelUser {
