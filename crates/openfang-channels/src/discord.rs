@@ -1053,6 +1053,7 @@ impl ChannelAdapter for DiscordAdapter {
                 // Demoted from info! to debug! — production EnvFilter (info)
                 // emits zero correlatable event to the main log; dev mode
                 // opts in via RUST_LOG=...resolver_audit=debug.
+                #[cfg(debug_assertions)]
                 debug!(
                     target: RESOLVER_AUDIT_TARGET,
                     "recipient_resolved adapter=discord input={:?} resolved_platform_id={} via={}",
