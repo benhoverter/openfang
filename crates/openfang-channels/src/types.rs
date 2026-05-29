@@ -284,6 +284,70 @@ pub struct ChannelStatus {
 // Re-export policy/format types from openfang-types for convenience.
 pub use openfang_types::config::{DmPolicy, GroupPolicy, OutputFormat};
 
+/// Structured error returned by [`ChannelAdapter::resolve_recipient`] when
+/// a recipient string cannot be turned into a platform-native identifier.
+///
+/// These variants are surfaced verbatim through `ToolError::RecipientUnresolved`
+/// so the calling agent can distinguish "you typed it wrong" from "we know
+/// who you mean but can't reach them" from "this is ambiguous, please qualify".
+#[derive(Debug, Clone)]
+pub enum ResolutionError {
+    /// No channel or known user matches the recipient string.
+    ///
+    /// For Discord this typically means we have never seen an inbound
+    /// MESSAGE_CREATE from the named user, or GUILD_CREATE has not yet
+    /// landed channel metadata for the named channel.
+    UnknownRecipient { recipient: String },
+
+    /// A bare channel name (e.g. `"general"` or `"#general"`) matches more
+    /// than one guild's channel list. The agent must qualify with the
+    /// channel mention `<#…>` or upstream tooling.
+    AmbiguousChannel { name: String, guilds: Vec<String> },
+
+    /// A bare username (no leading `@` or `<@id>` form) was passed as a DM
+    /// target. Refused by design to eliminate the username-collision class
+    /// where a legitimate Discord user shares a username with someone the
+    /// agent intends to message (see ANAI-55 security review, finding F1).
+    BareNameDmRefused { name: String },
+
+    /// The platform refused to open a DM channel with the resolved user
+    /// (e.g. Discord returned 403 because DMs are closed or the bot is
+    /// blocked). Fail-closed; no auto-retry.
+    DmOpenFailed { user_id: String, status: u16 },
+}
+
+impl std::fmt::Display for ResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolutionError::UnknownRecipient { recipient } => write!(
+                f,
+                "No channel or known user matches `{recipient}`. The user must \
+                 have messaged us at least once before they can be addressed by name."
+            ),
+            ResolutionError::AmbiguousChannel { name, guilds } => write!(
+                f,
+                "Channel `#{name}` exists in {} guilds ({}). Use the channel \
+                 mention `<#…>` to disambiguate.",
+                guilds.len(),
+                guilds.join(", ")
+            ),
+            ResolutionError::BareNameDmRefused { name } => write!(
+                f,
+                "DM recipient must be qualified as `@{name}` or `<@user_id>`. \
+                 Bare names are not resolved for DM safety."
+            ),
+            ResolutionError::DmOpenFailed { user_id, status } => write!(
+                f,
+                "Platform refused to open a DM channel with user {user_id} \
+                 (status {status}). They may have DMs disabled or have blocked \
+                 the bot."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResolutionError {}
+
 /// Trait that every channel adapter must implement.
 ///
 /// A channel adapter bridges a messaging platform to the OpenFang kernel by converting
@@ -366,6 +430,31 @@ pub trait ChannelAdapter: Send + Sync {
     /// logged regardless of this setting.
     fn suppress_error_responses(&self) -> bool {
         false
+    }
+
+    /// Resolve a free-form recipient string into a platform-native
+    /// [`ChannelUser`] before dispatch.
+    ///
+    /// The default implementation is **passthrough** — it wraps the input
+    /// string as both `platform_id` and `display_name`. This preserves the
+    /// pre-ANAI-55 behavior for every adapter that does not override the
+    /// method (i.e. every adapter except Discord, until others opt in).
+    ///
+    /// Adapters that override this method should:
+    /// - Accept platform-native IDs (e.g. Discord snowflakes) verbatim.
+    /// - Accept the platform's mention/handle forms where they exist.
+    /// - Fail closed with a structured [`ResolutionError`] on miss,
+    ///   ambiguity, or any unsafe shorthand.
+    /// - Never blast a message at a fallback recipient on resolution failure.
+    ///
+    /// See ANAI-55 and the channel-send-attachments proposal for the
+    /// Discord-specific resolution matrix.
+    async fn resolve_recipient(&self, recipient: &str) -> Result<ChannelUser, ResolutionError> {
+        Ok(ChannelUser {
+            platform_id: recipient.to_string(),
+            display_name: recipient.to_string(),
+            openfang_user: None,
+        })
     }
 }
 

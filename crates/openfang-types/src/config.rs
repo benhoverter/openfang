@@ -1975,7 +1975,9 @@ pub struct DiscordConfig {
     pub allowed_users: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
-    /// Gateway intents bitmask (default: 37376 = GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
+    /// Gateway intents bitmask (default: 37377 = GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT).
+    /// GUILDS is required for GUILD_CREATE / CHANNEL_* events, which populate the
+    /// (guild_id, channel_name) → channel_id cache used by ANAI-55 recipient resolution.
     pub intents: u64,
     /// Ignore messages from other bots (default: true).
     /// Set to false to allow bot-to-bot interactions in multi-agent setups.
@@ -2004,7 +2006,7 @@ impl Default for DiscordConfig {
             allowed_guilds: vec![],
             allowed_users: vec![],
             default_agent: None,
-            intents: 37376,
+            intents: 37377,
             ignore_bots: true,
             default_channel_id: None,
             free_response_channels: vec![],
@@ -4038,7 +4040,7 @@ mod tests {
         let dc = DiscordConfig::default();
         assert_eq!(dc.bot_token_env, "DISCORD_BOT_TOKEN");
         assert!(dc.allowed_guilds.is_empty());
-        assert_eq!(dc.intents, 37376);
+        assert_eq!(dc.intents, 37377);
         assert!(dc.ignore_bots);
     }
 
