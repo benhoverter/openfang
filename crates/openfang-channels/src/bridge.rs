@@ -634,7 +634,7 @@ async fn send_agent_response(
     output_format: OutputFormat,
 ) {
     let workspace_root = agent_workspace_root(handle, agent_id).await;
-    send_parsed(
+    let _ = send_parsed(
         adapter,
         user,
         text,
@@ -642,7 +642,7 @@ async fn send_agent_response(
         output_format,
         SendOptions { workspace_root },
     )
-    .await
+    .await;
 }
 
 /// Caller-supplied context for an outbound send.
@@ -674,7 +674,7 @@ async fn send_response(
     thread_id: Option<&str>,
     output_format: OutputFormat,
 ) {
-    send_parsed(
+    let _ = send_parsed(
         adapter,
         user,
         text,
@@ -682,7 +682,7 @@ async fn send_response(
         output_format,
         SendOptions::default(),
     )
-    .await
+    .await;
 }
 
 /// Parse outbound `<openfang:attach .../>` markers, apply channel
@@ -692,6 +692,14 @@ async fn send_response(
 /// proactive-send path (commit 3). The `options.workspace_root`, when
 /// set, is forwarded to [`outbound_attach::parse`] as the sole allow-root,
 /// scoping attachment resolution to that agent's workspace.
+/// Returns the list of `<openfang:attach .../>` directives whose paths
+/// parsed but whose resolution failed (missing file, outside allow-roots,
+/// oversized, …) — `(directive_path, reason)` per entry. Callers that
+/// surface a tool-call result back to the agent (e.g.
+/// `kernel::send_channel_message` for the `channel_send` tool) should
+/// include this list so the agent can react to silent drops. The bridge
+/// reply-path discards it; the WARN log inside `outbound_attach::parse`
+/// remains the operator-facing record.
 pub async fn send_parsed(
     adapter: &dyn ChannelAdapter,
     user: &ChannelUser,
@@ -699,7 +707,7 @@ pub async fn send_parsed(
     thread_id: Option<&str>,
     output_format: OutputFormat,
     options: SendOptions,
-) {
+) -> Vec<(String, String)> {
     // Parse `<openfang:attach .../>` markers BEFORE formatting — channel
     // formatters (telegram HTML, slack mrkdwn) escape `<` and would break
     // marker detection downstream.
@@ -718,14 +726,18 @@ pub async fn send_parsed(
         allow_roots: allow_roots_override.as_deref(),
         base: options.workspace_root.as_deref(),
     };
-    let (text_to_format, attachment_blocks): (String, Vec<ChannelContent>) =
-        match crate::outbound_attach::parse(&text, parse_opts).await {
-            crate::outbound_attach::Parsed::NoMarkers => (text, Vec::new()),
-            crate::outbound_attach::Parsed::WithAttachments {
-                stripped_text,
-                files,
-            } => (stripped_text, files),
-        };
+    let (text_to_format, attachment_blocks, skipped): (
+        String,
+        Vec<ChannelContent>,
+        Vec<(String, String)>,
+    ) = match crate::outbound_attach::parse(&text, parse_opts).await {
+        crate::outbound_attach::Parsed::NoMarkers => (text, Vec::new(), Vec::new()),
+        crate::outbound_attach::Parsed::WithAttachments {
+            stripped_text,
+            files,
+            skipped,
+        } => (stripped_text, files, skipped),
+    };
 
     let formatted = if adapter.name() == "wecom" {
         formatter::format_for_wecom(&text_to_format, output_format)
@@ -757,6 +769,8 @@ pub async fn send_parsed(
     if let Err(e) = result {
         error!("Failed to send response: {e}");
     }
+
+    skipped
 }
 
 pub fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {

@@ -90,6 +90,13 @@ pub enum Parsed {
     WithAttachments {
         stripped_text: String,
         files: Vec<ChannelContent>,
+        /// Attachments whose directive parsed but whose resolution failed
+        /// (missing file, outside allow-roots, oversized, …). Each tuple
+        /// is `(directive_path, reason)`. The message body still sends;
+        /// callers that surface tool-call results back to the agent
+        /// should include this list so the agent can react to silent
+        /// drops. Empty when every directive resolved.
+        skipped: Vec<(String, String)>,
     },
 }
 
@@ -414,11 +421,13 @@ pub async fn parse(text: &str, opts: ParseOptions<'_>) -> Parsed {
     }
 
     let mut files: Vec<ChannelContent> = Vec::with_capacity(directives.len());
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for d in &directives {
         match resolve_directive(d, allow_roots, opts.base).await {
             Ok(block) => files.push(block),
             Err(e) => {
                 warn!("outbound_attach: skipping {}: {}", d.path, e);
+                skipped.push((d.path.clone(), e));
             }
         }
     }
@@ -426,6 +435,7 @@ pub async fn parse(text: &str, opts: ParseOptions<'_>) -> Parsed {
     Parsed::WithAttachments {
         stripped_text,
         files,
+        skipped,
     }
 }
 
@@ -471,6 +481,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert_eq!(stripped_text, "Here you go:  done.");
                 assert_eq!(files.len(), 1);
@@ -507,6 +518,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert_eq!(stripped_text, "for the meeting");
                 assert_eq!(files.len(), 1);
@@ -590,6 +602,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert_eq!(stripped_text, "");
                 assert!(
@@ -759,6 +772,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert_eq!(stripped_text, "first  then  end");
                 assert_eq!(files.len(), 2);
@@ -779,6 +793,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert!(files.is_empty());
                 assert!(
@@ -831,6 +846,7 @@ mod tests {
             Parsed::WithAttachments {
                 stripped_text,
                 files,
+                skipped: _,
             } => {
                 assert_eq!(stripped_text, "before  after");
                 assert!(
@@ -932,6 +948,64 @@ mod tests {
                     }
                     _ => panic!("expected FileData"),
                 }
+            }
+            _ => panic!("expected WithAttachments"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_file_populates_skipped() {
+        // A directive whose path doesn't exist must populate `skipped`
+        // with (path, reason) so callers can surface it to the agent.
+        // The message still parses successfully and the text portion
+        // comes through — partial success is intentional (see module
+        // docs); the skipped vec is the channel for telling the caller
+        // *what* got dropped.
+        let (_tmp, roots) = fixture_root();
+        let base = roots[0].clone();
+        let text = "before <openfang:attach path=\"does-not-exist.txt\"/> after";
+        let opts = ParseOptions {
+            allow_roots: Some(&roots),
+            base: Some(&base),
+        };
+        match parse(text, opts).await {
+            Parsed::WithAttachments {
+                stripped_text,
+                files,
+                skipped,
+            } => {
+                assert_eq!(stripped_text, "before  after");
+                assert!(files.is_empty());
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0].0, "does-not-exist.txt");
+                assert!(
+                    skipped[0].1.contains("canonicalize"),
+                    "expected canonicalize error, got: {}",
+                    skipped[0].1
+                );
+            }
+            _ => panic!("expected WithAttachments"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_attachment_leaves_skipped_empty() {
+        // Happy path: a resolvable directive yields an empty `skipped`
+        // vec. Pins the invariant that `skipped` is the *failure*
+        // channel, not a per-directive audit log.
+        let (tmp, roots) = fixture_root();
+        let path = tmp.path().join("ok.txt");
+        std::fs::write(&path, b"ok").unwrap();
+        let canon = std::fs::canonicalize(&path).unwrap();
+        let text = format!("<openfang:attach path=\"{}\"/>", canon.display());
+        match parse(&text, opts_with_roots(&roots)).await {
+            Parsed::WithAttachments { files, skipped, .. } => {
+                assert_eq!(files.len(), 1);
+                assert!(
+                    skipped.is_empty(),
+                    "happy path must not populate skipped, got: {:?}",
+                    skipped
+                );
             }
             _ => panic!("expected WithAttachments"),
         }

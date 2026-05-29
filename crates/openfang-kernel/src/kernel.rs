@@ -7768,7 +7768,7 @@ impl KernelHandle for OpenFangKernel {
         // identically to bridge reply-path responses. The workspace_root
         // (when supplied by the caller — typically the channel_send tool)
         // scopes outbound attachments to the calling agent's workspace.
-        openfang_channels::bridge::send_parsed(
+        let skipped = openfang_channels::bridge::send_parsed(
             adapter.as_ref(),
             &user,
             message.to_string(),
@@ -7780,7 +7780,17 @@ impl KernelHandle for OpenFangKernel {
         )
         .await;
 
-        Ok(format!("Message sent to {} via {}", recipient, channel))
+        let mut out = format!("Message sent to {} via {}", recipient, channel);
+        if !skipped.is_empty() {
+            // Surface dropped attachments so the agent can react. The
+            // message body still sent; the underlying WARN log in
+            // outbound_attach::parse remains the operator-facing record.
+            out.push_str("\n\nSkipped attachments:");
+            for (path, reason) in &skipped {
+                out.push_str(&format!("\n- {}: {}", path, reason));
+            }
+        }
+        Ok(out)
     }
 
     async fn send_channel_media(
