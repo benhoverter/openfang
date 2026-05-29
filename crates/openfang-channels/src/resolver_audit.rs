@@ -60,8 +60,7 @@ fn audit_log_path() -> PathBuf {
     openfang_home().join("daemon").join("resolver_audit.log")
 }
 
-fn open_audit_file() -> Option<Mutex<File>> {
-    let path = audit_log_path();
+fn open_audit_file(path: &std::path::Path) -> Option<Mutex<File>> {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::error!(
@@ -77,19 +76,41 @@ fn open_audit_file() -> Option<Mutex<File>> {
     opts.create(true).append(true);
     #[cfg(unix)]
     {
-        opts.mode(0o600);
+        // O_NOFOLLOW: refuse to open if the audit path is a symlink.
+        // Defense-in-depth: $OPENFANG_HOME is user-owned, but a pre-staged
+        // symlink at the audit path would otherwise redirect daemon writes.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    match opts.open(&path) {
-        Ok(f) => Some(Mutex::new(f)),
+    let file = match opts.open(&path) {
+        Ok(f) => f,
         Err(e) => {
             tracing::error!(
                 "resolver_audit: failed to open log {}: {}",
                 path.display(),
                 e
             );
-            None
+            return None;
+        }
+    };
+
+    // `OpenOptions::mode` only applies on file *creation*. If the file
+    // pre-exists with looser permissions (manual touch, stray test, prior
+    // build under different umask), converge it to 0o600 unconditionally.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::error!(
+                "resolver_audit: failed to set mode 0o600 on {}: {}",
+                path.display(),
+                e
+            );
+            // Continue: better to audit with looser perms than not at all.
+            // The error is recorded above for the operator.
         }
     }
+
+    Some(Mutex::new(file))
 }
 
 /// Record a successful recipient resolution. Best-effort: a failure to write
@@ -101,7 +122,7 @@ fn open_audit_file() -> Option<Mutex<File>> {
 /// `via` is a short tag for the resolution path (e.g. `"snowflake"`,
 /// `"channel_mention"`, `"username_cache"`).
 pub fn record_resolution(adapter: &str, input: &str, platform_id: &str, via: &str) {
-    let slot = AUDIT_FILE.get_or_init(open_audit_file);
+    let slot = AUDIT_FILE.get_or_init(|| open_audit_file(&audit_log_path()));
     let Some(mu) = slot else {
         return;
     };
@@ -109,10 +130,12 @@ pub fn record_resolution(adapter: &str, input: &str, platform_id: &str, via: &st
     let line = format!(
         "{ts} adapter={adapter} input={input:?} resolved_platform_id={platform_id} via={via}\n"
     );
-    if let Ok(mut f) = mu.lock() {
-        if let Err(e) = f.write_all(line.as_bytes()) {
-            tracing::error!("resolver_audit: write failed: {}", e);
-        }
+    // Recover from a poisoned mutex: with only `writeln!` in the critical
+    // section, panic-while-holding is nearly impossible, but if it ever
+    // happens we'd silently mute the audit log forever. Take the inner.
+    let mut f = mu.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = f.write_all(line.as_bytes()) {
+        tracing::error!("resolver_audit: write failed: {}", e);
     }
 }
 
@@ -120,21 +143,35 @@ pub fn record_resolution(adapter: &str, input: &str, platform_id: &str, via: &st
 mod tests {
     use super::*;
 
-    /// Verifies that `open_audit_file` creates the file with mode `0o600` on
-    /// Unix and that the parent directory is created lazily.
-    ///
-    /// NOTE: `AUDIT_FILE` is a process-wide `OnceLock`, so the public
-    /// `record_resolution` path can only be exercised hermetically once per
-    /// test binary. We test the open path directly to keep this test
-    /// independent of other tests in the crate.
+    /// `audit_log_path()` composes `$OPENFANG_HOME/daemon/resolver_audit.log`.
+    /// We test this via env mutation in exactly one place; all other tests
+    /// pass an explicit path into `open_audit_file` to avoid env-var races
+    /// under parallel test execution.
+    #[test]
+    fn audit_log_path_composes_under_openfang_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Single-test env mutation; the result is consumed before any other
+        // test could observe it. Still, prefer the explicit-path tests below
+        // for new coverage.
+        let prev = std::env::var("OPENFANG_HOME").ok();
+        std::env::set_var("OPENFANG_HOME", tmp.path());
+        let p = audit_log_path();
+        match prev {
+            Some(v) => std::env::set_var("OPENFANG_HOME", v),
+            None => std::env::remove_var("OPENFANG_HOME"),
+        }
+        assert!(p.starts_with(tmp.path()));
+        assert!(p.ends_with("daemon/resolver_audit.log"));
+    }
+
+    /// `open_audit_file` creates the file with mode `0o600` on Unix and
+    /// creates the parent directory lazily.
     #[test]
     fn open_audit_file_creates_0600_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var("OPENFANG_HOME").ok();
-        std::env::set_var("OPENFANG_HOME", tmp.path());
+        let path = tmp.path().join("daemon").join("resolver_audit.log");
 
-        let path = audit_log_path();
-        assert!(open_audit_file().is_some());
+        assert!(open_audit_file(&path).is_some());
         assert!(
             path.exists(),
             "audit file not created at {}",
@@ -148,10 +185,48 @@ mod tests {
             let mode = md.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "audit file mode is {:o}, expected 0600", mode);
         }
+    }
 
-        match prev {
-            Some(v) => std::env::set_var("OPENFANG_HOME", v),
-            None => std::env::remove_var("OPENFANG_HOME"),
-        }
+    /// Defense-in-depth: if the audit path pre-exists as a symlink,
+    /// `O_NOFOLLOW` must cause the open to fail closed (returns `None`)
+    /// instead of redirecting daemon writes to the symlink target.
+    #[cfg(unix)]
+    #[test]
+    fn open_audit_file_refuses_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon").join("resolver_audit.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let target = tmp.path().join("symlink_target.log");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(
+            open_audit_file(&path).is_none(),
+            "expected None when audit path is a symlink"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "symlink target was written to despite O_NOFOLLOW"
+        );
+    }
+
+    /// `OpenOptions::mode` only applies on creation. If the file pre-exists
+    /// with looser perms, we must converge it to 0o600 on open.
+    #[cfg(unix)]
+    #[test]
+    fn open_audit_file_converges_mode_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon").join("resolver_audit.log");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(open_audit_file(&path).is_some());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected mode 0o600, got {:o}", mode);
     }
 }
