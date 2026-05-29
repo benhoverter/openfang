@@ -12,6 +12,7 @@ pub mod irc;
 pub mod matrix;
 pub mod mattermost;
 pub mod outbound_attach;
+pub mod resolver_audit;
 pub mod rocketchat;
 pub mod router;
 pub mod signal;
