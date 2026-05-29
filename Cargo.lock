@@ -4017,6 +4017,7 @@ dependencies = [
  "html-escape",
  "imap",
  "lettre",
+ "libc",
  "mailparse",
  "native-tls",
  "openfang-types",
