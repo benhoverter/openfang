@@ -7740,11 +7740,15 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55: turn the free-form recipient string into a platform-native
+        // ChannelUser via the adapter's resolver. Discord overrides this to
+        // accept snowflakes, `<#…>` / `<@…>` mentions, `#channel-name` (when
+        // unambiguous across guilds), and `@username`. Bare names are refused.
+        // Every other adapter still uses the trait's default passthrough.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| format!("recipient resolution failed: {e}"))?;
 
         // Pick the same default OutputFormat the bridge reply-path uses for
         // this channel, with the wecom-specific config override applied.
@@ -7805,11 +7809,11 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55 — see send_channel_message for rationale.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| format!("recipient resolution failed: {e}"))?;
 
         let content = match media_type {
             "image" => openfang_channels::types::ChannelContent::Image {
@@ -7872,11 +7876,11 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55 — see send_channel_message for rationale.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| format!("recipient resolution failed: {e}"))?;
 
         let content = openfang_channels::types::ChannelContent::FileData {
             data,
