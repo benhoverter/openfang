@@ -5,14 +5,15 @@
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    ResolutionError,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -26,6 +27,21 @@ const DISCORD_MSG_LIMIT: usize = 2000;
 /// MESSAGE_UPDATE (embed resolution) events arrive within seconds of the
 /// original CREATE; entries older than this cap are safe to discard.
 const MAX_DEDUP_MSG_IDS: usize = 2_000;
+
+// --- ANAI-55 recipient resolution ------------------------------------------
+/// Dedicated `tracing` target for the recipient-resolution audit log.
+///
+/// Kept separate from the message-payload log target so a log scrape cannot
+/// trivially correlate "agent X resolved recipient Y" with the message body
+/// (security review observability ask).
+const RESOLVER_AUDIT_TARGET: &str = "openfang_channels::discord::resolver_audit";
+
+/// Window for the resolution-failure burst counter.
+const RESOLVER_FAIL_WINDOW: Duration = Duration::from_secs(60);
+
+/// Failures within `RESOLVER_FAIL_WINDOW` above this count emit a single
+/// `warn!` (rate-limited via the deque so we don't spam at high rates).
+const RESOLVER_FAIL_WARN_THRESHOLD: usize = 20;
 
 /// Discord Gateway opcodes.
 mod opcode {
@@ -77,6 +93,27 @@ pub struct DiscordAdapter {
     /// Populated immediately when MESSAGE_CREATE is forwarded — before bridge processing —
     /// to eliminate the race window where MESSAGE_UPDATE arrives before thread creation completes.
     threaded_message_ids: Arc<RwLock<HashSet<String>>>,
+
+    // --- ANAI-55 recipient resolution caches -------------------------------
+    /// `username` → `user_id`. Populated passively on every inbound
+    /// MESSAGE_CREATE. Services `@username` DM resolution only — bare names
+    /// are refused (see [`ResolutionError::BareNameDmRefused`]).
+    /// Last-write-wins on collision; overwrites emit a `debug!` line.
+    username_to_user_id: Arc<RwLock<HashMap<String, String>>>,
+
+    /// `(guild_id, channel_name)` → `channel_id`. Keyed by guild to prevent
+    /// cross-guild `#name` collisions (security F2). Populated from
+    /// GUILD_CREATE, GUILD_UPDATE, CHANNEL_CREATE, CHANNEL_UPDATE; evicted
+    /// on CHANNEL_DELETE.
+    channel_name_to_channel_id: Arc<RwLock<HashMap<(String, String), String>>>,
+
+    /// `user_id` → DM channel id. Populated on first successful DM-open via
+    /// `POST /users/@me/channels`. 4xx fails closed; no auto-retry.
+    user_id_to_dm_channel_id: Arc<RwLock<HashMap<String, String>>>,
+
+    /// Sliding-window timestamps of recent resolution failures (used for the
+    /// burst-warn defense-in-depth signal).
+    resolution_failures: Arc<RwLock<VecDeque<Instant>>>,
 }
 
 impl DiscordAdapter {
@@ -104,6 +141,10 @@ impl DiscordAdapter {
             resume_gateway_url: Arc::new(RwLock::new(None)),
             created_thread_ids: Arc::new(RwLock::new(HashMap::new())),
             threaded_message_ids: Arc::new(RwLock::new(HashSet::new())),
+            username_to_user_id: Arc::new(RwLock::new(HashMap::new())),
+            channel_name_to_channel_id: Arc::new(RwLock::new(HashMap::new())),
+            user_id_to_dm_channel_id: Arc::new(RwLock::new(HashMap::new())),
+            resolution_failures: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 
@@ -163,6 +204,182 @@ impl DiscordAdapter {
             .send()
             .await?;
         Ok(())
+    }
+
+    /// Open (or fetch) the DM channel for a given user snowflake.
+    ///
+    /// On success returns the DM channel id and inserts it into
+    /// `user_id_to_dm_channel_id` for future calls. On HTTP 4xx the status
+    /// code is returned to the caller for fail-closed handling — no
+    /// auto-retry (see ANAI-55 §3.2 step 6). Transport failures map to `0`.
+    async fn api_open_dm_channel(&self, user_id: &str) -> Result<String, u16> {
+        let url = format!("{DISCORD_API_BASE}/users/@me/channels");
+        let body = serde_json::json!({ "recipient_id": user_id });
+        let resp = match self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("discord DM-open transport error for {user_id}: {e}");
+                return Err(0);
+            }
+        };
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(status);
+        }
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("discord DM-open returned non-JSON for {user_id}: {e}");
+                return Err(status);
+            }
+        };
+        let dm_id = match v["id"].as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                warn!("discord DM-open missing `id` field for {user_id}");
+                return Err(status);
+            }
+        };
+        self.user_id_to_dm_channel_id
+            .write()
+            .await
+            .insert(user_id.to_string(), dm_id.clone());
+        Ok(dm_id)
+    }
+
+    /// ANAI-55 resolver body. Returns `(platform_id, via_label)` on success.
+    async fn resolve_recipient_inner(
+        &self,
+        recipient: &str,
+    ) -> Result<(String, &'static str), ResolutionError> {
+        let r = recipient.trim();
+        if r.is_empty() {
+            return Err(ResolutionError::UnknownRecipient {
+                recipient: recipient.to_string(),
+            });
+        }
+
+        // 1. Raw snowflake.
+        if is_snowflake(r) {
+            return Ok((r.to_string(), "snowflake"));
+        }
+
+        // 2. Channel mention <#id>.
+        if let Some(id) = strip_channel_mention(r) {
+            if is_snowflake(&id) {
+                return Ok((id, "channel_mention"));
+            }
+        }
+
+        // 3. User mention <@id> / <@!id> — DM-open with the id.
+        if let Some(id) = strip_user_mention(r) {
+            if is_snowflake(&id) {
+                return self
+                    .resolve_user_id_to_dm(&id)
+                    .await
+                    .map(|d| (d, "user_mention+dm_open"));
+            }
+        }
+
+        // 4. `#name` or bare channel-shaped name.
+        let (had_hash, name_part) = if let Some(stripped) = r.strip_prefix('#') {
+            (true, stripped)
+        } else {
+            (false, r)
+        };
+
+        if !name_part.is_empty() && is_channel_name_shape(name_part) {
+            let cache = self.channel_name_to_channel_id.read().await;
+            let mut hits: Vec<(String, String)> = cache
+                .iter()
+                .filter(|((_gid, n), _cid)| n == name_part)
+                .map(|((gid, _n), cid)| (gid.clone(), cid.clone()))
+                .collect();
+            drop(cache);
+            match hits.len() {
+                1 => {
+                    let (_gid, cid) = hits.pop().unwrap();
+                    return Ok((cid, "channel_name"));
+                }
+                n if n > 1 => {
+                    let guilds: Vec<String> = hits.into_iter().map(|(g, _)| g).collect();
+                    return Err(ResolutionError::AmbiguousChannel {
+                        name: name_part.to_string(),
+                        guilds,
+                    });
+                }
+                _ => {
+                    if had_hash {
+                        return Err(ResolutionError::UnknownRecipient {
+                            recipient: recipient.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 5. `@username` — DM path.
+        if let Some(uname) = r.strip_prefix('@') {
+            if !uname.is_empty() && is_username_shape(uname) {
+                let user_id = self.username_to_user_id.read().await.get(uname).cloned();
+                return match user_id {
+                    Some(uid) => self
+                        .resolve_user_id_to_dm(&uid)
+                        .await
+                        .map(|d| (d, "username_cache+dm_open")),
+                    None => Err(ResolutionError::UnknownRecipient {
+                        recipient: recipient.to_string(),
+                    }),
+                };
+            }
+        }
+
+        // 6. Bare name — refused as a DM target (ANAI-55 F1).
+        Err(ResolutionError::BareNameDmRefused {
+            name: r.to_string(),
+        })
+    }
+
+    /// Step 6 of the resolver: cache-or-open the DM channel for a user id.
+    async fn resolve_user_id_to_dm(&self, user_id: &str) -> Result<String, ResolutionError> {
+        if let Some(dm) = self
+            .user_id_to_dm_channel_id
+            .read()
+            .await
+            .get(user_id)
+            .cloned()
+        {
+            return Ok(dm);
+        }
+        self.api_open_dm_channel(user_id)
+            .await
+            .map_err(|status| ResolutionError::DmOpenFailed {
+                user_id: user_id.to_string(),
+                status,
+            })
+    }
+
+    /// Record a resolution failure for the sliding-window burst-warn signal.
+    /// Returns `true` the single time the threshold is crossed within a window.
+    async fn note_resolution_failure(&self) -> bool {
+        let now = Instant::now();
+        let mut q = self.resolution_failures.write().await;
+        while let Some(front) = q.front() {
+            if now.duration_since(*front) > RESOLVER_FAIL_WINDOW {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        q.push_back(now);
+        q.len() == RESOLVER_FAIL_WARN_THRESHOLD + 1
     }
 
     /// Create a thread from a message in a Discord channel.
@@ -295,6 +512,8 @@ impl ChannelAdapter for DiscordAdapter {
         let resume_url_store = self.resume_gateway_url.clone();
         let created_thread_ids = self.created_thread_ids.clone();
         let threaded_message_ids = self.threaded_message_ids.clone();
+        let username_to_user_id = self.username_to_user_id.clone();
+        let channel_name_to_channel_id = self.channel_name_to_channel_id.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         tokio::spawn(async move {
@@ -527,6 +746,28 @@ impl ChannelAdapter for DiscordAdapter {
                                 }
 
                                 "MESSAGE_CREATE" | "MESSAGE_UPDATE" => {
+                                    // Passively populate the username cache
+                                    // for ANAI-55 `@username` resolution.
+                                    // Done before parse so we still learn the
+                                    // mapping even when the message itself is
+                                    // dropped by allow-list filters downstream.
+                                    if event_name == "MESSAGE_CREATE" {
+                                        if let (Some(uname), Some(uid)) = (
+                                            d["author"]["username"].as_str(),
+                                            d["author"]["id"].as_str(),
+                                        ) {
+                                            let mut cache = username_to_user_id.write().await;
+                                            if let Some(prev) = cache.get(uname) {
+                                                if prev != uid {
+                                                    debug!(
+                                                        "discord username cache overwrite:                                                          {uname} {prev} -> {uid}"
+                                                    );
+                                                }
+                                            }
+                                            cache.insert(uname.to_string(), uid.to_string());
+                                        }
+                                    }
+
                                     if let Some(msg) = parse_discord_message(
                                         d,
                                         &bot_user_id,
@@ -577,19 +818,73 @@ impl ChannelAdapter for DiscordAdapter {
                                     }
                                 }
 
-                                "THREAD_DELETE" | "CHANNEL_DELETE" => {
-                                    // Clean up tracking when a thread is deleted so the
-                                    // next message in the parent channel is treated fresh.
+                                "THREAD_DELETE" => {
                                     if let Some(tid) = d["id"].as_str() {
                                         created_thread_ids.write().await.remove(tid);
-                                        // Prune the dedup set to prevent unbounded growth.
-                                        // Entries older than MAX_DEDUP_MSG_IDS are safe to
-                                        // discard — embed UPDATE events arrive within seconds.
                                         let mut ids = threaded_message_ids.write().await;
                                         if ids.len() > MAX_DEDUP_MSG_IDS {
                                             ids.clear();
                                         }
-                                        debug!("Discord thread/channel deleted: {tid}");
+                                        debug!("Discord thread deleted: {tid}");
+                                    }
+                                }
+
+                                "CHANNEL_DELETE" => {
+                                    if let Some(cid) = d["id"].as_str() {
+                                        created_thread_ids.write().await.remove(cid);
+                                        let mut ids = threaded_message_ids.write().await;
+                                        if ids.len() > MAX_DEDUP_MSG_IDS {
+                                            ids.clear();
+                                        }
+                                        debug!("Discord channel deleted: {cid}");
+                                    }
+                                    // Evict from the (guild_id, name) → channel_id
+                                    // cache so ANAI-55 `#name` resolution doesn't keep
+                                    // routing to a dead channel.
+                                    if let (Some(gid), Some(name)) =
+                                        (d["guild_id"].as_str(), d["name"].as_str())
+                                    {
+                                        channel_name_to_channel_id
+                                            .write()
+                                            .await
+                                            .remove(&(gid.to_string(), name.to_string()));
+                                    }
+                                }
+
+                                "GUILD_CREATE" | "GUILD_UPDATE" => {
+                                    // Populate (guild_id, channel_name) → channel_id from
+                                    // the GUILD payload. Requires the GUILDS gateway
+                                    // intent (bit 0); default Discord adapter intents
+                                    // include it post-ANAI-55.
+                                    if let (Some(gid), Some(channels)) =
+                                        (d["id"].as_str(), d["channels"].as_array())
+                                    {
+                                        let mut cache = channel_name_to_channel_id.write().await;
+                                        for ch in channels {
+                                            if let (Some(cname), Some(cid)) =
+                                                (ch["name"].as_str(), ch["id"].as_str())
+                                            {
+                                                cache.insert(
+                                                    (gid.to_string(), cname.to_string()),
+                                                    cid.to_string(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
+                                    // Keep `(guild_id, name) → channel_id` fresh as
+                                    // channels are added or renamed.
+                                    if let (Some(gid), Some(cname), Some(cid)) = (
+                                        d["guild_id"].as_str(),
+                                        d["name"].as_str(),
+                                        d["id"].as_str(),
+                                    ) {
+                                        channel_name_to_channel_id.write().await.insert(
+                                            (gid.to_string(), cname.to_string()),
+                                            cid.to_string(),
+                                        );
                                     }
                                 }
 
@@ -742,6 +1037,39 @@ impl ChannelAdapter for DiscordAdapter {
         let _ = self.shutdown_tx.send(true);
         Ok(())
     }
+
+    /// Discord recipient resolver (ANAI-55).
+    ///
+    /// Resolution order: snowflake → `<#…>` channel mention → `<@…>` user
+    /// mention → `#name` / single-token channel name → `@username` → bare
+    /// name (refused). See `2026-05-28-anai-55-proposal-v2.md` §3.2.
+    async fn resolve_recipient(&self, recipient: &str) -> Result<ChannelUser, ResolutionError> {
+        match self.resolve_recipient_inner(recipient).await {
+            Ok((platform_id, via)) => {
+                info!(
+                    target: RESOLVER_AUDIT_TARGET,
+                    "recipient_resolved adapter=discord input={:?}                      resolved_platform_id={} via={}",
+                    recipient, platform_id, via
+                );
+                Ok(ChannelUser {
+                    platform_id,
+                    display_name: recipient.to_string(),
+                    openfang_user: None,
+                })
+            }
+            Err(e) => {
+                if self.note_resolution_failure().await {
+                    warn!(
+                        "discord resolver: >{} failures in last {}s (most recent: {})",
+                        RESOLVER_FAIL_WARN_THRESHOLD,
+                        RESOLVER_FAIL_WINDOW.as_secs(),
+                        e
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Maximum byte size for an attachment to be classified as a vision-eligible
@@ -813,6 +1141,48 @@ fn classify_discord_attachment(att: &serde_json::Value) -> ChannelContent {
             size,
         }
     }
+}
+
+/// True for ASCII-digit strings 17-20 chars long (Discord snowflake shape).
+fn is_snowflake(s: &str) -> bool {
+    let len = s.len();
+    (17..=20).contains(&len) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Match `<#1234567890>` and return the inner digits.
+fn strip_channel_mention(s: &str) -> Option<String> {
+    let inner = s.strip_prefix("<#")?.strip_suffix('>')?;
+    if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+        Some(inner.to_string())
+    } else {
+        None
+    }
+}
+
+/// Match `<@1234567890>` or `<@!1234567890>` and return the inner digits.
+fn strip_user_mention(s: &str) -> Option<String> {
+    let inner = s.strip_prefix("<@")?.strip_suffix('>')?;
+    let inner = inner.strip_prefix('!').unwrap_or(inner);
+    if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+        Some(inner.to_string())
+    } else {
+        None
+    }
+}
+
+/// Discord channel-name charset: lowercase alphanumeric, `-`, `_`.
+fn is_channel_name_shape(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// Discord username charset (post-discriminator world): lowercase
+/// alphanumeric, `.`, `_`.
+fn is_username_shape(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_')
 }
 
 /// Parse a Discord MESSAGE_CREATE or MESSAGE_UPDATE payload into a `ChannelMessage`.
@@ -1631,5 +2001,144 @@ mod tests {
         let d = payload_with("", vec![]);
         let msg = parse_discord_message(&d, &bot_id, &[], &[], true, &empty_threads()).await;
         assert!(msg.is_none());
+    }
+
+    // --- ANAI-55 resolver tests --------------------------------------------
+
+    fn make_adapter() -> DiscordAdapter {
+        DiscordAdapter::new(
+            "test_token".to_string(),
+            vec![],
+            vec![],
+            true,
+            37377,
+            "false".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolver_passthrough_snowflake() {
+        let a = make_adapter();
+        let u = a.resolve_recipient("1476626559401066688").await.unwrap();
+        assert_eq!(u.platform_id, "1476626559401066688");
+    }
+
+    #[tokio::test]
+    async fn resolver_channel_mention() {
+        let a = make_adapter();
+        let u = a.resolve_recipient("<#1476626559401066688>").await.unwrap();
+        assert_eq!(u.platform_id, "1476626559401066688");
+    }
+
+    #[tokio::test]
+    async fn resolver_user_mention_uncached_attempts_dm_open() {
+        // No DM cache entry → resolver falls through to api_open_dm_channel,
+        // which fails (no network) and we get DmOpenFailed. We only assert
+        // the *error class*, not the status code, since transport failure
+        // surfaces as `0`.
+        let a = make_adapter();
+        let err = a
+            .resolve_recipient("<@1086446153098342510>")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolutionError::DmOpenFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_channel_name_single_guild() {
+        let a = make_adapter();
+        a.channel_name_to_channel_id.write().await.insert(
+            ("guild_A".to_string(), "system-code".to_string()),
+            "1476626559401066688".to_string(),
+        );
+        let u = a.resolve_recipient("#system-code").await.unwrap();
+        assert_eq!(u.platform_id, "1476626559401066688");
+
+        let u2 = a.resolve_recipient("system-code").await.unwrap();
+        assert_eq!(u2.platform_id, "1476626559401066688");
+    }
+
+    #[tokio::test]
+    async fn resolver_channel_name_ambiguous_across_guilds() {
+        let a = make_adapter();
+        {
+            let mut c = a.channel_name_to_channel_id.write().await;
+            c.insert(
+                ("guild_A".to_string(), "general".to_string()),
+                "111".to_string(),
+            );
+            c.insert(
+                ("guild_B".to_string(), "general".to_string()),
+                "222".to_string(),
+            );
+        }
+        let err = a.resolve_recipient("#general").await.unwrap_err();
+        match err {
+            ResolutionError::AmbiguousChannel { name, guilds } => {
+                assert_eq!(name, "general");
+                assert_eq!(guilds.len(), 2);
+            }
+            other => panic!("expected AmbiguousChannel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_explicit_hash_no_hit_is_unknown() {
+        let a = make_adapter();
+        let err = a.resolve_recipient("#nope").await.unwrap_err();
+        assert!(matches!(err, ResolutionError::UnknownRecipient { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolver_bare_name_with_no_channel_is_refused_as_dm() {
+        let a = make_adapter();
+        let err = a.resolve_recipient("benhoverter").await.unwrap_err();
+        match err {
+            ResolutionError::BareNameDmRefused { name } => assert_eq!(name, "benhoverter"),
+            other => panic!("expected BareNameDmRefused, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_at_username_uncached_is_unknown() {
+        let a = make_adapter();
+        let err = a.resolve_recipient("@nobody").await.unwrap_err();
+        assert!(matches!(err, ResolutionError::UnknownRecipient { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolver_at_username_cached_attempts_dm_open() {
+        let a = make_adapter();
+        a.username_to_user_id
+            .write()
+            .await
+            .insert("benhoverter".to_string(), "1086446153098342510".to_string());
+        let err = a.resolve_recipient("@benhoverter").await.unwrap_err();
+        assert!(matches!(err, ResolutionError::DmOpenFailed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolver_dm_channel_cache_hit_skips_api_call() {
+        let a = make_adapter();
+        a.username_to_user_id
+            .write()
+            .await
+            .insert("benhoverter".to_string(), "1086446153098342510".to_string());
+        a.user_id_to_dm_channel_id
+            .write()
+            .await
+            .insert("1086446153098342510".to_string(), "dm_chan_999".to_string());
+        let u = a.resolve_recipient("@benhoverter").await.unwrap();
+        assert_eq!(u.platform_id, "dm_chan_999");
+    }
+
+    #[tokio::test]
+    async fn resolver_empty_input_is_unknown() {
+        let a = make_adapter();
+        let err = a.resolve_recipient("").await.unwrap_err();
+        assert!(matches!(err, ResolutionError::UnknownRecipient { .. }));
     }
 }
