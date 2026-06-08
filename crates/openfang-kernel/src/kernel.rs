@@ -8007,6 +8007,7 @@ mod tests {
     #[test]
     fn test_manifest_to_capabilities() {
         let mut manifest = AgentManifest {
+            file_policy: None,
             name: "test".to_string(),
             version: "0.1.0".to_string(),
             description: "test".to_string(),
@@ -8051,6 +8052,7 @@ mod tests {
     #[test]
     fn test_merge_preserves_workspace_when_disk_omits_it() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "old".to_string(),
@@ -8102,6 +8104,7 @@ mod tests {
     #[test]
     fn test_merge_respects_explicit_disk_workspace() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8159,6 +8162,7 @@ mod tests {
             ..Default::default()
         };
         let mut restored_manifest = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8273,6 +8277,7 @@ mod tests {
 
     fn test_manifest(name: &str, description: &str, tags: Vec<String>) -> AgentManifest {
         AgentManifest {
+            file_policy: None,
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: description.to_string(),

@@ -271,41 +271,55 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
     Ok(ops)
 }
 
-/// Resolve a patch path through workspace confinement.
-fn resolve_patch_path(raw: &str, workspace_root: &Path) -> Result<PathBuf, String> {
-    crate::workspace_sandbox::resolve_sandbox_path(raw, workspace_root)
+/// Resolve a patch path through workspace confinement and `file_policy`.
+/// Patch targets are always writes; prompt-tier is fail-closed here because
+/// apply_patch is multi-path and per-target interactive approval is out of
+/// scope for v1.
+fn resolve_patch_path(
+    raw: &str,
+    workspace_root: &Path,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+) -> Result<PathBuf, String> {
+    crate::workspace_sandbox::resolve_with_policy(raw, workspace_root, file_policy, true, false)
 }
 
 /// Apply parsed patch operations against the filesystem.
 ///
-/// All file paths are confined to `workspace_root` via sandbox resolution.
-pub async fn apply_patch(ops: &[PatchOp], workspace_root: &Path) -> PatchResult {
+/// All file paths are confined to `workspace_root` via sandbox resolution and
+/// governed by `file_policy` when active.
+pub async fn apply_patch(
+    ops: &[PatchOp],
+    workspace_root: &Path,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+) -> PatchResult {
     let mut result = PatchResult::default();
 
     for op in ops {
         match op {
-            PatchOp::AddFile { path, content } => match resolve_patch_path(path, workspace_root) {
-                Ok(resolved) => {
-                    if let Some(parent) = resolved.parent() {
-                        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                            result.errors.push(format!("mkdir {}: {}", path, e));
-                            continue;
+            PatchOp::AddFile { path, content } => {
+                match resolve_patch_path(path, workspace_root, file_policy) {
+                    Ok(resolved) => {
+                        if let Some(parent) = resolved.parent() {
+                            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                                result.errors.push(format!("mkdir {}: {}", path, e));
+                                continue;
+                            }
+                        }
+                        match tokio::fs::write(&resolved, content).await {
+                            Ok(()) => result.files_added += 1,
+                            Err(e) => result.errors.push(format!("write {}: {}", path, e)),
                         }
                     }
-                    match tokio::fs::write(&resolved, content).await {
-                        Ok(()) => result.files_added += 1,
-                        Err(e) => result.errors.push(format!("write {}: {}", path, e)),
-                    }
+                    Err(e) => result.errors.push(format!("{}: {}", path, e)),
                 }
-                Err(e) => result.errors.push(format!("{}: {}", path, e)),
-            },
+            }
 
             PatchOp::UpdateFile {
                 path,
                 move_to,
                 hunks,
             } => {
-                let resolved = match resolve_patch_path(path, workspace_root) {
+                let resolved = match resolve_patch_path(path, workspace_root, file_policy) {
                     Ok(r) => r,
                     Err(e) => {
                         result.errors.push(format!("{}: {}", path, e));
@@ -327,7 +341,7 @@ pub async fn apply_patch(ops: &[PatchOp], workspace_root: &Path) -> PatchResult 
                     Ok(patched) => {
                         // Determine target path (move or in-place)
                         let target = if let Some(new_path) = move_to {
-                            match resolve_patch_path(new_path, workspace_root) {
+                            match resolve_patch_path(new_path, workspace_root, file_policy) {
                                 Ok(t) => {
                                     result.files_moved += 1;
                                     t
@@ -364,15 +378,17 @@ pub async fn apply_patch(ops: &[PatchOp], workspace_root: &Path) -> PatchResult 
                 }
             }
 
-            PatchOp::DeleteFile { path } => match resolve_patch_path(path, workspace_root) {
-                Ok(resolved) => match tokio::fs::remove_file(&resolved).await {
-                    Ok(()) => result.files_deleted += 1,
-                    Err(e) => {
-                        result.errors.push(format!("delete {}: {}", path, e));
-                    }
-                },
-                Err(e) => result.errors.push(format!("{}: {}", path, e)),
-            },
+            PatchOp::DeleteFile { path } => {
+                match resolve_patch_path(path, workspace_root, file_policy) {
+                    Ok(resolved) => match tokio::fs::remove_file(&resolved).await {
+                        Ok(()) => result.files_deleted += 1,
+                        Err(e) => {
+                            result.errors.push(format!("delete {}: {}", path, e));
+                        }
+                    },
+                    Err(e) => result.errors.push(format!("{}: {}", path, e)),
+                }
+            }
         }
     }
 
@@ -736,7 +752,7 @@ mod tests {
             },
         ];
 
-        let result = apply_patch(&ops, &dir).await;
+        let result = apply_patch(&ops, &dir, None).await;
         assert!(result.is_ok());
         assert_eq!(result.files_added, 1);
         assert_eq!(result.files_updated, 1);
@@ -770,7 +786,7 @@ mod tests {
             path: "doomed.txt".to_string(),
         }];
 
-        let result = apply_patch(&ops, &dir).await;
+        let result = apply_patch(&ops, &dir, None).await;
         assert!(result.is_ok());
         assert_eq!(result.files_deleted, 1);
         assert!(!dir.join("doomed.txt").exists());
