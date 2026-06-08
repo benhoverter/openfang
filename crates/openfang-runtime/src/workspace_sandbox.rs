@@ -5,18 +5,17 @@
 //!
 //! Defense in depth: in addition to confining to `workspace_root`, this module
 //! hard-denies access to a curated set of sensitive paths under the OpenFang
-//! home directory (secrets, credentials, runtime tokens, daemon logs). The
-//! deny-list fires regardless of `workspace_root` configuration, so a
-//! misconfigured agent manifest (e.g. `workspace_root = "~/.openfang"`) or a
-//! future tool surface that bypasses workspace confinement cannot exfiltrate
-//! these files.
+//! home directory (secrets, credentials, runtime tokens, daemon logs) and under
+//! `$HOME` (e.g. `~/.mcp-auth/` OAuth tokens). The deny-list fires regardless of
+//! `workspace_root`, so a misconfigured manifest (e.g. `workspace_root =
+//! "~/.openfang"`) or a future tool surface that bypasses workspace confinement
+//! cannot exfiltrate these files.
 //!
-//! A second deny region covers sensitive paths under the user's `$HOME` but
-//! outside `$OPENFANG_HOME` — notably `~/.mcp-auth/`, which holds OAuth
-//! tokens for `mcp-remote` and other MCP clients. Same threat model: a
-//! misconfigured `workspace_root` (e.g. `~`) or a bypass of workspace
-//! confinement must not be able to read those tokens.
+//! This sensitive-path floor ships alongside `file_policy` (path-tier
+//! governance): the floor is absolute and runs before any tier evaluation, so
+//! no `file_policy` rule can ever widen access past a sensitive-path deny.
 
+use openfang_types::config::{FileAccessTier, FilePolicy};
 use std::path::{Path, PathBuf};
 
 /// Resolve the OpenFang home directory.
@@ -24,7 +23,7 @@ use std::path::{Path, PathBuf};
 /// Priority: `OPENFANG_HOME` env var > `~/.openfang`.
 ///
 /// Mirrors `openfang_types::config::openfang_home_dir` (private there). Kept
-/// local to avoid a cross-crate dependency cycle from runtime → types.
+/// local to avoid a cross-crate dependency cycle from runtime -> types.
 fn openfang_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("OPENFANG_HOME") {
         return Some(PathBuf::from(home));
@@ -76,9 +75,9 @@ pub(crate) fn is_sensitive_openfang_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Returns `Some(reason)` if `path` resolves to a sensitive directory under
-/// the user's `$HOME` but outside `$OPENFANG_HOME` that must never be read
-/// or written by an agent, regardless of `workspace_root`.
+/// Returns `Some(reason)` if `path` resolves to a sensitive directory under the
+/// user's `$HOME` but outside `$OPENFANG_HOME` that must never be read or
+/// written by an agent, regardless of `workspace_root`.
 ///
 /// Companion to [`is_sensitive_openfang_path`] for credentials that live
 /// outside `$OPENFANG_HOME`. As of writing the only entry is `~/.mcp-auth/`
@@ -101,16 +100,11 @@ pub(crate) fn is_sensitive_home_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Resolve a user-supplied path within a workspace sandbox.
-///
-/// - Rejects `..` components outright.
-/// - Relative paths are joined with `workspace_root`.
-/// - Absolute paths are checked against the workspace root after canonicalization.
-/// - For new files: canonicalizes the parent directory and appends the filename.
-/// - The final canonical path must start with the canonical workspace root.
-/// - Hard-denies sensitive OpenFang paths (`config.toml`, secrets, vault, run/,
-///   daemon logs, credential files) regardless of workspace root.
-pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<PathBuf, String> {
+/// The sandbox *floor*: `..`-rejection + canonicalization + the sensitive-path
+/// deny-list. Absolute and non-overridable — no `file_policy` tier rule can
+/// widen past it. Returns the canonical candidate WITHOUT applying the
+/// workspace clamp (that is [`enforce_workspace_clamp`]'s job).
+pub(crate) fn sandbox_floor(user_path: &str, workspace_root: &Path) -> Result<PathBuf, String> {
     let path = Path::new(user_path);
 
     // Reject any `..` components
@@ -126,11 +120,6 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
     } else {
         workspace_root.join(path)
     };
-
-    // Canonicalize the workspace root
-    let canon_root = workspace_root
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
 
     // Canonicalize the candidate (or its parent for new files)
     let canon_candidate = if candidate.exists() {
@@ -169,8 +158,7 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
     }
 
     // Defense in depth (continued): hard-deny sensitive `$HOME` paths outside
-    // `$OPENFANG_HOME` — e.g. `~/.mcp-auth/` OAuth tokens. Same rationale as
-    // above; the check is independent of `workspace_root`.
+    // `$OPENFANG_HOME` — e.g. `~/.mcp-auth/` OAuth tokens.
     if let Some(reason) = is_sensitive_home_path(&canon_candidate) {
         tracing::warn!(
             target: "openfang_runtime::sandbox",
@@ -186,7 +174,20 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
         ));
     }
 
-    // Verify the canonical path is inside the workspace
+    Ok(canon_candidate)
+}
+
+/// The legacy workspace clamp: require the canonical candidate to live under
+/// the canonical workspace root. This is what `file_policy` replaces with tier
+/// evaluation when a policy is active.
+fn enforce_workspace_clamp(
+    canon_candidate: PathBuf,
+    workspace_root: &Path,
+) -> Result<PathBuf, String> {
+    let canon_root = workspace_root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+
     if !canon_candidate.starts_with(&canon_root) {
         return Err(format!(
             "Access denied: path '{}' resolves outside workspace. \
@@ -194,11 +195,71 @@ pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<Pa
              mcp_filesystem_* tools (e.g. mcp_filesystem_read_file, \
              mcp_filesystem_list_directory) to access files outside \
              the workspace.",
-            user_path
+            canon_candidate.display()
         ));
     }
-
     Ok(canon_candidate)
+}
+
+/// Resolve a user-supplied path within a workspace sandbox (legacy behavior:
+/// floor + workspace clamp).
+///
+/// - Rejects `..` components outright.
+/// - Relative paths are joined with `workspace_root`.
+/// - Absolute paths are checked against the workspace root after canonicalization.
+/// - For new files: canonicalizes the parent directory and appends the filename.
+/// - The final canonical path must start with the canonical workspace root.
+/// - Hard-denies sensitive OpenFang / `$HOME` paths regardless of workspace root.
+///
+/// Public signature unchanged so existing callers compile untouched; the
+/// policy-aware path is [`resolve_with_policy`].
+pub fn resolve_sandbox_path(user_path: &str, workspace_root: &Path) -> Result<PathBuf, String> {
+    let canon = sandbox_floor(user_path, workspace_root)?;
+    enforce_workspace_clamp(canon, workspace_root)
+}
+
+/// Resolve a user-supplied path under an optional `file_policy`.
+///
+/// - The floor always runs first (`..`-reject, canonicalize, sensitive-path deny).
+/// - `None` or a disabled policy => legacy workspace clamp (back-compat).
+/// - An enabled policy => longest-prefix tier evaluation against the canonical
+///   path. `Deny` rejects; `Read` rejects writes; `Write` allows; `Prompt`
+///   allows only when `prompt_preapproved` (the caller's pre-pass gated it),
+///   otherwise fails closed.
+pub fn resolve_with_policy(
+    user_path: &str,
+    workspace_root: &Path,
+    file_policy: Option<&FilePolicy>,
+    needs_write: bool,
+    prompt_preapproved: bool,
+) -> Result<PathBuf, String> {
+    let canon = sandbox_floor(user_path, workspace_root)?;
+    match file_policy {
+        None => enforce_workspace_clamp(canon, workspace_root),
+        Some(fp) if !fp.enabled => enforce_workspace_clamp(canon, workspace_root),
+        Some(fp) => {
+            let canon_root = workspace_root
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+            match fp.tier_for(&canon, &canon_root) {
+                FileAccessTier::Deny => Err(format!(
+                    "Access denied by file_policy: '{}' (deny tier)",
+                    canon.display()
+                )),
+                FileAccessTier::Read if needs_write => Err(format!(
+                    "Access denied by file_policy: '{}' is read-only",
+                    canon.display()
+                )),
+                FileAccessTier::Read | FileAccessTier::Write => Ok(canon),
+                FileAccessTier::Prompt if prompt_preapproved => Ok(canon),
+                FileAccessTier::Prompt => Err(format!(
+                    "Access denied by file_policy: '{}' requires approval \
+                     (prompt tier) and was not pre-approved",
+                    canon.display()
+                )),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -475,5 +536,93 @@ mod tests {
         // fire first; we only require that one of them denies access.
         let err = result.unwrap_err();
         assert!(err.contains("Access denied"), "got: {}", err);
+    }
+
+    // -------------------------------------------------------------------
+    // file_policy tier-evaluation tests (resolve_with_policy)
+    // -------------------------------------------------------------------
+
+    use openfang_types::config::{FileAccessTier, FilePolicy, FileRule};
+
+    fn policy(default_tier: FileAccessTier, rules: Vec<(&str, FileAccessTier)>) -> FilePolicy {
+        FilePolicy {
+            enabled: true,
+            default_tier,
+            rules: rules
+                .into_iter()
+                .map(|(p, t)| FileRule {
+                    path: p.to_string(),
+                    tier: t,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_policy_none_matches_legacy_clamp() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let with_none = resolve_with_policy("f.txt", dir.path(), None, false, true);
+        let legacy = resolve_sandbox_path("f.txt", dir.path());
+        assert_eq!(with_none.is_ok(), legacy.is_ok());
+        assert_eq!(with_none.unwrap(), legacy.unwrap());
+    }
+
+    #[test]
+    fn test_policy_disabled_matches_legacy_clamp() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let mut fp = policy(FileAccessTier::Deny, vec![]);
+        fp.enabled = false;
+        let r = resolve_with_policy("f.txt", dir.path(), Some(&fp), true, false);
+        assert!(r.is_ok(), "disabled policy must fall back to legacy clamp");
+    }
+
+    #[test]
+    fn test_policy_default_deny_blocks_unmatched() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let fp = policy(FileAccessTier::Deny, vec![]);
+        let r = resolve_with_policy("f.txt", dir.path(), Some(&fp), false, false);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("deny tier"));
+    }
+
+    #[test]
+    fn test_policy_read_tier_blocks_write_allows_read() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let fp = policy(FileAccessTier::Read, vec![]);
+        assert!(resolve_with_policy("f.txt", dir.path(), Some(&fp), false, false).is_ok());
+        let w = resolve_with_policy("f.txt", dir.path(), Some(&fp), true, false);
+        assert!(w.is_err());
+        assert!(w.unwrap_err().contains("read-only"));
+    }
+
+    #[test]
+    fn test_policy_longest_prefix_wins() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("f.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "x").unwrap();
+        // whole workspace = read, but sub/ = deny (longer prefix wins).
+        let fp = policy(
+            FileAccessTier::Deny,
+            vec![(".", FileAccessTier::Read), ("sub", FileAccessTier::Deny)],
+        );
+        assert!(resolve_with_policy("top.txt", dir.path(), Some(&fp), false, false).is_ok());
+        assert!(resolve_with_policy("sub/f.txt", dir.path(), Some(&fp), false, false).is_err());
+    }
+
+    #[test]
+    fn test_policy_prompt_fail_closed_without_preapproval() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let fp = policy(FileAccessTier::Prompt, vec![]);
+        // Not pre-approved => denied.
+        assert!(resolve_with_policy("f.txt", dir.path(), Some(&fp), true, false).is_err());
+        // Pre-approved (execute_tool's pre-pass gated it) => allowed.
+        assert!(resolve_with_policy("f.txt", dir.path(), Some(&fp), true, true).is_ok());
     }
 }
