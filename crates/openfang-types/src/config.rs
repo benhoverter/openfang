@@ -934,6 +934,92 @@ impl Default for CanvasConfig {
     }
 }
 
+/// Per-tier filesystem access level for a path rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileAccessTier {
+    /// No access: file_read / file_list / file_write / apply_patch /
+    /// create_directory are all rejected for matching paths.
+    Deny,
+    /// Read-only: file_read and file_list allowed; mutating verbs rejected.
+    Read,
+    /// Full read + write.
+    Write,
+    /// Gated: route through the human-approval surface before allowing.
+    /// Fail-closed (== Deny) when the approval surface is unavailable.
+    #[default]
+    Prompt,
+}
+
+/// One filesystem path rule: a path prefix and the access tier granted to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileRule {
+    /// Path prefix. Relative entries resolve against the agent's workspace
+    /// root at match time; absolute entries match canonical absolute paths.
+    pub path: String,
+    /// Access tier for paths under `path`.
+    pub tier: FileAccessTier,
+}
+
+/// Filesystem access policy. Mirrors `ExecPolicy`'s config ergonomics.
+///
+/// When `enabled` is false (the default) the policy is inert and the legacy
+/// workspace clamp applies — existing agents are unaffected. When enabled, the
+/// clamp is replaced by longest-prefix tier evaluation against the resolved
+/// canonical path; an absolute, non-overridable sensitive-path floor still
+/// runs first and always wins.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct FilePolicy {
+    /// Opt-in switch. False => inert (legacy workspace clamp), byte-for-byte.
+    pub enabled: bool,
+    /// Tier for any path not matched by a rule. Defaults to `Deny`
+    /// (fail-closed) so an enabled policy never silently widens.
+    pub default_tier: FileAccessTier,
+    /// Path rules. Longest matching `path` prefix wins (not file order).
+    pub rules: Vec<FileRule>,
+}
+
+impl Default for FilePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_tier: FileAccessTier::Deny,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl FilePolicy {
+    /// Longest-prefix tier match for `canon_path` (already canonicalized).
+    /// Relative rule paths resolve against `canon_workspace_root`; absolute
+    /// rule paths match as-is. Returns `default_tier` when no rule matches.
+    pub fn tier_for(
+        &self,
+        canon_path: &std::path::Path,
+        canon_workspace_root: &std::path::Path,
+    ) -> FileAccessTier {
+        let mut best: Option<(usize, FileAccessTier)> = None;
+        for rule in &self.rules {
+            let rule_path = std::path::Path::new(&rule.path);
+            let resolved = if rule_path.is_absolute() {
+                rule_path.to_path_buf()
+            } else if rule.path.is_empty() || rule.path == "." {
+                canon_workspace_root.to_path_buf()
+            } else {
+                canon_workspace_root.join(rule_path)
+            };
+            if canon_path.starts_with(&resolved) {
+                let len = resolved.as_os_str().len();
+                if best.is_none_or(|(blen, _)| len > blen) {
+                    best = Some((len, rule.tier));
+                }
+            }
+        }
+        best.map_or(self.default_tier, |(_, t)| t)
+    }
+}
+
 /// Shell/exec security mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1229,6 +1315,9 @@ pub struct KernelConfig {
     /// Shell/exec security policy.
     #[serde(default)]
     pub exec_policy: ExecPolicy,
+    /// Filesystem access policy (path-tier governance).
+    #[serde(default)]
+    pub file_policy: FilePolicy,
     /// Agent bindings for multi-account routing.
     #[serde(default)]
     pub bindings: Vec<AgentBinding>,
@@ -1523,6 +1612,7 @@ impl Default for KernelConfig {
             max_cron_jobs: default_max_cron_jobs(),
             include: Vec::new(),
             exec_policy: ExecPolicy::default(),
+            file_policy: FilePolicy::default(),
             bindings: Vec::new(),
             broadcast: BroadcastConfig::default(),
             auto_reply: AutoReplyConfig::default(),
@@ -1635,6 +1725,7 @@ impl std::fmt::Debug for KernelConfig {
             .field("max_cron_jobs", &self.max_cron_jobs)
             .field("include", &format!("{} file(s)", self.include.len()))
             .field("exec_policy", &self.exec_policy.mode)
+            .field("file_policy", &self.file_policy.enabled)
             .field("bindings", &format!("{} binding(s)", self.bindings.len()))
             .field(
                 "broadcast",
