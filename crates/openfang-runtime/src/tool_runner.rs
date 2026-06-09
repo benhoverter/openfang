@@ -231,8 +231,9 @@ pub async fn execute_tool(
     // helper treats an already-approved prompt as write); deny / timeout /
     // no-kernel => fail closed. apply_patch is multi-path and is governed
     // per-target in its helper (prompt-tier fails closed there for v1).
+    let mut prevalidated_path: Option<PathBuf> = None;
     if let Some(fp) = file_policy {
-        if fp.enabled {
+        if fp.is_active() {
             if let Some((_needs_write, raw_path)) = fs_tool_single_path(tool_name, input) {
                 if let Some(root) = workspace_root {
                     if let (Ok(canon), Ok(canon_root)) = (
@@ -273,6 +274,11 @@ pub async fn execute_tool(
                                 };
                             }
                         }
+                        // F5: remember the canonical path validated (and prompt-
+                        // approved) here so the tool can assert its own I/O
+                        // target matches — a swap during the approval window
+                        // makes them differ and fails closed.
+                        prevalidated_path = Some(canon);
                     }
                 }
             }
@@ -282,10 +288,42 @@ pub async fn execute_tool(
     debug!(tool_name, "Executing tool");
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, workspace_root, file_policy).await,
-        "file_write" => tool_file_write(input, workspace_root, file_policy).await,
-        "file_list" => tool_file_list(input, workspace_root, file_policy).await,
-        "create_directory" => tool_create_directory(input, workspace_root, file_policy).await,
+        "file_read" => {
+            tool_file_read(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "file_write" => {
+            tool_file_write(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "file_list" => {
+            tool_file_list(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "create_directory" => {
+            tool_create_directory(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
         "apply_patch" => tool_apply_patch(input, workspace_root, file_policy).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
@@ -1492,9 +1530,11 @@ async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))
@@ -1504,9 +1544,11 @@ async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, true)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1590,12 +1632,14 @@ async fn tool_create_directory(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     if raw_path.is_empty() {
         return Err("'path' parameter is empty".to_string());
     }
     let resolved = resolve_directory_path_for_create(raw_path, workspace_root)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     // Sensitive-path floor parity: resolve_directory_path_for_create has its own
     // clamp and does not run sandbox_floor, so apply the sensitive-path deny here.
     if let Some(reason) = crate::workspace_sandbox::is_sensitive_openfang_path(&resolved)
@@ -1648,9 +1692,11 @@ async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     let mut entries = tokio::fs::read_dir(&resolved)
         .await
         .map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -4180,8 +4226,13 @@ mod tests {
     async fn test_create_directory_creates_nested() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
-        let result =
-            tool_create_directory(&serde_json::json!({"path": "a/b/c"}), Some(root), None).await;
+        let result = tool_create_directory(
+            &serde_json::json!({"path": "a/b/c"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         let expected = root.join("a").join("b").join("c");
         assert!(
@@ -4196,12 +4247,22 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         // First create
-        let r1 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root), None)
-            .await;
+        let r1 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(r1.is_ok());
         // Second create on existing dir should also succeed
-        let r2 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root), None)
-            .await;
+        let r2 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(r2.is_ok(), "Expected idempotent success, got: {:?}", r2);
     }
 
@@ -4222,6 +4283,7 @@ mod tests {
             &serde_json::json!({"path": "secret/sub"}),
             Some(root),
             Some(&policy),
+            None,
         )
         .await;
         assert!(r.is_err(), "deny-tier directory must be refused: {:?}", r);
@@ -4236,6 +4298,7 @@ mod tests {
             &serde_json::json!({"path": "anywhere"}),
             None,
             Some(&policy),
+            None,
         )
         .await;
         assert!(
@@ -4248,7 +4311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_directory_missing_path_param() {
-        let result = tool_create_directory(&serde_json::json!({}), None, None).await;
+        let result = tool_create_directory(&serde_json::json!({}), None, None, None).await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains("Missing 'path'"), "got: {msg}");

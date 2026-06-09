@@ -299,6 +299,30 @@ pub fn resolve_with_policy(
     }
 }
 
+/// F5 TOCTOU guard. Confirm the path resolved for the actual filesystem
+/// operation matches the canonical path validated (and possibly approval-gated)
+/// earlier in the same tool call. A mismatch means the target changed between
+/// validation and use — e.g. a symlink swapped during a human approval window —
+/// so fail closed.
+///
+/// This closes the approval-window TOCTOU. A narrow residual remains between
+/// this final resolution and the kernel `open()` (the canonicalize->open
+/// window); eliminating it needs `openat`/`O_NOFOLLOW` semantics that std does
+/// not expose portably, tracked as a fast-follow.
+pub(crate) fn assert_prevalidated(
+    resolved: &Path,
+    prevalidated: Option<&Path>,
+) -> Result<(), String> {
+    match prevalidated {
+        Some(expected) if expected != resolved => Err(format!(
+            "Access denied: target changed during the validation/approval window (validated '{}', now resolves to '{}') — possible TOCTOU; failing closed.",
+            expected.display(),
+            resolved.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +762,17 @@ mod tests {
         );
         // A non-credential dotfile is not hard-denied (prompt backstops it).
         assert_eq!(is_sensitive_home_path(&home.join(".gitconfig")), None);
+    }
+
+    #[test]
+    fn test_assert_prevalidated_toctou_guard() {
+        // No pre-validated path => always ok (legacy / non-policy path).
+        assert!(assert_prevalidated(Path::new("/a/b"), None).is_ok());
+        // Matching => ok.
+        assert!(assert_prevalidated(Path::new("/a/b"), Some(Path::new("/a/b"))).is_ok());
+        // Diverged after validation => fail closed.
+        let e = assert_prevalidated(Path::new("/evil"), Some(Path::new("/a/b")));
+        assert!(e.is_err());
+        assert!(e.unwrap_err().contains("TOCTOU"));
     }
 }
