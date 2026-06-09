@@ -75,27 +75,64 @@ pub(crate) fn is_sensitive_openfang_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Returns `Some(reason)` if `path` resolves to a sensitive directory under the
-/// user's `$HOME` but outside `$OPENFANG_HOME` that must never be read or
-/// written by an agent, regardless of `workspace_root`.
+/// Returns `Some(reason)` if `path` resolves to a sensitive credential
+/// directory/file under the user's `$HOME` but outside `$OPENFANG_HOME` that
+/// must never be read or written by an agent, regardless of `workspace_root`.
 ///
-/// Companion to [`is_sensitive_openfang_path`] for credentials that live
-/// outside `$OPENFANG_HOME`. As of writing the only entry is `~/.mcp-auth/`
-/// (OAuth tokens used by `mcp-remote` and similar MCP clients). Add new
-/// first-component patterns conservatively: this fires for *any* agent on
-/// *any* workspace, including misconfigured ones, so over-denial here costs
-/// more than under-denial elsewhere.
+/// This is the curated **hard-deny floor** (Layer 1): an absolute, curated set
+/// of credential-bearing paths. It fires for *any* agent on *any* workspace,
+/// including misconfigured ones, and no `file_policy` allow rule can widen past
+/// it. Other `$HOME` dotfiles are NOT hard-denied here — they fall to the
+/// `file_policy` prompt tier (Layer 2), so a coarse allow rule cannot silently
+/// reach them.
+///
+/// Matching is component-sequence aware: single-component entries (e.g.
+/// `.ssh`) deny the whole subtree; two-deep entries (e.g. `.config/gcloud`)
+/// deny only that named child so sibling `.config/*` reads still fall to
+/// prompt rather than being hard-denied.
+///
+/// The set is hardcoded for v1 (not config-extensible — YAGNI). Add new
+/// entries conservatively: over-denial here costs more than under-denial
+/// elsewhere.
 ///
 /// `path` should be canonicalized before this check.
 pub(crate) fn is_sensitive_home_path(path: &Path) -> Option<&'static str> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let canon_home = home.canonicalize().ok()?;
     let rel = path.strip_prefix(&canon_home).ok()?;
-    let first = rel.components().next()?.as_os_str().to_str()?;
+    let mut comps = rel.components();
+    let first = comps.next()?.as_os_str().to_str()?;
 
     match first {
         // OAuth tokens for mcp-remote and similar MCP clients.
         ".mcp-auth" => Some("oauth-tokens"),
+        // SSH private keys, known_hosts, client config.
+        ".ssh" => Some("ssh"),
+        // Cloud / cluster credentials.
+        ".aws" => Some("aws-credentials"),
+        ".gnupg" => Some("gpg-keyring"),
+        ".kube" => Some("kube-config"),
+        // Single-file credential stores.
+        ".netrc" => Some("netrc"),
+        ".git-credentials" => Some("git-credentials"),
+        ".npmrc" => Some("npmrc"),
+        ".pypirc" => Some("pypirc"),
+        ".pgpass" => Some("pgpass"),
+        // Two-deep credential dirs/files: match on the second component so
+        // sibling entries (e.g. `.config/nvim`) fall through to prompt.
+        ".config" => match comps.next()?.as_os_str().to_str()? {
+            "gcloud" => Some("gcloud-credentials"),
+            "gh" => Some("gh-token"),
+            _ => None,
+        },
+        ".docker" => match comps.next()?.as_os_str().to_str()? {
+            "config.json" => Some("docker-config"),
+            _ => None,
+        },
+        ".cargo" => match comps.next()?.as_os_str().to_str()? {
+            "credentials" | "credentials.toml" => Some("cargo-credentials"),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -624,5 +661,76 @@ mod tests {
         assert!(resolve_with_policy("f.txt", dir.path(), Some(&fp), true, false).is_err());
         // Pre-approved (execute_tool's pre-pass gated it) => allowed.
         assert!(resolve_with_policy("f.txt", dir.path(), Some(&fp), true, true).is_ok());
+    }
+
+    #[test]
+    fn test_sensitive_home_credential_floor() {
+        // Curated Layer-1 hard-deny set: credential-bearing $HOME paths that
+        // must deny regardless of workspace_root, joining .mcp-auth.
+        let Some(home) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|h| h.canonicalize().ok())
+        else {
+            return; // $HOME unset/unreadable; skip.
+        };
+
+        // Single-component dirs hard-deny their whole subtree.
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".ssh").join("id_ed25519")),
+            Some("ssh")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".aws").join("credentials")),
+            Some("aws-credentials")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".gnupg").join("secring.gpg")),
+            Some("gpg-keyring")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".kube").join("config")),
+            Some("kube-config")
+        );
+        // Single-file credential stores.
+        assert_eq!(is_sensitive_home_path(&home.join(".netrc")), Some("netrc"));
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".git-credentials")),
+            Some("git-credentials")
+        );
+        assert_eq!(is_sensitive_home_path(&home.join(".npmrc")), Some("npmrc"));
+        assert_eq!(is_sensitive_home_path(&home.join(".pypirc")), Some("pypirc"));
+        assert_eq!(is_sensitive_home_path(&home.join(".pgpass")), Some("pgpass"));
+
+        // Two-deep entries hard-deny only the named child...
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".config").join("gcloud").join("creds.db")),
+            Some("gcloud-credentials")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".config").join("gh").join("hosts.yml")),
+            Some("gh-token")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".docker").join("config.json")),
+            Some("docker-config")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".cargo").join("credentials.toml")),
+            Some("cargo-credentials")
+        );
+
+        // ...while sibling .config/* and .docker/* fall through to None
+        // (Layer-2 prompt territory, NOT hard-denied).
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".config").join("nvim").join("init.lua")),
+            None
+        );
+        assert_eq!(is_sensitive_home_path(&home.join(".config")), None);
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".docker").join("contexts")),
+            None
+        );
+        // A non-credential dotfile is not hard-denied (prompt backstops it).
+        assert_eq!(is_sensitive_home_path(&home.join(".gitconfig")), None);
     }
 }
