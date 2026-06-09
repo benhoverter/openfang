@@ -283,16 +283,51 @@ fn resolve_patch_path(
     crate::workspace_sandbox::resolve_with_policy(raw, workspace_root, file_policy, true, false)
 }
 
+/// Raw target path(s) an op will touch — for the pre-application policy pass.
+fn op_targets(op: &PatchOp) -> Vec<&str> {
+    match op {
+        PatchOp::AddFile { path, .. } | PatchOp::DeleteFile { path } => vec![path.as_str()],
+        PatchOp::UpdateFile { path, move_to, .. } => {
+            let mut v = vec![path.as_str()];
+            if let Some(m) = move_to {
+                v.push(m.as_str());
+            }
+            v
+        }
+    }
+}
+
 /// Apply parsed patch operations against the filesystem.
 ///
 /// All file paths are confined to `workspace_root` via sandbox resolution and
 /// governed by `file_policy` when active.
+///
+/// F3: a policy pre-pass validates *every* target against workspace
+/// confinement and `file_policy` before any write, so a denied target later in
+/// the patch cannot leave earlier targets partially written. This is a policy
+/// pre-check, not filesystem-transactional rollback — a mid-apply I/O failure
+/// can still leave partial writes (std offers no clean rollback) — but no write
+/// occurs past a policy-*denied* target.
 pub async fn apply_patch(
     ops: &[PatchOp],
     workspace_root: &Path,
     file_policy: Option<&openfang_types::config::FilePolicy>,
 ) -> PatchResult {
     let mut result = PatchResult::default();
+
+    // F3: policy pre-pass — reject the whole patch if any target is denied.
+    let mut precheck_errors = Vec::new();
+    for op in ops {
+        for raw in op_targets(op) {
+            if let Err(e) = resolve_patch_path(raw, workspace_root, file_policy) {
+                precheck_errors.push(format!("{}: {}", raw, e));
+            }
+        }
+    }
+    if !precheck_errors.is_empty() {
+        result.errors = precheck_errors;
+        return result;
+    }
 
     for op in ops {
         match op {
@@ -790,6 +825,52 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.files_deleted, 1);
         assert!(!dir.join("doomed.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_f3_denied_target_blocks_all_writes() {
+        use openfang_types::config::{FileAccessTier, FilePolicy, FileRule};
+        let dir = std::env::temp_dir().join("openfang_patch_f3_test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(dir.join("secret")).await.unwrap();
+
+        // Workspace writable, but a `secret/` subtree is denied.
+        let policy = FilePolicy::new(
+            true,
+            FileAccessTier::Write,
+            vec![FileRule {
+                path: "secret".to_string(),
+                tier: FileAccessTier::Deny,
+            }],
+        );
+
+        // First op is allowed; second targets the denied subtree.
+        let ops = vec![
+            PatchOp::AddFile {
+                path: "allowed.txt".to_string(),
+                content: "hi".to_string(),
+            },
+            PatchOp::AddFile {
+                path: "secret/leak.txt".to_string(),
+                content: "x".to_string(),
+            },
+        ];
+
+        let result = apply_patch(&ops, &dir, Some(&policy)).await;
+        assert!(
+            !result.is_ok(),
+            "patch must be rejected when any target is policy-denied"
+        );
+        assert_eq!(
+            result.files_added, 0,
+            "no writes past a policy-denied target (pre-pass)"
+        );
+        assert!(
+            !dir.join("allowed.txt").exists(),
+            "the allowed target must not be written when the patch is rejected"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
