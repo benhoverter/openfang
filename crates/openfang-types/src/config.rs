@@ -951,6 +951,29 @@ pub enum FileAccessTier {
     Prompt,
 }
 
+impl FileAccessTier {
+    /// Restrictiveness rank — higher means less access. Used to pick the more
+    /// restrictive of two tiers when imposing a hard floor (F2).
+    const fn restrictiveness(self) -> u8 {
+        match self {
+            Self::Write => 0,
+            Self::Read => 1,
+            Self::Prompt => 2,
+            Self::Deny => 3,
+        }
+    }
+
+    /// Return the more restrictive (lower-access) of `self` and `other`.
+    #[must_use]
+    pub fn floor(self, other: Self) -> Self {
+        if other.restrictiveness() > self.restrictiveness() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
 /// One filesystem path rule: a path prefix and the access tier granted to it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileRule {
@@ -978,6 +1001,12 @@ pub struct FilePolicy {
     pub default_tier: FileAccessTier,
     /// Path rules. Longest matching `path` prefix wins (not file order).
     pub rules: Vec<FileRule>,
+    /// Runtime-resolved global floor (F2). When set, this policy may only
+    /// *narrow* access relative to the floor — never widen past it. Populated
+    /// by the kernel at spawn/restart from the global `[file_policy]`; never
+    /// serialized, and re-derived from current config on every boot.
+    #[serde(skip)]
+    floor: Option<Box<FilePolicy>>,
 }
 
 impl Default for FilePolicy {
@@ -986,15 +1015,82 @@ impl Default for FilePolicy {
             enabled: false,
             default_tier: FileAccessTier::Deny,
             rules: Vec::new(),
+            floor: None,
         }
     }
 }
 
 impl FilePolicy {
-    /// Longest-prefix tier match for `canon_path` (already canonicalized).
+    /// Construct a policy from its public configuration. No floor is attached;
+    /// the kernel attaches one at spawn/restart via [`Self::resolve_under_floor`].
+    #[must_use]
+    pub fn new(enabled: bool, default_tier: FileAccessTier, rules: Vec<FileRule>) -> Self {
+        Self {
+            enabled,
+            default_tier,
+            rules,
+            floor: None,
+        }
+    }
+
+    /// Longest-prefix tier match for `canon_path`, capped by any hard floor.
+    ///
+    /// Evaluates this policy's own rules and, when a global floor is attached
+    /// (F2), returns the *more restrictive* of the two — a per-agent policy can
+    /// only narrow access, never widen past the floor. A disabled policy
+    /// imposes no cap of its own and defers entirely to its floor.
+    pub fn tier_for(
+        &self,
+        canon_path: &std::path::Path,
+        canon_workspace_root: &std::path::Path,
+    ) -> FileAccessTier {
+        let own = if self.enabled {
+            self.own_tier_for(canon_path, canon_workspace_root)
+        } else {
+            FileAccessTier::Write
+        };
+        match &self.floor {
+            Some(floor) => own.floor(floor.tier_for(canon_path, canon_workspace_root)),
+            None => own,
+        }
+    }
+
+    /// True when this policy (or its floor) must be enforced rather than
+    /// falling back to the legacy workspace clamp.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.enabled || self.floor.as_ref().is_some_and(|f| f.enabled)
+    }
+
+    /// Attach `floor` as a hard floor beneath this override. A disabled floor
+    /// imposes no constraint and is dropped.
+    #[must_use]
+    pub fn with_floor(mut self, floor: FilePolicy) -> Self {
+        if floor.enabled {
+            self.floor = Some(Box::new(floor));
+        }
+        self
+    }
+
+    /// Resolve the effective in-memory policy for an agent: the global
+    /// `[file_policy]` is a hard floor beneath the agent's optional manifest
+    /// override. With no override the global applies wholesale; with one, the
+    /// override may only narrow it (F2).
+    #[must_use]
+    pub fn resolve_under_floor(
+        global: &FilePolicy,
+        manifest_override: Option<FilePolicy>,
+    ) -> FilePolicy {
+        match manifest_override {
+            None => global.clone(),
+            Some(ov) => ov.with_floor(global.clone()),
+        }
+    }
+
+    /// Raw longest-prefix match against this policy's own rules (no floor).
     /// Relative rule paths resolve against `canon_workspace_root`; absolute
     /// rule paths match as-is. Returns `default_tier` when no rule matches.
-    pub fn tier_for(
+    fn own_tier_for(
         &self,
         canon_path: &std::path::Path,
         canon_workspace_root: &std::path::Path,
@@ -4788,5 +4884,142 @@ shell_env_passthrough = ["*"]
 "#;
         let policy: ExecPolicy = toml::from_str(toml_str).unwrap();
         assert_eq!(policy.shell_env_passthrough, vec!["*"]);
+    }
+
+    // ── F2: file_policy hard-floor inheritance ────────────────────────
+
+    fn frule(path: &str, tier: FileAccessTier) -> FileRule {
+        FileRule {
+            path: path.to_string(),
+            tier,
+        }
+    }
+
+    #[test]
+    fn file_access_tier_floor_picks_more_restrictive() {
+        use FileAccessTier::{Deny, Prompt, Read, Write};
+        assert_eq!(Write.floor(Read), Read);
+        assert_eq!(Read.floor(Write), Read);
+        assert_eq!(Read.floor(Prompt), Prompt);
+        assert_eq!(Prompt.floor(Deny), Deny);
+        assert_eq!(Write.floor(Deny), Deny);
+        assert_eq!(Read.floor(Read), Read);
+    }
+
+    #[test]
+    fn file_policy_no_override_inherits_global_wholesale() {
+        let global = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Deny,
+            rules: vec![frule("/data", FileAccessTier::Read)],
+            floor: None,
+        };
+        let eff = FilePolicy::resolve_under_floor(&global, None);
+        assert_eq!(eff, global);
+    }
+
+    #[test]
+    fn file_policy_override_cannot_widen_past_global() {
+        let root = std::path::Path::new("/ws");
+        let global = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Deny,
+            rules: vec![frule("/data", FileAccessTier::Read)],
+            floor: None,
+        };
+        // Agent tries to widen /data to Write and open /secret (global-denied).
+        let ov = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Write,
+            rules: vec![
+                frule("/data", FileAccessTier::Write),
+                frule("/secret", FileAccessTier::Write),
+            ],
+            floor: None,
+        };
+        let eff = FilePolicy::resolve_under_floor(&global, Some(ov));
+        // /data: global Read caps the agent's Write.
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/data/x"), root),
+            FileAccessTier::Read
+        );
+        // /secret: global default Deny caps the agent's Write.
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/secret/x"), root),
+            FileAccessTier::Deny
+        );
+    }
+
+    #[test]
+    fn file_policy_override_may_narrow() {
+        let root = std::path::Path::new("/ws");
+        let global = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Write,
+            rules: vec![],
+            floor: None,
+        };
+        let ov = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Read,
+            rules: vec![frule("/secret", FileAccessTier::Deny)],
+            floor: None,
+        };
+        let eff = FilePolicy::resolve_under_floor(&global, Some(ov));
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/x"), root),
+            FileAccessTier::Read
+        );
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/secret/y"), root),
+            FileAccessTier::Deny
+        );
+    }
+
+    #[test]
+    fn file_policy_disabled_override_cannot_escape_enabled_floor() {
+        let root = std::path::Path::new("/ws");
+        let global = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Read,
+            rules: vec![],
+            floor: None,
+        };
+        // A disabled override must NOT drop back to the legacy clamp when an
+        // enabled global floor exists.
+        let ov = FilePolicy {
+            enabled: false,
+            default_tier: FileAccessTier::Write,
+            rules: vec![],
+            floor: None,
+        };
+        let eff = FilePolicy::resolve_under_floor(&global, Some(ov));
+        assert!(
+            eff.is_active(),
+            "enabled global floor must force enforcement"
+        );
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/anything"), root),
+            FileAccessTier::Read
+        );
+    }
+
+    #[test]
+    fn file_policy_disabled_global_imposes_no_floor() {
+        let root = std::path::Path::new("/ws");
+        let global = FilePolicy::default(); // enabled = false
+        let ov = FilePolicy {
+            enabled: true,
+            default_tier: FileAccessTier::Write,
+            rules: vec![],
+            floor: None,
+        };
+        let eff = FilePolicy::resolve_under_floor(&global, Some(ov.clone()));
+        // Disabled floor is dropped; the override stands unmodified.
+        assert_eq!(eff, ov);
+        assert_eq!(
+            eff.tier_for(std::path::Path::new("/x"), root),
+            FileAccessTier::Write
+        );
     }
 }

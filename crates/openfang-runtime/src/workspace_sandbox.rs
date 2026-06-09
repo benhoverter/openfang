@@ -273,7 +273,7 @@ pub fn resolve_with_policy(
     let canon = sandbox_floor(user_path, workspace_root)?;
     match file_policy {
         None => enforce_workspace_clamp(canon, workspace_root),
-        Some(fp) if !fp.enabled => enforce_workspace_clamp(canon, workspace_root),
+        Some(fp) if !fp.is_active() => enforce_workspace_clamp(canon, workspace_root),
         Some(fp) => {
             let canon_root = workspace_root
                 .canonicalize()
@@ -582,17 +582,17 @@ mod tests {
     use openfang_types::config::{FileAccessTier, FilePolicy, FileRule};
 
     fn policy(default_tier: FileAccessTier, rules: Vec<(&str, FileAccessTier)>) -> FilePolicy {
-        FilePolicy {
-            enabled: true,
+        FilePolicy::new(
+            true,
             default_tier,
-            rules: rules
+            rules
                 .into_iter()
                 .map(|(p, t)| FileRule {
                     path: p.to_string(),
                     tier: t,
                 })
                 .collect(),
-        }
+        )
     }
 
     #[test]
@@ -698,8 +698,14 @@ mod tests {
             Some("git-credentials")
         );
         assert_eq!(is_sensitive_home_path(&home.join(".npmrc")), Some("npmrc"));
-        assert_eq!(is_sensitive_home_path(&home.join(".pypirc")), Some("pypirc"));
-        assert_eq!(is_sensitive_home_path(&home.join(".pgpass")), Some("pgpass"));
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".pypirc")),
+            Some("pypirc")
+        );
+        assert_eq!(
+            is_sensitive_home_path(&home.join(".pgpass")),
+            Some("pgpass")
+        );
 
         // Two-deep entries hard-deny only the named child...
         assert_eq!(
