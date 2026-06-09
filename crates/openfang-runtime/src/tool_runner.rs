@@ -1609,8 +1609,14 @@ async fn tool_create_directory(
     }
     // file_policy governs directory creation as a write verb (prompt-tier is
     // pre-approved by execute_tool's pre-pass for this single-path tool).
-    if let (Some(fp), Some(root)) = (file_policy, workspace_root) {
-        if fp.enabled {
+    // F4: enforce via is_active() (so a disabled per-agent override cannot
+    // escape an enabled global floor) and fail closed when an active policy has
+    // no workspace root to evaluate against — previously this path fell open.
+    if let Some(fp) = file_policy {
+        if fp.is_active() {
+            let Some(root) = workspace_root else {
+                return Err("Access denied: create_directory requires a workspace root when a file_policy is active".to_string());
+            };
             let canon_root = root
                 .canonicalize()
                 .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
@@ -4197,6 +4203,47 @@ mod tests {
         let r2 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root), None)
             .await;
         assert!(r2.is_ok(), "Expected idempotent success, got: {:?}", r2);
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_f4_denied_tier_blocks() {
+        use openfang_types::config::{FileAccessTier, FilePolicy, FileRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let policy = FilePolicy::new(
+            true,
+            FileAccessTier::Write,
+            vec![FileRule {
+                path: "secret".to_string(),
+                tier: FileAccessTier::Deny,
+            }],
+        );
+        let r = tool_create_directory(
+            &serde_json::json!({"path": "secret/sub"}),
+            Some(root),
+            Some(&policy),
+        )
+        .await;
+        assert!(r.is_err(), "deny-tier directory must be refused: {:?}", r);
+        assert!(!root.join("secret").join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_f4_active_policy_no_root_fails_closed() {
+        use openfang_types::config::{FileAccessTier, FilePolicy};
+        let policy = FilePolicy::new(true, FileAccessTier::Write, vec![]);
+        let r = tool_create_directory(
+            &serde_json::json!({"path": "anywhere"}),
+            None,
+            Some(&policy),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "active policy with no workspace root must fail closed: {:?}",
+            r
+        );
+        assert!(r.unwrap_err().contains("workspace root"));
     }
 
     #[tokio::test]
