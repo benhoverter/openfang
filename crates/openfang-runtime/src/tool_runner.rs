@@ -5167,10 +5167,7 @@ mod tests {
     fn synth_attach_single_relative_path() {
         let v = serde_json::json!(["report.pdf"]);
         let out = super::synthesize_attach_directives("see attached", Some(&v)).unwrap();
-        assert_eq!(
-            out,
-            "<openfang:attach path=\"report.pdf\"/>\nsee attached"
-        );
+        assert_eq!(out, "<openfang:attach path=\"report.pdf\"/>\nsee attached");
     }
 
     #[test]
@@ -5264,5 +5261,4 @@ mod tests {
         // Defence in depth lives in outbound_attach::resolve_directive,
         // which canonicalises and applies allow_roots — see its tests.
     }
-
 }

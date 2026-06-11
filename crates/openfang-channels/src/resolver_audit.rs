@@ -81,7 +81,7 @@ fn open_audit_file(path: &std::path::Path) -> Option<Mutex<File>> {
         // symlink at the audit path would otherwise redirect daemon writes.
         opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = match opts.open(&path) {
+    let file = match opts.open(path) {
         Ok(f) => f,
         Err(e) => {
             tracing::error!(
@@ -99,7 +99,7 @@ fn open_audit_file(path: &std::path::Path) -> Option<Mutex<File>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             tracing::error!(
                 "resolver_audit: failed to set mode 0o600 on {}: {}",
                 path.display(),
