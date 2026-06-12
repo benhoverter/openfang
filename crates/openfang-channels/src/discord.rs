@@ -34,6 +34,7 @@ const MAX_DEDUP_MSG_IDS: usize = 2_000;
 /// Kept separate from the message-payload log target so a log scrape cannot
 /// trivially correlate "agent X resolved recipient Y" with the message body
 /// (security review observability ask).
+#[cfg(debug_assertions)]
 const RESOLVER_AUDIT_TARGET: &str = "openfang_channels::discord::resolver_audit";
 
 /// Window for the resolution-failure burst counter.
