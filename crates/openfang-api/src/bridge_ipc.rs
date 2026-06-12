@@ -601,7 +601,7 @@ async fn dispatch_call(
         workspace_root_arg, // scoped to the authenticated agent's workspace; gated above
         Some(&kernel.media_engine),
         effective_exec_policy,
-        None, // file_policy
+        entry.manifest.file_policy.as_ref(), // F6: agent's resolved policy (was None — silent tier downgrade on bridge)
         if kernel.config.tts.enabled {
             Some(&kernel.tts_engine)
         } else {
