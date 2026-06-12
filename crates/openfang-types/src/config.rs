@@ -974,11 +974,53 @@ impl FileAccessTier {
     }
 }
 
+/// Expand a leading `~` (`~` or `~/...`) in a file-rule path against the user's
+/// home directory, turning it into an absolute path. Done once at load time
+/// (see [`deserialize_tilde_path`]) so the longest-prefix matcher in
+/// [`FilePolicy::own_tier_for`] compares an absolute rule against canonical
+/// targets instead of silently joining `~` onto the workspace root — the cause
+/// of grants like `path = "~/work"` never matching under `default_tier = deny`.
+///
+/// Only a *leading* tilde is special; `~user` and embedded tildes are left
+/// untouched (no shell-style user lookup). When the home directory cannot be
+/// resolved the path is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    expand_tilde_with(path, dirs::home_dir())
+}
+
+/// Pure core of [`expand_tilde`] with an injectable home dir for testing.
+fn expand_tilde_with(path: &str, home: Option<PathBuf>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest).to_string_lossy().into_owned(),
+        None => path.to_string(),
+    }
+}
+
+/// Serde hook: expand a leading `~` in a [`FileRule`] path during
+/// deserialization. Option B — normalize once at load time rather than at every
+/// match — so a config like `path = "~/work"` becomes an absolute prefix the
+/// matcher can actually hit.
+fn deserialize_tilde_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(expand_tilde(&raw))
+}
+
 /// One filesystem path rule: a path prefix and the access tier granted to it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileRule {
     /// Path prefix. Relative entries resolve against the agent's workspace
     /// root at match time; absolute entries match canonical absolute paths.
+    /// A leading `~` is expanded to the user's home directory at load time.
+    #[serde(deserialize_with = "deserialize_tilde_path")]
     pub path: String,
     /// Access tier for paths under `path`.
     pub tier: FileAccessTier,
@@ -5021,5 +5063,84 @@ shell_env_passthrough = ["*"]
             eff.tier_for(std::path::Path::new("/x"), root),
             FileAccessTier::Write
         );
+    }
+
+    // ---- tilde-path expansion (Option B: normalize at load time) ----
+
+    #[test]
+    fn expand_tilde_leading_slash_form() {
+        assert_eq!(
+            expand_tilde_with("~/work/proj", Some(PathBuf::from("/home/ben"))),
+            "/home/ben/work/proj"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_bare_tilde() {
+        assert_eq!(
+            expand_tilde_with("~", Some(PathBuf::from("/home/ben"))),
+            "/home/ben"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_trailing_slash_home_no_double_sep() {
+        // PathBuf::join normalizes the separator regardless of a trailing slash.
+        assert_eq!(
+            expand_tilde_with("~/x", Some(PathBuf::from("/home/ben/"))),
+            "/home/ben/x"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_user_form_left_literal() {
+        // No shell-style `~user` lookup: only a leading `~` or `~/` is special.
+        assert_eq!(
+            expand_tilde_with("~secret/x", Some(PathBuf::from("/home/ben"))),
+            "~secret/x"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_absolute_and_relative_unchanged() {
+        let home = Some(PathBuf::from("/home/ben"));
+        assert_eq!(expand_tilde_with("/abs/path", home.clone()), "/abs/path");
+        assert_eq!(expand_tilde_with("rel/path", home), "rel/path");
+    }
+
+    #[test]
+    fn expand_tilde_no_home_passthrough() {
+        // Fail-safe: when home can't be resolved the path is left untouched
+        // (it simply won't match — never silently widens).
+        assert_eq!(expand_tilde_with("~/foo", None), "~/foo");
+    }
+
+    #[test]
+    fn file_rule_tilde_expands_on_deserialize() {
+        let rule: FileRule = toml::from_str("path = \"~/work\"\ntier = \"write\"").unwrap();
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(rule.path, home.join("work").to_string_lossy());
+            assert!(std::path::Path::new(&rule.path).is_absolute());
+        }
+        assert_eq!(rule.tier, FileAccessTier::Write);
+    }
+
+    #[test]
+    fn tilde_rule_matches_target_after_expansion() {
+        // The regression: under `default_tier = deny`, a `~/grant` write rule
+        // must actually grant write to a canonical path under $HOME/grant.
+        let Some(home) = dirs::home_dir() else {
+            return; // no home in this env; nothing to prove
+        };
+        let fp: FilePolicy = toml::from_str(
+            "enabled = true\ndefault_tier = \"deny\"\n[[rules]]\npath = \"~/grant\"\ntier = \"write\"\n",
+        )
+        .unwrap();
+        let target = home.join("grant").join("file.txt");
+        let ws = std::path::Path::new("/some/other/workspace");
+        assert_eq!(fp.tier_for(&target, ws), FileAccessTier::Write);
+        // A sibling outside the grant still hits the deny default.
+        let ungranted = home.join("ungranted").join("file.txt");
+        assert_eq!(fp.tier_for(&ungranted, ws), FileAccessTier::Deny);
     }
 }
