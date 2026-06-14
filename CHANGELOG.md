@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `file_convert` tool: renders a workspace file to another format via a
+  data-driven recipe table (`<openfang_home>/convert/recipes.toml`), shelling out
+  at daemon privilege behind a hardened seam — allowlisted formats,
+  workspace-sandboxed paths, argv-array spawn with no shell string, absolute
+  launcher, and a call-time `needs` preflight (`MISSING_DEP` with no partial
+  run). Ships one recipe, `md` -> `pdf` (wraps `scripts/build-pdf.sh`); new
+  formats are manifest rows, no Rust. Grant via `tools = ["file_convert"]` in
+  `agent.toml`. See `docs/file-convert.md`.
+
 ## [0.5.10] - 2026-04-17
 
 ### Fixed
