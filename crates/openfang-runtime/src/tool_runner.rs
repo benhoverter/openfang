@@ -637,7 +637,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
                     "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
-                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." }
+                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
+                    "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
                 },
                 "required": ["format", "input"]
             }),
@@ -1621,6 +1622,54 @@ async fn tool_file_convert_in(
                 .into_owned()
         });
 
+    // Resolve the render preset (if any) into a trusted var map. The caller
+    // supplies only a preset *key*; the dimension/scale strings that reach argv
+    // are manifest-authored. Fail-closed on an unknown or unexpected preset,
+    // mirroring the UNKNOWN_FORMAT pattern above (no spawn, no filesystem
+    // access yet).
+    let requested_preset = input["preset"].as_str().filter(|s| !s.trim().is_empty());
+    let empty_vars = std::collections::BTreeMap::new();
+    let preset_vars: &std::collections::BTreeMap<String, String> = if recipe.presets.is_empty() {
+        if requested_preset.is_some() {
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_PRESET",
+                &format!("conversion '{from}'->'{to}' takes no presets"),
+            ));
+        }
+        &empty_vars
+    } else {
+        let chosen = match requested_preset.or(recipe.default_preset.as_deref()) {
+            Some(c) => c,
+            None => {
+                return Ok(convert_err(
+                    to,
+                    "UNKNOWN_PRESET",
+                    &format!(
+                        "conversion '{from}'->'{to}' requires a preset but none was given and no default is set"
+                    ),
+                ));
+            }
+        };
+        match recipe.presets.get(chosen) {
+            Some(vars) => vars,
+            None => {
+                let offered = recipe
+                    .presets
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(convert_err(
+                    to,
+                    "UNKNOWN_PRESET",
+                    &format!("unknown preset '{chosen}' for '{from}'->'{to}'. Offered: {offered}"),
+                ));
+            }
+        }
+    };
+
+
     // §5.1 path validation: both paths must resolve INSIDE the workspace.
     // resolve_sandbox_path rejects `..`, absolute escape, and symlink escape;
     // the input must exist and the output's parent directory must exist.
@@ -1652,6 +1701,7 @@ async fn tool_file_convert_in(
         script_dir: &scripts_dir,
         input: &resolved_input,
         output: &resolved_output,
+        vars: preset_vars,
     }) {
         Ok(a) => a,
         // A bad token is a manifest-authoring defect, not a conversion outcome.
@@ -5545,6 +5595,108 @@ mod convert_dispatch_tests {
         assert_eq!(v["error"]["code"], "MISSING_DEP");
         assert_eq!(v["error"]["message"], "needs 'typst'");
         assert!(v.get("output_path").is_none());
+    }
+
+    #[cfg(unix)]
+    fn hermetic_home_presets() -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(
+            &stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$2.argv\"\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{script}/stub.sh\", \"{input}\", \"{output}\", \"{viewport}\"]\nout_ext = \"txt\"\ndefault_preset = \"desktop\"\n\n[recipe.presets.mobile]\nviewport = \"MOBILEVP\"\n\n[recipe.presets.desktop]\nviewport = \"DESKTOPVP\"\n",
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(unix)]
+    fn read_argv_log(ws: &Path, out_rel: &str) -> String {
+        let mut p = ws.join(out_rel).into_os_string();
+        p.push(".argv");
+        fs::read_to_string(&p).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_selects_named_vars() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "mobile" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        assert!(log.lines().any(|l| l == "MOBILEVP"), "argv log: {log}");
+        assert!(!log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_omitted_uses_default() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        assert!(log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_unknown_preset_rejected() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "phone" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_on_presetless_recipe_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "mobile" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
     }
 
     #[test]
