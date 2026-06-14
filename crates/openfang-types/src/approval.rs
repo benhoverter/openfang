@@ -174,6 +174,12 @@ impl ApprovalRequest {
 
         // -- origin (optional) --
         if let Some(origin) = &self.origin {
+            if origin.channel_type.len() > MAX_ORIGIN_FIELD_LEN {
+                return Err(format!(
+                    "origin.channel_type too long ({} chars, max {MAX_ORIGIN_FIELD_LEN})",
+                    origin.channel_type.len()
+                ));
+            }
             for (label, value) in [
                 ("origin.channel_id", &origin.channel_id),
                 ("origin.thread_id", &origin.thread_id),
@@ -439,6 +445,20 @@ mod tests {
         let mut req = valid_request();
         req.tool_name = "a".repeat(65);
         let err = req.validate().unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn request_origin_channel_type_too_long_rejected() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "a".repeat(257),
+            channel_id: None,
+            thread_id: None,
+            recipient: None,
+        });
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("origin.channel_type"), "{err}");
         assert!(err.contains("too long"), "{err}");
     }
 
