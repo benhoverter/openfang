@@ -1549,6 +1549,18 @@ async fn tool_file_convert(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
 ) -> Result<String, String> {
+    tool_file_convert_in(input, workspace_root, &crate::convert::openfang_home_dir()).await
+}
+
+/// Inner `file_convert` dispatcher with an injectable OpenFang home directory,
+/// so hermetic tests can supply their own `scripts/` + `convert/recipes.toml`
+/// without mutating process-global env. Production calls this via the wrapper
+/// above with the real resolved home.
+async fn tool_file_convert_in(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    home: &Path,
+) -> Result<String, String> {
     // Request-shape validation (a malformed call, not a conversion outcome):
     // these stay plain Err. Everything from the recipe lookup onward speaks the
     // structured envelope so callers can branch on `ok` + `error.code`.
@@ -1579,8 +1591,7 @@ async fn tool_file_convert(
     // §5.2 allowlist (fail-closed): resolve the (from, to) pair against the
     // recipe table. An unknown pair is UNKNOWN_FORMAT, never a silent fallback,
     // and is rejected before any filesystem access or spawn.
-    let home = crate::convert::openfang_home_dir();
-    let recipes = crate::convert::load_recipes(&home)
+    let recipes = crate::convert::load_recipes(home)
         .map_err(|e| format!("Failed to load conversion recipes: {e}"))?;
     let recipe = match recipes.lookup(from, to) {
         Some(r) => r,
@@ -5317,6 +5328,203 @@ mod tests {
 #[cfg(test)]
 mod convert_dispatch_tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+
+    /// Build a hermetic OpenFang home: `scripts/stub.sh` + `convert/recipes.toml`
+    /// defining md->txt. The stub is a 2-arg `INPUT OUTPUT` copier that also
+    /// records its raw argv to `<output>.argv`, so a test can prove a
+    /// metachar-laden path arrived as ONE literal argument (no shell expansion).
+    #[cfg(unix)]
+    fn hermetic_home(needs: &str) -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(
+            &stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$2.argv\"\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        let needs_line = if needs.is_empty() {
+            String::new()
+        } else {
+            format!("needs = [\"{needs}\"]\n")
+        };
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            format!(
+                "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{{script}}/stub.sh\", \"{{input}}\", \"{{output}}\"]\n{needs_line}out_ext = \"txt\"\n"
+            ),
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(unix)]
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_happy_path_md_to_txt() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "# hi").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(v["format"], "txt");
+        assert_eq!(v["output_path"], "note.txt");
+        assert!(ws.path().join("note.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_input_traversal_blocked() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "../escape.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_output_traversal_blocked() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "output": "../escape.txt" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_absolute_input_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "/tmp/outside-abs.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_absolute_output_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "output": "/tmp/escape.txt" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_unknown_format_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "pdf", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "UNKNOWN_FORMAT", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_missing_dep_no_partial_run() {
+        let home = hermetic_home("totally-absent-binary-xyz");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "MISSING_DEP", "envelope: {out}");
+        // No partial run: the stub never executed, so no output file exists.
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_injection_reaches_recipe_as_literal_arg() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        // A filename loaded with shell metacharacters. If ANY layer evaluated it
+        // through a shell, `pwned`/`pwned2` would be created.
+        let evil = "evil; $(touch pwned) `touch pwned2`.md";
+        fs::write(ws.path().join(evil), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": evil }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {out}");
+        // No shell expansion occurred anywhere in the pipeline.
+        assert!(!ws.path().join("pwned").exists(), "injection executed!");
+        assert!(!ws.path().join("pwned2").exists(), "injection executed!");
+        // The stub received the metachar path as ONE literal argv entry.
+        let expected_out = Path::new(evil).with_extension("txt");
+        assert!(ws.path().join(&expected_out).is_file());
+        let mut argv_log = ws.path().join(&expected_out).into_os_string();
+        argv_log.push(".argv");
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(
+            logged.lines().any(|l| l.ends_with(evil)),
+            "metachar path not a single literal arg; argv log: {logged}"
+        );
+    }
 
     #[test]
     fn convert_ok_envelope_shape() {
