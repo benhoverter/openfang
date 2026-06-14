@@ -767,17 +767,47 @@ pub async fn send_parsed(
         }
     };
 
-    let result = if let Some(tid) = thread_id {
-        adapter.send_in_thread(user, content, tid).await
-    } else {
-        adapter.send(user, content).await
-    };
+    let result = dispatch_content(adapter, user, content, thread_id).await;
 
     if let Err(e) = result {
         error!("Failed to send response: {e}");
     }
 
     skipped
+}
+
+/// Degrade-aware dispatch chokepoint (ANAI-82 Piece 1).
+///
+/// Single point through which outbound [`ChannelContent`] reaches an adapter.
+/// If the content is [`ChannelContent::Interactive`] (action buttons) but the
+/// target adapter cannot render it (`!supports_interactive()`), collapse it to
+/// its plain-text body via [`ChannelContent::degrade_to_text`] before sending.
+/// This keeps the ~50 non-Discord adapters from ever receiving a variant they
+/// cannot render, and gives the interactive approval-prompt emit path (Piece 2)
+/// a safe sink on every channel.
+async fn dispatch_content(
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    content: ChannelContent,
+    thread_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = if matches!(content, ChannelContent::Interactive { .. })
+        && !adapter.supports_interactive()
+    {
+        debug!(
+            adapter = adapter.name(),
+            "degrading Interactive content to text (adapter lacks button support)"
+        );
+        content.degrade_to_text()
+    } else {
+        content
+    };
+
+    if let Some(tid) = thread_id {
+        adapter.send_in_thread(user, content, tid).await
+    } else {
+        adapter.send(user, content).await
+    }
 }
 
 pub fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
@@ -2432,7 +2462,7 @@ async fn handle_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ChannelType;
+    use crate::types::{ButtonStyle, ChannelType, InteractiveButton};
     use std::sync::Mutex;
 
     /// Mock kernel handle for testing.
@@ -2471,6 +2501,111 @@ mod tests {
             vec![]
         };
         assert_eq!(args, vec!["hello-world"]);
+    }
+
+    /// Records every [`ChannelContent`] handed to `send` so dispatch-path tests
+    /// can assert what the adapter actually received. `interactive` toggles
+    /// [`ChannelAdapter::supports_interactive`] to exercise both branches of the
+    /// degrade chokepoint (ANAI-82 Piece 1).
+    struct RecordingAdapter {
+        interactive: bool,
+        received: Mutex<Vec<ChannelContent>>,
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for RecordingAdapter {
+        fn name(&self) -> &str {
+            "recording-mock"
+        }
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Custom("recording-mock".to_string())
+        }
+        async fn start(
+            &self,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = ChannelMessage> + Send>>,
+            Box<dyn std::error::Error>,
+        > {
+            Err("mock adapter does not stream".into())
+        }
+        async fn send(
+            &self,
+            _user: &ChannelUser,
+            content: ChannelContent,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.received.lock().unwrap().push(content);
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+        fn supports_interactive(&self) -> bool {
+            self.interactive
+        }
+    }
+
+    fn sample_interactive() -> ChannelContent {
+        ChannelContent::Interactive {
+            text: "Approve request? /approve abc123".to_string(),
+            buttons: vec![InteractiveButton {
+                custom_id: "ap:abc123".to_string(),
+                label: "Approve".to_string(),
+                style: ButtonStyle::Success,
+            }],
+        }
+    }
+
+    fn test_user() -> ChannelUser {
+        ChannelUser {
+            platform_id: "u1".to_string(),
+            display_name: "tester".to_string(),
+            openfang_user: None,
+        }
+    }
+
+    /// Adapter WITHOUT button support: Interactive must be degraded to its text
+    /// body before it ever reaches `send` (the ~50 non-Discord adapters).
+    #[tokio::test]
+    async fn dispatch_degrades_interactive_when_unsupported() {
+        let adapter = RecordingAdapter {
+            interactive: false,
+            received: Mutex::new(Vec::new()),
+        };
+        let user = test_user();
+
+        dispatch_content(&adapter, &user, sample_interactive(), None)
+            .await
+            .unwrap();
+
+        let received = adapter.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        match &received[0] {
+            ChannelContent::Text(t) => {
+                assert!(t.contains("/approve abc123"), "text body must survive degrade");
+            }
+            other => panic!("expected degraded Text, got {other:?}"),
+        }
+    }
+
+    /// Adapter WITH button support (Discord): Interactive passes through intact.
+    #[tokio::test]
+    async fn dispatch_preserves_interactive_when_supported() {
+        let adapter = RecordingAdapter {
+            interactive: true,
+            received: Mutex::new(Vec::new()),
+        };
+        let user = test_user();
+
+        dispatch_content(&adapter, &user, sample_interactive(), None)
+            .await
+            .unwrap();
+
+        let received = adapter.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(
+            matches!(received[0], ChannelContent::Interactive { .. }),
+            "interactive-capable adapter must receive Interactive unchanged"
+        );
     }
 
     #[tokio::test]
