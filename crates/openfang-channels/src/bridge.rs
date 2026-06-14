@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
-use openfang_types::approval::ApprovalRequest;
+use openfang_types::approval::{ApprovalOrigin, ApprovalRequest};
 use openfang_types::commands::{self as slash_commands, Surfaces};
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle};
 use openfang_types::message::ContentBlock;
@@ -121,6 +121,39 @@ pub trait ChannelBridgeHandle: Send + Sync {
             .collect::<Vec<_>>()
             .join("\n");
         self.send_message(agent_id, &text).await
+    }
+
+    /// Send a message to an agent, carrying the live origin of the triggering
+    /// run so a downstream approval prompt can be pushed back to the exact
+    /// channel/conversation it came from.
+    ///
+    /// Default implementation ignores `origin` and delegates to
+    /// [`send_message`](Self::send_message) — preserving current behavior for
+    /// every adapter and caller that does not override it. Only the real kernel
+    /// impl (openfang-api) overrides this to thread `origin` into the run.
+    async fn send_message_with_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        origin: ApprovalOrigin,
+    ) -> Result<String, String> {
+        let _ = origin;
+        self.send_message(agent_id, message).await
+    }
+
+    /// Origin-carrying counterpart to
+    /// [`send_message_with_blocks`](Self::send_message_with_blocks).
+    ///
+    /// Default implementation ignores `origin` and delegates to the non-origin
+    /// block variant.
+    async fn send_message_with_blocks_and_origin(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<ContentBlock>,
+        origin: ApprovalOrigin,
+    ) -> Result<String, String> {
+        let _ = origin;
+        self.send_message_with_blocks(agent_id, blocks).await
     }
 
     /// Find an agent by name, returning its ID.
@@ -2501,6 +2534,28 @@ mod tests {
             vec![]
         };
         assert_eq!(args, vec!["hello-world"]);
+    }
+
+    /// The origin-carrying trait method must, by default, ignore `origin` and
+    /// behave exactly like `send_message` — so the ~50 adapters and all existing
+    /// callers are unaffected until the real kernel impl overrides it (ANAI-82
+    /// Piece 2, Option Y plumbing).
+    #[tokio::test]
+    async fn send_message_with_origin_defaults_to_send_message() {
+        let handle = MockHandle {
+            agents: Mutex::new(Vec::new()),
+        };
+        let origin = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: Some("chan-1".to_string()),
+            thread_id: None,
+            recipient: Some("peer-1".to_string()),
+        };
+        let out = handle
+            .send_message_with_origin(AgentId::new(), "hello", origin)
+            .await
+            .unwrap();
+        assert_eq!(out, "Echo: hello");
     }
 
     /// Records every [`ChannelContent`] handed to `send` so dispatch-path tests
