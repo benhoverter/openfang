@@ -12,7 +12,7 @@ with **zero Rust changes**.
 ## Tool surface
 
 ```
-file_convert(format, input, output?)
+file_convert(format, input, output?, preset?)
 ```
 
 | Param    | Required | Meaning |
@@ -20,6 +20,7 @@ file_convert(format, input, output?)
 | `format` | yes      | Target format (e.g. `"pdf"`). Must match a recipe's `to`. |
 | `input`  | yes      | Workspace-relative path to the source file. Its extension selects the recipe's `from`. |
 | `output` | no       | Workspace-relative output path. Defaults to the input path with the recipe's `out_ext`. |
+| `preset` | no       | Render preset key (e.g. `"mobile"`, `"desktop"`) selecting manifest-authored size/scale. Must be one the target recipe offers; omit to use the recipe's `default_preset`. Ignored by recipes with no presets. |
 
 ### Result envelope
 
@@ -40,9 +41,49 @@ Success and conversion failures are returned as a structured JSON envelope:
 }
 ```
 
-Error codes: `UNKNOWN_FORMAT`, `BAD_PATH`, `MISSING_DEP`, `CONVERT_FAILED`.
+Error codes: `UNKNOWN_FORMAT`, `UNKNOWN_PRESET`, `BAD_PATH`, `MISSING_DEP`, `CONVERT_FAILED`.
 (Genuinely malformed calls — e.g. a missing `format`/`input` argument — surface
 as a plain tool error, not an envelope.)
+
+## Render presets
+
+Some recipes (e.g. `html` -> `png`) render at a chosen size. Rather than letting
+a caller pass raw width/height/scale text into the conversion command, a recipe
+declares a **named-preset menu** and the caller selects one by key. The
+dimension/scale strings that reach the conversion command are **manifest-
+authored**, never caller text -- so presets add dimension control with no new
+argv trust surface.
+
+```toml
+[[recipe]]
+from    = "html"
+to      = "png"
+argv    = ["{script}/html2png.sh", "{input}", "-o", "{output}", "--viewport", "{viewport}", "--scale", "{scale}"]
+needs   = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+out_ext = "png"
+default_preset = "mobile"
+
+[recipe.presets.mobile]
+viewport = "390,844"
+scale    = "3"
+
+[recipe.presets.desktop]
+viewport = "1280,800"
+scale    = "2"
+```
+
+A call of `file_convert("png", "mock.html", preset="desktop")` substitutes the
+`desktop` preset's `{viewport}`/`{scale}` into argv. Omitting `preset` uses
+`default_preset`. An unknown preset, or a `preset` on a recipe that defines none,
+returns `UNKNOWN_PRESET` (fail-closed, no spawn).
+
+Preset rules enforced at manifest load (a violation is a hard `Invalid` error):
+
+- `default_preset` is required iff `presets` is non-empty, and must name a real
+  preset.
+- Every argv `{var}` beyond `{script}`/`{input}`/`{output}` must be defined by
+  **every** preset (so no preset leaves a token unsubstituted).
+- A preset may not reuse the reserved names `script`/`input`/`output`.
 
 ## Granting the tool
 

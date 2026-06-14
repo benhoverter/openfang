@@ -12,7 +12,7 @@
 //! later subissues (ANAI-69/70/71) and intentionally do NOT appear here.
 
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Location of the recipe manifest, relative to the OpenFang home directory.
@@ -43,6 +43,17 @@ pub struct Recipe {
     pub needs: Vec<String>,
     /// Extension of the produced output file (no leading dot).
     pub out_ext: String,
+    /// Named render presets: preset-name -> { token-name -> value }. Values
+    /// are manifest-authored and substituted into argv via `{token}`s
+    /// alongside `{script}`/`{input}`/`{output}`. Empty for recipes that
+    /// take no presets.
+    #[serde(default)]
+    pub presets: BTreeMap<String, BTreeMap<String, String>>,
+    /// Preset used when the caller omits `preset`. REQUIRED iff `presets` is
+    /// non-empty (validated at load time); MUST be `None` when `presets` is
+    /// empty. Names a key in `presets`.
+    #[serde(default)]
+    pub default_preset: Option<String>,
 }
 
 /// TOML envelope: the manifest is an array-of-tables under `[[recipe]]`.
@@ -92,6 +103,11 @@ pub struct ArgvTokens<'a> {
     pub input: &'a Path,
     /// Sandbox-resolved absolute output path, substituted for `{output}`.
     pub output: &'a Path,
+    /// Selected preset's variables: token-name -> value. Empty when the
+    /// recipe defines no presets. Values are manifest-authored and
+    /// substituted with the same trust as argv literals; no caller string
+    /// ever reaches this map.
+    pub vars: &'a BTreeMap<String, String>,
 }
 
 impl Recipe {
@@ -120,19 +136,24 @@ impl Recipe {
                     format!("recipe argv element {elem:?} has an unterminated '{{' token")
                 })?;
                 let tok = &rest[start..=end];
-                if !KNOWN.contains(&tok) {
+                let name = &rest[start + 1..end];
+                if !KNOWN.contains(&tok) && !tokens.vars.contains_key(name) {
                     return Err(format!(
                         "recipe argv element {elem:?} contains unknown token {tok:?}; \
-                         supported tokens are {{script}}, {{input}}, {{output}}"
+                         supported tokens are {{script}}, {{input}}, {{output}}, \
+                         plus this recipe's preset variables"
                     ));
                 }
                 rest = &rest[end + 1..];
             }
-            out.push(
-                elem.replace("{script}", &script)
-                    .replace("{input}", &input)
-                    .replace("{output}", &output),
-            );
+            let mut resolved = elem
+                .replace("{script}", &script)
+                .replace("{input}", &input)
+                .replace("{output}", &output);
+            for (vname, vval) in tokens.vars {
+                resolved = resolved.replace(&format!("{{{vname}}}"), vval);
+            }
+            out.push(resolved);
         }
         Ok(out)
     }
@@ -243,6 +264,7 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
                 r.from, r.to
             )));
         }
+        validate_presets(r).map_err(|reason| invalid(reason))?;
         let key = (r.from.to_ascii_lowercase(), r.to.to_ascii_lowercase());
         if !seen.insert(key) {
             return Err(invalid(format!(
@@ -254,9 +276,81 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
     Ok(())
 }
 
+/// Validate a recipe's preset table (the preset spec's load-time rules):
+/// `default_preset` present-iff-`presets`, the default names a real preset, no
+/// preset reuses a reserved token name, and every argv `{var}` beyond
+/// `{script}`/`{input}`/`{output}` is defined by *every* preset (so no preset
+/// can leave a token unsubstituted at dispatch time). Returns the failure
+/// reason as a `String`, which the caller wraps into a `RecipeError::Invalid`.
+fn validate_presets(r: &Recipe) -> Result<(), String> {
+    const RESERVED: [&str; 3] = ["script", "input", "output"];
+
+    if r.presets.is_empty() {
+        if r.default_preset.is_some() {
+            return Err(format!(
+                "recipe {}->{} sets `default_preset` but defines no presets",
+                r.from, r.to
+            ));
+        }
+        return Ok(());
+    }
+
+    match &r.default_preset {
+        None => {
+            return Err(format!(
+                "recipe {}->{} defines presets but no `default_preset`",
+                r.from, r.to
+            ));
+        }
+        Some(d) if !r.presets.contains_key(d) => {
+            return Err(format!(
+                "recipe {}->{} `default_preset` = {:?} is not a defined preset",
+                r.from, r.to, d
+            ));
+        }
+        Some(_) => {}
+    }
+
+    for (pname, vars) in &r.presets {
+        for key in vars.keys() {
+            if RESERVED.contains(&key.as_str()) {
+                return Err(format!(
+                    "recipe {}->{} preset {:?} uses reserved token name {:?}",
+                    r.from, r.to, pname, key
+                ));
+            }
+        }
+    }
+
+    for elem in &r.argv {
+        let mut rest = elem.as_str();
+        while let Some(start) = rest.find('{') {
+            let end = match rest[start..].find('}') {
+                Some(i) => start + i,
+                None => break,
+            };
+            let name = &rest[start + 1..end];
+            if !RESERVED.contains(&name) {
+                for (pname, vars) in &r.presets {
+                    if !vars.contains_key(name) {
+                        return Err(format!(
+                            "recipe {}->{} argv token {{{}}} is not defined by preset {:?}",
+                            r.from, r.to, name, pname
+                        ));
+                    }
+                }
+            }
+            rest = &rest[end + 1..];
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
 
@@ -275,6 +369,7 @@ mod tests {
                 script_dir: Path::new("/home/.openfang/scripts"),
                 input: Path::new("/ws/doc.md"),
                 output: Path::new("/ws/doc.pdf"),
+                vars: &BTreeMap::new(),
             })
             .unwrap();
         assert_eq!(argv[0], "/home/.openfang/scripts/build-pdf.sh");
@@ -292,12 +387,15 @@ mod tests {
             argv: vec!["{script}/x".into(), "{evil}".into()],
             needs: vec![],
             out_ext: "pdf".into(),
+            presets: BTreeMap::new(),
+            default_preset: None,
         };
         let err = recipe
             .resolve_argv(&ArgvTokens {
                 script_dir: Path::new("/s"),
                 input: Path::new("/i"),
                 output: Path::new("/o"),
+                vars: &BTreeMap::new(),
             })
             .unwrap_err();
         assert!(err.contains("unknown token"));
@@ -311,12 +409,15 @@ mod tests {
             argv: vec!["{input".into()],
             needs: vec![],
             out_ext: "pdf".into(),
+            presets: BTreeMap::new(),
+            default_preset: None,
         };
         let err = recipe
             .resolve_argv(&ArgvTokens {
                 script_dir: Path::new("/s"),
                 input: Path::new("/i"),
                 output: Path::new("/o"),
+                vars: &BTreeMap::new(),
             })
             .unwrap_err();
         assert!(err.contains("unterminated"));
@@ -454,4 +555,175 @@ mod tests {
         let err = load_recipes(home.path()).unwrap_err();
         assert!(matches!(err, RecipeError::Invalid { .. }));
     }
+
+    #[test]
+    fn resolve_argv_substitutes_preset_vars() {
+        let mut vars = BTreeMap::new();
+        vars.insert("viewport".to_string(), "390,844".to_string());
+        vars.insert("scale".to_string(), "3".to_string());
+        let recipe = Recipe {
+            from: "html".into(),
+            to: "png".into(),
+            argv: vec![
+                "{script}/html2png.sh".into(),
+                "{input}".into(),
+                "-o".into(),
+                "{output}".into(),
+                "--viewport".into(),
+                "{viewport}".into(),
+                "--scale".into(),
+                "{scale}".into(),
+            ],
+            needs: vec![],
+            out_ext: "png".into(),
+            presets: BTreeMap::new(),
+            default_preset: None,
+        };
+        let argv = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/s"),
+                input: Path::new("/ws/a.html"),
+                output: Path::new("/ws/a.png"),
+                vars: &vars,
+            })
+            .unwrap();
+        assert!(argv.contains(&"390,844".to_string()));
+        assert!(argv.contains(&"3".to_string()));
+        assert!(!argv.iter().any(|a| a.contains('{')));
+    }
+
+    #[test]
+    fn resolve_argv_preset_value_is_literal_not_reparsed() {
+        let mut vars = BTreeMap::new();
+        vars.insert("vp".to_string(), "x; touch pwned".to_string());
+        let recipe = Recipe {
+            from: "html".into(),
+            to: "png".into(),
+            argv: vec!["{script}/r.sh".into(), "{vp}".into()],
+            needs: vec![],
+            out_ext: "png".into(),
+            presets: BTreeMap::new(),
+            default_preset: None,
+        };
+        let argv = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/s"),
+                input: Path::new("/i"),
+                output: Path::new("/o"),
+                vars: &vars,
+            })
+            .unwrap();
+        assert_eq!(argv[1], "x; touch pwned");
+    }
+
+    fn preset_manifest(default_line: &str, mobile_vp: &str) -> String {
+        format!(
+            r#"
+                [[recipe]]
+                from = "html"
+                to = "png"
+                argv = ["{{script}}/html2png.sh", "{{input}}", "{{output}}", "{{viewport}}"]
+                out_ext = "png"
+                {default_line}
+
+                [recipe.presets.mobile]
+                viewport = "{mobile_vp}"
+
+                [recipe.presets.desktop]
+                viewport = "1280,800"
+            "#
+        )
+    }
+
+    #[test]
+    fn valid_preset_manifest_loads() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            &preset_manifest("default_preset = \"mobile\"", "390,844"),
+        );
+        let set = load_recipes(home.path()).unwrap();
+        let r = set.lookup("html", "png").unwrap();
+        assert_eq!(r.default_preset.as_deref(), Some("mobile"));
+        assert_eq!(r.presets.len(), 2);
+    }
+
+    #[test]
+    fn manifest_missing_default_preset_invalid() {
+        let home = TempDir::new().unwrap();
+        write_manifest(home.path(), &preset_manifest("", "390,844"));
+        let err = load_recipes(home.path()).unwrap_err();
+        assert!(matches!(err, RecipeError::Invalid { .. }));
+    }
+
+    #[test]
+    fn manifest_default_preset_not_in_table_invalid() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            &preset_manifest("default_preset = \"phone\"", "390,844"),
+        );
+        let err = load_recipes(home.path()).unwrap_err();
+        assert!(matches!(err, RecipeError::Invalid { .. }));
+    }
+
+    #[test]
+    fn argv_var_missing_from_a_preset_invalid() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "html"
+                to = "png"
+                argv = ["{script}/h.sh", "{input}", "{output}", "{scale}"]
+                out_ext = "png"
+                default_preset = "mobile"
+
+                [recipe.presets.mobile]
+                viewport = "390,844"
+            "#,
+        );
+        let err = load_recipes(home.path()).unwrap_err();
+        assert!(matches!(err, RecipeError::Invalid { .. }));
+    }
+
+    #[test]
+    fn default_preset_without_presets_invalid() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/build-pdf.sh", "{input}", "{output}"]
+                out_ext = "pdf"
+                default_preset = "mobile"
+            "#,
+        );
+        let err = load_recipes(home.path()).unwrap_err();
+        assert!(matches!(err, RecipeError::Invalid { .. }));
+    }
+
+    #[test]
+    fn presetless_recipe_still_valid() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/build-pdf.sh", "{input}", "{output}"]
+                needs = ["pandoc", "typst"]
+                out_ext = "pdf"
+            "#,
+        );
+        let set = load_recipes(home.path()).unwrap();
+        let r = set.lookup("md", "pdf").unwrap();
+        assert!(r.presets.is_empty());
+        assert!(r.default_preset.is_none());
+    }
 }
+
