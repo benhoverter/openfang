@@ -329,6 +329,9 @@ pub async fn execute_tool(
         }
         "apply_patch" => tool_apply_patch(input, workspace_root, file_policy).await,
 
+        // File conversion tool (recipe-driven, allowlisted formats)
+        "file_convert" => tool_file_convert(input, workspace_root).await,
+
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
             // Taint check: block URLs containing secrets/PII from being exfiltrated
@@ -746,6 +749,19 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["patch"]
+            }),
+        },
+        ToolDefinition {
+            name: "file_convert".to_string(),
+            description: "Convert a workspace file from one format to another using an allowlisted recipe table (e.g. Markdown to PDF). The source format is inferred from the input file extension; the target format is the 'format' argument. Only conversions defined in the recipe manifest are permitted. Paths are relative to the agent workspace.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
+                    "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
+                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." }
+                },
+                "required": ["format", "input"]
             }),
         },
         // --- Web tools ---
@@ -1724,6 +1740,78 @@ async fn tool_file_list(
     }
     files.sort();
     Ok(files.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
+// File conversion tool
+// ---------------------------------------------------------------------------
+
+/// `file_convert` — render a workspace file to another format via an
+/// allowlisted recipe table (see [`crate::convert`]).
+///
+/// ANAI-69 scope: tool registration + dispatch wiring + fail-closed recipe
+/// resolution. The security core — sandbox path validation, argv-template
+/// token substitution, absolute-binary resolution, and subprocess execution —
+/// is intentionally deferred to ANAI-70. This handler validates the request
+/// against the recipe table and reports the resolved plan; it does NOT touch
+/// the filesystem or spawn a process yet.
+async fn tool_file_convert(
+    input: &serde_json::Value,
+    _workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let to = input["format"]
+        .as_str()
+        .ok_or("Missing 'format' parameter (target format, e.g. \"pdf\")")?;
+    let input_path = input["input"]
+        .as_str()
+        .ok_or("Missing 'input' parameter (workspace-relative source file)")?;
+    if input_path.trim().is_empty() {
+        return Err("'input' parameter is empty".to_string());
+    }
+
+    // Derive the source format from the input file extension (pure string op;
+    // no filesystem access — that lands in ANAI-70).
+    let from = Path::new(input_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| {
+            format!("Cannot determine source format: input '{input_path}' has no file extension")
+        })?;
+
+    // Load the recipe table and resolve the (from, to) pair. Fail-closed: an
+    // unknown pair is a hard error, never a silent fallback.
+    let home = crate::convert::openfang_home_dir();
+    let recipes = crate::convert::load_recipes(&home)
+        .map_err(|e| format!("Failed to load conversion recipes: {e}"))?;
+    let recipe = recipes.lookup(from, to).ok_or_else(|| {
+        let supported = recipes
+            .recipes()
+            .iter()
+            .map(|r| format!("{}->{}", r.from, r.to))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("No conversion recipe for '{from}'->'{to}'. Supported: {supported}")
+    })?;
+
+    let output_path = input["output"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            Path::new(input_path)
+                .with_extension(&recipe.out_ext)
+                .to_string_lossy()
+                .into_owned()
+        });
+
+    // ANAI-70 replaces this tail with: sandbox-resolve input/output, substitute
+    // the argv template ({script}/{input}/{output}), resolve binaries to
+    // absolute paths, preflight `needs`, and spawn the subprocess.
+    Err(format!(
+        "file_convert is registered but execution is not yet wired: recipe '{from}'->'{to}' \
+         resolved (argv template: {:?}, planned output: '{output_path}'). Secure path \
+         validation and subprocess execution land in ANAI-70.",
+        recipe.argv
+    ))
 }
 
 // ---------------------------------------------------------------------------
