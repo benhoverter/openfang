@@ -104,6 +104,23 @@ pub fn recipes_path(home_dir: &Path) -> PathBuf {
     home_dir.join(RECIPES_REL_PATH)
 }
 
+/// Resolve the OpenFang home directory used to locate the recipe manifest.
+///
+/// Priority: `OPENFANG_HOME` env var > `$HOME/.openfang` (or `%USERPROFILE%`).
+/// Mirrors the canonical resolver in `openfang-types::config` (which is
+/// private) using the same `HOME`/`USERPROFILE` convention the rest of the
+/// runtime uses, so the convert tool finds the manifest the same way the rest
+/// of OpenFang resolves its home — without pulling in a new dependency.
+pub fn openfang_home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("OPENFANG_HOME") {
+        return PathBuf::from(home);
+    }
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".openfang"))
+        .unwrap_or_else(|_| PathBuf::from(".openfang"))
+}
+
 /// The compiled-in default recipe table, parsed from [`DEFAULT_RECIPES_TOML`].
 ///
 /// Panics only if the embedded template is itself malformed, which a unit test
