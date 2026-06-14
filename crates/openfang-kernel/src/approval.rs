@@ -211,6 +211,7 @@ mod tests {
             risk_level: RiskLevel::High,
             requested_at: Utc::now(),
             timeout_secs,
+            origin: None,
         }
     }
 

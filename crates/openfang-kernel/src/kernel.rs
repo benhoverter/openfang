@@ -7713,6 +7713,7 @@ impl KernelHandle for OpenFangKernel {
             risk_level: crate::approval::ApprovalManager::classify_risk(tool_name),
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
+            origin: None,
         };
 
         let decision = self.approval_manager.request_approval(req).await;
