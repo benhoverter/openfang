@@ -7249,6 +7249,7 @@ pub async fn mcp_http(
             workspace_path.as_deref(),
             Some(&state.kernel.media_engine),
             effective_exec_policy,
+            None, // file_policy
             if state.kernel.config.tts.enabled {
                 Some(&state.kernel.tts_engine)
             } else {

@@ -41,6 +41,8 @@ use std::sync::Arc;
 
 use rmcp::{model::*, service::RequestContext, ErrorData as McpError, ServerHandler};
 
+use crate::protocol::UpstreamToolDef;
+
 /// Narrow seam between the bridge and the OpenFang runtime.
 ///
 /// The runtime (or, in the real topology, an IPC-backed adapter that talks
@@ -65,6 +67,19 @@ pub trait ToolDispatcher: Send + Sync {
     /// For ANAI-30 this is the static four-tool slice; ANAI-31+ will derive
     /// it from `agent.toml`.
     fn allowed_tools(&self) -> Vec<String>;
+
+    /// Forwarded upstream MCP tools the daemon told us this agent may
+    /// invoke (from `agent.toml mcp_servers`, resolved server-side at
+    /// list-upstream time). Default: none.
+    ///
+    /// Names are already namespaced (`mcp_{server}_{tool}`) and are
+    /// advertised by the bridge in addition to the built-in surface
+    /// without going through [`Self::allowed_tools`] — that field gates
+    /// the OpenFang built-in slice; upstream gating is handled
+    /// server-side by the daemon against the agent's MCP allowlist.
+    fn upstream_tools(&self) -> Vec<UpstreamToolDef> {
+        Vec::new()
+    }
 
     /// Invoke a tool by name with a JSON argument blob. The dispatcher is
     /// responsible for capability enforcement; the bridge MUST NOT assume the
@@ -484,14 +499,47 @@ impl Bridge {
     }
 
     /// Tools the bridge will both advertise and accept calls for, given the
-    /// dispatcher's allowed set.
+    /// dispatcher's allowed set, plus any daemon-forwarded upstream MCP tools.
     fn permitted_tools(&self) -> Vec<Tool> {
         let allowed = self.dispatcher.allowed_tools();
-        built_in_tools()
+        let mut tools: Vec<Tool> = built_in_tools()
             .into_iter()
             .filter(|t| allowed.iter().any(|a| a.as_str() == t.name.as_ref()))
-            .collect()
+            .collect();
+        // Append upstream MCP tools. NOT gated by `allowed_tools()` —
+        // server-side `agent.toml mcp_servers` gating already happened
+        // when the daemon answered `ListUpstream`. Name collisions with
+        // built-ins are refused at MCP discovery in the daemon, so we
+        // trust the names here.
+        for def in self.dispatcher.upstream_tools() {
+            tools.push(upstream_def_to_tool(def));
+        }
+        tools
     }
+
+    /// True if `name` is among the advertised upstream MCP tools.
+    fn is_advertised_upstream(&self, name: &str) -> bool {
+        self.dispatcher
+            .upstream_tools()
+            .into_iter()
+            .any(|t| t.name == name)
+    }
+}
+
+/// Convert a daemon-forwarded upstream MCP tool definition into the
+/// rmcp `Tool` shape advertised on the MCP wire. Description defaults
+/// to an empty string when absent; input schema is taken verbatim, or
+/// substituted with an empty object if the upstream sent a non-object.
+fn upstream_def_to_tool(def: UpstreamToolDef) -> Tool {
+    let schema_map = match def.input_schema {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    Tool::new(
+        def.name,
+        def.description.unwrap_or_default(),
+        std::sync::Arc::new(schema_map),
+    )
 }
 
 impl ServerHandler for Bridge {
@@ -527,10 +575,21 @@ impl ServerHandler for Bridge {
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Null);
 
-        // Defense-in-depth: re-check the allowlist before crossing the seam.
-        // The dispatcher will enforce again; that's intentional.
+        // Defense-in-depth: re-check before crossing the seam. The
+        // dispatcher will enforce again; that's intentional.
+        //
+        // Two paths:
+        // - Built-in tools: must appear in `allowed_tools()` (the
+        //   `OPENFANG_BRIDGE_ALLOWED` / `DEFAULT_ALLOWED` gate).
+        // - Upstream `mcp_*` tools: must have been advertised by
+        //   the daemon at list-upstream time. The daemon also
+        //   enforces `agent.toml mcp_servers` server-side on
+        //   dispatch.
         let allowed = self.dispatcher.allowed_tools();
-        if !allowed.iter().any(|a| a == tool_name) {
+        let is_builtin_allowed = allowed.iter().any(|a| a == tool_name);
+        let is_advertised_upstream =
+            tool_name.starts_with("mcp_") && self.is_advertised_upstream(tool_name);
+        if !is_builtin_allowed && !is_advertised_upstream {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "tool '{tool_name}' not permitted for this agent"
             ))]));
@@ -572,7 +631,19 @@ mod tests {
     struct StubDispatcher {
         agent: String,
         allowed: Vec<String>,
+        upstream: Vec<UpstreamToolDef>,
         canned: DispatchOk,
+    }
+
+    impl StubDispatcher {
+        fn new(agent: &str, allowed: Vec<String>, canned: DispatchOk) -> Self {
+            Self {
+                agent: agent.into(),
+                allowed,
+                upstream: Vec::new(),
+                canned,
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -582,6 +653,9 @@ mod tests {
         }
         fn allowed_tools(&self) -> Vec<String> {
             self.allowed.clone()
+        }
+        fn upstream_tools(&self) -> Vec<UpstreamToolDef> {
+            self.upstream.clone()
         }
         async fn call(
             &self,
@@ -624,21 +698,84 @@ mod tests {
 
     #[test]
     fn permitted_tools_intersects_with_dispatcher_allowed() {
-        let bridge = Bridge::new(Arc::new(StubDispatcher {
-            agent: "a".into(),
+        let bridge = Bridge::new(Arc::new(StubDispatcher::new(
+            "a",
             // Dispatcher permits only file_read of the built-in slice;
             // not_a_real_tool is unknown to the bridge and must be ignored.
-            allowed: vec!["file_read".into(), "not_a_real_tool".into()],
-            canned: DispatchOk {
+            vec!["file_read".into(), "not_a_real_tool".into()],
+            DispatchOk {
                 content: String::new(),
                 is_error: false,
             },
-        }));
+        )));
         let names: Vec<String> = bridge
             .permitted_tools()
             .into_iter()
             .map(|t| t.name.into_owned())
             .collect();
         assert_eq!(names, vec!["file_read".to_string()]);
+    }
+
+    #[test]
+    fn permitted_tools_appends_upstream_after_builtins() {
+        let mut stub = StubDispatcher::new(
+            "a",
+            vec!["file_read".into()],
+            DispatchOk {
+                content: String::new(),
+                is_error: false,
+            },
+        );
+        stub.upstream = vec![
+            UpstreamToolDef {
+                name: "mcp_linear_getteams".into(),
+                server: "linear".into(),
+                description: Some("List teams".into()),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            UpstreamToolDef {
+                name: "mcp_notion_search".into(),
+                server: "notion".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let bridge = Bridge::new(Arc::new(stub));
+        let names: Vec<String> = bridge
+            .permitted_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect();
+        // Built-in first, then upstream, preserving order.
+        assert_eq!(
+            names,
+            vec![
+                "file_read".to_string(),
+                "mcp_linear_getteams".to_string(),
+                "mcp_notion_search".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn is_advertised_upstream_matches_only_advertised_names() {
+        let mut stub = StubDispatcher::new(
+            "a",
+            vec![],
+            DispatchOk {
+                content: String::new(),
+                is_error: false,
+            },
+        );
+        stub.upstream = vec![UpstreamToolDef {
+            name: "mcp_linear_getteams".into(),
+            server: "linear".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        }];
+        let bridge = Bridge::new(Arc::new(stub));
+        assert!(bridge.is_advertised_upstream("mcp_linear_getteams"));
+        assert!(!bridge.is_advertised_upstream("mcp_linear_unknown"));
+        assert!(!bridge.is_advertised_upstream("file_read"));
     }
 }

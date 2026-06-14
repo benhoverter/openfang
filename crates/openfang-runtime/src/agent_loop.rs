@@ -933,6 +933,7 @@ pub async fn run_agent_loop(
 
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
+                    let effective_file_policy = manifest.file_policy.as_ref();
 
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
@@ -956,6 +957,7 @@ pub async fn run_agent_loop(
                         workspace_root,
                         media_engine,
                         effective_exec_policy,
+                        effective_file_policy,
                         tts_engine,
                         docker_config,
                         process_manager,
@@ -2166,6 +2168,7 @@ pub async fn run_agent_loop_streaming(
 
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
+                    let effective_file_policy = manifest.file_policy.as_ref();
 
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
@@ -2189,6 +2192,7 @@ pub async fn run_agent_loop_streaming(
                         workspace_root,
                         media_engine,
                         effective_exec_policy,
+                        effective_file_policy,
                         tts_engine,
                         docker_config,
                         process_manager,

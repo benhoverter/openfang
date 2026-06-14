@@ -114,6 +114,18 @@ const BRIDGE_MCP_SERVER_NAME: &str = "openfang";
 ///   shells, these adjuncts must not become live.
 /// - `SlashCommand` — invokes CC's skill substrate, a parallel curation
 ///   surface. OpenFang's skill curation is the canonical path; deny CC's.
+/// - `Skill` — the same skill-invocation substrate as `SlashCommand`,
+///   reached by name rather than slash. Reconciled with it: the native CC
+///   skills behind it (`schedule`, `loop`, `update-config`, `run`) are
+///   OpenFang-First violations; OF's `skill_execute` is the canonical path.
+/// - `Task` — CC's subagent spawner, a parallel orchestration plane.
+///   OpenFang owns orchestration via `agent_spawn`/`agent_send`; denied so
+///   a subprocess can't fork an unobserved CC subagent tree.
+/// - `AskUserQuestion` — interactive multiple-choice picker. Inert by
+///   construction under OF's launch mode (`-p`, stdin nulled, no TTY): it
+///   can never reach the user and dead-ends silently. Denied so CC returns
+///   an explicit deny `tool_result` instead of a silent black hole the
+///   model may confabulate around.
 /// - `EnterWorktree`/`ExitWorktree` — creates a git worktree on disk
 ///   outside the agent workspace, a direct FS-escape primitive. A native
 ///   workspace-aware worktree tool is on the follow-up backlog; until then,
@@ -135,10 +147,10 @@ const BRIDGE_MCP_SERVER_NAME: &str = "openfang";
 ///   notifications. Soft policy gap rather than security; denied to keep
 ///   comms on the canonical path.
 ///
-/// Deliberately NOT denied: `TodoWrite`, `Task` (subagent), `Skill`,
-/// `AskUserQuestion`, `EnterPlanMode`/`ExitPlanMode`, `TaskOutput`/
-/// `TaskStop`, `ToolSearch` — agent-internal control flow / UX with no
-/// escape surface to the host system.
+/// Deliberately NOT denied: `TodoWrite`, `EnterPlanMode`/`ExitPlanMode`,
+/// `TaskOutput`/`TaskStop`, `ToolSearch` — agent-internal control flow /
+/// bookkeeping the agent loop depends on, with no escape surface to the
+/// host system.
 const CC_NATIVE_DENY: &[&str] = &[
     // Shell execution + adjuncts
     "Bash",
@@ -161,8 +173,13 @@ const CC_NATIVE_DENY: &[&str] = &[
     // Network
     "WebFetch",
     "WebSearch",
-    // Skill / command substrate
+    // Skill / command substrate (OpenFang-First: OF skill curation is canonical)
     "SlashCommand",
+    "Skill",
+    // Subagent orchestration (OpenFang-First: OF owns agent_spawn/agent_send)
+    "Task",
+    // Headless-inert interactive picker (no TTY under -p / stdin-null)
+    "AskUserQuestion",
     // Scheduling / remote control plane (OpenFang-First)
     "CronCreate",
     "CronDelete",
@@ -1854,9 +1871,6 @@ mod tests {
         // would break legitimate agent loops with no security upside.
         for must_allow in [
             "TodoWrite",
-            "Task",
-            "Skill",
-            "AskUserQuestion",
             "EnterPlanMode",
             "ExitPlanMode",
             "TaskOutput",
@@ -1903,6 +1917,24 @@ mod tests {
         assert!(
             CC_NATIVE_DENY.contains(&"SlashCommand"),
             "SlashCommand must be denied (parallel skill curation surface)"
+        );
+
+        // Skill + Task — parallel control-plane substrates. Reconciled
+        // with SlashCommand (same skill room) and OF orchestration.
+        assert!(
+            CC_NATIVE_DENY.contains(&"Skill"),
+            "Skill must be denied (parallel skill substrate; reconciles with SlashCommand)"
+        );
+        assert!(
+            CC_NATIVE_DENY.contains(&"Task"),
+            "Task must be denied (OpenFang-First: OF owns subagent orchestration)"
+        );
+
+        // AskUserQuestion — headless-inert interactive picker. Deny
+        // replaces a silent dead-end with an explicit deny tool_result.
+        assert!(
+            CC_NATIVE_DENY.contains(&"AskUserQuestion"),
+            "AskUserQuestion must be denied (headless-inert; no TTY under -p/stdin-null)"
         );
 
         // Scheduling / remote control plane — OpenFang-First.

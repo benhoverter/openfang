@@ -1314,6 +1314,7 @@ impl OpenFangKernel {
                     // had no effect on agents whose manifests cached the older
                     // inherited Allowlist policy at spawn time).
                     let mut disk_has_exec_policy_override = false;
+                    let mut disk_has_file_policy_override = false;
 
                     // Check if TOML on disk is newer/different — if so, update from file
                     let mut entry = entry;
@@ -1335,6 +1336,9 @@ impl OpenFangKernel {
                                         // kernel default below).
                                         if disk_manifest.exec_policy.is_some() {
                                             disk_has_exec_policy_override = true;
+                                        }
+                                        if disk_manifest.file_policy.is_some() {
+                                            disk_has_file_policy_override = true;
                                         }
                                         // Compare key fields to detect changes.
                                         // IMPORTANT: keep this list in sync with AgentManifest
@@ -1370,7 +1374,9 @@ impl OpenFangKernel {
                                             || disk_manifest.autonomous != entry.manifest.autonomous
                                             || disk_manifest.resources != entry.manifest.resources
                                             || disk_manifest.exec_policy
-                                                != entry.manifest.exec_policy;
+                                                != entry.manifest.exec_policy
+                                            || disk_manifest.file_policy
+                                                != entry.manifest.file_policy;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1446,6 +1452,22 @@ impl OpenFangKernel {
                         restored_entry.manifest.exec_policy =
                             Some(kernel.config.exec_policy.clone());
                     }
+
+                    // F2: re-resolve file_policy under the current global floor
+                    // on every restart (mirrors exec_policy #1132) so config
+                    // edits propagate and the transient floor — which is never
+                    // persisted — is re-derived. A disk override is kept as the
+                    // narrowing layer; absent one, global applies wholesale.
+                    let fp_override = if disk_has_file_policy_override {
+                        restored_entry.manifest.file_policy.take()
+                    } else {
+                        None
+                    };
+                    restored_entry.manifest.file_policy =
+                        Some(openfang_types::config::FilePolicy::resolve_under_floor(
+                            &kernel.config.file_policy,
+                            fp_override,
+                        ));
 
                     // Apply global budget defaults to restored agents
                     apply_budget_defaults(
@@ -1664,6 +1686,15 @@ impl OpenFangKernel {
             manifest.exec_policy = Some(self.config.exec_policy.clone());
         }
         info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
+
+        // F2: resolve file_policy under the global floor. The global
+        // `[file_policy]` is a hard floor — a per-agent override may only
+        // narrow it, never widen past it. With no override the global applies
+        // wholesale (closes the dead-global-config defect).
+        manifest.file_policy = Some(openfang_types::config::FilePolicy::resolve_under_floor(
+            &self.config.file_policy,
+            manifest.file_policy.take(),
+        ));
 
         // Overlay kernel default_model onto agent if agent didn't explicitly choose.
         // Treat empty or "default" as "use the kernel's configured default_model".
@@ -3335,6 +3366,18 @@ impl OpenFangKernel {
                 .is_some_and(|p| p == &self.config.exec_policy)
             {
                 manifest_for_disk.exec_policy = None;
+            }
+            // F2: same treatment for the inherited file_policy. The wholesale
+            // global-inherit case (== global) is stripped so a later config
+            // edit is not shadowed by a stale snapshot. A genuine per-agent
+            // override carries a transient floor and so never compares equal to
+            // the bare global, and is therefore preserved.
+            if manifest_for_disk
+                .file_policy
+                .as_ref()
+                .is_some_and(|p| p == &self.config.file_policy)
+            {
+                manifest_for_disk.file_policy = None;
             }
             match toml::to_string_pretty(&manifest_for_disk) {
                 Ok(toml_str) => {
@@ -6812,6 +6855,9 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
     if disk.exec_policy.is_none() && entry.exec_policy.is_some() {
         disk.exec_policy = entry.exec_policy.clone();
     }
+    if disk.file_policy.is_none() && entry.file_policy.is_some() {
+        disk.file_policy = entry.file_policy.clone();
+    }
     disk
 }
 
@@ -8025,6 +8071,7 @@ mod tests {
     #[test]
     fn test_manifest_to_capabilities() {
         let mut manifest = AgentManifest {
+            file_policy: None,
             name: "test".to_string(),
             version: "0.1.0".to_string(),
             description: "test".to_string(),
@@ -8069,6 +8116,7 @@ mod tests {
     #[test]
     fn test_merge_preserves_workspace_when_disk_omits_it() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "old".to_string(),
@@ -8120,6 +8168,7 @@ mod tests {
     #[test]
     fn test_merge_respects_explicit_disk_workspace() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8177,6 +8226,7 @@ mod tests {
             ..Default::default()
         };
         let mut restored_manifest = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8291,6 +8341,7 @@ mod tests {
 
     fn test_manifest(name: &str, description: &str, tags: Vec<String>) -> AgentManifest {
         AgentManifest {
+            file_policy: None,
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: description.to_string(),
