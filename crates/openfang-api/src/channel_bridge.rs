@@ -646,7 +646,73 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         msg
     }
 
-    async fn resolve_approval_text(&self, id_prefix: &str, approve: bool) -> String {
+    async fn resolve_approval_text(
+        &self,
+        id_prefix: &str,
+        approve: bool,
+        channel_type: &str,
+        approver_user_id: &str,
+        approver_display: &str,
+    ) -> String {
+        // ── #2a authz gate ──────────────────────────────
+        // Pre-#2a this stamped `decided_by = "channel"` with NO identity check:
+        // any user on a bound channel could resolve another agent's approval and
+        // the audit trail recorded only the literal "channel". We now (1) require
+        // an identified, authorized operator and (2) record the REAL approver.
+        //
+        // SECURITY DECISION POINT (flagged to security-openfang): when RBAC is
+        // disabled (`auth.is_enabled() == false`) we record the real channel
+        // identity but do NOT gate — matching the bridge's allow-all-when-
+        // unconfigured posture elsewhere. Fail-closed here would break every
+        // non-RBAC deployment's /approve. Confirm desired posture before merge.
+        // audit_label carries the stable uid:name; channel echo shows name
+        // only so we don't leak the internal UserId UUID to the channel.
+        let (approver_label, approver_echo): (String, String) = if self.kernel.auth.is_enabled() {
+            match self.kernel.auth.identify(channel_type, approver_user_id) {
+                Some(uid) => {
+                    if let Err(e) = self
+                        .kernel
+                        .auth
+                        .authorize(uid, &openfang_kernel::auth::Action::ApproveExecution)
+                    {
+                        return format!("Not authorized to resolve approvals: {e}");
+                    }
+                    // M1 (ANAI-81): anchor decided_by on the stable UserId
+                    // (UUID), not the mutable display name. Names are non-unique
+                    // and change across reloads; anchoring the audit record on
+                    // uid preserves correlation. Format `uid:name` for a
+                    // human-readable record without losing the stable key.
+                    let name = self
+                        .kernel
+                        .auth
+                        .get_user(uid)
+                        .map(|u| u.name)
+                        .unwrap_or_else(|| approver_display.to_string());
+                    (format!("{uid}:{name}"), name)
+                }
+                None => {
+                    return "Unrecognized user — not authorized to resolve approvals.".to_string();
+                }
+            }
+        } else {
+            // RBAC disabled: fail-open-but-recorded (security-openfang verdict A).
+            // We record the real channel identity but do NOT gate, matching the
+            // bridge's allow-when-unconfigured posture. WARN so operators see an
+            // approval was resolved without identity verification on a possibly
+            // shared channel. (True shared-vs-DM discrimination would need a
+            // channel-scope signal threaded here; tracked as follow-up.)
+            warn!(
+                channel_type = %channel_type,
+                approver = %approver_user_id,
+                "Approval resolved with RBAC disabled — resolver identity \
+                 unverified; enable users/RBAC to gate /approve on shared channels"
+            );
+            (
+                format!("{channel_type}:{approver_user_id} ({approver_display})"),
+                approver_display.to_string(),
+            )
+        };
+
         let pending = self.kernel.approval_manager.list_pending();
         let matched: Vec<_> = pending
             .iter()
@@ -664,17 +730,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 match self.kernel.approval_manager.resolve(
                     req.id,
                     decision,
-                    Some("channel".to_string()),
+                    Some(approver_label.clone()),
                 ) {
                     Ok(_) => {
                         let verb = if approve { "Approved" } else { "Rejected" };
                         let id_str = req.id.to_string();
                         format!(
-                            "{} [{}] {} — {}",
+                            "{} [{}] {} — {} (by {})",
                             verb,
                             safe_truncate_str(&id_str, 8),
                             req.tool_name,
-                            req.agent_id
+                            req.agent_id,
+                            approver_echo
                         )
                     }
                     Err(e) => format!("Failed to resolve approval: {e}"),

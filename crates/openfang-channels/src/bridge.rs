@@ -315,7 +315,14 @@ pub trait ChannelBridgeHandle: Send + Sync {
     }
 
     /// Approve or reject a pending approval by UUID prefix.
-    async fn resolve_approval_text(&self, _id_prefix: &str, _approve: bool) -> String {
+    async fn resolve_approval_text(
+        &self,
+        _id_prefix: &str,
+        _approve: bool,
+        _channel_type: &str,
+        _approver_user_id: &str,
+        _approver_display: &str,
+    ) -> String {
         "Approvals not available.".to_string()
     }
 
@@ -1046,6 +1053,7 @@ async fn dispatch_message(
             router,
             &message.sender,
             sender_user_id(message),
+            channel_type_str(&message.channel),
         )
         .await;
         send_response(adapter, &message.sender, result, thread_id, output_format).await;
@@ -1257,6 +1265,7 @@ async fn dispatch_message(
                 router,
                 &message.sender,
                 sender_user_id(message),
+                channel_type_str(&message.channel),
             )
             .await;
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
@@ -2142,6 +2151,7 @@ async fn handle_command(
     router: &Arc<AgentRouter>,
     sender: &ChannelUser,
     user_id: &str,
+    channel_type: &str,
 ) -> String {
     // Canonicalise through the unified command registry: aliases resolve to
     // their canonical name and matching is case-insensitive. If the command
@@ -2368,14 +2378,30 @@ async fn handle_command(
             if args.is_empty() {
                 "Usage: /approve <id-prefix>".to_string()
             } else {
-                handle.resolve_approval_text(&args[0], true).await
+                handle
+                    .resolve_approval_text(
+                        &args[0],
+                        true,
+                        channel_type,
+                        user_id,
+                        &sender.display_name,
+                    )
+                    .await
             }
         }
         "reject" => {
             if args.is_empty() {
                 "Usage: /reject <id-prefix>".to_string()
             } else {
-                handle.resolve_approval_text(&args[0], false).await
+                handle
+                    .resolve_approval_text(
+                        &args[0],
+                        false,
+                        channel_type,
+                        user_id,
+                        &sender.display_name,
+                    )
+                    .await
             }
         }
 
@@ -2469,10 +2495,10 @@ mod tests {
             openfang_user: None,
         };
 
-        let result = handle_command("agents", &[], &handle, &router, &sender, "user1").await;
+        let result = handle_command("agents", &[], &handle, &router, &sender, "user1", "cli").await;
         assert!(result.contains("coder"));
 
-        let result = handle_command("help", &[], &handle, &router, &sender, "user1").await;
+        let result = handle_command("help", &[], &handle, &router, &sender, "user1", "cli").await;
         assert!(result.contains("/agents"));
     }
 
@@ -2497,6 +2523,7 @@ mod tests {
             &router,
             &sender,
             "user1",
+            "telegram",
         )
         .await;
         assert!(result.contains("Now talking to agent: coder"));
@@ -2532,6 +2559,7 @@ mod tests {
             &router,
             &sender,
             user_id,
+            "discord",
         )
         .await;
         assert!(result.contains("Now talking to agent: coder"));
@@ -2561,7 +2589,7 @@ mod tests {
             openfang_user: None,
         };
 
-        let result = handle_command("agent", &[], &handle, &router, &sender, "user1").await;
+        let result = handle_command("agent", &[], &handle, &router, &sender, "user1", "cli").await;
         assert!(result.contains("Usage: /agent <name>"));
         assert!(result.contains("coder"));
     }
