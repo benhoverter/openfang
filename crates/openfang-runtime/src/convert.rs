@@ -79,6 +79,65 @@ impl RecipeSet {
     }
 }
 
+/// The set of `{token}` values substituted into a recipe's argv at dispatch
+/// time. Every value is a resolved, trusted path: `script_dir` is the runtime's
+/// scripts directory and `input`/`output` are sandbox-validated workspace
+/// paths. Substitution is the only way caller-influenced data enters the argv,
+/// and the result is always spawned via an argv array (never a shell string),
+/// so a path can never smuggle shell syntax such as `; rm -rf`.
+pub struct ArgvTokens<'a> {
+    /// Absolute path of `<openfang_home>/scripts`, substituted for `{script}`.
+    pub script_dir: &'a Path,
+    /// Sandbox-resolved absolute input path, substituted for `{input}`.
+    pub input: &'a Path,
+    /// Sandbox-resolved absolute output path, substituted for `{output}`.
+    pub output: &'a Path,
+}
+
+impl Recipe {
+    /// Substitute `{script}`, `{input}`, and `{output}` into this recipe's argv
+    /// template, producing a concrete argv ready to spawn.
+    ///
+    /// The template is validated first: every `{...}` placeholder must be one of
+    /// the three known tokens, so a typo'd or hostile manifest token (e.g.
+    /// `{home}`) is a hard error rather than a silently-unsubstituted literal.
+    /// Substitution itself is plain replacement of the known tokens only.
+    pub fn resolve_argv(&self, tokens: &ArgvTokens) -> Result<Vec<String>, String> {
+        const KNOWN: [&str; 3] = ["{script}", "{input}", "{output}"];
+        if self.argv.is_empty() {
+            return Err("recipe argv is empty".to_string());
+        }
+        let script = tokens.script_dir.to_string_lossy();
+        let input = tokens.input.to_string_lossy();
+        let output = tokens.output.to_string_lossy();
+
+        let mut out = Vec::with_capacity(self.argv.len());
+        for elem in &self.argv {
+            // Validate the template element: reject any unknown `{...}` token.
+            let mut rest = elem.as_str();
+            while let Some(start) = rest.find('{') {
+                let end = rest[start..].find('}').map(|i| start + i).ok_or_else(|| {
+                    format!("recipe argv element {elem:?} has an unterminated '{{' token")
+                })?;
+                let tok = &rest[start..=end];
+                if !KNOWN.contains(&tok) {
+                    return Err(format!(
+                        "recipe argv element {elem:?} contains unknown token {tok:?}; \
+                         supported tokens are {{script}}, {{input}}, {{output}}"
+                    ));
+                }
+                rest = &rest[end + 1..];
+            }
+            out.push(
+                elem.replace("{script}", &script)
+                    .replace("{input}", &input)
+                    .replace("{output}", &output),
+            );
+        }
+        Ok(out)
+    }
+}
+
 /// Errors raised while loading the recipe manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeError {
@@ -206,6 +265,61 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn resolve_argv_substitutes_known_tokens() {
+        let recipe = &default_recipes()[0];
+        let argv = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/home/.openfang/scripts"),
+                input: Path::new("/ws/doc.md"),
+                output: Path::new("/ws/doc.pdf"),
+            })
+            .unwrap();
+        assert_eq!(argv[0], "/home/.openfang/scripts/build-pdf.sh");
+        assert!(argv.contains(&"/ws/doc.md".to_string()));
+        assert!(argv.contains(&"/ws/doc.pdf".to_string()));
+        // No template tokens survive substitution.
+        assert!(!argv.iter().any(|a| a.contains('{')));
+    }
+
+    #[test]
+    fn resolve_argv_rejects_unknown_token() {
+        let recipe = Recipe {
+            from: "md".into(),
+            to: "pdf".into(),
+            argv: vec!["{script}/x".into(), "{evil}".into()],
+            needs: vec![],
+            out_ext: "pdf".into(),
+        };
+        let err = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/s"),
+                input: Path::new("/i"),
+                output: Path::new("/o"),
+            })
+            .unwrap_err();
+        assert!(err.contains("unknown token"));
+    }
+
+    #[test]
+    fn resolve_argv_rejects_unterminated_token() {
+        let recipe = Recipe {
+            from: "md".into(),
+            to: "pdf".into(),
+            argv: vec!["{input".into()],
+            needs: vec![],
+            out_ext: "pdf".into(),
+        };
+        let err = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/s"),
+                input: Path::new("/i"),
+                output: Path::new("/o"),
+            })
+            .unwrap_err();
+        assert!(err.contains("unterminated"));
     }
 
     #[test]
