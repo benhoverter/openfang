@@ -150,6 +150,7 @@ pub async fn execute_tool(
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    origin: Option<&openfang_types::approval::ApprovalOrigin>,
 ) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
@@ -198,7 +199,7 @@ pub async fn execute_tool(
                 tool_name,
                 openfang_types::truncate_str(&input_str, 200)
             );
-            match kh.request_approval(agent_id_str, tool_name, &summary).await {
+            match kh.request_approval(agent_id_str, tool_name, &summary, origin).await {
                 Ok(true) => {
                     debug!(tool_name, "Approval granted — proceeding with execution");
                 }
@@ -254,7 +255,8 @@ pub async fn execute_tool(
                                         kh.request_approval(
                                             caller_agent_id.unwrap_or("unknown"),
                                             tool_name,
-                                            &summary
+                                            &summary,
+                                            None,
                                         )
                                         .await,
                                         Ok(true)
@@ -4232,6 +4234,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(
@@ -4262,6 +4265,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4289,6 +4293,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4316,6 +4321,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4440,6 +4446,7 @@ mod tests {
             None,                 // tts_engine
             None,                 // docker_config
             None,                 // process_manager
+            None,                 // origin
         )
         .await;
         assert!(
@@ -4471,6 +4478,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4498,6 +4506,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -4525,6 +4534,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4552,6 +4562,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4580,6 +4591,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4612,6 +4624,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
@@ -4658,6 +4671,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // Should NOT be the capability-enforcement "Permission denied" — it should
@@ -4694,6 +4708,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4864,6 +4879,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4910,6 +4926,7 @@ mod tests {
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);

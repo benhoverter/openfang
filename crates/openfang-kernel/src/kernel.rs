@@ -2450,6 +2450,7 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                None, // origin (Piece 2 plumbing — populated at gated emit step)
             )
             .await;
 
@@ -3043,6 +3044,7 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            None, // origin (Piece 2 plumbing — populated at gated emit step)
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -7689,6 +7691,7 @@ impl KernelHandle for OpenFangKernel {
         agent_id: &str,
         tool_name: &str,
         action_summary: &str,
+        origin: Option<&openfang_types::approval::ApprovalOrigin>,
     ) -> Result<bool, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
@@ -7713,7 +7716,7 @@ impl KernelHandle for OpenFangKernel {
             risk_level: crate::approval::ApprovalManager::classify_risk(tool_name),
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
-            origin: None,
+            origin: origin.cloned(),
         };
 
         let decision = self.approval_manager.request_approval(req).await;

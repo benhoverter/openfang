@@ -7261,6 +7261,7 @@ pub async fn mcp_http(
                 None
             },
             Some(&*state.kernel.process_manager),
+            None, // origin (no channel origin on MCP-HTTP tool path)
         )
         .await;
 

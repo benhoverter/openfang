@@ -613,6 +613,7 @@ async fn dispatch_call(
             None
         },
         Some(&*kernel.process_manager),
+        None, // origin (no channel origin on bridge IPC tool path)
     )
     .await;
 

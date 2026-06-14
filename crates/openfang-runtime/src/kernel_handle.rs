@@ -142,8 +142,9 @@ pub trait KernelHandle: Send + Sync {
         agent_id: &str,
         tool_name: &str,
         action_summary: &str,
+        origin: Option<&openfang_types::approval::ApprovalOrigin>,
     ) -> Result<bool, String> {
-        let _ = (agent_id, tool_name, action_summary);
+        let _ = (agent_id, tool_name, action_summary, origin);
         Ok(true) // Default: auto-approve
     }
 
