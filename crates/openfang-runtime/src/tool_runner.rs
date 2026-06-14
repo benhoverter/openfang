@@ -1545,7 +1545,7 @@ async fn tool_file_list(
 /// the filesystem or spawn a process yet.
 async fn tool_file_convert(
     input: &serde_json::Value,
-    _workspace_root: Option<&Path>,
+    workspace_root: Option<&Path>,
 ) -> Result<String, String> {
     let to = input["format"]
         .as_str()
@@ -1591,15 +1591,123 @@ async fn tool_file_convert(
                 .into_owned()
         });
 
-    // ANAI-70 replaces this tail with: sandbox-resolve input/output, substitute
-    // the argv template ({script}/{input}/{output}), resolve binaries to
-    // absolute paths, preflight `needs`, and spawn the subprocess.
-    Err(format!(
-        "file_convert is registered but execution is not yet wired: recipe '{from}'->'{to}' \
-         resolved (argv template: {:?}, planned output: '{output_path}'). Secure path \
-         validation and subprocess execution land in ANAI-70.",
-        recipe.argv
-    ))
+    // ANAI-70 security core: clamp paths, substitute the argv template with
+    // resolved paths only, pin the launcher absolute, and spawn via argv array.
+
+    // §5.1 path validation: both paths must resolve INSIDE the workspace.
+    // resolve_sandbox_path rejects `..`, absolute escapes, and symlink escapes;
+    // the input must exist and the output's parent directory must exist.
+    let root = workspace_root.ok_or("file_convert requires a workspace root")?;
+    let resolved_input = crate::workspace_sandbox::resolve_sandbox_path(input_path, root)
+        .map_err(|e| format!("input path rejected: {e}"))?;
+    let resolved_output = crate::workspace_sandbox::resolve_sandbox_path(&output_path, root)
+        .map_err(|e| format!("output path rejected: {e}"))?;
+
+    // §5.3 argv-template substitution: tokens -> resolved literal paths only.
+    let scripts_dir = home.join("scripts");
+    let argv = recipe.resolve_argv(&crate::convert::ArgvTokens {
+        script_dir: &scripts_dir,
+        input: &resolved_input,
+        output: &resolved_output,
+    })?;
+
+    // §5.5 absolute-binary resolution: the launcher (argv[0]) must be an
+    // absolute path to an existing regular file. We never trust the daemon's
+    // bare PATH to find the launcher itself.
+    let program = argv[0].clone();
+    crate::subprocess_sandbox::validate_executable_path(&program)?;
+    let program_path = Path::new(&program);
+    if !program_path.is_absolute() {
+        return Err(format!(
+            "recipe launcher '{program}' did not resolve to an absolute path \
+             (argv[0] must begin with the {{script}} token or an absolute path)"
+        ));
+    }
+    if !program_path.is_file() {
+        return Err(format!(
+            "recipe launcher '{program}' not found; expected an executable at this path"
+        ));
+    }
+
+    // Spawn via argv array -- no shell, so substituted paths cannot inject shell
+    // syntax. Env is cleared then repopulated with the daemon's safe vars, and
+    // PATH is prefixed with a guaranteed set of tool directories so the
+    // launcher's own `command -v` lookups (e.g. pandoc, typst) resolve even
+    // under launchd's thin PATH (the ANAI-67 finding).
+    let mut cmd = tokio::process::Command::new(program_path);
+    cmd.args(&argv[1..]);
+    cmd.current_dir(root);
+    crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
+    cmd.env("PATH", convert_path_with_prefix());
+    cmd.stdin(std::process::Stdio::null());
+
+    let proc = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn conversion launcher '{program}': {e}"))?;
+
+    if !proc.status.success() {
+        let stderr = String::from_utf8_lossy(&proc.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&proc.stdout).trim().to_string()
+        } else {
+            detail.to_string()
+        };
+        return Ok(convert_envelope(
+            false,
+            to,
+            &output_path,
+            Some(&format!(
+                "conversion failed ({}): {}",
+                proc.status,
+                openfang_types::truncate_str(&detail, 600)
+            )),
+        ));
+    }
+
+    if !resolved_output.exists() {
+        return Ok(convert_envelope(
+            false,
+            to,
+            &output_path,
+            Some("conversion command reported success but produced no output file"),
+        ));
+    }
+
+    Ok(convert_envelope(true, to, &output_path, None))
+}
+
+/// Build the structured `file_convert` result envelope:
+/// `{ ok, format, output_path?, error? }`. ANAI-71 hardens this with an
+/// error-code taxonomy and a call-time `needs` preflight; ANAI-70 ships the
+/// working shape so callers can already branch on `ok`.
+fn convert_envelope(ok: bool, format: &str, output_path: &str, error: Option<&str>) -> String {
+    let mut obj = serde_json::json!({ "ok": ok, "format": format });
+    if ok {
+        obj["output_path"] = serde_json::Value::String(output_path.to_string());
+    }
+    if let Some(err) = error {
+        obj["error"] = serde_json::Value::String(err.to_string());
+    }
+    obj.to_string()
+}
+
+/// Compose the child PATH for a conversion spawn: a guaranteed prefix of common
+/// tool directories (which launchd may omit) ahead of the daemon's own PATH,
+/// de-duplicated and joined with the platform separator. This is the ANAI-67
+/// "inject a guaranteed PATH prefix" half of the hybrid launcher/PATH decision.
+fn convert_path_with_prefix() -> std::ffi::OsString {
+    let guaranteed = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+    let mut dirs: Vec<PathBuf> = guaranteed.iter().map(|d| PathBuf::from(*d)).collect();
+    if let Some(existing) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&existing) {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
