@@ -933,6 +933,25 @@ fn binding_context_for(message: &ChannelMessage) -> BindingContext {
     }
 }
 
+/// Build the live [`ApprovalOrigin`] for an incoming message so a downstream
+/// approval prompt can be pushed back to the exact channel/conversation that
+/// triggered the run.
+///
+/// `channel_type` / `channel_id` / `recipient` are sourced from the same
+/// single-source-of-truth as routing ([`binding_context_for`]); `thread_id`
+/// carries the resolved (possibly auto-created) thread the run is replying in.
+/// `recipient` is audit/targeting only — never an authz carrier (the clicker is
+/// re-authorized from the platform-attested interaction identity).
+fn approval_origin_for(message: &ChannelMessage, thread_id: Option<&str>) -> ApprovalOrigin {
+    let ctx = binding_context_for(message);
+    ApprovalOrigin {
+        channel_type: ctx.channel,
+        channel_id: ctx.channel_id,
+        thread_id: thread_id.map(String::from),
+        recipient: Some(ctx.peer_id),
+    }
+}
+
 /// If an error contains "Agent not found", try to re-resolve the channel's default agent
 /// by name (the name stored at bridge startup). Returns `Some(new_id)` on success.
 async fn try_reresolution(
@@ -1577,8 +1596,15 @@ async fn dispatch_message(
         text.clone()
     };
 
+    // Carry the live origin so a downstream approval prompt can be pushed back
+    // to this exact channel/conversation. Nothing reads `origin` until the emit
+    // site (step 5) — this is behavior-preserving on every existing path.
+    let origin = approval_origin_for(message, thread_id);
+
     // Send to agent and relay response
-    let result = handle.send_message(agent_id, &prefixed_text).await;
+    let result = handle
+        .send_message_with_origin(agent_id, &prefixed_text, origin.clone())
+        .await;
 
     // Stop the typing refresh now that we have a response
     typing_task.abort();
@@ -1615,7 +1641,9 @@ async fn dispatch_message(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message(new_id, &text).await;
+                let retry = handle
+                    .send_message_with_origin(new_id, &text, origin.clone())
+                    .await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {
@@ -2055,8 +2083,11 @@ async fn dispatch_with_blocks(
     // Continuous typing indicator (see spawn_typing_loop doc)
     let typing_task = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
 
+    // Carry the live origin (see text path) — behavior-preserving until emit.
+    let origin = approval_origin_for(message, thread_id);
+
     let result = handle
-        .send_message_with_blocks(agent_id, blocks.clone())
+        .send_message_with_blocks_and_origin(agent_id, blocks.clone(), origin.clone())
         .await;
 
     typing_task.abort();
@@ -2103,7 +2134,9 @@ async fn dispatch_with_blocks(
             // Try re-resolution before reporting error
             if let Some(new_id) = try_reresolution(&e, &channel_key, handle, router).await {
                 let typing_task2 = spawn_typing_loop(adapter_arc.clone(), message.sender.clone());
-                let retry = handle.send_message_with_blocks(new_id, blocks).await;
+                let retry = handle
+                    .send_message_with_blocks_and_origin(new_id, blocks, origin.clone())
+                    .await;
                 typing_task2.abort();
                 match retry {
                     Ok(response) => {
