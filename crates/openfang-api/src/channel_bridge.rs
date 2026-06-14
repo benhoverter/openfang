@@ -69,6 +69,67 @@ pub struct KernelBridgeAdapter {
     started_at: Instant,
 }
 
+/// #2a (ANAI-81) authz decision for resolving a channel approval.
+///
+/// Returns `Ok((audit_label, channel_echo))` for an authorized resolver, or
+/// `Err(message)` carrying the channel-facing rejection text. Extracted
+/// verbatim from `resolve_approval_text` so the gate's branching is
+/// unit-testable against a cheap `AuthManager` fixture without standing up a
+/// full kernel (see the `classify_approver_*` tests below).
+///
+/// - `audit_label` is the stable `uid:name` recorded in `decided_by` (UUID
+///   anchor, name as decoration).
+/// - `channel_echo` is the name only — we never leak the internal UserId UUID
+///   back to the channel.
+fn classify_approver(
+    auth: &openfang_kernel::auth::AuthManager,
+    channel_type: &str,
+    approver_user_id: &str,
+    approver_display: &str,
+) -> Result<(String, String), String> {
+    if auth.is_enabled() {
+        match auth.identify(channel_type, approver_user_id) {
+            Some(uid) => {
+                if let Err(e) =
+                    auth.authorize(uid, &openfang_kernel::auth::Action::ApproveExecution)
+                {
+                    return Err(format!("Not authorized to resolve approvals: {e}"));
+                }
+                // M1 (ANAI-81): anchor decided_by on the stable UserId (UUID),
+                // not the mutable display name. Names are non-unique and change
+                // across reloads; anchoring the audit record on uid preserves
+                // correlation. Format `uid:name` for a human-readable record
+                // without losing the stable key.
+                let name = auth
+                    .get_user(uid)
+                    .map(|u| u.name)
+                    .unwrap_or_else(|| approver_display.to_string());
+                Ok((format!("{uid}:{name}"), name))
+            }
+            None => {
+                Err("Unrecognized user — not authorized to resolve approvals.".to_string())
+            }
+        }
+    } else {
+        // RBAC disabled: fail-open-but-recorded (security-openfang verdict A).
+        // We record the real channel identity but do NOT gate, matching the
+        // bridge's allow-when-unconfigured posture. WARN so operators see an
+        // approval was resolved without identity verification on a possibly
+        // shared channel. (True shared-vs-DM discrimination would need a
+        // channel-scope signal threaded here; tracked as follow-up.)
+        warn!(
+            channel_type = %channel_type,
+            approver = %approver_user_id,
+            "Approval resolved with RBAC disabled — resolver identity \
+             unverified; enable users/RBAC to gate /approve on shared channels"
+        );
+        Ok((
+            format!("{channel_type}:{approver_user_id} ({approver_display})"),
+            approver_display.to_string(),
+        ))
+    }
+}
+
 #[async_trait]
 impl ChannelBridgeHandle for KernelBridgeAdapter {
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
@@ -657,60 +718,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         // ── #2a authz gate ──────────────────────────────
         // Pre-#2a this stamped `decided_by = "channel"` with NO identity check:
         // any user on a bound channel could resolve another agent's approval and
-        // the audit trail recorded only the literal "channel". We now (1) require
-        // an identified, authorized operator and (2) record the REAL approver.
-        //
-        // SECURITY DECISION POINT (flagged to security-openfang): when RBAC is
-        // disabled (`auth.is_enabled() == false`) we record the real channel
-        // identity but do NOT gate — matching the bridge's allow-all-when-
-        // unconfigured posture elsewhere. Fail-closed here would break every
-        // non-RBAC deployment's /approve. Confirm desired posture before merge.
-        // audit_label carries the stable uid:name; channel echo shows name
-        // only so we don't leak the internal UserId UUID to the channel.
-        let (approver_label, approver_echo): (String, String) = if self.kernel.auth.is_enabled() {
-            match self.kernel.auth.identify(channel_type, approver_user_id) {
-                Some(uid) => {
-                    if let Err(e) = self
-                        .kernel
-                        .auth
-                        .authorize(uid, &openfang_kernel::auth::Action::ApproveExecution)
-                    {
-                        return format!("Not authorized to resolve approvals: {e}");
-                    }
-                    // M1 (ANAI-81): anchor decided_by on the stable UserId
-                    // (UUID), not the mutable display name. Names are non-unique
-                    // and change across reloads; anchoring the audit record on
-                    // uid preserves correlation. Format `uid:name` for a
-                    // human-readable record without losing the stable key.
-                    let name = self
-                        .kernel
-                        .auth
-                        .get_user(uid)
-                        .map(|u| u.name)
-                        .unwrap_or_else(|| approver_display.to_string());
-                    (format!("{uid}:{name}"), name)
-                }
-                None => {
-                    return "Unrecognized user — not authorized to resolve approvals.".to_string();
-                }
-            }
-        } else {
-            // RBAC disabled: fail-open-but-recorded (security-openfang verdict A).
-            // We record the real channel identity but do NOT gate, matching the
-            // bridge's allow-when-unconfigured posture. WARN so operators see an
-            // approval was resolved without identity verification on a possibly
-            // shared channel. (True shared-vs-DM discrimination would need a
-            // channel-scope signal threaded here; tracked as follow-up.)
-            warn!(
-                channel_type = %channel_type,
-                approver = %approver_user_id,
-                "Approval resolved with RBAC disabled — resolver identity \
-                 unverified; enable users/RBAC to gate /approve on shared channels"
-            );
-            (
-                format!("{channel_type}:{approver_user_id} ({approver_display})"),
-                approver_display.to_string(),
-            )
+        // the audit trail recorded only the literal "channel". The gate now
+        // requires an identified, authorized operator and records the REAL
+        // approver. Branching logic + the RBAC-disabled fail-open posture
+        // (security-openfang verdict A) live in `classify_approver`, which is
+        // unit-tested below.
+        let (approver_label, approver_echo): (String, String) = match classify_approver(
+            &self.kernel.auth,
+            channel_type,
+            approver_user_id,
+            approver_display,
+        ) {
+            Ok(pair) => pair,
+            Err(msg) => return msg,
         };
 
         let pending = self.kernel.approval_manager.list_pending();
@@ -2050,5 +2070,105 @@ mod tests {
 
         let feishu = config.channels.feishu.expect("feishu config should exist");
         assert_eq!(feishu.mode, openfang_types::config::FeishuMode::Websocket);
+    }
+
+    // ── #2a (ANAI-81) classify_approver gate ────────────────────────────
+    // The kernel-layer authorize() matrix (admin floor, unrecognized-denied)
+    // is covered in openfang-kernel's auth.rs tests. These cover the bridge
+    // glue that the kernel tests can't see: the RBAC-enabled/disabled
+    // branching, the stable `uid:name` audit label, the name-only channel echo
+    // (no UserId UUID leak), and the rejection strings — all without standing
+    // up a full OpenFangKernel fixture.
+    use super::classify_approver;
+    use openfang_kernel::auth::AuthManager;
+    use openfang_types::config::UserConfig;
+    use std::collections::HashMap;
+
+    /// One user per role, each bound on discord. Mirrors the kernel auth.rs
+    /// fixture so the two layers exercise the same role matrix.
+    fn rbac_role_configs() -> Vec<UserConfig> {
+        let bind = |id: &str| {
+            let mut m = HashMap::new();
+            m.insert("discord".to_string(), id.to_string());
+            m
+        };
+        vec![
+            UserConfig {
+                name: "Owner".to_string(),
+                role: "owner".to_string(),
+                channel_bindings: bind("owner-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Admin".to_string(),
+                role: "admin".to_string(),
+                channel_bindings: bind("admin-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Member".to_string(),
+                role: "user".to_string(),
+                channel_bindings: bind("user-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Viewer".to_string(),
+                role: "viewer".to_string(),
+                channel_bindings: bind("viewer-1"),
+                api_key_hash: None,
+            },
+        ]
+    }
+
+    // Authorized resolvers (Admin floor) get Ok((uid:name, name)). The audit
+    // label is anchored on the stable UserId; the channel echo is name-only.
+    #[test]
+    fn test_classify_approver_admin_floor_records_uid_name() {
+        let auth = AuthManager::new(&rbac_role_configs());
+
+        for (bind_id, name) in [("admin-1", "Admin"), ("owner-1", "Owner")] {
+            let uid = auth
+                .identify("discord", bind_id)
+                .expect("bound user resolves");
+            let (label, echo) = classify_approver(&auth, "discord", bind_id, "ignored-display")
+                .expect("authorized resolver");
+            assert_eq!(label, format!("{uid}:{name}"), "audit label is uid:name");
+            assert_eq!(echo, name, "channel echo is name-only");
+            assert!(!echo.contains(':'), "echo must not leak the UserId UUID");
+        }
+    }
+
+    // Recognized-but-below-floor roles (user, viewer) are denied.
+    #[test]
+    fn test_classify_approver_below_floor_denied() {
+        let auth = AuthManager::new(&rbac_role_configs());
+        for bind_id in ["user-1", "viewer-1"] {
+            let err = classify_approver(&auth, "discord", bind_id, "d")
+                .expect_err("below-floor role denied");
+            assert!(err.contains("Not authorized"), "got: {err}");
+        }
+    }
+
+    // An unrecognized channel identity is rejected before authorize().
+    #[test]
+    fn test_classify_approver_unrecognized_denied() {
+        let auth = AuthManager::new(&rbac_role_configs());
+        let err = classify_approver(&auth, "discord", "stranger", "d")
+            .expect_err("unrecognized user denied");
+        assert!(err.contains("Unrecognized"), "got: {err}");
+    }
+
+    // RBAC disabled (no users configured): fail-open-but-recorded. No gate,
+    // but the real channel identity is stamped into the audit label and the
+    // display name is echoed. (security-openfang verdict A.)
+    #[test]
+    fn test_classify_approver_rbac_disabled_fail_open_records_channel_identity() {
+        let auth = AuthManager::new(&[]);
+        assert!(!auth.is_enabled(), "no users => RBAC disabled");
+
+        let (label, echo) = classify_approver(&auth, "discord", "raw-123", "Ben")
+            .expect("fail-open records without gating");
+        assert_eq!(label, "discord:raw-123 (Ben)");
+        assert_eq!(echo, "Ben");
     }
 }
