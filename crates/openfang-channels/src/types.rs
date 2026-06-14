@@ -86,6 +86,16 @@ pub enum ChannelContent {
     /// content blocks. Implementations should not produce nested `Multipart`
     /// values; consumers may `debug_assert!` against nesting.
     Multipart(Vec<ChannelContent>),
+    /// An interactive message: a text body plus one or more action buttons.
+    /// Discord renders this as a message with an action row; adapters that do
+    /// not override [`ChannelAdapter::supports_interactive`] degrade to the
+    /// `text` body alone (callers MUST keep `text` self-sufficient, e.g. it
+    /// still contains `/approve <id>` for the #2a text path). `buttons` carry
+    /// an opaque `custom_id` only — never authorization (ANAI-82).
+    Interactive {
+        text: String,
+        buttons: Vec<InteractiveButton>,
+    },
 }
 
 /// A unified message from any channel.
@@ -371,6 +381,16 @@ pub trait ChannelAdapter: Send + Sync {
         user: &ChannelUser,
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Whether this adapter can render [`ChannelContent::Interactive`]
+    /// (action buttons). Default `false`: the dispatch path degrades
+    /// interactive content to its text body before calling `send`. Discord
+    /// overrides this to `true` (ANAI-82). Keeping the default `false` means
+    /// the ~50 other adapters need no change and never receive a variant they
+    /// cannot render.
+    fn supports_interactive(&self) -> bool {
+        false
+    }
 
     /// Send a typing indicator (optional — default no-op).
     async fn send_typing(&self, _user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {
@@ -680,5 +700,57 @@ mod tests {
         };
         let json = serde_json::to_string(&receipt).unwrap();
         assert!(json.contains("Connection refused"));
+    }
+}
+
+
+/// A single button in a [`ChannelContent::Interactive`] action row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InteractiveButton {
+    /// Opaque identifier echoed back verbatim on click (Discord `custom_id`).
+    /// Encodes the approval request id + nonce; MUST NOT carry authorization
+    /// (capability-in-URL antipattern — authz is the clicking user, checked
+    /// server-side at resolve time). Discord caps this at 100 chars.
+    pub custom_id: String,
+    /// Visible button label.
+    pub label: String,
+    /// Visual style hint; mapped to a native style by the adapter.
+    pub style: ButtonStyle,
+}
+
+/// Visual style for an [`InteractiveButton`]. Names are platform-neutral;
+/// adapters map them to native styles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ButtonStyle {
+    Primary,
+    Secondary,
+    Success,
+    Danger,
+}
+
+impl ButtonStyle {
+    /// Discord Component button `style` integer (API v10):
+    /// Primary=1, Secondary=2, Success=3, Danger=4.
+    pub fn discord_style(self) -> u8 {
+        match self {
+            ButtonStyle::Primary => 1,
+            ButtonStyle::Secondary => 2,
+            ButtonStyle::Success => 3,
+            ButtonStyle::Danger => 4,
+        }
+    }
+}
+
+impl ChannelContent {
+    /// Collapse a richer variant to a plain-text equivalent for adapters that
+    /// cannot render it. Used by the dispatch path to gracefully degrade an
+    /// [`ChannelContent::Interactive`] to text on adapters whose
+    /// [`ChannelAdapter::supports_interactive`] is `false`. All other variants
+    /// pass through unchanged.
+    pub fn degrade_to_text(self) -> ChannelContent {
+        match self {
+            ChannelContent::Interactive { text, .. } => ChannelContent::Text(text),
+            other => other,
+        }
     }
 }

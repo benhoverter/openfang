@@ -5,6 +5,7 @@
 
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
+    InteractiveButton,
     ResolutionError,
 };
 use async_trait::async_trait;
@@ -191,6 +192,36 @@ impl DiscordAdapter {
                 let body_text = resp.text().await.unwrap_or_default();
                 warn!("Discord sendMessage failed: {body_text}");
             }
+        }
+        Ok(())
+    }
+
+    /// Send a message carrying an action row of buttons (ANAI-82).
+    ///
+    /// Approval prompts are short and never split, so this sends a single
+    /// message with a `components` payload. Discord caps an action row at 5
+    /// buttons and `custom_id` at 100 chars; `build_action_rows` chunks to fit.
+    async fn api_send_interactive(
+        &self,
+        channel_id: &str,
+        text: &str,
+        buttons: &[InteractiveButton],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let body = serde_json::json!({
+            "content": text,
+            "components": build_action_rows(buttons),
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord interactive sendMessage failed: {body_text}");
         }
         Ok(())
     }
@@ -971,6 +1002,10 @@ impl ChannelAdapter for DiscordAdapter {
         Ok(Box::pin(stream))
     }
 
+    fn supports_interactive(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         user: &ChannelUser,
@@ -981,6 +1016,9 @@ impl ChannelAdapter for DiscordAdapter {
         match content {
             ChannelContent::Text(text) => {
                 self.api_send_message(channel_id, &text).await?;
+            }
+            ChannelContent::Interactive { text, buttons } => {
+                self.api_send_interactive(channel_id, &text, &buttons).await?;
             }
             _ => {
                 self.api_send_message(channel_id, "(Unsupported content type)")
@@ -2149,5 +2187,92 @@ mod tests {
         let a = make_adapter();
         let err = a.resolve_recipient("").await.unwrap_err();
         assert!(matches!(err, ResolutionError::UnknownRecipient { .. }));
+    }
+}
+
+
+/// Build Discord `components` action rows from platform-neutral buttons.
+/// Discord allows max 5 buttons per action row (and 5 rows); buttons are
+/// chunked into rows of 5. Each button is component type 2 (Button).
+fn build_action_rows(buttons: &[InteractiveButton]) -> Vec<serde_json::Value> {
+    buttons
+        .chunks(5)
+        .map(|row| {
+            let comps: Vec<serde_json::Value> = row
+                .iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "type": 2,
+                        "style": b.style.discord_style(),
+                        "label": b.label,
+                        "custom_id": b.custom_id,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "type": 1, "components": comps })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod anai82_interactive_tests {
+    use super::*;
+    use crate::types::ButtonStyle;
+
+    fn btn(custom_id: &str, label: &str, style: ButtonStyle) -> InteractiveButton {
+        InteractiveButton {
+            custom_id: custom_id.to_string(),
+            label: label.to_string(),
+            style,
+        }
+    }
+
+    #[test]
+    fn discord_style_mapping_matches_api_v10() {
+        assert_eq!(ButtonStyle::Primary.discord_style(), 1);
+        assert_eq!(ButtonStyle::Secondary.discord_style(), 2);
+        assert_eq!(ButtonStyle::Success.discord_style(), 3);
+        assert_eq!(ButtonStyle::Danger.discord_style(), 4);
+    }
+
+    #[test]
+    fn action_row_shape_and_button_fields() {
+        let rows = build_action_rows(&[
+            btn("ap:abc123:n0", "Approve", ButtonStyle::Success),
+            btn("dn:abc123:n0", "Deny", ButtonStyle::Danger),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["type"], 1);
+        let comps = rows[0]["components"].as_array().unwrap();
+        assert_eq!(comps.len(), 2);
+        assert_eq!(comps[0]["type"], 2);
+        assert_eq!(comps[0]["style"], 3);
+        assert_eq!(comps[0]["label"], "Approve");
+        assert_eq!(comps[0]["custom_id"], "ap:abc123:n0");
+        assert_eq!(comps[1]["style"], 4);
+        assert_eq!(comps[1]["custom_id"], "dn:abc123:n0");
+    }
+
+    #[test]
+    fn buttons_chunk_into_rows_of_five() {
+        let buttons: Vec<InteractiveButton> = (0..6)
+            .map(|i| btn(&format!("c{i}"), "b", ButtonStyle::Secondary))
+            .collect();
+        let rows = build_action_rows(&buttons);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["components"].as_array().unwrap().len(), 5);
+        assert_eq!(rows[1]["components"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn degrade_to_text_collapses_interactive() {
+        let ic = ChannelContent::Interactive {
+            text: "Approve request abc? /approve abc".to_string(),
+            buttons: vec![btn("ap:abc:n0", "Approve", ButtonStyle::Success)],
+        };
+        match ic.degrade_to_text() {
+            ChannelContent::Text(t) => assert_eq!(t, "Approve request abc? /approve abc"),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 }

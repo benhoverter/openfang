@@ -1114,6 +1114,14 @@ async fn dispatch_message(
                         provider_metadata: None,
                     });
                 }
+                // Outbound-only variant; never expected inbound. Render
+                // its text body defensively rather than drop the message.
+                ChannelContent::Interactive { text, .. } => {
+                    blocks.push(ContentBlock::Text {
+                        text: text.clone(),
+                        provider_metadata: None,
+                    });
+                }
                 // Defensive: debug_assert above catches this in dev; ignore
                 // gracefully in release.
                 ChannelContent::Multipart(_) => {}
@@ -1184,6 +1192,8 @@ async fn dispatch_message(
 
     let text = match &message.content {
         ChannelContent::Text(t) => t.clone(),
+        // Outbound-only variant; never expected inbound. Fall back to text.
+        ChannelContent::Interactive { text, .. } => text.clone(),
         ChannelContent::Command { .. } => unreachable!(), // handled above
         ChannelContent::Image {
             ref url,
@@ -1238,6 +1248,8 @@ async fn dispatch_message(
                 ChannelContent::Command { name, args } => {
                     format!("/{name} {}", args.join(" "))
                 }
+                // Outbound-only; never expected inbound. Fall back to text.
+                ChannelContent::Interactive { text, .. } => text.clone(),
                 // Nesting is rejected by adapters; emit empty so the join
                 // doesn't insert spurious separators.
                 ChannelContent::Multipart(_) => String::new(),
