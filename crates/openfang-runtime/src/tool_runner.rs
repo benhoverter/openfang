@@ -1749,16 +1749,21 @@ async fn tool_file_list(
 /// `file_convert` — render a workspace file to another format via an
 /// allowlisted recipe table (see [`crate::convert`]).
 ///
-/// ANAI-69 scope: tool registration + dispatch wiring + fail-closed recipe
-/// resolution. The security core — sandbox path validation, argv-template
-/// token substitution, absolute-binary resolution, and subprocess execution —
-/// is intentionally deferred to ANAI-70. This handler validates the request
-/// against the recipe table and reports the resolved plan; it does NOT touch
-/// the filesystem or spawn a process yet.
+/// `file_convert` dispatcher (ANAI-67..71): the load-bearing security seam.
+/// Resolves the request against the allowlisted recipe table (fail-closed),
+/// clamps both paths into the caller's workspace, substitutes the argv template
+/// with resolved paths only, pins the launcher to an absolute file, preflights
+/// the recipe's external `needs`, then spawns via an argv array (never a shell
+/// string) with a guaranteed PATH. Every conversion outcome — success and the
+/// four failure codes (UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED) —
+/// is returned as the structured envelope from `convert_ok` / `convert_err`.
 async fn tool_file_convert(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
 ) -> Result<String, String> {
+    // Request-shape validation (a malformed call, not a conversion outcome):
+    // these stay plain Err. Everything from the recipe lookup onward speaks the
+    // structured envelope so callers can branch on `ok` + `error.code`.
     let to = input["format"]
         .as_str()
         .ok_or("Missing 'format' parameter (target format, e.g. \"pdf\")")?;
@@ -1769,30 +1774,44 @@ async fn tool_file_convert(
         return Err("'input' parameter is empty".to_string());
     }
 
-    // Derive the source format from the input file extension (pure string op;
-    // no filesystem access — that lands in ANAI-70).
-    let from = Path::new(input_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .ok_or_else(|| {
-            format!("Cannot determine source format: input '{input_path}' has no file extension")
-        })?;
+    // Derive the source format from the input file extension (pure string op).
+    let from = match Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        Some(ext) => ext,
+        None => {
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_FORMAT",
+                &format!(
+                    "input '{input_path}' has no file extension; cannot determine source format"
+                ),
+            ));
+        }
+    };
 
-    // Load the recipe table and resolve the (from, to) pair. Fail-closed: an
-    // unknown pair is a hard error, never a silent fallback.
+    // §5.2 allowlist (fail-closed): resolve the (from, to) pair against the
+    // recipe table. An unknown pair is UNKNOWN_FORMAT, never a silent fallback,
+    // and is rejected before any filesystem access or spawn.
     let home = crate::convert::openfang_home_dir();
     let recipes = crate::convert::load_recipes(&home)
         .map_err(|e| format!("Failed to load conversion recipes: {e}"))?;
-    let recipe = recipes.lookup(from, to).ok_or_else(|| {
-        let supported = recipes
-            .recipes()
-            .iter()
-            .map(|r| format!("{}->{}", r.from, r.to))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("No conversion recipe for '{from}'->'{to}'. Supported: {supported}")
-    })?;
+    let recipe = match recipes.lookup(from, to) {
+        Some(r) => r,
+        None => {
+            let supported = recipes
+                .recipes()
+                .iter()
+                .map(|r| format!("{}->{}", r.from, r.to))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_FORMAT",
+                &format!("no conversion recipe for '{from}'->'{to}'. Supported: {supported}"),
+            ));
+        }
+    };
 
+    // Default the output next to the input, with the recipe's output extension.
     let output_path = input["output"]
         .as_str()
         .map(|s| s.to_string())
@@ -1803,29 +1822,45 @@ async fn tool_file_convert(
                 .into_owned()
         });
 
-    // ANAI-70 security core: clamp paths, substitute the argv template with
-    // resolved paths only, pin the launcher absolute, and spawn via argv array.
-
     // §5.1 path validation: both paths must resolve INSIDE the workspace.
-    // resolve_sandbox_path rejects `..`, absolute escapes, and symlink escapes;
+    // resolve_sandbox_path rejects `..`, absolute escape, and symlink escape;
     // the input must exist and the output's parent directory must exist.
     let root = workspace_root.ok_or("file_convert requires a workspace root")?;
-    let resolved_input = crate::workspace_sandbox::resolve_sandbox_path(input_path, root)
-        .map_err(|e| format!("input path rejected: {e}"))?;
-    let resolved_output = crate::workspace_sandbox::resolve_sandbox_path(&output_path, root)
-        .map_err(|e| format!("output path rejected: {e}"))?;
+    let resolved_input = match crate::workspace_sandbox::resolve_sandbox_path(input_path, root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(convert_err(
+                to,
+                "BAD_PATH",
+                &format!("input path rejected: {e}"),
+            ))
+        }
+    };
+    let resolved_output = match crate::workspace_sandbox::resolve_sandbox_path(&output_path, root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(convert_err(
+                to,
+                "BAD_PATH",
+                &format!("output path rejected: {e}"),
+            ))
+        }
+    };
 
     // §5.3 argv-template substitution: tokens -> resolved literal paths only.
     let scripts_dir = home.join("scripts");
-    let argv = recipe.resolve_argv(&crate::convert::ArgvTokens {
+    let argv = match recipe.resolve_argv(&crate::convert::ArgvTokens {
         script_dir: &scripts_dir,
         input: &resolved_input,
         output: &resolved_output,
-    })?;
+    }) {
+        Ok(a) => a,
+        // A bad token is a manifest-authoring defect, not a conversion outcome.
+        Err(e) => return Err(format!("recipe argv template invalid: {e}")),
+    };
 
     // §5.5 absolute-binary resolution: the launcher (argv[0]) must be an
-    // absolute path to an existing regular file. We never trust the daemon's
-    // bare PATH to find the launcher itself.
+    // absolute path. We never trust the daemon's bare PATH to find it.
     let program = argv[0].clone();
     crate::subprocess_sandbox::validate_executable_path(&program)?;
     let program_path = Path::new(&program);
@@ -1835,22 +1870,44 @@ async fn tool_file_convert(
              (argv[0] must begin with the {{script}} token or an absolute path)"
         ));
     }
+
+    // Compose the child PATH once: a guaranteed tool-dir prefix ahead of the
+    // daemon's own PATH. Used for BOTH the preflight and the spawn, so what we
+    // verify is exactly what the child resolves against.
+    let child_path = convert_path_with_prefix();
+
+    // §5.4 call-time preflight (the §4.3 drift backstop): the launcher and every
+    // external `need` must be resolvable BEFORE we spawn. A missing binary is
+    // MISSING_DEP — never a partial invocation.
     if !program_path.is_file() {
-        return Err(format!(
-            "recipe launcher '{program}' not found; expected an executable at this path"
+        return Ok(convert_err(
+            to,
+            "MISSING_DEP",
+            &format!(
+                "file_convert {from}->{to} launcher '{program}' not found. Recipe present, launcher missing."
+            ),
         ));
+    }
+    for need in &recipe.needs {
+        if find_on_path(need, &child_path).is_none() {
+            return Ok(convert_err(
+                to,
+                "MISSING_DEP",
+                &format!(
+                    "file_convert {from}->{to} needs '{need}', not found on PATH. Recipe present, binary missing."
+                ),
+            ));
+        }
     }
 
     // Spawn via argv array -- no shell, so substituted paths cannot inject shell
-    // syntax. Env is cleared then repopulated with the daemon's safe vars, and
-    // PATH is prefixed with a guaranteed set of tool directories so the
-    // launcher's own `command -v` lookups (e.g. pandoc, typst) resolve even
-    // under launchd's thin PATH (the ANAI-67 finding).
+    // syntax. Env is cleared then repopulated with the daemon's safe vars, then
+    // PATH is replaced with the guaranteed-prefixed PATH we just preflighted.
     let mut cmd = tokio::process::Command::new(program_path);
     cmd.args(&argv[1..]);
     cmd.current_dir(root);
     crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
-    cmd.env("PATH", convert_path_with_prefix());
+    cmd.env("PATH", &child_path);
     cmd.stdin(std::process::Stdio::null());
 
     let proc = cmd
@@ -1866,45 +1923,93 @@ async fn tool_file_convert(
         } else {
             detail.to_string()
         };
-        return Ok(convert_envelope(
-            false,
+        return Ok(convert_err(
             to,
-            &output_path,
-            Some(&format!(
-                "conversion failed ({}): {}",
+            "CONVERT_FAILED",
+            &format!(
+                "conversion command exited with {}: {}",
                 proc.status,
                 openfang_types::truncate_str(&detail, 600)
-            )),
+            ),
         ));
     }
 
     if !resolved_output.exists() {
-        return Ok(convert_envelope(
-            false,
+        return Ok(convert_err(
             to,
-            &output_path,
-            Some("conversion command reported success but produced no output file"),
+            "CONVERT_FAILED",
+            "conversion command reported success but produced no output file",
         ));
     }
 
-    Ok(convert_envelope(true, to, &output_path, None))
+    Ok(convert_ok(to, &output_path))
 }
 
-/// Build the structured `file_convert` result envelope:
-/// `{ ok, format, output_path?, error? }`. ANAI-71 hardens this with an
-/// error-code taxonomy and a call-time `needs` preflight; ANAI-70 ships the
-/// working shape so callers can already branch on `ok`.
-fn convert_envelope(ok: bool, format: &str, output_path: &str, error: Option<&str>) -> String {
-    let mut obj = serde_json::json!({ "ok": ok, "format": format });
-    if ok {
-        obj["output_path"] = serde_json::Value::String(output_path.to_string());
-    }
-    if let Some(err) = error {
-        obj["error"] = serde_json::Value::String(err.to_string());
-    }
-    obj.to_string()
+/// Build the `file_convert` success envelope:
+/// `{ "ok": true, "format": "<fmt>", "output_path": "<path>" }`. The path is the
+/// workspace-relative form the caller passed (or the derived default) — the path
+/// a follow-up `file_read` can use directly.
+fn convert_ok(format: &str, output_path: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "format": format,
+        "output_path": output_path
+    })
+    .to_string()
 }
 
+/// Build the structured `file_convert` error envelope (§4.3):
+/// `{ "ok": false, "format": "<fmt>", "error": { "code": "<CODE>", "message": "<msg>" } }`.
+/// `code` is one of UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED.
+fn convert_err(format: &str, code: &str, message: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "format": format,
+        "error": { "code": code, "message": message }
+    })
+    .to_string()
+}
+
+/// Resolve a bare binary name against a composed PATH, returning the first
+/// matching executable. Close enough to `command -v` for a preflight backstop:
+/// on Unix it requires an executable bit; elsewhere an existing regular file.
+/// A name that already contains a path separator is checked as-is, not searched.
+fn find_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    if bin.contains('/') || bin.contains('\\') {
+        let p = PathBuf::from(bin);
+        return if is_executable_file(&p) {
+            Some(p)
+        } else {
+            None
+        };
+    }
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join(bin);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether `path` is a regular file that is executable (Unix checks the exec
+/// bit; other platforms fall back to file existence).
+fn is_executable_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
 /// Compose the child PATH for a conversion spawn: a guaranteed prefix of common
 /// tool directories (which launchd may omit) ahead of the daemon's own PATH,
 /// de-duplicated and joined with the platform separator. This is the ANAI-67
@@ -5729,5 +5834,41 @@ mod tests {
         assert!(out.contains("<openfang:attach path=\"../../../etc/hosts\"/>"));
         // Defence in depth lives in outbound_attach::resolve_directive,
         // which canonicalises and applies allow_roots — see its tests.
+    }
+}
+
+#[cfg(test)]
+mod convert_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn convert_ok_envelope_shape() {
+        let s = convert_ok("pdf", "out/doc.pdf");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["format"], "pdf");
+        assert_eq!(v["output_path"], "out/doc.pdf");
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn convert_err_envelope_shape() {
+        let s = convert_err("pdf", "MISSING_DEP", "needs 'typst'");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["format"], "pdf");
+        assert_eq!(v["error"]["code"], "MISSING_DEP");
+        assert_eq!(v["error"]["message"], "needs 'typst'");
+        assert!(v.get("output_path").is_none());
+    }
+
+    #[test]
+    fn find_on_path_locates_executable() {
+        #[cfg(unix)]
+        {
+            let path = std::ffi::OsString::from("/usr/bin:/bin");
+            assert!(find_on_path("sh", &path).is_some());
+            assert!(find_on_path("definitely-not-a-real-binary-xyz", &path).is_none());
+        }
     }
 }
