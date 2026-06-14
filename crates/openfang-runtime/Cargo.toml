@@ -12,6 +12,7 @@ openfang-skills = { path = "../openfang-skills" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
