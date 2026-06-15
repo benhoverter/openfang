@@ -1919,6 +1919,49 @@ pub async fn start_channel_bridge_with_config(
     if started_names.is_empty() {
         (None, Vec::new())
     } else {
+        // §8 step 5 — emit consumer. Subscribe to the approval lifecycle event
+        // stream and push a prompt back to the originating conversation when a
+        // request is submitted. This is the ONLY place `ApprovalRequest.origin`
+        // goes live, and it is a pure side-effect: the surfacer never resolves
+        // a request (resolution stays on the text `/approve` and button paths,
+        // which re-authorize from the platform-attested interaction identity)
+        // and never feeds `origin`/`recipient` into authorization.
+        let mut approval_rx = kernel.approval_manager.subscribe();
+        let mut surfacer_shutdown = manager.shutdown_receiver();
+        let surfacer_kernel = kernel.clone();
+        let surfacer = tokio::spawn(async move {
+            use openfang_kernel::approval::ApprovalEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                tokio::select! {
+                    ev = approval_rx.recv() => match ev {
+                        Ok(ApprovalEvent::Submitted(req)) => {
+                            surfacer_kernel.surface_approval_prompt(&req).await;
+                        }
+                        // Resolved / TimedOut carry no proactive push in this step.
+                        Ok(_) => {}
+                        // Lossy broadcast: a dropped/lagged event means "no
+                        // proactive prompt", never "no approval". The decision
+                        // path (await/timeout in request_approval) is wholly
+                        // independent of this listener. Log and keep going.
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(
+                                missed = n,
+                                "approval surfacer lagged; {n} prompt(s) not pushed (approvals unaffected)"
+                            );
+                        }
+                        Err(RecvError::Closed) => break,
+                    },
+                    _ = surfacer_shutdown.changed() => {
+                        if *surfacer_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("approval surfacer task stopped");
+        });
+        manager.attach_task(surfacer);
         (Some(manager), started_names)
     }
 }

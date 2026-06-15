@@ -447,6 +447,23 @@ impl BridgeManager {
         &self.router
     }
 
+    /// A receiver for this bridge's shutdown signal.
+    ///
+    /// Lets an externally-spawned side-effect task (e.g. the approval surfacer
+    /// in openfang-api, which needs the kernel's `ApprovalManager`) observe the
+    /// same shutdown as the adapter dispatch loops, so it is torn down on
+    /// `stop()` / channel reload rather than leaking across reloads.
+    pub fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown_rx.clone()
+    }
+
+    /// Hand the manager ownership of an externally-spawned task so it is awaited
+    /// during `stop()`. The task is expected to observe
+    /// [`shutdown_receiver`](Self::shutdown_receiver) and exit on signal.
+    pub fn attach_task(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.tasks.push(task);
+    }
+
     /// Start an adapter: subscribe to its message stream and spawn a dispatch task.
     ///
     /// Each incoming message is dispatched as a concurrent task so that slow LLM

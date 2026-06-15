@@ -7271,6 +7271,174 @@ async fn cron_fan_out_targets(
     }
 }
 
+/// Resolved destination for a proactive approval-prompt push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalPushTarget {
+    pub channel_type: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+}
+
+/// Decide whether — and where — to proactively surface an approval prompt.
+///
+/// Fail-closed: returns `None` (⇒ no proactive push; the self-sufficient text
+/// `/approve <id>` body that already accompanied the request stands) unless the
+/// request carries an `origin` with BOTH a non-empty `channel_type` and a
+/// concrete, non-empty `channel_id`. Anything less can only resolve to a
+/// broader or ambiguous destination, which would be a cross-channel leak.
+///
+/// `recipient` (the triggering peer_id) is deliberately NOT part of the target:
+/// it is audit/targeting metadata only, never an authorization or routing input
+/// here. The resolved push goes to the *conversation* (`channel_id`), and the
+/// operator who later acts on the prompt is re-authorized from the
+/// platform-attested interaction identity, not from `origin`.
+pub(crate) fn approval_push_target(
+    req: &openfang_types::approval::ApprovalRequest,
+) -> Option<ApprovalPushTarget> {
+    let origin = req.origin.as_ref()?;
+    if origin.channel_type.is_empty() {
+        return None;
+    }
+    let channel_id = origin.channel_id.as_deref()?;
+    if channel_id.is_empty() {
+        return None;
+    }
+    Some(ApprovalPushTarget {
+        channel_type: origin.channel_type.clone(),
+        channel_id: channel_id.to_string(),
+        thread_id: origin.thread_id.clone(),
+    })
+}
+
+impl OpenFangKernel {
+    /// Surface a freshly-submitted approval request back to the channel /
+    /// conversation that triggered the run (§8 step 5 — the emit consumer).
+    ///
+    /// Pure side-effect: this only *pushes a prompt*. It NEVER resolves the
+    /// request. Approval still happens via the text `/approve <id>` command or
+    /// the button-interaction handler, both of which re-authorize the operator
+    /// from the platform-attested interaction identity. `origin` (including
+    /// `recipient`) is audit/targeting only and is never an authorization
+    /// carrier — nothing here reaches `classify_approver`.
+    ///
+    /// Fail-closed: with no resolvable [`ApprovalPushTarget`] or a failed push,
+    /// we log and return. We never best-effort to a broader or different
+    /// channel.
+    pub async fn surface_approval_prompt(&self, req: &openfang_types::approval::ApprovalRequest) {
+        let Some(target) = approval_push_target(req) else {
+            tracing::debug!(
+                request_id = %req.id,
+                "approval surfacer: no resolvable push target; text /approve path stands"
+            );
+            return;
+        };
+
+        // Self-sufficient prompt body: STILL carries `/approve <id>` so it
+        // degrades correctly on adapters that cannot render anything richer.
+        let id = req.id;
+        let message = format!(
+            "🔐 Approval needed — agent `{agent}` wants to run `{tool}`.\n{summary}\n\nApprove: `/approve {id}`   ·   Reject: `/reject {id}`",
+            agent = req.agent_id,
+            tool = req.tool_name,
+            summary = req.action_summary,
+        );
+
+        // `target.channel_id` is the addressing target (the originating
+        // conversation). `origin.recipient` is intentionally absent from the
+        // target and is never passed as an authz input.
+        match self
+            .send_channel_message(
+                &target.channel_type,
+                &target.channel_id,
+                &message,
+                target.thread_id.as_deref(),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(request_id = %id, "approval prompt pushed to origin")
+            }
+            Err(e) => tracing::warn!(
+                request_id = %id,
+                error = %e,
+                "approval surfacer: push failed; text /approve path stands"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_surface_tests {
+    use super::approval_push_target;
+    use openfang_types::approval::{ApprovalOrigin, ApprovalRequest, RiskLevel};
+
+    fn req_with(origin: Option<ApprovalOrigin>) -> ApprovalRequest {
+        ApprovalRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-x".to_string(),
+            tool_name: "shell_exec".to_string(),
+            description: "run a command".to_string(),
+            action_summary: "rm -rf /tmp/x".to_string(),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: 300,
+            origin,
+        }
+    }
+
+    #[test]
+    fn no_target_when_origin_absent() {
+        assert_eq!(approval_push_target(&req_with(None)), None);
+    }
+
+    #[test]
+    fn no_target_when_channel_type_empty() {
+        let o = ApprovalOrigin {
+            channel_type: String::new(),
+            channel_id: Some("C123".to_string()),
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(o))), None);
+    }
+
+    #[test]
+    fn no_target_when_channel_id_missing_or_empty() {
+        let missing = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: None,
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(missing))), None);
+
+        let empty = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: Some(String::new()),
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(empty))), None);
+    }
+
+    #[test]
+    fn target_carries_conversation_and_thread_but_not_recipient() {
+        let o = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: Some("C123".to_string()),
+            thread_id: Some("T456".to_string()),
+            recipient: Some("U999".to_string()),
+        };
+        let target = approval_push_target(&req_with(Some(o))).expect("resolvable");
+        assert_eq!(target.channel_type, "discord");
+        assert_eq!(target.channel_id, "C123");
+        assert_eq!(target.thread_id.as_deref(), Some("T456"));
+        // recipient (peer_id) must never be carried into the push target.
+        // (Structurally enforced: ApprovalPushTarget has no recipient field.)
+    }
+}
+
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
     fn token_issuer(&self) -> Option<Arc<dyn TokenIssuer>> {
