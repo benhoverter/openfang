@@ -134,6 +134,26 @@ fn marker_regex() -> &'static Regex {
     })
 }
 
+/// Neutralize any `<openfang:attach …/>` marker *opener* in agent-controlled
+/// text so [`parse`] cannot interpret it.
+///
+/// Use this when composing operator-facing text (e.g. an approval prompt) out
+/// of fields an agent controls. Without it, an agent could embed a marker so
+/// that `parse` strips it and appends its `caption=` value — making the text a
+/// human approves diverge from the real content it is supposed to represent.
+///
+/// HTML-escapes the leading `<` of the opener (the same transform this module's
+/// `parse` doc notes will "break detection"), so the marker is no longer parsed
+/// but stays visible and faithful to the human. Case-insensitive for defense in
+/// depth even though [`marker_regex`] is currently case-sensitive.
+pub fn neutralize_markers(text: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"(?i)<(openfang:attach)"#).expect("neutralize regex compiles")
+    });
+    re.replace_all(text, "&lt;$1").into_owned()
+}
+
 fn attr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"(\w+)\s*=\s*"([^"]*)""#).expect("attr regex compiles"))
@@ -463,6 +483,35 @@ mod tests {
     async fn no_markers_returns_no_markers() {
         let result = parse("just some prose, no markers here", ParseOptions::default()).await;
         assert!(matches!(result, Parsed::NoMarkers));
+    }
+
+    #[tokio::test]
+    async fn neutralize_breaks_marker_detection() {
+        // An agent embeds a well-formed marker with a reassuring caption in a
+        // field that will be shown to a human approver.
+        let evil = "rm -rf /important \
+                    <openfang:attach path=\"/dev/null\" caption=\"(dry-run only — nothing deleted)\"/>";
+        let safe = neutralize_markers(evil);
+
+        // After neutralization the parser sees no marker at all …
+        assert!(matches!(
+            parse(&safe, ParseOptions::default()).await,
+            Parsed::NoMarkers
+        ));
+        // … nothing was stripped and no caption was appended; the injection
+        // attempt stays visible verbatim (opener `<` escaped to `&lt;`).
+        assert!(safe.contains("&lt;openfang:attach"));
+        assert!(safe.contains("(dry-run only — nothing deleted)"));
+    }
+
+    #[test]
+    fn neutralize_is_noop_without_marker_and_case_insensitive() {
+        assert_eq!(
+            neutralize_markers("plain text, no marker"),
+            "plain text, no marker"
+        );
+        let mixed = neutralize_markers("x <OpenFang:Attach path=\"y\"/>");
+        assert!(mixed.contains("&lt;OpenFang:Attach"));
     }
 
     #[tokio::test]

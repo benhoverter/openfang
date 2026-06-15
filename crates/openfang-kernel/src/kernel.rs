@@ -7336,11 +7336,18 @@ impl OpenFangKernel {
         // Self-sufficient prompt body: STILL carries `/approve <id>` so it
         // degrades correctly on adapters that cannot render anything richer.
         let id = req.id;
+        // Agent-controlled fields flow through `send_channel_message` →
+        // `outbound_attach::parse`. Neutralize any `<openfang:attach …/>` marker
+        // so a requesting agent cannot strip text / inject a `caption=` line and
+        // make the rendered prompt diverge from the real action (security-openfang
+        // MEDIUM, ANAI-82). The marker stays visible (opener `<` escaped) but is
+        // never interpreted; file exfil is independently blocked (no allow_roots).
+        let neutralize = openfang_channels::outbound_attach::neutralize_markers;
         let message = format!(
             "🔐 Approval needed — agent `{agent}` wants to run `{tool}`.\n{summary}\n\nApprove: `/approve {id}`   ·   Reject: `/reject {id}`",
-            agent = req.agent_id,
-            tool = req.tool_name,
-            summary = req.action_summary,
+            agent = neutralize(&req.agent_id),
+            tool = neutralize(&req.tool_name),
+            summary = neutralize(&req.action_summary),
         );
 
         // `target.channel_id` is the addressing target (the originating
