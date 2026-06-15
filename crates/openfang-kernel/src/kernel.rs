@@ -35,6 +35,7 @@ use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
+use openfang_types::turn::TurnTrigger;
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -1955,6 +1956,7 @@ impl OpenFangKernel {
             None,
             None,
             false,
+            TurnTrigger::User,
         )
         .await
     }
@@ -1976,6 +1978,7 @@ impl OpenFangKernel {
             .map(|arc| arc as Arc<dyn KernelHandle>);
         self.send_message_with_handle_and_blocks(
             agent_id, message, handle, None, None, None, None, true,
+            TurnTrigger::User,
         )
         .await
     }
@@ -2006,6 +2009,7 @@ impl OpenFangKernel {
             None,
             Some(origin),
             true,
+            TurnTrigger::User,
         )
         .await
     }
@@ -2031,6 +2035,7 @@ impl OpenFangKernel {
             None,
             None,
             true,
+            TurnTrigger::User,
         )
         .await
     }
@@ -2059,6 +2064,7 @@ impl OpenFangKernel {
             None,
             Some(origin),
             true,
+            TurnTrigger::User,
         )
         .await
     }
@@ -2081,6 +2087,7 @@ impl OpenFangKernel {
             sender_name,
             None,
             false,
+            TurnTrigger::User,
         )
         .await
     }
@@ -2094,6 +2101,9 @@ impl OpenFangKernel {
     /// Per-agent locking ensures that concurrent messages for the same agent
     /// are serialized (preventing session corruption), while messages for
     /// different agents run in parallel.
+    // The kernel send funnel is the single convergence point for every
+    // message-entry path; its width is intentional. ANAI-84 added the
+    // required `trigger` param, tipping it to 8 args.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message_with_handle_and_blocks(
         &self,
@@ -2105,6 +2115,7 @@ impl OpenFangKernel {
         sender_name: Option<String>,
         origin: Option<openfang_types::approval::ApprovalOrigin>,
         text_reply_is_delivery: bool,
+        trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -2144,6 +2155,7 @@ impl OpenFangKernel {
                 sender_name,
                 origin,
                 text_reply_is_delivery,
+                trigger,
             )
             .await
         };
@@ -2592,6 +2604,9 @@ impl OpenFangKernel {
                 Some(&kernel_clone.process_manager),
                 content_blocks,
                 None, // origin (Piece 2 plumbing — populated at gated emit step)
+                // Streaming entry is interactive-only; no autonomous minter routes
+                // through it, so it is always a user-origin turn. (ANAI-84)
+                TurnTrigger::User,
             )
             .await;
 
@@ -2853,6 +2868,7 @@ impl OpenFangKernel {
         sender_name: Option<String>,
         origin: Option<openfang_types::approval::ApprovalOrigin>,
         text_reply_is_delivery: bool,
+        trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
         // Piece 3 (ANAI-82): stash this run's approval origin keyed by agent_id
         // so the bridge-IPC tool-call path — a separate task with no handle to the
@@ -3215,6 +3231,7 @@ impl OpenFangKernel {
             content_blocks,
             origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
             text_reply_is_delivery,
+            trigger,
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -4499,7 +4516,22 @@ impl OpenFangKernel {
                     let aid = *agent_id;
                     let msg = message.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = kernel.send_message(aid, &msg).await {
+                        // ANAI-84: trigger-dispatched turns are proactive-origin.
+                        let handle = Some(Arc::clone(&kernel) as Arc<dyn KernelHandle>);
+                        if let Err(e) = kernel
+                            .send_message_with_handle_and_blocks(
+                                aid,
+                                &msg,
+                                handle,
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                TurnTrigger::Proactive,
+                            )
+                            .await
+                        {
                             warn!(agent = %aid, "Trigger dispatch failed: {e}");
                         }
                     });
@@ -5298,14 +5330,22 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, move |aid, msg, trigger| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
-                    match k.send_message(aid, &msg).await {
+                    // ANAI-84: background.rs supplies the typed trigger
+                    // (Heartbeat for continuous, Cron for periodic).
+                    let handle = Some(Arc::clone(&k) as Arc<dyn KernelHandle>);
+                    match k
+                        .send_message_with_handle_and_blocks(
+                            aid, &msg, handle, None, None, None, None, false, trigger,
+                        )
+                        .await
+                    {
                         Ok(_) => {}
                         Err(e) => {
-                            // send_message already records the panic in supervisor,
-                            // just log the background context here
+                            // The funnel already records the panic in supervisor;
+                            // just log the background context here.
                             warn!(agent_id = %aid, error = %e, "Background tick failed");
                         }
                     }
@@ -6885,7 +6925,18 @@ impl OpenFangKernel {
                 let kh: Arc<dyn KernelHandle> = self.clone();
                 match tokio::time::timeout(
                     timeout,
-                    self.send_message_with_handle(agent_id, message, Some(kh), None, None),
+                    // ANAI-84: named cron job turns are cron-origin.
+                    self.send_message_with_handle_and_blocks(
+                        agent_id,
+                        message,
+                        Some(kh),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        TurnTrigger::Cron,
+                    ),
                 )
                 .await
                 {
@@ -7780,8 +7831,24 @@ impl KernelHandle for OpenFangKernel {
                 .map(|e| e.id)
                 .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
         };
+        // ANAI-84: inter-agent sends are agent-call-origin, not user-origin.
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
         let result = self
-            .send_message(id, message)
+            .send_message_with_handle_and_blocks(
+                id,
+                message,
+                handle,
+                None,
+                None,
+                None,
+                None,
+                false,
+                TurnTrigger::AgentCall,
+            )
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
         Ok(result.response)
@@ -8506,7 +8573,26 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
                 .ok_or_else(|| format!("Agent not found: {agent}"))?
         };
 
-        match self.send_message(agent_id, message).await {
+        // ANAI-84: inter-agent sends are agent-call-origin, not user-origin.
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        match self
+            .send_message_with_handle_and_blocks(
+                agent_id,
+                message,
+                handle,
+                None,
+                None,
+                None,
+                None,
+                false,
+                TurnTrigger::AgentCall,
+            )
+            .await
+        {
             Ok(result) => Ok(result.response),
             Err(e) => Err(format!("{e}")),
         }

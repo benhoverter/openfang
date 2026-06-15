@@ -25,6 +25,7 @@ use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
+use openfang_types::turn::TurnTrigger;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -323,12 +324,20 @@ pub async fn run_agent_loop(
     // not a fabricated tool call.  Default `false` for cron, agent_send,
     // API direct, and other callers where text alone is NOT delivery.
     text_reply_is_delivery: bool,
+    trigger: TurnTrigger,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(
         agent = %manifest.name,
         text_reply_is_delivery,
         "Starting agent loop"
     );
+
+    // ANAI-84: typed turn provenance, captured into episodic metadata at Exit B.
+    let trigger_meta: HashMap<String, serde_json::Value> = {
+        let mut m = HashMap::new();
+        m.insert("trigger".to_string(), serde_json::json!(trigger.as_str()));
+        m
+    };
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -771,7 +780,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    trigger_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -784,7 +793,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    trigger_meta.clone(),
                                 )
                                 .await;
                         }
@@ -796,7 +805,7 @@ pub async fn run_agent_loop(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            HashMap::new(),
+                            trigger_meta.clone(),
                         )
                         .await;
                 }
@@ -1591,8 +1600,16 @@ pub async fn run_agent_loop_streaming(
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    trigger: TurnTrigger,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
+
+    // ANAI-84: typed turn provenance, captured into episodic metadata at Exit B.
+    let trigger_meta: HashMap<String, serde_json::Value> = {
+        let mut m = HashMap::new();
+        m.insert("trigger".to_string(), serde_json::json!(trigger.as_str()));
+        m
+    };
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -2015,7 +2032,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    trigger_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -2028,7 +2045,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    trigger_meta.clone(),
                                 )
                                 .await;
                         }
@@ -2040,7 +2057,7 @@ pub async fn run_agent_loop_streaming(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            HashMap::new(),
+                            trigger_meta.clone(),
                         )
                         .await;
                 }
@@ -3888,6 +3905,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -3943,6 +3961,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -4000,6 +4019,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -4055,6 +4075,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -4102,6 +4123,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4228,6 +4250,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should recover via retry");
@@ -4277,6 +4300,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4333,6 +4357,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -5311,6 +5336,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Agent loop should complete");
@@ -5383,6 +5409,7 @@ mod tests {
             None,
             None, // origin
             false,
+            TurnTrigger::User,
         )
         .await
         .expect("Agent loop should recover nested XML tool calls");
@@ -5457,6 +5484,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Normal loop should complete");
@@ -5521,6 +5549,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete");
@@ -5665,6 +5694,7 @@ mod tests {
             None,  // user_content_blocks
             None, // origin
             false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("loop should complete");
@@ -5719,6 +5749,7 @@ mod tests {
             None, // user_content_blocks
             None, // origin
             true, // text_reply_is_delivery — suppress phantom guard
+            TurnTrigger::User,
         )
         .await
         .expect("loop should complete");

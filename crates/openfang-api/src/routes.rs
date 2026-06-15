@@ -449,6 +449,7 @@ pub async fn send_message(
             // approval prompt back to — falls back to the text /approve path.
             None,
             false,
+            openfang_types::turn::TurnTrigger::User,
         )
         .await
     {
