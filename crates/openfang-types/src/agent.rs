@@ -204,17 +204,12 @@ impl AgentMode {
         match self {
             Self::Observe => vec![],
             Self::Assist => {
-                let read_only = [
-                    "file_read",
-                    "file_list",
-                    "memory_recall",
-                    "web_fetch",
-                    "web_search",
-                    "agent_list",
-                ];
+                // Single source of truth: `crate::turn::READ_ONLY_TOOLS`,
+                // shared with the ANAI-76 capture predicate so the two cannot
+                // drift.
                 tools
                     .into_iter()
-                    .filter(|t| read_only.contains(&t.name.as_str()))
+                    .filter(|t| crate::turn::tool_is_read_only(t.name.as_str()))
                     .collect()
             }
             Self::Full => tools,
