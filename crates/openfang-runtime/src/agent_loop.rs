@@ -25,7 +25,7 @@ use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
-use openfang_types::turn::TurnTrigger;
+use openfang_types::turn::{should_capture_turn, TurnEffects, TurnTrigger};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -287,6 +287,27 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
     }
 }
 
+/// ANAI-77: build the episodic capture metadata for a completed turn,
+/// stamping the **shadow** would-drop verdict when the conservative predicate
+/// (ANAI-76) would drop this turn (an inert heartbeat). Observe-only: callers
+/// always `remember`; nothing is skipped. The real skip is deferred to
+/// ANAI-85, which reads `metadata["would_drop"]` fleet-wide to size the change.
+fn capture_metadata(
+    base: &HashMap<String, serde_json::Value>,
+    trigger: TurnTrigger,
+    effects: &TurnEffects,
+) -> HashMap<String, serde_json::Value> {
+    let mut meta = base.clone();
+    if should_capture_turn(trigger, effects).is_drop() {
+        meta.insert("would_drop".to_string(), serde_json::json!(true));
+        meta.insert(
+            "would_drop_reason".to_string(),
+            serde_json::json!("heartbeat_inert"),
+        );
+    }
+    meta
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -526,6 +547,9 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // ANAI-77: turn-scoped side-effect summary, fed by observe_tool per
+    // executed tool; drives the shadow would-drop verdict at Exit B.
+    let mut turn_effects = TurnEffects::new();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -766,6 +790,11 @@ pub async fn run_agent_loop(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
+                // ANAI-77 (observe-only): stamp the shadow would-drop verdict
+                // into the capture metadata. Nothing is skipped here — ANAI-85
+                // will consume metadata["would_drop"] to gate real drops.
+                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
@@ -780,7 +809,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    trigger_meta.clone(),
+                                    capture_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -793,7 +822,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    trigger_meta.clone(),
+                                    capture_meta.clone(),
                                 )
                                 .await;
                         }
@@ -805,7 +834,7 @@ pub async fn run_agent_loop(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            trigger_meta.clone(),
+                            capture_meta.clone(),
                         )
                         .await;
                 }
@@ -1046,6 +1075,11 @@ pub async fn run_agent_loop(
                         content: final_content,
                         is_error: result.is_error,
                     });
+
+                    // ANAI-77: record the executed tool's side-effect class so an
+                    // inert heartbeat is recognizable at Exit B. Conservative:
+                    // unknown tools count as side-effecting (keep-bias).
+                    turn_effects.observe_tool(&tool_call.name);
                 }
 
                 append_tool_error_guidance(&mut tool_result_blocks);
@@ -1789,6 +1823,9 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // ANAI-77: turn-scoped side-effect summary, fed by observe_tool per
+    // executed tool; drives the shadow would-drop verdict at Exit B.
+    let mut turn_effects = TurnEffects::new();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -2018,6 +2055,11 @@ pub async fn run_agent_loop_streaming(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
+                // ANAI-77 (observe-only): stamp the shadow would-drop verdict
+                // into the capture metadata. Nothing is skipped here — ANAI-85
+                // will consume metadata["would_drop"] to gate real drops.
+                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
@@ -2032,7 +2074,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    trigger_meta.clone(),
+                                    capture_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -2045,7 +2087,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    trigger_meta.clone(),
+                                    capture_meta.clone(),
                                 )
                                 .await;
                         }
@@ -2057,7 +2099,7 @@ pub async fn run_agent_loop_streaming(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            trigger_meta.clone(),
+                            capture_meta.clone(),
                         )
                         .await;
                 }
@@ -2306,6 +2348,11 @@ pub async fn run_agent_loop_streaming(
                         content: final_content,
                         is_error: result.is_error,
                     });
+
+                    // ANAI-77: record the executed tool's side-effect class so an
+                    // inert heartbeat is recognizable at Exit B. Conservative:
+                    // unknown tools count as side-effecting (keep-bias).
+                    turn_effects.observe_tool(&tool_call.name);
                 }
 
                 append_tool_error_guidance(&mut tool_result_blocks);
