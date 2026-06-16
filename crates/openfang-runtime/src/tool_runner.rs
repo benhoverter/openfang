@@ -41,6 +41,7 @@ pub const FS_SANDBOXED_TOOLS: &[&str] = &[
     "create_directory",
     "shell_exec",
     "apply_patch",
+    "file_convert",
 ];
 
 /// Check if a tool name refers to a shell execution tool.

@@ -85,6 +85,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "shell_exec",
     "web_search",
     "apply_patch",
+    "file_convert",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -1573,10 +1574,10 @@ mod tests {
     #[test]
     fn allowlist_cardinality_pin() {
         use openfang_mcp_bridge::{built_in_tools, DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
-        assert_eq!(ALLOWED_TOOLS.len(), 17, "ALLOWED_TOOLS surface cardinality");
+        assert_eq!(ALLOWED_TOOLS.len(), 18, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            17,
+            18,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -1586,8 +1587,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            14,
-            "DEFAULT_ALLOWED bridge-default cardinality (17 − 3 privileged)"
+            15,
+            "DEFAULT_ALLOWED bridge-default cardinality (18 − 3 privileged)"
         );
     }
 

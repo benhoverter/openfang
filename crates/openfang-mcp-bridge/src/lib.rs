@@ -170,6 +170,7 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     "shell_exec",
     "web_search",
     "apply_patch",
+    "file_convert",
 ];
 
 /// Agent-lifecycle tools that are dispatchable by the daemon and advertised
@@ -478,6 +479,30 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "required": ["query"]
             })),
         ),
+        // Mirrors `openfang_runtime::tool_runner` -> `file_convert`. Workspace-
+        // scoped: the runtime requires a `workspace_root` and resolves the
+        // `input`/`output` paths against it; the daemon-side `FS_SANDBOXED_TOOLS`
+        // gate fails the call closed when no workspace is registered. The tool
+        // dispatch + recipe security core live on the file-convert leaf; this
+        // entry is the cross-leaf advertise surface the bridge owes it.
+        Tool::new(
+            "file_convert",
+            "Convert a workspace file from one format to another using an \
+             allowlisted recipe table (e.g. Markdown to PDF). The source format \
+             is inferred from the input file extension; the target format is the \
+             'format' argument. Only conversions defined in the recipe manifest \
+             are permitted. Paths are relative to the agent workspace.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
+                    "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
+                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
+                    "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
+                },
+                "required": ["format", "input"]
+            })),
+        ),
     ]
 }
 
@@ -690,6 +715,7 @@ mod tests {
                 "shell_exec",
                 "apply_patch",
                 "web_search",
+                "file_convert",
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"

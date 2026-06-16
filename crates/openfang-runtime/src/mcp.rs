@@ -372,6 +372,7 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "shell_exec",
     "web_search",
     "apply_patch",
+    "file_convert",
 ];
 
 /// True if `name` shadows an OpenFang built-in tool.
