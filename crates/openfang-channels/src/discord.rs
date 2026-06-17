@@ -536,6 +536,9 @@ impl ChannelAdapter for DiscordAdapter {
 
         let token = self.token.clone();
         let intents = self.intents;
+        // Cloned for the INTERACTION_CREATE ACK path (ANAI-82). reqwest::Client
+        // is an Arc internally, so this is a cheap handle clone.
+        let http_client = self.client.clone();
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
         let ignore_bots = self.ignore_bots;
@@ -847,6 +850,158 @@ impl ChannelAdapter for DiscordAdapter {
                                         if tx.send(msg).await.is_err() {
                                             return;
                                         }
+                                    }
+                                }
+
+                                "INTERACTION_CREATE" => {
+                                    // ANAI-82: Discord component (button) clicks
+                                    // on approval prompts. type 3 =
+                                    // MESSAGE_COMPONENT; anything else (slash
+                                    // commands, modals) is not ours — ignore
+                                    // without ACK so Discord surfaces its own
+                                    // error rather than us swallowing it.
+                                    if d["type"].as_u64() != Some(3) {
+                                        continue;
+                                    }
+
+                                    let interaction_id =
+                                        d["id"].as_str().unwrap_or("").to_string();
+                                    let interaction_token =
+                                        d["token"].as_str().unwrap_or("").to_string();
+                                    if interaction_id.is_empty()
+                                        || interaction_token.is_empty()
+                                    {
+                                        continue;
+                                    }
+
+                                    // ACK first, inside Discord's 3s window. type
+                                    // 6 = DEFERRED_UPDATE_MESSAGE: acknowledges
+                                    // without editing the prompt, so the buttons
+                                    // stay live until the RBAC-checked resolution
+                                    // posts its reply. The callback is authorized
+                                    // by the interaction token in the URL — no bot
+                                    // auth header. Best-effort: a failed ACK only
+                                    // costs the clicker an "interaction failed"
+                                    // toast; the decision still routes below.
+                                    let ack_url = format!(
+                                        "{DISCORD_API_BASE}/interactions/{interaction_id}/{interaction_token}/callback"
+                                    );
+                                    if let Err(e) = http_client
+                                        .post(&ack_url)
+                                        .json(&serde_json::json!({ "type": 6 }))
+                                        .send()
+                                        .await
+                                    {
+                                        warn!("Discord: interaction ACK failed: {e}");
+                                    }
+
+                                    // custom_id is an opaque correlator only — it
+                                    // carries NO authorization (ANAI-82). The
+                                    // clicking user's identity is what gets gated,
+                                    // server-side, by the same `classify_approver`
+                                    // path the text `/approve` command uses.
+                                    let custom_id =
+                                        d["data"]["custom_id"].as_str().unwrap_or("");
+                                    let (approve, approval_id) =
+                                        match parse_approval_custom_id(custom_id) {
+                                            Some(v) => v,
+                                            // Not an approval button — ACKed above
+                                            // so the user sees no error; nothing to
+                                            // route.
+                                            None => continue,
+                                        };
+
+                                    // Clicking user: guild interactions nest the
+                                    // user under `member`, DMs put it at top level.
+                                    let user_obj = if d.get("member").is_some() {
+                                        &d["member"]["user"]
+                                    } else {
+                                        &d["user"]
+                                    };
+                                    let clicker_id =
+                                        user_obj["id"].as_str().unwrap_or("");
+                                    if clicker_id.is_empty() {
+                                        continue;
+                                    }
+
+                                    // Apply the same coarse channel filters as the
+                                    // message path (the fine-grained gate is RBAC
+                                    // at resolve time). An un-allowed user/guild
+                                    // must not even route a decision.
+                                    if !allowed_users.is_empty()
+                                        && !allowed_users.iter().any(|u| u == clicker_id)
+                                    {
+                                        debug!(
+                                            "Discord: ignoring interaction from unlisted user {clicker_id}"
+                                        );
+                                        continue;
+                                    }
+                                    if !allowed_guilds.is_empty() {
+                                        if let Some(gid) = d["guild_id"].as_str() {
+                                            if !allowed_guilds.iter().any(|g| g == gid) {
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    let username =
+                                        user_obj["username"].as_str().unwrap_or("Unknown");
+                                    let discriminator = user_obj["discriminator"]
+                                        .as_str()
+                                        .unwrap_or("0");
+                                    let display_name = if discriminator == "0"
+                                        || discriminator.is_empty()
+                                    {
+                                        username.to_string()
+                                    } else {
+                                        format!("{username}#{discriminator}")
+                                    };
+
+                                    let channel_id =
+                                        d["channel_id"].as_str().unwrap_or("");
+                                    if channel_id.is_empty() {
+                                        continue;
+                                    }
+
+                                    // Synthesize the exact `/approve|/reject <id>`
+                                    // command the text path produces, attributed
+                                    // to the clicking user. Routing it through the
+                                    // normal pipeline means the button decision and
+                                    // the text command share one authz code path —
+                                    // `classify_approver` keyed on
+                                    // `metadata["sender_user_id"]` (the clicker),
+                                    // never on `custom_id`. `platform_id` is the
+                                    // channel id (send path); the user id lives in
+                                    // metadata, mirroring `parse_discord_message`.
+                                    let mut metadata = HashMap::new();
+                                    metadata.insert(
+                                        "sender_user_id".to_string(),
+                                        serde_json::json!(clicker_id),
+                                    );
+                                    let synthetic = ChannelMessage {
+                                        channel: ChannelType::Discord,
+                                        platform_message_id: interaction_id.clone(),
+                                        sender: ChannelUser {
+                                            platform_id: channel_id.to_string(),
+                                            display_name,
+                                            openfang_user: None,
+                                        },
+                                        content: ChannelContent::Command {
+                                            name: if approve {
+                                                "approve".to_string()
+                                            } else {
+                                                "reject".to_string()
+                                            },
+                                            args: vec![approval_id],
+                                        },
+                                        target_agent: None,
+                                        timestamp: chrono::Utc::now(),
+                                        is_group: d["guild_id"].as_str().is_some(),
+                                        thread_id: None,
+                                        metadata,
+                                    };
+                                    if tx.send(synthetic).await.is_err() {
+                                        return;
                                     }
                                 }
 
@@ -2194,6 +2349,26 @@ mod tests {
 /// Build Discord `components` action rows from platform-neutral buttons.
 /// Discord allows max 5 buttons per action row (and 5 rows); buttons are
 /// chunked into rows of 5. Each button is component type 2 (Button).
+/// Parse an approval button `custom_id` (`ap:<id>:n0` / `dn:<id>:n0`) into
+/// `(approve, approval_id)`. Returns `None` for any custom_id that is not an
+/// approval button. The custom_id is an opaque correlator and carries NO
+/// authorization (ANAI-82) — the clicking user's identity is gated separately,
+/// server-side, at resolve time.
+fn parse_approval_custom_id(custom_id: &str) -> Option<(bool, String)> {
+    let mut parts = custom_id.splitn(3, ':');
+    let action = parts.next()?;
+    let approval_id = parts.next()?;
+    if approval_id.is_empty() {
+        return None;
+    }
+    let approve = match action {
+        "ap" => true,
+        "dn" => false,
+        _ => return None,
+    };
+    Some((approve, approval_id.to_string()))
+}
+
 fn build_action_rows(buttons: &[InteractiveButton]) -> Vec<serde_json::Value> {
     buttons
         .chunks(5)
@@ -2251,6 +2426,46 @@ mod anai82_interactive_tests {
         assert_eq!(comps[0]["custom_id"], "ap:abc123:n0");
         assert_eq!(comps[1]["style"], 4);
         assert_eq!(comps[1]["custom_id"], "dn:abc123:n0");
+    }
+
+    #[test]
+    fn parse_approval_custom_id_round_trips_surfacer_scheme() {
+        // The surfacer emits `ap:<uuid>:n0` / `dn:<uuid>:n0`; the inbound
+        // handler must recover (approve, id) from exactly that shape.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let (approve, id) =
+            parse_approval_custom_id(&format!("ap:{uuid}:n0")).expect("approve parses");
+        assert!(approve);
+        assert_eq!(id, uuid);
+
+        let (approve, id) =
+            parse_approval_custom_id(&format!("dn:{uuid}:n0")).expect("deny parses");
+        assert!(!approve);
+        assert_eq!(id, uuid);
+    }
+
+    #[test]
+    fn parse_approval_custom_id_rejects_foreign_and_malformed() {
+        // Non-approval buttons (some other feature's custom_id) must not route.
+        assert!(parse_approval_custom_id("foo:bar:baz").is_none());
+        // Missing id segment.
+        assert!(parse_approval_custom_id("ap").is_none());
+        // Empty id segment.
+        assert!(parse_approval_custom_id("ap::n0").is_none());
+        // Wrong action verb.
+        assert!(parse_approval_custom_id("approve:abc:n0").is_none());
+        // Empty string.
+        assert!(parse_approval_custom_id("").is_none());
+    }
+
+    #[test]
+    fn parse_approval_custom_id_id_with_colons_is_first_segment_only() {
+        // splitn(3) caps segments: a nonce containing a stray colon stays in
+        // the third field and never corrupts the recovered id.
+        let (approve, id) =
+            parse_approval_custom_id("ap:abc123:n0:extra").expect("parses");
+        assert!(approve);
+        assert_eq!(id, "abc123");
     }
 
     #[test]
