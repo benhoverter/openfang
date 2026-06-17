@@ -179,6 +179,14 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Per-agent stash of the active run's [`ApprovalOrigin`] (Piece 3, ANAI-82).
+    /// The bridge-IPC tool-call path runs on a separate task with no handle to
+    /// the run's origin stack, so it resolves a push target by looking up the
+    /// running agent here. `agent_msg_locks` guarantees one run per agent at a
+    /// time, making this key race-free. Cleared on run exit by a drop guard.
+    /// Audit/targeting metadata only — never an authz carrier.
+    pub active_run_origins:
+        dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
     /// Bridge token issuer — populated by the daemon at boot via
@@ -1255,6 +1263,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            active_run_origins: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
             // Phase E: the daemon hands us its `BridgeAuthority` at boot so
             // post-boot `resolve_driver` and agent-loop fallback paths see the
@@ -2826,6 +2835,32 @@ impl OpenFangKernel {
         origin: Option<openfang_types::approval::ApprovalOrigin>,
         text_reply_is_delivery: bool,
     ) -> KernelResult<AgentLoopResult> {
+        // Piece 3 (ANAI-82): stash this run's approval origin keyed by agent_id
+        // so the bridge-IPC tool-call path — a separate task with no handle to the
+        // run's origin stack — can resolve a push target. The per-agent message
+        // lock (`agent_msg_locks`) guarantees one run per agent at a time, so this
+        // key is race-free. The drop guard clears it on ANY exit (early `?`-return,
+        // panic), so a finished run never leaks a stale origin into the next one.
+        // Origin stays audit/targeting metadata; the bridge authorizes off the
+        // daemon-issued agent identity, not this map.
+        struct ActiveRunOriginGuard<'a> {
+            origins:
+                &'a dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+            agent_id: AgentId,
+        }
+        impl Drop for ActiveRunOriginGuard<'_> {
+            fn drop(&mut self) {
+                self.origins.remove(&self.agent_id);
+            }
+        }
+        let _origin_guard = origin.as_ref().map(|o| {
+            self.active_run_origins.insert(agent_id, o.clone());
+            ActiveRunOriginGuard {
+                origins: &self.active_run_origins,
+                agent_id,
+            }
+        });
+
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)

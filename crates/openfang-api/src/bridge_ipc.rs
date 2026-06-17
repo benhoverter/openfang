@@ -587,6 +587,14 @@ async fn dispatch_call(
     let effective_exec_policy = exec_ctx.exec_policy_ref();
     let allowed_env_arg: Option<&[String]> = exec_ctx.allowed_env();
 
+    // Piece 3 (ANAI-82): the bridge IPC tool call runs on a separate task from
+    // the agent's run loop, so origin isn't on this stack. Resolve it from the
+    // kernel's per-run stash, keyed by the already-authenticated agent id.
+    let bridge_origin = kernel
+        .active_run_origins
+        .get(&resolved_agent_id)
+        .map(|r| r.clone());
+
     let result = openfang_runtime::tool_runner::execute_tool(
         &format!("bridge-{}", call.request_id),
         &call.tool_name,
@@ -614,7 +622,9 @@ async fn dispatch_call(
             None
         },
         Some(&*kernel.process_manager),
-        None, // origin (no channel origin on bridge IPC tool path)
+        // Piece 3 (ANAI-82): in-flight run's origin (targeting/audit only;
+        // authz already enforced off the authenticated agent id above).
+        bridge_origin.as_ref(),
     )
     .await;
 
