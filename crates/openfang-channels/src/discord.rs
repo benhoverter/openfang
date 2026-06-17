@@ -206,7 +206,7 @@ impl DiscordAdapter {
         channel_id: &str,
         text: &str,
         buttons: &[InteractiveButton],
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
         let body = serde_json::json!({
             "content": text,
@@ -222,6 +222,42 @@ impl DiscordAdapter {
         if !resp.status().is_success() {
             let body_text = resp.text().await.unwrap_or_default();
             warn!("Discord interactive sendMessage failed: {body_text}");
+            return Ok(None);
+        }
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Discord interactive sendMessage returned non-JSON: {e}");
+                return Ok(None);
+            }
+        };
+        Ok(v["id"].as_str().map(|s| s.to_string()))
+    }
+
+    /// Edit a message in place: replace its `content` and clear any action-row
+    /// `components` (ANAI-82 edit-on-resolve). Best-effort — a non-2xx logs and
+    /// returns Ok so a failed edit never poisons the resolve path.
+    async fn api_edit_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let body = serde_json::json!({
+            "content": text,
+            "components": [],
+        });
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bot {}", self.token.as_str()))
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            warn!("Discord editMessage failed: {body_text}");
         }
         Ok(())
     }
@@ -1181,6 +1217,32 @@ impl ChannelAdapter for DiscordAdapter {
             }
         }
         Ok(())
+    }
+
+    /// ANAI-82 edit-on-resolve: send the approval prompt with buttons and
+    /// return the created Discord message id so the kernel can later strip the
+    /// buttons + stamp the outcome in place. `platform_id` is the channel id.
+    async fn send_interactive_with_id(
+        &self,
+        user: &ChannelUser,
+        text: String,
+        buttons: Vec<InteractiveButton>,
+        _thread_id: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        self.api_send_interactive(&user.platform_id, &text, &buttons)
+            .await
+    }
+
+    /// ANAI-82 edit-on-resolve: PATCH the prompt message, replacing its body
+    /// and clearing the action row. `platform_id` is the channel id.
+    async fn edit_message(
+        &self,
+        user: &ChannelUser,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.api_edit_message(&user.platform_id, message_id, text)
+            .await
     }
 
     async fn send_typing(&self, user: &ChannelUser) -> Result<(), Box<dyn std::error::Error>> {

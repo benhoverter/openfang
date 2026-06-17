@@ -58,6 +58,17 @@ impl LlmDriver for StubDriver {
     }
 }
 
+/// Addressing coordinates of a surfaced approval prompt, stored so the kernel
+/// can edit it in place once the approval resolves (ANAI-82 edit-on-resolve).
+/// `user.platform_id` is the channel id for Discord; `message_id` is the
+/// created prompt message. Metadata only — never an authorization input.
+#[derive(Clone)]
+pub struct ApprovalPromptCoords {
+    pub channel_type: String,
+    pub user: openfang_channels::types::ChannelUser,
+    pub message_id: String,
+}
+
 pub struct OpenFangKernel {
     /// Kernel configuration.
     pub config: KernelConfig,
@@ -187,6 +198,13 @@ pub struct OpenFangKernel {
     /// Audit/targeting metadata only — never an authz carrier.
     pub active_run_origins:
         dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+    /// Discord coordinates of a surfaced approval prompt, keyed by approval id
+    /// (ANAI-82 edit-on-resolve). Populated by `surface_approval_prompt` only
+    /// when the adapter returned a message id (Discord), and read once by
+    /// `edit_approval_prompt` after an *authorized* resolve to strip the buttons
+    /// and stamp the outcome. Addressing metadata only — never an authz carrier;
+    /// the resolve decision is already gated server-side before this is read.
+    pub approval_prompt_coords: dashmap::DashMap<uuid::Uuid, ApprovalPromptCoords>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
     /// Bridge token issuer — populated by the daemon at boot via
@@ -1264,6 +1282,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
+            approval_prompt_coords: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
             // Phase E: the daemon hands us its `BridgeAuthority` at boot so
             // post-boot `resolve_driver` and agent-loop fallback paths see the
@@ -7561,7 +7580,21 @@ impl OpenFangKernel {
         )
         .await
         {
-            Ok(_) => {
+            Ok(maybe_msg_id) => {
+                // Stash the prompt's coordinates so an authorized resolve can
+                // edit it in place (strip buttons + stamp outcome). Only adapters
+                // that render buttons (Discord) return an id; everyone else
+                // degraded to the text body and there is nothing to edit.
+                if let Some(msg_id) = maybe_msg_id {
+                    self.approval_prompt_coords.insert(
+                        id,
+                        ApprovalPromptCoords {
+                            channel_type: target.channel_type.clone(),
+                            user: user.clone(),
+                            message_id: msg_id,
+                        },
+                    );
+                }
                 tracing::debug!(request_id = %id, "approval prompt pushed to origin")
             }
             Err(e) => tracing::warn!(
@@ -7569,6 +7602,40 @@ impl OpenFangKernel {
                 error = %e,
                 "approval surfacer: push failed; text /approve path stands"
             ),
+        }
+    }
+
+    /// Edit a surfaced approval prompt in place after an *authorized* resolve:
+    /// strip the action buttons and stamp the outcome + command (ANAI-82
+    /// edit-on-resolve). No-op when no prompt coordinates were stored (the
+    /// prompt degraded to text, or the platform exposes no message id).
+    ///
+    /// MUST be called only after `ApprovalManager::resolve` returns `Ok` — the
+    /// real decision is known there, so the stamp can never lie about an
+    /// unauthorized click. The stored coordinates are addressing metadata only;
+    /// they are read, never used as an authorization input. Best-effort: a
+    /// failed edit is logged and swallowed so it never poisons the resolve path.
+    pub async fn edit_approval_prompt(&self, id: uuid::Uuid, verb: &str, command: &str) {
+        let Some((_, coords)) = self.approval_prompt_coords.remove(&id) else {
+            return;
+        };
+        let Some(adapter) = self
+            .channel_adapters
+            .get(&coords.channel_type)
+            .map(|a| a.clone())
+        else {
+            return;
+        };
+        let stamp = format!("{verb} · `{command}`");
+        if let Err(e) = adapter
+            .edit_message(&coords.user, &coords.message_id, &stamp)
+            .await
+        {
+            tracing::warn!(
+                request_id = %id,
+                error = %e,
+                "approval prompt edit-on-resolve failed; resolution still stands"
+            );
         }
     }
 }

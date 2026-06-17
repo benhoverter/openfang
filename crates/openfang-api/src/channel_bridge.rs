@@ -778,6 +778,22 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                     Ok(_) => {
                         let verb = if approve { "Approved" } else { "Rejected" };
                         let id_str = req.id.to_string();
+                        // ANAI-82 edit-on-resolve: stamp the surfaced prompt in
+                        // place (strip buttons, record outcome + command). Only
+                        // fires now that the decision is authorized + resolved,
+                        // so the stamp can never lie under RBAC. No-op when no
+                        // prompt was surfaced with editable coordinates. This
+                        // unifies the button and text `/approve` paths: both
+                        // stamp the prompt.
+                        let stamp_verb = if approve { "✅ Approved" } else { "❌ Rejected" };
+                        let command = format!(
+                            "/{} {}",
+                            if approve { "approve" } else { "reject" },
+                            safe_truncate_str(&id_str, 8)
+                        );
+                        self.kernel
+                            .edit_approval_prompt(req.id, stamp_verb, &command)
+                            .await;
                         format!(
                             "{} [{}] {} — {} (by {})",
                             verb,

@@ -407,6 +407,44 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Send an interactive (action-button) message and return the created
+    /// message id when the platform exposes one (ANAI-82 edit-on-resolve).
+    ///
+    /// Default impl renders the buttons via the normal `send`/`send_in_thread`
+    /// path and returns `Ok(None)` — it captures no id. Only adapters that
+    /// override `supports_interactive()` (Discord) override this to return the
+    /// real message id, which the kernel later uses to edit the prompt in place
+    /// once an approval resolves. The returned id is addressing metadata only,
+    /// never an authorization carrier.
+    async fn send_interactive_with_id(
+        &self,
+        user: &ChannelUser,
+        text: String,
+        buttons: Vec<InteractiveButton>,
+        thread_id: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let content = ChannelContent::Interactive { text, buttons };
+        if let Some(tid) = thread_id {
+            self.send_in_thread(user, content, tid).await?;
+        } else {
+            self.send(user, content).await?;
+        }
+        Ok(None)
+    }
+
+    /// Edit a previously sent message in place: replace its text body and clear
+    /// any action-button components (ANAI-82 edit-on-resolve). Optional —
+    /// default no-op so the ~50 non-Discord adapters need no change. Discord
+    /// overrides this to PATCH the message and strip its components.
+    async fn edit_message(
+        &self,
+        _user: &ChannelUser,
+        _message_id: &str,
+        _text: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
     /// Stop the adapter and clean up resources.
     async fn stop(&self) -> Result<(), Box<dyn std::error::Error>>;
 

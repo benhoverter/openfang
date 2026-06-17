@@ -873,14 +873,25 @@ pub async fn send_interactive(
     text: String,
     buttons: Vec<crate::types::InteractiveButton>,
     thread_id: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    dispatch_content(
-        adapter,
-        user,
-        ChannelContent::Interactive { text, buttons },
-        thread_id,
-    )
-    .await
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    // Adapters that render buttons (Discord) return the created message id so
+    // the kernel can edit the prompt in place once the approval resolves
+    // (ANAI-82 edit-on-resolve). Everyone else degrades to the plain-text body
+    // — which still carries `/approve {id}` — and returns `None`.
+    if adapter.supports_interactive() {
+        adapter
+            .send_interactive_with_id(user, text, buttons, thread_id)
+            .await
+    } else {
+        dispatch_content(
+            adapter,
+            user,
+            ChannelContent::Interactive { text, buttons },
+            thread_id,
+        )
+        .await?;
+        Ok(None)
+    }
 }
 
 pub fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
