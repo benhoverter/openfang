@@ -172,6 +172,52 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(result.response)
     }
 
+    async fn send_message_with_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_channel_reply_with_origin(agent_id, message, origin)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        // Silent/NO_REPLY responses should not be forwarded to channels
+        if result.silent {
+            return Ok(String::new());
+        }
+        Ok(result.response)
+    }
+
+    async fn send_message_with_blocks_and_origin(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> Result<String, String> {
+        // Extract text for the message parameter (used for memory recall / logging)
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                openfang_types::message::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "[Image]".to_string()
+        } else {
+            text
+        };
+        let result = self
+            .kernel
+            .send_message_channel_reply_with_blocks_and_origin(agent_id, &text, blocks, origin)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }

@@ -445,6 +445,9 @@ pub async fn send_message(
             // these are None/empty; pass None explicitly to be defensive.
             None,
             None,
+            // origin: this HTTP route has no channel origin to push an
+            // approval prompt back to — falls back to the text /approve path.
+            None,
             false,
         )
         .await

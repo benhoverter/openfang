@@ -1925,6 +1925,7 @@ impl OpenFangKernel {
             Some(blocks),
             None,
             None,
+            None,
             false,
         )
         .await
@@ -1945,8 +1946,40 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
-        self.send_message_with_handle_and_blocks(agent_id, message, handle, None, None, None, true)
-            .await
+        self.send_message_with_handle_and_blocks(
+            agent_id, message, handle, None, None, None, None, true,
+        )
+        .await
+    }
+
+    /// Origin-carrying counterpart to [`Self::send_message_channel_reply`].
+    ///
+    /// Threads the triggering run's [`ApprovalOrigin`] down to the agent loop
+    /// so a downstream approval prompt (e.g. `shell_exec`) is pushed back to
+    /// the exact channel/conversation that triggered the run. `origin` is
+    /// audit/targeting metadata only — never an authorization carrier.
+    pub async fn send_message_channel_reply_with_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            None,
+            None,
+            None,
+            Some(origin),
+            true,
+        )
+        .await
     }
 
     /// Multimodal channel-reply variant; see [`Self::send_message_channel_reply`].
@@ -1968,6 +2001,35 @@ impl OpenFangKernel {
             Some(blocks),
             None,
             None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Origin-carrying multimodal counterpart to
+    /// [`Self::send_message_channel_reply_with_blocks`]. See
+    /// [`Self::send_message_channel_reply_with_origin`] for the `origin` contract.
+    pub async fn send_message_channel_reply_with_blocks_and_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            Some(blocks),
+            None,
+            None,
+            Some(origin),
             true,
         )
         .await
@@ -1989,6 +2051,7 @@ impl OpenFangKernel {
             None,
             sender_id,
             sender_name,
+            None,
             false,
         )
         .await
@@ -2012,6 +2075,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        origin: Option<openfang_types::approval::ApprovalOrigin>,
         text_reply_is_delivery: bool,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
@@ -2050,6 +2114,7 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                origin,
                 text_reply_is_delivery,
             )
             .await
@@ -2758,6 +2823,7 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        origin: Option<openfang_types::approval::ApprovalOrigin>,
         text_reply_is_delivery: bool,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
@@ -3093,7 +3159,7 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
-            None, // origin (Piece 2 plumbing — populated at gated emit step)
+            origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
             text_reply_is_delivery,
         )
         .await
