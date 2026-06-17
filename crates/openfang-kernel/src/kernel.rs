@@ -7626,7 +7626,12 @@ impl OpenFangKernel {
         else {
             return;
         };
-        let stamp = format!("{verb} · `{command}`");
+        // `command` is now the agent-controlled action_summary (ANAI-82), so it
+        // gets the same `<openfang:attach …/>` neutralization the surface path
+        // applies — a requesting agent must not inject a marker into the
+        // restamped prompt (security-openfang MEDIUM).
+        let safe = openfang_channels::outbound_attach::neutralize_markers(command);
+        let stamp = format!("{verb} · `{safe}`");
         if let Err(e) = adapter
             .edit_message(&coords.user, &coords.message_id, &stamp)
             .await

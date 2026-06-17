@@ -786,13 +786,16 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         // unifies the button and text `/approve` paths: both
                         // stamp the prompt.
                         let stamp_verb = if approve { "✅ Approved" } else { "❌ Rejected" };
-                        let command = format!(
-                            "/{} {}",
-                            if approve { "approve" } else { "reject" },
-                            safe_truncate_str(&id_str, 8)
-                        );
+                        // ANAI-82: stamp the command being resolved (not the
+                        // `/approve <id>` slash echo) so chat keeps a record of
+                        // what was approved/rejected. For shell_exec this is the
+                        // literal command line; for other tools it's the action
+                        // description. Both approve and reject paths append it.
+                        // action_summary is agent-controlled, so the kernel
+                        // neutralizes `<openfang:attach …/>` markers before render.
+                        let command = safe_truncate_str(&req.action_summary, 160);
                         self.kernel
-                            .edit_approval_prompt(req.id, stamp_verb, &command)
+                            .edit_approval_prompt(req.id, stamp_verb, command)
                             .await;
                         format!(
                             "{} [{}] {} — {} (by {})",
