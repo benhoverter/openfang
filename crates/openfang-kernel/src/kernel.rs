@@ -7501,18 +7501,65 @@ impl OpenFangKernel {
             summary = neutralize(&req.action_summary),
         );
 
+        // Buttons carry only the request id + a nonce — never authorization.
+        // The clicking user's identity is checked server-side at resolve time
+        // (the same `classify_approver` gate as the text `/approve` path); the
+        // custom_id is an opaque correlator (ANAI-82). Scheme: `ap:<id>:n0`
+        // (approve) / `dn:<id>:n0` (deny), parsed by the INTERACTION_CREATE
+        // handler in the Discord adapter.
+        let buttons = vec![
+            openfang_channels::types::InteractiveButton {
+                custom_id: format!("ap:{id}:n0"),
+                label: "Approve".to_string(),
+                style: openfang_channels::types::ButtonStyle::Success,
+            },
+            openfang_channels::types::InteractiveButton {
+                custom_id: format!("dn:{id}:n0"),
+                label: "Deny".to_string(),
+                style: openfang_channels::types::ButtonStyle::Danger,
+            },
+        ];
+
         // `target.channel_id` is the addressing target (the originating
         // conversation). `origin.recipient` is intentionally absent from the
         // target and is never passed as an authz input.
-        match self
-            .send_channel_message(
-                &target.channel_type,
-                &target.channel_id,
-                &message,
-                target.thread_id.as_deref(),
-                None,
-            )
-            .await
+        //
+        // Resolve the adapter + recipient directly (rather than via the
+        // text-only `send_channel_message`) so the prompt can carry an action
+        // row. `bridge::send_interactive` degrades to the plain-text body —
+        // which still contains `/approve {id}` — on adapters without button
+        // support, so the ~50 non-Discord channels are unaffected.
+        let Some(adapter) = self
+            .channel_adapters
+            .get(&target.channel_type)
+            .map(|a| a.clone())
+        else {
+            tracing::warn!(
+                request_id = %id,
+                channel = %target.channel_type,
+                "approval surfacer: no adapter for channel; text /approve path stands"
+            );
+            return;
+        };
+        let user = match adapter.resolve_recipient(&target.channel_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %id,
+                    error = %e,
+                    "approval surfacer: recipient unresolved; text /approve path stands"
+                );
+                return;
+            }
+        };
+        match openfang_channels::bridge::send_interactive(
+            adapter.as_ref(),
+            &user,
+            message,
+            buttons,
+            target.thread_id.as_deref(),
+        )
+        .await
         {
             Ok(_) => {
                 tracing::debug!(request_id = %id, "approval prompt pushed to origin")

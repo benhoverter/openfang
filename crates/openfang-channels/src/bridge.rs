@@ -860,6 +860,29 @@ async fn dispatch_content(
     }
 }
 
+/// Proactively send an interactive (action-button) message to a single
+/// recipient (ANAI-82 approval prompts). Wraps the body + buttons in
+/// [`ChannelContent::Interactive`] and routes through [`dispatch_content`],
+/// which degrades to the plain-text body on adapters that cannot render
+/// buttons (`!supports_interactive()`). This is the kernel surfacer's only
+/// entry point for buttons, so the degrade rule and adapter-specific
+/// rendering stay owned here rather than leaking into the kernel.
+pub async fn send_interactive(
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    text: String,
+    buttons: Vec<crate::types::InteractiveButton>,
+    thread_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    dispatch_content(
+        adapter,
+        user,
+        ChannelContent::Interactive { text, buttons },
+        thread_id,
+    )
+    .await
+}
+
 pub fn default_output_format_for_channel(channel_type: &str) -> OutputFormat {
     match channel_type {
         "telegram" => OutputFormat::TelegramHtml,
