@@ -215,6 +215,39 @@ pub async fn execute_tool(
         );
     }
 
+    // SECURITY: For shell_exec, enforce the exec allowlist BEFORE the approval
+    // gate. A command the allowlist wall will reject must never surface an
+    // approval prompt or populate the approve-similar cache — otherwise the
+    // operator sees an "Approved · cached" stamp for a command the very next
+    // layer hard-denies (the `whoami` incident, 2026-06-17). Full mode is
+    // unaffected: validate_command_allowlist returns Ok(()) immediately in Full,
+    // so control falls through and the no-prompt guarantee still comes solely
+    // from `exec_policy_bypasses_approval` above (which this block does not
+    // touch). The canonical wall in the shell_exec match arm is retained as
+    // idempotent defense-in-depth.
+    if tool_name == "shell_exec" {
+        if let Some(policy) = exec_policy {
+            let command = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Err(reason) =
+                crate::subprocess_sandbox::validate_command_allowlist(command, policy)
+            {
+                let reason = reason.trim_end_matches('.');
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "shell_exec blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                         To allow shell commands, set exec_policy.mode = 'full' in the agent manifest or config.toml.",
+                        policy.mode
+                    ),
+                    is_error: true,
+                };
+            }
+        }
+    }
+
     if let Some(kh) = kernel {
         if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
@@ -5254,6 +5287,9 @@ mod tests {
         created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         cancelled: std::sync::Mutex<Vec<String>>,
         jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+        // Flips true if the approval gate ever called request_approval. Used to
+        // prove the allowlist wall short-circuits BEFORE the gate for shell_exec.
+        approval_requested: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -5262,6 +5298,7 @@ mod tests {
                 created: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
+                approval_requested: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -5366,6 +5403,26 @@ mod tests {
             self.cancelled.lock().unwrap().push(job_id.to_string());
             Ok(())
         }
+
+        // Mark this kernel as "approval is configured" so the gate at
+        // execute_tool would fire for any tool — unless something short-circuits
+        // ahead of it.
+        fn requires_approval(&self, _tool_name: &str) -> bool {
+            true
+        }
+
+        async fn request_approval(
+            &self,
+            _agent_id: &str,
+            _tool_name: &str,
+            _action_summary: &str,
+            _origin: Option<&openfang_types::approval::ApprovalOrigin>,
+            _cache_binary: Option<&str>,
+        ) -> Result<bool, String> {
+            self.approval_requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
     }
 
     #[tokio::test]
@@ -5401,6 +5458,66 @@ mod tests {
         assert_eq!(job["action"]["message"], "Daily report");
         assert!(job["schedule"]["expr"].is_string());
         assert_eq!(job["one_shot"], false);
+    }
+
+    /// The allowlist wall must run BEFORE the approval gate for shell_exec.
+    /// A non-allowlisted command in Allowlist mode must be hard-denied without
+    /// ever firing the approval gate — no prompt, no approve-similar cache
+    /// population, and therefore no misleading "Approved · cached" stamp for a
+    /// command the next layer rejects (the `whoami` incident, 2026-06-17).
+    #[tokio::test]
+    async fn test_allowlist_wall_precedes_approval_gate_for_shell_exec() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["grep".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "whoami" });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(&handle),
+            None, // allowed_tools (capability check skipped)
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,          // media_engine
+            Some(&policy), // exec_policy
+            None,          // file_policy
+            None,          // tts_engine
+            None,          // docker_config
+            None,          // process_manager
+            None,          // origin
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "non-allowlisted shell_exec must be blocked, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("not in the exec allowlist"),
+            "block must come from the allowlist wall, got: {}",
+            result.content
+        );
+        assert!(
+            !fake
+                .approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "approval gate must NOT fire for a command the allowlist wall rejects \
+             (no prompt, no cache, no misleading Approved stamp)"
+        );
     }
 
     #[tokio::test]
