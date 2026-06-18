@@ -5520,6 +5520,70 @@ mod tests {
         );
     }
 
+    /// Positive control for the wall-before-gate ordering. An *allowlisted*
+    /// command in Allowlist mode must CLEAR the wall, reach the approval gate,
+    /// and fire it. This makes the negative test above a true negative: it
+    /// proves the spy's `request_approval` is wired as the `KernelHandle`
+    /// trait impl (not a dead inherent method) and that it *does* record a
+    /// call when the gate is actually reached. Without this, an un-fired spy
+    /// in the negative test could be a false pass (e.g. a mis-wired spy that
+    /// never records regardless of gate firing).
+    #[tokio::test]
+    async fn test_allowlisted_command_reaches_approval_gate_for_shell_exec() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["grep".to_string()],
+            ..ExecPolicy::default()
+        };
+        // `grep` IS allowlisted, so it clears the wall and reaches the gate.
+        // `--version` exits 0 immediately, so the post-approval execution is
+        // fast and side-effect-free.
+        let input = serde_json::json!({ "command": "grep --version" });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(&handle),
+            None, // allowed_tools (capability check skipped)
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,          // media_engine
+            Some(&policy), // exec_policy
+            None,          // file_policy
+            None,          // tts_engine
+            None,          // docker_config
+            None,          // process_manager
+            None,          // origin
+        )
+        .await;
+
+        // The gate MUST have fired — this is the positive control.
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "approval gate MUST fire for an allowlisted command that clears the \
+             wall — proves the spy records gate calls and the negative test is \
+             a true negative"
+        );
+        // And the wall did NOT block it (independent of the command's exit
+        // code, so this assertion is robust across grep implementations).
+        assert!(
+            !result.content.contains("not in the exec allowlist"),
+            "an allowlisted command must clear the wall, got: {}",
+            result.content
+        );
+    }
+
     #[tokio::test]
     async fn test_schedule_create_rejects_missing_description() {
         let fake = Arc::new(FakeKernelHandle::new());
