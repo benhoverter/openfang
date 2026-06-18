@@ -31,6 +31,34 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// Maximum length of an origin routing field (channel_id / thread_id / recipient), chars.
 const MAX_ORIGIN_FIELD_LEN: usize = 256;
 
+/// Default approval-cache entry lifetime (seconds).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+
+/// Default approval-cache max uses per cached entry.
+pub const DEFAULT_CACHE_MAX_USES: u32 = 50;
+
+/// Upper bound on a configured cache TTL (seconds). 24h — a daemon bounce
+/// clears the in-memory cache anyway, so this just rejects absurd values.
+const MAX_CACHE_TTL_SECS: u64 = 86_400;
+
+/// Upper bound on a configured per-entry use count.
+const MAX_CACHE_MAX_USES: u32 = 100_000;
+
+/// Binaries for which the "Approve Similar" button is suppressed. The binary
+/// alone carries no risk signal — the args do — so caching a whole binary here
+/// (`rm`, `dd`, …) would hand back the very gate it exists to enforce. These
+/// always collapse to a per-command human decision (Once / [Tool] / Deny).
+pub const SIMILAR_DENYLIST: &[&str] = &[
+    "rm", "dd", "mkfs", "kill", "killall", "chmod", "chown", "mv", "shutdown", "reboot",
+];
+
+/// Returns true if `binary` (argv\[0\], exact spelling) is on the
+/// Approve-Similar denylist. Spelling-sensitive by design: `rm` and `/bin/rm`
+/// are distinct keys, which only ever narrows the cached radius.
+pub fn is_similar_denylisted(binary: &str) -> bool {
+    SIMILAR_DENYLIST.contains(&binary)
+}
+
 // ---------------------------------------------------------------------------
 // RiskLevel
 // ---------------------------------------------------------------------------
@@ -214,6 +242,27 @@ pub struct ApprovalResponse {
 }
 
 // ---------------------------------------------------------------------------
+// CacheScope
+// ---------------------------------------------------------------------------
+
+/// The caching intent an operator selected when resolving an approval. This is
+/// a *resolution* concept — it never reaches the requesting agent, which only
+/// ever sees `Approved` / `Denied`.
+///
+/// - `SimilarBinary(argv0)` — "Approve Similar": cache all `shell_exec` calls
+///   whose first token equals `argv0` (exact spelling). Only offered for
+///   `shell_exec` and only when `argv0` is not [`is_similar_denylisted`].
+/// - `Tool` — "Approve Tool": cache all calls to the request's tool. Never
+///   offered for `shell_exec` (that blanket trust is `exec_policy.mode = full`
+///   territory, set in `agent.toml`, not a per-prompt button).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    SimilarBinary(String),
+    Tool,
+}
+
+// ---------------------------------------------------------------------------
 // ApprovalPolicy
 // ---------------------------------------------------------------------------
 
@@ -235,6 +284,12 @@ pub struct ApprovalPolicy {
     /// Alias: if `auto_approve = true`, clears the require list at boot.
     #[serde(default, alias = "auto_approve")]
     pub auto_approve: bool,
+    /// Approval-cache entry lifetime in seconds. Default: 3600 (1h). A daemon
+    /// bounce clears the in-memory cache regardless. `0` disables caching.
+    pub cache_ttl_secs: u64,
+    /// Max times a single cached approval may be reused before it is evicted.
+    /// Default: 50. `0` disables caching.
+    pub cache_max_uses: u32,
 }
 
 impl Default for ApprovalPolicy {
@@ -244,6 +299,8 @@ impl Default for ApprovalPolicy {
             timeout_secs: 60,
             auto_approve_autonomous: false,
             auto_approve: false,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+            cache_max_uses: DEFAULT_CACHE_MAX_USES,
         }
     }
 }
@@ -328,6 +385,20 @@ impl ApprovalPolicy {
                     "require_approval[{i}] may only contain alphanumeric characters and underscores: \"{name}\""
                 ));
             }
+        }
+
+        // -- cache bounds --
+        if self.cache_ttl_secs > MAX_CACHE_TTL_SECS {
+            return Err(format!(
+                "cache_ttl_secs too large ({}, max {MAX_CACHE_TTL_SECS})",
+                self.cache_ttl_secs
+            ));
+        }
+        if self.cache_max_uses > MAX_CACHE_MAX_USES {
+            return Err(format!(
+                "cache_max_uses too large ({}, max {MAX_CACHE_MAX_USES})",
+                self.cache_max_uses
+            ));
         }
 
         Ok(())
@@ -834,11 +905,66 @@ mod tests {
             timeout_secs: 120,
             auto_approve_autonomous: true,
             auto_approve: false,
+            cache_ttl_secs: 1800,
+            cache_max_uses: 25,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.require_approval, policy.require_approval);
         assert_eq!(back.timeout_secs, 120);
         assert!(back.auto_approve_autonomous);
+        assert_eq!(back.cache_ttl_secs, 1800);
+        assert_eq!(back.cache_max_uses, 25);
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval cache: scope, denylist, policy defaults + bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_scope_serde_roundtrip() {
+        for scope in [CacheScope::SimilarBinary("rm".into()), CacheScope::Tool] {
+            let json = serde_json::to_string(&scope).unwrap();
+            let back: CacheScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(scope, back);
+        }
+    }
+
+    #[test]
+    fn similar_denylist_membership() {
+        assert!(is_similar_denylisted("rm"));
+        assert!(is_similar_denylisted("dd"));
+        assert!(is_similar_denylisted("chmod"));
+        // spelling-sensitive: an absolute path is a different key
+        assert!(!is_similar_denylisted("/bin/rm"));
+        assert!(!is_similar_denylisted("grep"));
+        assert!(!is_similar_denylisted("ls"));
+    }
+
+    #[test]
+    fn policy_default_cache_fields() {
+        let p = ApprovalPolicy::default();
+        assert_eq!(p.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(p.cache_max_uses, DEFAULT_CACHE_MAX_USES);
+    }
+
+    #[test]
+    fn policy_cache_bounds_rejected() {
+        let mut p = ApprovalPolicy::default();
+        p.cache_ttl_secs = MAX_CACHE_TTL_SECS + 1;
+        assert!(p.validate().unwrap_err().contains("cache_ttl_secs"));
+
+        let mut p = ApprovalPolicy::default();
+        p.cache_max_uses = MAX_CACHE_MAX_USES + 1;
+        assert!(p.validate().unwrap_err().contains("cache_max_uses"));
+    }
+
+    #[test]
+    fn policy_cache_fields_default_when_absent() {
+        // older agent.toml / serialized policy without the new keys
+        let json = r#"{"require_approval":["shell_exec"],"timeout_secs":60,"auto_approve_autonomous":false,"auto_approve":false}"#;
+        let p: ApprovalPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(p.cache_max_uses, DEFAULT_CACHE_MAX_USES);
     }
 }
