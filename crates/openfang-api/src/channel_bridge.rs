@@ -130,6 +130,40 @@ fn classify_approver(
     }
 }
 
+/// Map a button/command cache-scope token to a concrete [`CacheScope`] for
+/// the resolved request, applying defense-in-depth guards that mirror which
+/// buttons the surfacer offers:
+/// - `"similar"`: shell_exec only, requires a parsed `cache_binary`, and is
+///   refused for the destructive denylist even if a crafted custom_id asks.
+/// - `"tool"`: refused for shell_exec (that blanket trust is
+///   `exec_policy.mode = full`, not a per-prompt cache).
+/// Any other token (incl. `"once"` / None / unknown) yields `None`.
+fn cache_scope_from_token(
+    token: Option<&str>,
+    req: &openfang_types::approval::ApprovalRequest,
+) -> Option<openfang_types::approval::CacheScope> {
+    use openfang_types::approval::{is_similar_denylisted, CacheScope};
+    match token {
+        Some("similar") => {
+            if req.tool_name != "shell_exec" {
+                return None;
+            }
+            let bin = req.cache_binary.as_deref()?;
+            if is_similar_denylisted(bin) {
+                return None;
+            }
+            Some(CacheScope::SimilarBinary(bin.to_string()))
+        }
+        Some("tool") => {
+            if req.tool_name == "shell_exec" {
+                return None;
+            }
+            Some(CacheScope::Tool)
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl ChannelBridgeHandle for KernelBridgeAdapter {
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
@@ -737,6 +771,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         channel_type: &str,
         approver_user_id: &str,
         approver_display: &str,
+        scope_token: Option<&str>,
     ) -> String {
         // ── #2a authz gate ──────────────────────────────
         // Pre-#2a this stamped `decided_by = "channel"` with NO identity check:
@@ -793,9 +828,40 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         // description. Both approve and reject paths append it.
                         // action_summary is agent-controlled, so the kernel
                         // neutralizes `<openfang:attach …/>` markers before render.
-                        let command = safe_truncate_str(&req.action_summary, 160);
+                        // Approval caching (opt-in via the chosen button /
+                        // `/approve <id> <scope>`): on an approve carrying a
+                        // caching scope, populate the cache and annotate the
+                        // stamp. Reject never caches (scope_token is None).
+                        let mut stamp_command =
+                            safe_truncate_str(&req.action_summary, 160).to_string();
+                        if approve {
+                            if let Some(scope) = cache_scope_from_token(scope_token, req) {
+                                let policy = self.kernel.approval_manager.policy();
+                                if policy.cache_ttl_secs > 0 && policy.cache_max_uses > 0 {
+                                    self.kernel
+                                        .approval_manager
+                                        .cache_decision(req, scope.clone());
+                                    let label = match &scope {
+                                        openfang_types::approval::CacheScope::SimilarBinary(b) => {
+                                            format!("cached: {b}")
+                                        }
+                                        openfang_types::approval::CacheScope::Tool => {
+                                            format!("cached: {} tool", req.tool_name)
+                                        }
+                                    };
+                                    // The whole string (incl. agent-controlled
+                                    // binary) is neutralized by edit_approval_prompt.
+                                    stamp_command = format!(
+                                        "{} · {label} ({}s/{})",
+                                        safe_truncate_str(&req.action_summary, 110),
+                                        policy.cache_ttl_secs,
+                                        policy.cache_max_uses
+                                    );
+                                }
+                            }
+                        }
                         self.kernel
-                            .edit_approval_prompt(req.id, stamp_verb, command)
+                            .edit_approval_prompt(req.id, stamp_verb, &stamp_command)
                             .await;
                         format!(
                             "{} [{}] {} — {} (by {})",
@@ -2134,6 +2200,7 @@ mod tests {
             requested_at: chrono::Utc::now(),
             timeout_secs: 300,
             origin: None,
+            cache_binary: None,
         };
 
         // An operator running /approvals must see the request verbatim, never a
@@ -2324,5 +2391,60 @@ mod tests {
             .expect("fail-open records without gating");
         assert_eq!(label, "discord:raw-123 (Ben)");
         assert_eq!(echo, "Ben");
+    }
+
+    // ── approval-cache scope resolution guards ──────────────────────────
+    use super::cache_scope_from_token;
+    use openfang_types::approval::{ApprovalRequest, CacheScope, RiskLevel};
+
+    fn req(tool: &str, binary: Option<&str>) -> ApprovalRequest {
+        ApprovalRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "a".to_string(),
+            tool_name: tool.to_string(),
+            description: "d".to_string(),
+            action_summary: "s".to_string(),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: 60,
+            origin: None,
+            cache_binary: binary.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn scope_similar_ok_for_safe_shell_binary() {
+        let r = req("shell_exec", Some("grep"));
+        assert_eq!(
+            cache_scope_from_token(Some("similar"), &r),
+            Some(CacheScope::SimilarBinary("grep".into()))
+        );
+    }
+
+    #[test]
+    fn scope_similar_refused_for_denylisted_binary() {
+        // defense-in-depth: even a crafted `as:` custom_id can't cache `rm`
+        let r = req("shell_exec", Some("rm"));
+        assert_eq!(cache_scope_from_token(Some("similar"), &r), None);
+    }
+
+    #[test]
+    fn scope_similar_refused_without_binary_or_non_shell() {
+        assert_eq!(cache_scope_from_token(Some("similar"), &req("shell_exec", None)), None);
+        assert_eq!(cache_scope_from_token(Some("similar"), &req("file_write", Some("grep"))), None);
+    }
+
+    #[test]
+    fn scope_tool_ok_for_non_shell_but_refused_for_shell() {
+        assert_eq!(cache_scope_from_token(Some("tool"), &req("file_write", None)), Some(CacheScope::Tool));
+        // Approve Tool for shell_exec is policy-forbidden (use exec mode=full)
+        assert_eq!(cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep"))), None);
+    }
+
+    #[test]
+    fn scope_once_and_unknown_never_cache() {
+        assert_eq!(cache_scope_from_token(None, &req("file_write", None)), None);
+        assert_eq!(cache_scope_from_token(Some("once"), &req("file_write", None)), None);
+        assert_eq!(cache_scope_from_token(Some("bogus"), &req("file_write", None)), None);
     }
 }

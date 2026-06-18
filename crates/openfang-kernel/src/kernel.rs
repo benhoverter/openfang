@@ -7523,21 +7523,49 @@ impl OpenFangKernel {
         // Buttons carry only the request id + a nonce — never authorization.
         // The clicking user's identity is checked server-side at resolve time
         // (the same `classify_approver` gate as the text `/approve` path); the
-        // custom_id is an opaque correlator (ANAI-82). Scheme: `ap:<id>:n0`
-        // (approve) / `dn:<id>:n0` (deny), parsed by the INTERACTION_CREATE
+        // custom_id is an opaque correlator (ANAI-82). Caching scheme:
+        //   `ap:<id>:n0` Approve Once   (always)
+        //   `as:<id>:n0` Approve Similar (shell_exec only, argv[0] off denylist)
+        //   `at:<id>:n0` Approve Tool    (non-shell tools only)
+        //   `dn:<id>:n0` Deny            (always)
+        // The custom_id encodes the *scope intent* only — never the binary,
+        // which the resolve site reads from the pending request's
+        // `cache_binary` (no truncation-mismatch risk). All sets are <= 5
+        // buttons (Discord's row cap). Parsed by the INTERACTION_CREATE
         // handler in the Discord adapter.
-        let buttons = vec![
-            openfang_channels::types::InteractiveButton {
-                custom_id: format!("ap:{id}:n0"),
-                label: "Approve".to_string(),
-                style: openfang_channels::types::ButtonStyle::Success,
-            },
-            openfang_channels::types::InteractiveButton {
-                custom_id: format!("dn:{id}:n0"),
-                label: "Deny".to_string(),
-                style: openfang_channels::types::ButtonStyle::Danger,
-            },
-        ];
+        use openfang_channels::types::{ButtonStyle, InteractiveButton};
+        let mut buttons = vec![InteractiveButton {
+            custom_id: format!("ap:{id}:n0"),
+            label: "Approve Once".to_string(),
+            style: ButtonStyle::Success,
+        }];
+        if req.tool_name == "shell_exec" {
+            // Approve Similar: blanket one binary (exact spelling). Suppressed
+            // for the destructive denylist where the binary alone carries no
+            // safe signal (`rm`, `dd`, …). Approve Tool is intentionally NOT
+            // offered for shell_exec — that blanket trust is `exec_policy.mode
+            // = full` in agent.toml, not a per-prompt button.
+            if let Some(bin) = req.cache_binary.as_deref() {
+                if !openfang_types::approval::is_similar_denylisted(bin) {
+                    buttons.push(InteractiveButton {
+                        custom_id: format!("as:{id}:n0"),
+                        label: "Approve Similar".to_string(),
+                        style: ButtonStyle::Success,
+                    });
+                }
+            }
+        } else {
+            buttons.push(InteractiveButton {
+                custom_id: format!("at:{id}:n0"),
+                label: "Approve Tool".to_string(),
+                style: ButtonStyle::Success,
+            });
+        }
+        buttons.push(InteractiveButton {
+            custom_id: format!("dn:{id}:n0"),
+            label: "Deny".to_string(),
+            style: ButtonStyle::Danger,
+        });
 
         // `target.channel_id` is the addressing target (the originating
         // conversation). `origin.recipient` is intentionally absent from the
@@ -7661,6 +7689,7 @@ mod approval_surface_tests {
             requested_at: chrono::Utc::now(),
             timeout_secs: 300,
             origin,
+            cache_binary: None,
         }
     }
 
@@ -8137,6 +8166,7 @@ impl KernelHandle for OpenFangKernel {
         tool_name: &str,
         action_summary: &str,
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
+        cache_binary: Option<&str>,
     ) -> Result<bool, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
@@ -8162,6 +8192,7 @@ impl KernelHandle for OpenFangKernel {
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
             origin: origin.cloned(),
+            cache_binary: cache_binary.map(str::to_string),
         };
 
         let decision = self.approval_manager.request_approval(req).await;

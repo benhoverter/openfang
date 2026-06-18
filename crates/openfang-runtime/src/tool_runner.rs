@@ -54,6 +54,30 @@ fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
 }
 
+/// Extract argv[0] (the binary) from a `shell_exec` command for approval
+/// caching's "Approve Similar" scope. Skips leading `VAR=value` environment
+/// assignments, then returns the first whitespace-delimited token. Returns
+/// `None` if nothing remains. shell_exec's input filter already bans shell
+/// metacharacters, so the first token is an unambiguous binary name.
+fn extract_cache_binary(command: &str) -> Option<String> {
+    for tok in command.split_whitespace() {
+        if let Some(eq) = tok.find('=') {
+            let name = &tok[..eq];
+            let looks_like_env = !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if looks_like_env {
+                continue;
+            }
+        }
+        return Some(tok.to_string());
+    }
+    None
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -200,7 +224,21 @@ pub async fn execute_tool(
                 tool_name,
                 openfang_types::truncate_str(&input_str, 200)
             );
-            match kh.request_approval(agent_id_str, tool_name, &summary, origin).await {
+            // Approve-Similar cache key source: argv[0] of a shell_exec
+            // command, extracted once here where structured input still
+            // exists (never re-parsed from the mangled action_summary).
+            let cache_binary = if tool_name == "shell_exec" {
+                input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(extract_cache_binary)
+            } else {
+                None
+            };
+            match kh
+                .request_approval(agent_id_str, tool_name, &summary, origin, cache_binary.as_deref())
+                .await
+            {
                 Ok(true) => {
                     debug!(tool_name, "Approval granted — proceeding with execution");
                 }
@@ -257,6 +295,7 @@ pub async fn execute_tool(
                                             caller_agent_id.unwrap_or("unknown"),
                                             tool_name,
                                             &summary,
+                                            None,
                                             None,
                                         )
                                         .await,
@@ -4048,6 +4087,35 @@ async fn tool_skill_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_cache_binary_basic() {
+        assert_eq!(extract_cache_binary("grep -r foo ."), Some("grep".into()));
+        assert_eq!(extract_cache_binary("rm -rf /tmp/x"), Some("rm".into()));
+        assert_eq!(extract_cache_binary("/bin/ls"), Some("/bin/ls".into()));
+    }
+
+    #[test]
+    fn extract_cache_binary_skips_leading_env_assignments() {
+        assert_eq!(
+            extract_cache_binary("RUST_LOG=debug cargo build"),
+            Some("cargo".into())
+        );
+        assert_eq!(
+            extract_cache_binary("A=1 B=2 ./run.sh"),
+            Some("./run.sh".into())
+        );
+    }
+
+    #[test]
+    fn extract_cache_binary_edge_cases() {
+        assert_eq!(extract_cache_binary(""), None);
+        assert_eq!(extract_cache_binary("   "), None);
+        // all-env produces no binary token
+        assert_eq!(extract_cache_binary("FOO=bar"), None);
+        // a token whose pre-'=' part is not a valid var name is treated as argv0
+        assert_eq!(extract_cache_binary("1bad=x cmd"), Some("1bad=x".into()));
+    }
 
     #[test]
     fn test_builtin_tool_definitions() {

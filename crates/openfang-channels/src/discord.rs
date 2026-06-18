@@ -938,7 +938,7 @@ impl ChannelAdapter for DiscordAdapter {
                                     // path the text `/approve` command uses.
                                     let custom_id =
                                         d["data"]["custom_id"].as_str().unwrap_or("");
-                                    let (approve, approval_id) =
+                                    let (approve, approval_id, scope_token) =
                                         match parse_approval_custom_id(custom_id) {
                                             Some(v) => v,
                                             // Not an approval button — ACKed above
@@ -1028,7 +1028,16 @@ impl ChannelAdapter for DiscordAdapter {
                                             } else {
                                                 "reject".to_string()
                                             },
-                                            args: vec![approval_id],
+                                            // Carry the caching scope intent as
+                                            // a second arg so the button decision
+                                            // shares the text `/approve` resolve
+                                            // path. Absent => Approve Once.
+                                            args: match scope_token {
+                                                Some(tok) => {
+                                                    vec![approval_id, tok.to_string()]
+                                                }
+                                                None => vec![approval_id],
+                                            },
                                         },
                                         target_agent: None,
                                         timestamp: chrono::Utc::now(),
@@ -2411,24 +2420,31 @@ mod tests {
 /// Build Discord `components` action rows from platform-neutral buttons.
 /// Discord allows max 5 buttons per action row (and 5 rows); buttons are
 /// chunked into rows of 5. Each button is component type 2 (Button).
-/// Parse an approval button `custom_id` (`ap:<id>:n0` / `dn:<id>:n0`) into
-/// `(approve, approval_id)`. Returns `None` for any custom_id that is not an
-/// approval button. The custom_id is an opaque correlator and carries NO
-/// authorization (ANAI-82) — the clicking user's identity is gated separately,
-/// server-side, at resolve time.
-fn parse_approval_custom_id(custom_id: &str) -> Option<(bool, String)> {
+/// Parse an approval button `custom_id` into `(approve, approval_id,
+/// scope_token)`. The verb selects the caching scope intent:
+///   `ap` Approve Once  -> (true,  id, None)
+///   `as` Approve Similar -> (true,  id, Some("similar"))
+///   `at` Approve Tool  -> (true,  id, Some("tool"))
+///   `dn` Deny          -> (false, id, None)
+/// Returns `None` for any custom_id that is not an approval button. The
+/// custom_id is an opaque correlator carrying NO authorization (ANAI-82) and
+/// NO binary — the clicking user is gated server-side at resolve time, and
+/// the binary for `similar` is read there from the pending request.
+fn parse_approval_custom_id(custom_id: &str) -> Option<(bool, String, Option<&'static str>)> {
     let mut parts = custom_id.splitn(3, ':');
     let action = parts.next()?;
     let approval_id = parts.next()?;
     if approval_id.is_empty() {
         return None;
     }
-    let approve = match action {
-        "ap" => true,
-        "dn" => false,
+    let (approve, scope_token) = match action {
+        "ap" => (true, None),
+        "as" => (true, Some("similar")),
+        "at" => (true, Some("tool")),
+        "dn" => (false, None),
         _ => return None,
     };
-    Some((approve, approval_id.to_string()))
+    Some((approve, approval_id.to_string(), scope_token))
 }
 
 fn build_action_rows(buttons: &[InteractiveButton]) -> Vec<serde_json::Value> {
@@ -2492,18 +2508,32 @@ mod anai82_interactive_tests {
 
     #[test]
     fn parse_approval_custom_id_round_trips_surfacer_scheme() {
-        // The surfacer emits `ap:<uuid>:n0` / `dn:<uuid>:n0`; the inbound
-        // handler must recover (approve, id) from exactly that shape.
+        // The surfacer emits ap/as/at/dn `<verb>:<uuid>:n0`; the inbound
+        // handler must recover (approve, id, scope_token) from that shape.
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        let (approve, id) =
-            parse_approval_custom_id(&format!("ap:{uuid}:n0")).expect("approve parses");
+        let (approve, id, scope) =
+            parse_approval_custom_id(&format!("ap:{uuid}:n0")).expect("approve once parses");
         assert!(approve);
         assert_eq!(id, uuid);
+        assert_eq!(scope, None);
 
-        let (approve, id) =
+        let (approve, id, scope) =
+            parse_approval_custom_id(&format!("as:{uuid}:n0")).expect("approve similar parses");
+        assert!(approve);
+        assert_eq!(id, uuid);
+        assert_eq!(scope, Some("similar"));
+
+        let (approve, id, scope) =
+            parse_approval_custom_id(&format!("at:{uuid}:n0")).expect("approve tool parses");
+        assert!(approve);
+        assert_eq!(id, uuid);
+        assert_eq!(scope, Some("tool"));
+
+        let (approve, id, scope) =
             parse_approval_custom_id(&format!("dn:{uuid}:n0")).expect("deny parses");
         assert!(!approve);
         assert_eq!(id, uuid);
+        assert_eq!(scope, None);
     }
 
     #[test]
@@ -2516,6 +2546,8 @@ mod anai82_interactive_tests {
         assert!(parse_approval_custom_id("ap::n0").is_none());
         // Wrong action verb.
         assert!(parse_approval_custom_id("approve:abc:n0").is_none());
+        // Unknown 2-char verb must not route.
+        assert!(parse_approval_custom_id("xx:abc:n0").is_none());
         // Empty string.
         assert!(parse_approval_custom_id("").is_none());
     }
@@ -2524,10 +2556,11 @@ mod anai82_interactive_tests {
     fn parse_approval_custom_id_id_with_colons_is_first_segment_only() {
         // splitn(3) caps segments: a nonce containing a stray colon stays in
         // the third field and never corrupts the recovered id.
-        let (approve, id) =
+        let (approve, id, scope) =
             parse_approval_custom_id("ap:abc123:n0:extra").expect("parses");
         assert!(approve);
         assert_eq!(id, "abc123");
+        assert_eq!(scope, None);
     }
 
     #[test]

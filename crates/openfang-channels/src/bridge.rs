@@ -347,7 +347,9 @@ pub trait ChannelBridgeHandle: Send + Sync {
         "No approvals pending.".to_string()
     }
 
-    /// Approve or reject a pending approval by UUID prefix.
+    /// Approve or reject a pending approval by UUID prefix. `scope_token`
+    /// (`"similar"` / `"tool"`, else None) carries the approval-cache intent
+    /// from the button or an optional second `/approve` arg.
     async fn resolve_approval_text(
         &self,
         _id_prefix: &str,
@@ -355,6 +357,7 @@ pub trait ChannelBridgeHandle: Send + Sync {
         _channel_type: &str,
         _approver_user_id: &str,
         _approver_display: &str,
+        _scope_token: Option<&str>,
     ) -> String {
         "Approvals not available.".to_string()
     }
@@ -2535,7 +2538,7 @@ async fn handle_command(
         "approvals" => handle.list_approvals_text().await,
         "approve" => {
             if args.is_empty() {
-                "Usage: /approve <id-prefix>".to_string()
+                "Usage: /approve <id-prefix> [once|similar|tool]".to_string()
             } else {
                 handle
                     .resolve_approval_text(
@@ -2544,6 +2547,7 @@ async fn handle_command(
                         channel_type,
                         user_id,
                         &sender.display_name,
+                        args.get(1).map(String::as_str),
                     )
                     .await
             }
@@ -2559,6 +2563,7 @@ async fn handle_command(
                         channel_type,
                         user_id,
                         &sender.display_name,
+                        None,
                     )
                     .await
             }

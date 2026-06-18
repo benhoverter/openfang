@@ -143,6 +143,11 @@ pub struct ApprovalRequest {
     /// Origin of the triggering run. `None` ⇒ fall back to the text approve path.
     #[serde(default)]
     pub origin: Option<ApprovalOrigin>,
+    /// argv[0] of a `shell_exec` command (exact spelling), extracted once at
+    /// the gate. Drives the "Approve Similar" cache key and button. `None` for
+    /// non-shell tools and for commands with no parseable first token.
+    #[serde(default)]
+    pub cache_binary: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -221,6 +226,16 @@ impl ApprovalRequest {
                         ));
                     }
                 }
+            }
+        }
+
+        // -- cache_binary (optional) --
+        if let Some(b) = &self.cache_binary {
+            if b.len() > MAX_ORIGIN_FIELD_LEN {
+                return Err(format!(
+                    "cache_binary too long ({} chars, max {MAX_ORIGIN_FIELD_LEN})",
+                    b.len()
+                ));
             }
         }
 
@@ -426,6 +441,7 @@ mod tests {
             requested_at: Utc::now(),
             timeout_secs: 60,
             origin: None,
+            cache_binary: None,
         }
     }
 
