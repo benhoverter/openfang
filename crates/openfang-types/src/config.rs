@@ -1185,6 +1185,11 @@ pub struct ExecPolicy {
     pub safe_bins: Vec<String>,
     /// Global command allowlist (when mode = allowlist).
     pub allowed_commands: Vec<String>,
+    /// Per-agent commands that are AUTO-APPROVED by the gate (no prompt) in
+    /// allowlist mode. Like `safe_bins` (the global "inherently safe" list)
+    /// but scoped to this agent: a base here suppresses the approval prompt
+    /// AND satisfies the allowlist wall.
+    pub trusted_commands: Vec<String>,
     /// Max execution timeout in seconds. Default: 30.
     pub timeout_secs: u64,
     /// Max output size in bytes. Default: 100KB.
@@ -1230,6 +1235,7 @@ impl Default for ExecPolicy {
             .map(String::from)
             .collect(),
             allowed_commands: Vec::new(),
+            trusted_commands: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),

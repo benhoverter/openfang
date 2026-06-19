@@ -778,6 +778,96 @@ fn extract_all_commands(command: &str) -> Vec<&str> {
 /// Validate a shell command against the exec policy.
 ///
 /// Returns `Ok(())` if the command is allowed, `Err(reason)` if blocked.
+/// Result of walking a command line: every base command it will execute.
+/// `bases` are top-level segments + wrapper-binary chains (env/sudo/nice/...);
+/// `inner` are commands found inside an inline shell-wrapper script.
+pub(crate) struct ExtractedBases {
+    pub bases: Vec<String>,
+    pub inner: Vec<String>,
+}
+
+/// Single source of truth for "what base commands does this command line run?"
+///
+/// Applies the same hard-deny gates the allowlist wall enforces (load-from-disk,
+/// wrapper-binary deny, inline-script interpreter deny, and the metacharacter
+/// check for non-wrapper commands). Any violation or parse failure returns
+/// `Err`; every caller MUST fail closed (treat `Err` as "reject / not approved").
+pub(crate) fn collect_command_bases(command: &str) -> Result<ExtractedBases, String> {
+    // S9-09: hard-deny load-from-disk / interactive flags before any parsing.
+    check_load_from_disk(command)?;
+
+    let inner = extract_shell_wrapper_commands(command)?;
+    let is_shell_wrapper = !inner.is_empty();
+
+    // Metacharacters can smuggle commands inside arguments of allowed binaries.
+    // Skip for shell wrappers — their inline script legitimately contains them
+    // and is validated via `inner` instead.
+    if !is_shell_wrapper {
+        if let Some(reason) = contains_shell_metacharacters(command) {
+            return Err(format!(
+                "Command blocked: contains {reason}. Shell metacharacters are not allowed in Allowlist mode."
+            ));
+        }
+    }
+
+    // S9-08: per-segment hard-deny gates + wrapper-binary recursion.
+    let mut bases: Vec<String> = Vec::new();
+    for seg in extract_all_segments(command) {
+        check_wrapper_binary_deny(seg)?;
+        check_inline_script_interpreter(seg)?;
+        let base = extract_base_command(seg);
+        if !base.is_empty() {
+            bases.push(base.to_string());
+        }
+        bases.extend(extract_wrapper_binary_chain(seg, 1)?);
+    }
+
+    Ok(ExtractedBases { bases, inner })
+}
+
+/// Source that auto-approved a command base at the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovedVia {
+    SafeBins,
+    TrustedCommands,
+}
+
+/// One auto-approved base command and the list it matched.
+#[derive(Debug, Clone)]
+pub struct ApprovedBase {
+    pub base: String,
+    pub via: ApprovedVia,
+}
+
+/// Gate predicate (#772 follow-up): `Some(report)` IFF EVERY base in `command`
+/// is pre-approved via `safe_bins` or `trusted_commands`, so the approval prompt
+/// can be suppressed. `None` on any unapproved base, an empty extraction, or any
+/// parse / hard-deny error — the caller then falls through to the prompt and the
+/// allowlist wall re-validates independently. Only meaningful in `Allowlist`
+/// mode (Full bypasses approval elsewhere; Deny blocks execution outright).
+pub fn command_approval_report(command: &str, policy: &ExecPolicy) -> Option<Vec<ApprovedBase>> {
+    if policy.mode != ExecSecurityMode::Allowlist {
+        return None;
+    }
+    let extracted = collect_command_bases(command).ok()?;
+    let mut report = Vec::new();
+    for base in extracted.bases.into_iter().chain(extracted.inner) {
+        let via = if policy.safe_bins.contains(&base) {
+            ApprovedVia::SafeBins
+        } else if policy.trusted_commands.contains(&base) {
+            ApprovedVia::TrustedCommands
+        } else {
+            return None; // unapproved base → fail closed
+        };
+        report.push(ApprovedBase { base, via });
+    }
+    if report.is_empty() {
+        None // empty extraction → fail closed
+    } else {
+        Some(report)
+    }
+}
+
 pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<(), String> {
     match policy.mode {
         ExecSecurityMode::Deny => {
@@ -791,80 +881,36 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
             Ok(())
         }
         ExecSecurityMode::Allowlist => {
-            // SECURITY (S9-09): Hard-deny load-from-disk / interactive flags
-            // on any shell wrapper BEFORE doing any other parsing. These flags
-            // sidestep inline allowlist validation entirely.
-            check_load_from_disk(command)?;
-
-            // SECURITY: Check for shell metacharacters BEFORE base-command extraction.
-            // These can smuggle commands inside arguments of allowed binaries.
-            //
-            // However, we must skip this check for commands wrapped in a known
-            // shell wrapper (e.g. `powershell -Command "..."`) because the
-            // inline script naturally contains metacharacters (quotes, semicolons).
-            // Those inner commands are validated separately below.
-            let inner_commands = extract_shell_wrapper_commands(command)?;
-            let is_shell_wrapper = !inner_commands.is_empty();
-
-            if !is_shell_wrapper {
-                if let Some(reason) = contains_shell_metacharacters(command) {
+            // Single source of truth for "what base commands does this line run?"
+            // (S9-08 / S9-09 / #794). `collect_command_bases` applies the same
+            // hard-deny gates and metacharacter checks; any failure → Err.
+            let extracted = collect_command_bases(command)?;
+            // Union semantics: a base in any of safe_bins, allowed_commands, or
+            // trusted_commands satisfies the wall — so a gate-auto-approved
+            // command (safe_bins ∪ trusted_commands) never dies here.
+            let approved = |base: &str| {
+                policy.safe_bins.iter().any(|sb| sb == base)
+                    || policy.allowed_commands.iter().any(|ac| ac == base)
+                    || policy.trusted_commands.iter().any(|tc| tc == base)
+            };
+            for base in &extracted.bases {
+                if !approved(base) {
                     return Err(format!(
-                        "Command blocked: contains {reason}. Shell metacharacters are not allowed in Allowlist mode."
+                        "Command '{base}' is not in the exec allowlist. Add it to \
+                         exec_policy.allowed_commands or exec_policy.safe_bins."
                     ));
                 }
             }
-
-            // SECURITY (S9-08): per-segment hard-deny gates and wrapper-binary
-            // recursion. Build the full set of base commands that must be in
-            // the allowlist, including binaries reached through env / sudo /
-            // nice / nohup / timeout.
-            let mut all_bases: Vec<String> = Vec::new();
-            for seg in extract_all_segments(command) {
-                check_wrapper_binary_deny(seg)?;
-                check_inline_script_interpreter(seg)?;
-                let base = extract_base_command(seg);
-                if !base.is_empty() {
-                    all_bases.push(base.to_string());
-                }
-                let chain = extract_wrapper_binary_chain(seg, 1)?;
-                all_bases.extend(chain);
-            }
-            for base in &all_bases {
-                // Check safe_bins first
-                if policy.safe_bins.iter().any(|sb| sb == base.as_str()) {
-                    continue;
-                }
-                // Check allowed_commands
-                if policy.allowed_commands.iter().any(|ac| ac == base.as_str()) {
-                    continue;
-                }
-                return Err(format!(
-                    "Command '{}' is not in the exec allowlist. Add it to exec_policy.allowed_commands or exec_policy.safe_bins.",
-                    base
-                ));
-            }
-
-            // SECURITY (#794): If the outer command is a shell wrapper
-            // (powershell, cmd, bash, etc.), also validate all commands
-            // found inside the inline script. This prevents bypassing the
-            // allowlist by wrapping disallowed commands inside an allowed
-            // shell.
-            if is_shell_wrapper {
-                for inner_cmd in &inner_commands {
-                    if policy.safe_bins.iter().any(|sb| sb == inner_cmd) {
-                        continue;
-                    }
-                    if policy.allowed_commands.iter().any(|ac| ac == inner_cmd) {
-                        continue;
-                    }
+            // SECURITY (#794): also validate commands found inside an inline
+            // shell-wrapper script.
+            for inner_cmd in &extracted.inner {
+                if !approved(inner_cmd) {
                     return Err(format!(
-                        "Command '{}' (inside shell wrapper) is not in the exec allowlist. \
-                         Add it to exec_policy.allowed_commands or exec_policy.safe_bins.",
-                        inner_cmd
+                        "Command '{inner_cmd}' (inside shell wrapper) is not in the exec \
+                         allowlist. Add it to exec_policy.allowed_commands or exec_policy.safe_bins."
                     ));
                 }
             }
-
             Ok(())
         }
     }
@@ -2170,5 +2216,78 @@ mod tests {
         assert!(validate_command_allowlist("sudo", &p).is_err());
         // `env` with only KEY=VALUE assignments and no inner command must reject.
         assert!(validate_command_allowlist("env FOO=bar", &p).is_err());
+    }
+
+    // ── trusted_commands: gate auto-approve + wall union (#772 follow-up) ──
+
+    fn trusted_policy() -> ExecPolicy {
+        ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["cargo".to_string()],
+            trusted_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        }
+    }
+
+    #[test]
+    fn test_trusted_report_all_approved_some() {
+        let p = trusted_policy();
+        // "git" ∈ trusted_commands; "echo" ∈ default safe_bins.
+        assert!(command_approval_report("git status", &p).is_some());
+        assert!(command_approval_report("echo hi", &p).is_some());
+    }
+
+    #[test]
+    fn test_trusted_report_sources_named() {
+        let p = trusted_policy();
+        let git = command_approval_report("git status", &p).expect("git approved");
+        assert_eq!(git[0].base, "git");
+        assert_eq!(git[0].via, ApprovedVia::TrustedCommands);
+        let echo = command_approval_report("echo hi", &p).expect("echo approved");
+        assert_eq!(echo[0].via, ApprovedVia::SafeBins);
+    }
+
+    #[test]
+    fn test_trusted_report_unapproved_base_none() {
+        let p = trusted_policy();
+        // "cargo" is in allowed_commands (prompt), NOT safe_bins/trusted →
+        // report must be None so the prompt still fires.
+        assert!(command_approval_report("cargo build", &p).is_none());
+        // wholly unknown command → None.
+        assert!(command_approval_report("curl https://x", &p).is_none());
+    }
+
+    #[test]
+    fn test_trusted_report_metachar_fails_closed_none() {
+        let p = trusted_policy();
+        // Metacharacters in a non-wrapper command → Err in extraction → None.
+        assert!(command_approval_report("git status; rm -rf /", &p).is_none());
+    }
+
+    #[test]
+    fn test_trusted_report_wrapper_unapproved_inner_none() {
+        let mut p = trusted_policy();
+        // Allow the wrapper binary itself, but the inner command is unapproved.
+        p.trusted_commands.push("bash".to_string());
+        assert!(command_approval_report("bash -c \"curl evil\"", &p).is_none());
+    }
+
+    #[test]
+    fn test_trusted_report_non_allowlist_mode_none() {
+        let p = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            trusted_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+        assert!(command_approval_report("git status", &p).is_none());
+    }
+
+    #[test]
+    fn test_trusted_command_satisfies_wall_union() {
+        let p = trusted_policy();
+        // "git" only in trusted_commands must still pass the allowlist wall.
+        assert!(validate_command_allowlist("git status", &p).is_ok());
+        // a non-listed command still rejected.
+        assert!(validate_command_allowlist("npm install", &p).is_err());
     }
 }

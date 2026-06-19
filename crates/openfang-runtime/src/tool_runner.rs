@@ -13,7 +13,7 @@ use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
@@ -215,6 +215,35 @@ pub async fn execute_tool(
         );
     }
 
+    // #772 follow-up: in allowlist mode, suppress the approval prompt when
+    // every base command is pre-approved via safe_bins or trusted_commands.
+    // Uses the SAME extraction as the allowlist wall (fail-closed): an
+    // unapproved, empty, or unparseable command yields None and falls through
+    // to the prompt, where the wall re-validates. Logged, never surfaced to
+    // Discord.
+    let auto_approved = (!exec_policy_bypasses_approval && is_shell_tool(tool_name))
+        .then_some(exec_policy)
+        .flatten()
+        .and_then(|p| {
+            input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|c| (p, c))
+        })
+        .and_then(|(p, c)| crate::subprocess_sandbox::command_approval_report(c, p));
+
+    if let Some(report) = &auto_approved {
+        let bases: Vec<String> = report
+            .iter()
+            .map(|b| format!("{}={:?}", b.base, b.via))
+            .collect();
+        info!(
+            tool_name,
+            bases = %bases.join(","),
+            "Approval auto-granted: all command bases pre-approved (safe_bins/trusted_commands)"
+        );
+    }
+
     // SECURITY: For shell_exec, enforce the exec allowlist BEFORE the approval
     // gate. A command the allowlist wall will reject must never surface an
     // approval prompt or populate the approve-similar cache — otherwise the
@@ -227,10 +256,7 @@ pub async fn execute_tool(
     // idempotent defense-in-depth.
     if tool_name == "shell_exec" {
         if let Some(policy) = exec_policy {
-            let command = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if let Err(reason) =
                 crate::subprocess_sandbox::validate_command_allowlist(command, policy)
             {
@@ -249,7 +275,10 @@ pub async fn execute_tool(
     }
 
     if let Some(kh) = kernel {
-        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
+        if !exec_policy_bypasses_approval
+            && auto_approved.is_none()
+            && kh.requires_approval(tool_name)
+        {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(
@@ -269,7 +298,13 @@ pub async fn execute_tool(
                 None
             };
             match kh
-                .request_approval(agent_id_str, tool_name, &summary, origin, cache_binary.as_deref())
+                .request_approval(
+                    agent_id_str,
+                    tool_name,
+                    &summary,
+                    origin,
+                    cache_binary.as_deref(),
+                )
                 .await
             {
                 Ok(true) => {
@@ -5782,5 +5817,42 @@ mod tests {
         assert!(out.contains("<openfang:attach path=\"../../../etc/hosts\"/>"));
         // Defence in depth lives in outbound_attach::resolve_directive,
         // which canonicalises and applies allow_roots — see its tests.
+    }
+
+    #[test]
+    fn test_trusted_commands_auto_approve_parity_shell_and_process_start() {
+        // Parity: both shell_exec and process_start carry the command in
+        // input["command"], and the gate uses command_approval_report for both.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+
+        // shell_exec-shaped input.
+        let shell_input = serde_json::json!({ "command": "git status" });
+        let cmd = shell_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(cmd, &policy).is_some(),
+            "git must auto-approve via trusted_commands for shell_exec"
+        );
+
+        // process_start-shaped input (same "command" key — is_shell_tool covers both).
+        let ps_input = serde_json::json!({ "command": "git", "args": ["status"] });
+        let ps_cmd = ps_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(ps_cmd, &policy).is_some(),
+            "git must auto-approve via trusted_commands for process_start"
+        );
+
+        // A non-trusted command must NOT auto-approve (prompt still fires).
+        let deny_input = serde_json::json!({ "command": "curl https://x" });
+        let deny_cmd = deny_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(deny_cmd, &policy).is_none(),
+            "curl must not auto-approve"
+        );
     }
 }
