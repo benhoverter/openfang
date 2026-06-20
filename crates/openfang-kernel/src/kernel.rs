@@ -18,6 +18,7 @@ use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
 };
 use openfang_runtime::audit::AuditLog;
+use openfang_runtime::bridge_auth::TokenIssuer;
 use openfang_runtime::drivers;
 use openfang_runtime::kernel_handle::{self, KernelHandle};
 use openfang_runtime::llm_driver::{
@@ -34,6 +35,7 @@ use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
+use openfang_types::turn::TurnTrigger;
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -55,6 +57,17 @@ impl LlmDriver for StubDriver {
                 .to_string(),
         ))
     }
+}
+
+/// Addressing coordinates of a surfaced approval prompt, stored so the kernel
+/// can edit it in place once the approval resolves (ANAI-82 edit-on-resolve).
+/// `user.platform_id` is the channel id for Discord; `message_id` is the
+/// created prompt message. Metadata only — never an authorization input.
+#[derive(Clone)]
+pub struct ApprovalPromptCoords {
+    pub channel_type: String,
+    pub user: openfang_channels::types::ChannelUser,
+    pub message_id: String,
 }
 
 pub struct OpenFangKernel {
@@ -178,8 +191,31 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// Per-agent stash of the active run's [`ApprovalOrigin`] (Piece 3, ANAI-82).
+    /// The bridge-IPC tool-call path runs on a separate task with no handle to
+    /// the run's origin stack, so it resolves a push target by looking up the
+    /// running agent here. `agent_msg_locks` guarantees one run per agent at a
+    /// time, making this key race-free. Cleared on run exit by a drop guard.
+    /// Audit/targeting metadata only — never an authz carrier.
+    pub active_run_origins:
+        dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+    /// Discord coordinates of a surfaced approval prompt, keyed by approval id
+    /// (ANAI-82 edit-on-resolve). Populated by `surface_approval_prompt` only
+    /// when the adapter returned a message id (Discord), and read once by
+    /// `edit_approval_prompt` after an *authorized* resolve to strip the buttons
+    /// and stamp the outcome. Addressing metadata only — never an authz carrier;
+    /// the resolve decision is already gated server-side before this is read.
+    pub approval_prompt_coords: dashmap::DashMap<uuid::Uuid, ApprovalPromptCoords>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// Bridge token issuer — populated by the daemon at boot via
+    /// `boot_with_config_and_issuer` (ANAI-31 phase E). Threaded into
+    /// `drivers::create_driver` so the Claude Code driver mints per-spawn,
+    /// short-lived bridge tokens registered with the IPC dispatcher. `None`
+    /// for non-daemon callers and non-unix targets, which keeps the legacy
+    /// ANAI-30 UUID path. The `set_token_issuer` setter is retained for
+    /// late-install scenarios but is unused by the live daemon path.
+    token_issuer: std::sync::RwLock<Option<Arc<dyn TokenIssuer>>>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -587,7 +623,30 @@ impl OpenFangKernel {
     }
 
     /// Boot the kernel with an explicit configuration.
-    pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
+    ///
+    /// Equivalent to [`boot_with_config_and_issuer`] with `token_issuer = None`.
+    /// Retained for non-daemon callers (tests, CLI one-shots, desktop embeds)
+    /// that do not construct a bridge `TokenIssuer`. The daemon path
+    /// (`openfang-cli::main` → `run_daemon`) calls the issuer-aware entrypoint
+    /// directly so boot-time drivers are wired through the hardened token
+    /// path. See ANAI-31 phase E.
+    pub fn boot_with_config(config: KernelConfig) -> KernelResult<Self> {
+        Self::boot_with_config_and_issuer(config, None)
+    }
+
+    /// Boot the kernel with an explicit configuration and an optional
+    /// bridge token issuer.
+    ///
+    /// Daemon entrypoint. The issuer (an `Arc<BridgeAuthority>` on unix; `None`
+    /// elsewhere) is populated into `self.token_issuer` **before** the boot
+    /// driver chain is constructed, so the three boot-time `create_driver`
+    /// sites can mint hardened bridge tokens for the Claude Code driver
+    /// instead of falling back to the legacy ANAI-30 UUID path. Closes the
+    /// boot-time loophole that survived phases C1/C2/D.
+    pub fn boot_with_config_and_issuer(
+        mut config: KernelConfig,
+        token_issuer: Option<Arc<dyn TokenIssuer>>,
+    ) -> KernelResult<Self> {
         if rustls::crypto::ring::default_provider()
             .install_default()
             .is_err()
@@ -699,7 +758,11 @@ impl OpenFangKernel {
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
-        let primary_result = drivers::create_driver(&driver_config);
+        // Phase E: the daemon entrypoint hands us the `BridgeAuthority` here so
+        // boot-time drivers get the same hardened token path as post-boot
+        // resolves. Non-daemon callers (tests, desktop embeds) pass `None` and
+        // boot-time drivers stay on the legacy UUID lane.
+        let primary_result = drivers::create_driver(&driver_config, token_issuer.clone());
         let mut driver_chain: Vec<Arc<dyn LlmDriver>> = Vec::new();
 
         match &primary_result {
@@ -723,7 +786,7 @@ impl OpenFangKernel {
                         // is replacing the *provider*, not the timeout policy.
                         subprocess_timeout_secs: config.default_model.subprocess_timeout_secs,
                     };
-                    match drivers::create_driver(&auto_config) {
+                    match drivers::create_driver(&auto_config, token_issuer.clone()) {
                         Ok(d) => {
                             info!(
                                 provider = %provider,
@@ -772,7 +835,7 @@ impl OpenFangKernel {
                 skip_permissions: true,
                 subprocess_timeout_secs: fb.subprocess_timeout_secs,
             };
-            match drivers::create_driver(&fb_config) {
+            match drivers::create_driver(&fb_config, token_issuer.clone()) {
                 Ok(d) => {
                     info!(
                         provider = %fb.provider,
@@ -1219,7 +1282,14 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            active_run_origins: dashmap::DashMap::new(),
+            approval_prompt_coords: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
+            // Phase E: the daemon hands us its `BridgeAuthority` at boot so
+            // post-boot `resolve_driver` and agent-loop fallback paths see the
+            // issuer immediately, without depending on a later
+            // `set_token_issuer` call. Non-daemon callers pass `None`.
+            token_issuer: std::sync::RwLock::new(token_issuer),
         };
 
         // Wire HAND.toml load events into the Merkle audit chain so reload
@@ -1273,6 +1343,7 @@ impl OpenFangKernel {
                     // had no effect on agents whose manifests cached the older
                     // inherited Allowlist policy at spawn time).
                     let mut disk_has_exec_policy_override = false;
+                    let mut disk_has_file_policy_override = false;
 
                     // Check if TOML on disk is newer/different — if so, update from file
                     let mut entry = entry;
@@ -1294,6 +1365,9 @@ impl OpenFangKernel {
                                         // kernel default below).
                                         if disk_manifest.exec_policy.is_some() {
                                             disk_has_exec_policy_override = true;
+                                        }
+                                        if disk_manifest.file_policy.is_some() {
+                                            disk_has_file_policy_override = true;
                                         }
                                         // Compare key fields to detect changes.
                                         // IMPORTANT: keep this list in sync with AgentManifest
@@ -1329,7 +1403,9 @@ impl OpenFangKernel {
                                             || disk_manifest.autonomous != entry.manifest.autonomous
                                             || disk_manifest.resources != entry.manifest.resources
                                             || disk_manifest.exec_policy
-                                                != entry.manifest.exec_policy;
+                                                != entry.manifest.exec_policy
+                                            || disk_manifest.file_policy
+                                                != entry.manifest.file_policy;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1405,6 +1481,22 @@ impl OpenFangKernel {
                         restored_entry.manifest.exec_policy =
                             Some(kernel.config.exec_policy.clone());
                     }
+
+                    // F2: re-resolve file_policy under the current global floor
+                    // on every restart (mirrors exec_policy #1132) so config
+                    // edits propagate and the transient floor — which is never
+                    // persisted — is re-derived. A disk override is kept as the
+                    // narrowing layer; absent one, global applies wholesale.
+                    let fp_override = if disk_has_file_policy_override {
+                        restored_entry.manifest.file_policy.take()
+                    } else {
+                        None
+                    };
+                    restored_entry.manifest.file_policy =
+                        Some(openfang_types::config::FilePolicy::resolve_under_floor(
+                            &kernel.config.file_policy,
+                            fp_override,
+                        ));
 
                     // Apply global budget defaults to restored agents
                     apply_budget_defaults(
@@ -1623,6 +1715,15 @@ impl OpenFangKernel {
             manifest.exec_policy = Some(self.config.exec_policy.clone());
         }
         info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
+
+        // F2: resolve file_policy under the global floor. The global
+        // `[file_policy]` is a hard floor — a per-agent override may only
+        // narrow it, never widen past it. With no override the global applies
+        // wholesale (closes the dead-global-config defect).
+        manifest.file_policy = Some(openfang_types::config::FilePolicy::resolve_under_floor(
+            &self.config.file_policy,
+            manifest.file_policy.take(),
+        ));
 
         // Overlay kernel default_model onto agent if agent didn't explicitly choose.
         // Treat empty or "default" as "use the kernel's configured default_model".
@@ -1853,6 +1954,117 @@ impl OpenFangKernel {
             Some(blocks),
             None,
             None,
+            None,
+            false,
+            TurnTrigger::User,
+        )
+        .await
+    }
+
+    /// Send a message in a channel-reply context: the caller (a channel
+    /// bridge) will deliver the agent's text response back to the originating
+    /// user-visible channel verbatim.  Sets `text_reply_is_delivery = true`
+    /// so the phantom-action detector does not misfire on legitimate
+    /// text-only replies that describe channel actions.
+    pub async fn send_message_channel_reply(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id, message, handle, None, None, None, None, true,
+            TurnTrigger::User,
+        )
+        .await
+    }
+
+    /// Origin-carrying counterpart to [`Self::send_message_channel_reply`].
+    ///
+    /// Threads the triggering run's [`ApprovalOrigin`] down to the agent loop
+    /// so a downstream approval prompt (e.g. `shell_exec`) is pushed back to
+    /// the exact channel/conversation that triggered the run. `origin` is
+    /// audit/targeting metadata only — never an authorization carrier.
+    pub async fn send_message_channel_reply_with_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            None,
+            None,
+            None,
+            Some(origin),
+            true,
+            TurnTrigger::User,
+        )
+        .await
+    }
+
+    /// Multimodal channel-reply variant; see [`Self::send_message_channel_reply`].
+    pub async fn send_message_channel_reply_with_blocks(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            Some(blocks),
+            None,
+            None,
+            None,
+            true,
+            TurnTrigger::User,
+        )
+        .await
+    }
+
+    /// Origin-carrying multimodal counterpart to
+    /// [`Self::send_message_channel_reply_with_blocks`]. See
+    /// [`Self::send_message_channel_reply_with_origin`] for the `origin` contract.
+    pub async fn send_message_channel_reply_with_blocks_and_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_with_handle_and_blocks(
+            agent_id,
+            message,
+            handle,
+            Some(blocks),
+            None,
+            None,
+            Some(origin),
+            true,
+            TurnTrigger::User,
         )
         .await
     }
@@ -1873,6 +2085,9 @@ impl OpenFangKernel {
             None,
             sender_id,
             sender_name,
+            None,
+            false,
+            TurnTrigger::User,
         )
         .await
     }
@@ -1886,6 +2101,10 @@ impl OpenFangKernel {
     /// Per-agent locking ensures that concurrent messages for the same agent
     /// are serialized (preventing session corruption), while messages for
     /// different agents run in parallel.
+    // The kernel send funnel is the single convergence point for every
+    // message-entry path; its width is intentional. ANAI-84 added the
+    // required `trigger` param, tipping it to 8 args.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_with_handle_and_blocks(
         &self,
         agent_id: AgentId,
@@ -1894,6 +2113,9 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        origin: Option<openfang_types::approval::ApprovalOrigin>,
+        text_reply_is_delivery: bool,
+        trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
@@ -1931,6 +2153,9 @@ impl OpenFangKernel {
                 content_blocks,
                 sender_id,
                 sender_name,
+                origin,
+                text_reply_is_delivery,
+                trigger,
             )
             .await
         };
@@ -2378,6 +2603,10 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                None, // origin (Piece 2 plumbing — populated at gated emit step)
+                // Streaming entry is interactive-only; no autonomous minter routes
+                // through it, so it is always a user-origin turn. (ANAI-84)
+                TurnTrigger::User,
             )
             .await;
 
@@ -2637,7 +2866,36 @@ impl OpenFangKernel {
         content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
         sender_id: Option<String>,
         sender_name: Option<String>,
+        origin: Option<openfang_types::approval::ApprovalOrigin>,
+        text_reply_is_delivery: bool,
+        trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
+        // Piece 3 (ANAI-82): stash this run's approval origin keyed by agent_id
+        // so the bridge-IPC tool-call path — a separate task with no handle to the
+        // run's origin stack — can resolve a push target. The per-agent message
+        // lock (`agent_msg_locks`) guarantees one run per agent at a time, so this
+        // key is race-free. The drop guard clears it on ANY exit (early `?`-return,
+        // panic), so a finished run never leaks a stale origin into the next one.
+        // Origin stays audit/targeting metadata; the bridge authorizes off the
+        // daemon-issued agent identity, not this map.
+        struct ActiveRunOriginGuard<'a> {
+            origins:
+                &'a dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+            agent_id: AgentId,
+        }
+        impl Drop for ActiveRunOriginGuard<'_> {
+            fn drop(&mut self) {
+                self.origins.remove(&self.agent_id);
+            }
+        }
+        let _origin_guard = origin.as_ref().map(|o| {
+            self.active_run_origins.insert(agent_id, o.clone());
+            ActiveRunOriginGuard {
+                origins: &self.active_run_origins,
+                agent_id,
+            }
+        });
+
         // Check metering quota before starting
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
@@ -2899,6 +3157,8 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                caller_agent_id: None,
+                allowed_tools: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -2969,6 +3229,9 @@ impl OpenFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
+            text_reply_is_delivery,
+            trigger,
         )
         .await
         .map_err(KernelError::OpenFang)?;
@@ -3292,6 +3555,18 @@ impl OpenFangKernel {
                 .is_some_and(|p| p == &self.config.exec_policy)
             {
                 manifest_for_disk.exec_policy = None;
+            }
+            // F2: same treatment for the inherited file_policy. The wholesale
+            // global-inherit case (== global) is stripped so a later config
+            // edit is not shadowed by a stale snapshot. A genuine per-agent
+            // override carries a transient floor and so never compares equal to
+            // the bare global, and is therefore preserved.
+            if manifest_for_disk
+                .file_policy
+                .as_ref()
+                .is_some_and(|p| p == &self.config.file_policy)
+            {
+                manifest_for_disk.file_policy = None;
             }
             match toml::to_string_pretty(&manifest_for_disk) {
                 Ok(toml_str) => {
@@ -4071,6 +4346,24 @@ impl OpenFangKernel {
         let _ = self.self_handle.set(Arc::downgrade(self));
     }
 
+    /// Install the daemon's bridge token issuer. Called once at boot by
+    /// `openfang-api::server.rs` after constructing the `Arc<BridgeAuthority>`.
+    /// Idempotent at the field level — last writer wins, but no production
+    /// caller writes more than once.
+    pub fn set_token_issuer(&self, issuer: Arc<dyn TokenIssuer>) {
+        if let Ok(mut slot) = self.token_issuer.write() {
+            *slot = Some(issuer);
+        }
+    }
+
+    /// Snapshot of the current bridge token issuer, if any. Cheap clone of an
+    /// `Arc`. Consumed by `drivers::create_driver` to hand the issuer to the
+    /// Claude Code driver, and (Phase C2) by `KernelHandle::token_issuer` so
+    /// the agent loop's fallback paths can mint hardened tokens too.
+    pub fn token_issuer(&self) -> Option<Arc<dyn TokenIssuer>> {
+        self.token_issuer.read().ok().and_then(|slot| slot.clone())
+    }
+
     // ─── Agent Binding management ──────────────────────────────────────
 
     /// List all agent bindings.
@@ -4223,7 +4516,22 @@ impl OpenFangKernel {
                     let aid = *agent_id;
                     let msg = message.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = kernel.send_message(aid, &msg).await {
+                        // ANAI-84: trigger-dispatched turns are proactive-origin.
+                        let handle = Some(Arc::clone(&kernel) as Arc<dyn KernelHandle>);
+                        if let Err(e) = kernel
+                            .send_message_with_handle_and_blocks(
+                                aid,
+                                &msg,
+                                handle,
+                                None,
+                                None,
+                                None,
+                                None,
+                                false,
+                                TurnTrigger::Proactive,
+                            )
+                            .await
+                        {
                             warn!(agent = %aid, "Trigger dispatch failed: {e}");
                         }
                     });
@@ -5022,14 +5330,22 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, move |aid, msg, trigger| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
-                    match k.send_message(aid, &msg).await {
+                    // ANAI-84: background.rs supplies the typed trigger
+                    // (Heartbeat for continuous, Cron for periodic).
+                    let handle = Some(Arc::clone(&k) as Arc<dyn KernelHandle>);
+                    match k
+                        .send_message_with_handle_and_blocks(
+                            aid, &msg, handle, None, None, None, None, false, trigger,
+                        )
+                        .await
+                    {
                         Ok(_) => {}
                         Err(e) => {
-                            // send_message already records the panic in supervisor,
-                            // just log the background context here
+                            // The funnel already records the panic in supervisor;
+                            // just log the background context here.
                             warn!(agent_id = %aid, error = %e, "Background tick failed");
                         }
                     }
@@ -5655,7 +5971,7 @@ impl OpenFangKernel {
                 subprocess_timeout_secs: primary_timeout,
             };
 
-            match drivers::create_driver(&driver_config) {
+            match drivers::create_driver(&driver_config, self.token_issuer()) {
                 Ok(d) => d,
                 Err(e) => {
                     // If fresh driver creation fails (e.g. key not yet set for this
@@ -5739,7 +6055,7 @@ impl OpenFangKernel {
                     None
                 },
             };
-            match drivers::create_driver(&config) {
+            match drivers::create_driver(&config, self.token_issuer()) {
                 Ok(d) => chain.push((d, strip_provider_prefix(&fb_model_name, &fb_provider))),
                 Err(e) => {
                     warn!("Fallback driver '{}' failed to init: {e}", fb_provider);
@@ -5774,7 +6090,7 @@ impl OpenFangKernel {
                 skip_permissions: true,
                 subprocess_timeout_secs: fb.subprocess_timeout_secs,
             };
-            match drivers::create_driver(&fb_config) {
+            match drivers::create_driver(&fb_config, self.token_issuer()) {
                 Ok(d) => {
                     chain.push((d, strip_provider_prefix(&fb.model, &fb.provider)));
                 }
@@ -6145,7 +6461,7 @@ impl OpenFangKernel {
     /// snapshot (which already includes global + workspace skills with correct
     /// override priority). When `None`, falls back to `self.skill_registry`
     /// (global-only, for diagnostic/non-agent callers).
-    fn available_tools_with_registry(
+    pub fn available_tools_with_registry(
         &self,
         agent_id: AgentId,
         skill_snapshot: Option<&openfang_skills::registry::SkillRegistry>,
@@ -6609,7 +6925,18 @@ impl OpenFangKernel {
                 let kh: Arc<dyn KernelHandle> = self.clone();
                 match tokio::time::timeout(
                     timeout,
-                    self.send_message_with_handle(agent_id, message, Some(kh), None, None),
+                    // ANAI-84: named cron job turns are cron-origin.
+                    self.send_message_with_handle_and_blocks(
+                        agent_id,
+                        message,
+                        Some(kh),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        TurnTrigger::Cron,
+                    ),
                 )
                 .await
                 {
@@ -6750,6 +7077,9 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
     }
     if disk.exec_policy.is_none() && entry.exec_policy.is_some() {
         disk.exec_policy = entry.exec_policy.clone();
+    }
+    if disk.file_policy.is_none() && entry.file_policy.is_some() {
+        disk.file_policy = entry.file_policy.clone();
     }
     disk
 }
@@ -7011,7 +7341,7 @@ async fn cron_deliver_response(
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
             // Deliver via the registered channel adapter
             kernel
-                .send_channel_message(channel, to, response, None)
+                .send_channel_message(channel, to, response, None, None)
                 .await
                 .map(|_| {
                     tracing::info!(channel = %channel, to = %to, "Cron: delivered to channel");
@@ -7031,7 +7361,7 @@ async fn cron_deliver_response(
                     let recipient = val["recipient"].as_str().unwrap_or("");
                     if !channel.is_empty() && !recipient.is_empty() {
                         kernel
-                            .send_channel_message(channel, recipient, response, None)
+                            .send_channel_message(channel, recipient, response, None, None)
                             .await
                             .map(|_| {
                                 tracing::info!(channel = %channel, recipient = %recipient, "Cron: delivered to last channel");
@@ -7108,7 +7438,7 @@ impl openfang_channels::bridge::ChannelBridgeHandle for KernelCronBridge {
         message: &str,
     ) -> Result<(), String> {
         self.kernel
-            .send_channel_message(channel_type, recipient, message, None)
+            .send_channel_message(channel_type, recipient, message, None, None)
             .await
             .map(|_| ())
     }
@@ -7162,8 +7492,316 @@ async fn cron_fan_out_targets(
     }
 }
 
+/// Resolved destination for a proactive approval-prompt push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApprovalPushTarget {
+    pub channel_type: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+}
+
+/// Decide whether — and where — to proactively surface an approval prompt.
+///
+/// Fail-closed: returns `None` (⇒ no proactive push; the self-sufficient text
+/// `/approve <id>` body that already accompanied the request stands) unless the
+/// request carries an `origin` with BOTH a non-empty `channel_type` and a
+/// concrete, non-empty `channel_id`. Anything less can only resolve to a
+/// broader or ambiguous destination, which would be a cross-channel leak.
+///
+/// `recipient` (the triggering peer_id) is deliberately NOT part of the target:
+/// it is audit/targeting metadata only, never an authorization or routing input
+/// here. The resolved push goes to the *conversation* (`channel_id`), and the
+/// operator who later acts on the prompt is re-authorized from the
+/// platform-attested interaction identity, not from `origin`.
+pub(crate) fn approval_push_target(
+    req: &openfang_types::approval::ApprovalRequest,
+) -> Option<ApprovalPushTarget> {
+    let origin = req.origin.as_ref()?;
+    if origin.channel_type.is_empty() {
+        return None;
+    }
+    let channel_id = origin.channel_id.as_deref()?;
+    if channel_id.is_empty() {
+        return None;
+    }
+    Some(ApprovalPushTarget {
+        channel_type: origin.channel_type.clone(),
+        channel_id: channel_id.to_string(),
+        thread_id: origin.thread_id.clone(),
+    })
+}
+
+impl OpenFangKernel {
+    /// Surface a freshly-submitted approval request back to the channel /
+    /// conversation that triggered the run (§8 step 5 — the emit consumer).
+    ///
+    /// Pure side-effect: this only *pushes a prompt*. It NEVER resolves the
+    /// request. Approval still happens via the text `/approve <id>` command or
+    /// the button-interaction handler, both of which re-authorize the operator
+    /// from the platform-attested interaction identity. `origin` (including
+    /// `recipient`) is audit/targeting only and is never an authorization
+    /// carrier — nothing here reaches `classify_approver`.
+    ///
+    /// Fail-closed: with no resolvable [`ApprovalPushTarget`] or a failed push,
+    /// we log and return. We never best-effort to a broader or different
+    /// channel.
+    pub async fn surface_approval_prompt(&self, req: &openfang_types::approval::ApprovalRequest) {
+        let Some(target) = approval_push_target(req) else {
+            tracing::debug!(
+                request_id = %req.id,
+                "approval surfacer: no resolvable push target; text /approve path stands"
+            );
+            return;
+        };
+
+        // Self-sufficient prompt body: STILL carries `/approve <id>` so it
+        // degrades correctly on adapters that cannot render anything richer.
+        let id = req.id;
+        // Agent-controlled fields flow through `send_channel_message` →
+        // `outbound_attach::parse`. Neutralize any `<openfang:attach …/>` marker
+        // so a requesting agent cannot strip text / inject a `caption=` line and
+        // make the rendered prompt diverge from the real action (security-openfang
+        // MEDIUM, ANAI-82). The marker stays visible (opener `<` escaped) but is
+        // never interpreted; file exfil is independently blocked (no allow_roots).
+        let neutralize = openfang_channels::outbound_attach::neutralize_markers;
+        let message = format!(
+            "🔐 Approval needed — agent `{agent}` wants to run `{tool}`.\n{summary}\n\nApprove: `/approve {id}`   ·   Reject: `/reject {id}`",
+            agent = neutralize(&req.agent_id),
+            tool = neutralize(&req.tool_name),
+            summary = neutralize(&req.action_summary),
+        );
+
+        // Buttons carry only the request id + a nonce — never authorization.
+        // The clicking user's identity is checked server-side at resolve time
+        // (the same `classify_approver` gate as the text `/approve` path); the
+        // custom_id is an opaque correlator (ANAI-82). Caching scheme:
+        //   `ap:<id>:n0` Approve Once   (always)
+        //   `as:<id>:n0` Approve Similar (shell_exec only, argv[0] off denylist)
+        //   `at:<id>:n0` Approve Tool    (non-shell tools only)
+        //   `dn:<id>:n0` Deny            (always)
+        // The custom_id encodes the *scope intent* only — never the binary,
+        // which the resolve site reads from the pending request's
+        // `cache_binary` (no truncation-mismatch risk). All sets are <= 5
+        // buttons (Discord's row cap). Parsed by the INTERACTION_CREATE
+        // handler in the Discord adapter.
+        use openfang_channels::types::{ButtonStyle, InteractiveButton};
+        let mut buttons = vec![InteractiveButton {
+            custom_id: format!("ap:{id}:n0"),
+            label: "Approve Once".to_string(),
+            style: ButtonStyle::Success,
+        }];
+        if req.tool_name == "shell_exec" {
+            // Approve Similar: blanket one binary (exact spelling). Suppressed
+            // for the destructive denylist where the binary alone carries no
+            // safe signal (`rm`, `dd`, …). Approve Tool is intentionally NOT
+            // offered for shell_exec — that blanket trust is `exec_policy.mode
+            // = full` in agent.toml, not a per-prompt button.
+            if let Some(bin) = req.cache_binary.as_deref() {
+                if !openfang_types::approval::is_similar_denylisted(bin) {
+                    buttons.push(InteractiveButton {
+                        custom_id: format!("as:{id}:n0"),
+                        label: "Approve Similar".to_string(),
+                        style: ButtonStyle::Success,
+                    });
+                }
+            }
+        } else {
+            buttons.push(InteractiveButton {
+                custom_id: format!("at:{id}:n0"),
+                label: "Approve Tool".to_string(),
+                style: ButtonStyle::Success,
+            });
+        }
+        buttons.push(InteractiveButton {
+            custom_id: format!("dn:{id}:n0"),
+            label: "Deny".to_string(),
+            style: ButtonStyle::Danger,
+        });
+
+        // `target.channel_id` is the addressing target (the originating
+        // conversation). `origin.recipient` is intentionally absent from the
+        // target and is never passed as an authz input.
+        //
+        // Resolve the adapter + recipient directly (rather than via the
+        // text-only `send_channel_message`) so the prompt can carry an action
+        // row. `bridge::send_interactive` degrades to the plain-text body —
+        // which still contains `/approve {id}` — on adapters without button
+        // support, so the ~50 non-Discord channels are unaffected.
+        let Some(adapter) = self
+            .channel_adapters
+            .get(&target.channel_type)
+            .map(|a| a.clone())
+        else {
+            tracing::warn!(
+                request_id = %id,
+                channel = %target.channel_type,
+                "approval surfacer: no adapter for channel; text /approve path stands"
+            );
+            return;
+        };
+        let user = match adapter.resolve_recipient(&target.channel_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %id,
+                    error = %e,
+                    "approval surfacer: recipient unresolved; text /approve path stands"
+                );
+                return;
+            }
+        };
+        match openfang_channels::bridge::send_interactive(
+            adapter.as_ref(),
+            &user,
+            message,
+            buttons,
+            target.thread_id.as_deref(),
+        )
+        .await
+        {
+            Ok(maybe_msg_id) => {
+                // Stash the prompt's coordinates so an authorized resolve can
+                // edit it in place (strip buttons + stamp outcome). Only adapters
+                // that render buttons (Discord) return an id; everyone else
+                // degraded to the text body and there is nothing to edit.
+                if let Some(msg_id) = maybe_msg_id {
+                    self.approval_prompt_coords.insert(
+                        id,
+                        ApprovalPromptCoords {
+                            channel_type: target.channel_type.clone(),
+                            user: user.clone(),
+                            message_id: msg_id,
+                        },
+                    );
+                }
+                tracing::debug!(request_id = %id, "approval prompt pushed to origin")
+            }
+            Err(e) => tracing::warn!(
+                request_id = %id,
+                error = %e,
+                "approval surfacer: push failed; text /approve path stands"
+            ),
+        }
+    }
+
+    /// Edit a surfaced approval prompt in place after an *authorized* resolve:
+    /// strip the action buttons and stamp the outcome + command (ANAI-82
+    /// edit-on-resolve). No-op when no prompt coordinates were stored (the
+    /// prompt degraded to text, or the platform exposes no message id).
+    ///
+    /// MUST be called only after `ApprovalManager::resolve` returns `Ok` — the
+    /// real decision is known there, so the stamp can never lie about an
+    /// unauthorized click. The stored coordinates are addressing metadata only;
+    /// they are read, never used as an authorization input. Best-effort: a
+    /// failed edit is logged and swallowed so it never poisons the resolve path.
+    pub async fn edit_approval_prompt(&self, id: uuid::Uuid, verb: &str, command: &str) {
+        let Some((_, coords)) = self.approval_prompt_coords.remove(&id) else {
+            return;
+        };
+        let Some(adapter) = self
+            .channel_adapters
+            .get(&coords.channel_type)
+            .map(|a| a.clone())
+        else {
+            return;
+        };
+        // `command` is now the agent-controlled action_summary (ANAI-82), so it
+        // gets the same `<openfang:attach …/>` neutralization the surface path
+        // applies — a requesting agent must not inject a marker into the
+        // restamped prompt (security-openfang MEDIUM).
+        let safe = openfang_channels::outbound_attach::neutralize_markers(command);
+        let stamp = format!("{verb} · `{safe}`");
+        if let Err(e) = adapter
+            .edit_message(&coords.user, &coords.message_id, &stamp)
+            .await
+        {
+            tracing::warn!(
+                request_id = %id,
+                error = %e,
+                "approval prompt edit-on-resolve failed; resolution still stands"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod approval_surface_tests {
+    use super::approval_push_target;
+    use openfang_types::approval::{ApprovalOrigin, ApprovalRequest, RiskLevel};
+
+    fn req_with(origin: Option<ApprovalOrigin>) -> ApprovalRequest {
+        ApprovalRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-x".to_string(),
+            tool_name: "shell_exec".to_string(),
+            description: "run a command".to_string(),
+            action_summary: "rm -rf /tmp/x".to_string(),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: 300,
+            origin,
+            cache_binary: None,
+        }
+    }
+
+    #[test]
+    fn no_target_when_origin_absent() {
+        assert_eq!(approval_push_target(&req_with(None)), None);
+    }
+
+    #[test]
+    fn no_target_when_channel_type_empty() {
+        let o = ApprovalOrigin {
+            channel_type: String::new(),
+            channel_id: Some("C123".to_string()),
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(o))), None);
+    }
+
+    #[test]
+    fn no_target_when_channel_id_missing_or_empty() {
+        let missing = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: None,
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(missing))), None);
+
+        let empty = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: Some(String::new()),
+            thread_id: None,
+            recipient: Some("U999".to_string()),
+        };
+        assert_eq!(approval_push_target(&req_with(Some(empty))), None);
+    }
+
+    #[test]
+    fn target_carries_conversation_and_thread_but_not_recipient() {
+        let o = ApprovalOrigin {
+            channel_type: "discord".to_string(),
+            channel_id: Some("C123".to_string()),
+            thread_id: Some("T456".to_string()),
+            recipient: Some("U999".to_string()),
+        };
+        let target = approval_push_target(&req_with(Some(o))).expect("resolvable");
+        assert_eq!(target.channel_type, "discord");
+        assert_eq!(target.channel_id, "C123");
+        assert_eq!(target.thread_id.as_deref(), Some("T456"));
+        // recipient (peer_id) must never be carried into the push target.
+        // (Structurally enforced: ApprovalPushTarget has no recipient field.)
+    }
+}
+
 #[async_trait]
 impl KernelHandle for OpenFangKernel {
+    fn token_issuer(&self) -> Option<Arc<dyn TokenIssuer>> {
+        OpenFangKernel::token_issuer(self)
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,
@@ -7193,8 +7831,24 @@ impl KernelHandle for OpenFangKernel {
                 .map(|e| e.id)
                 .ok_or_else(|| format!("Agent not found: {agent_id}"))?,
         };
+        // ANAI-84: inter-agent sends are agent-call-origin, not user-origin.
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
         let result = self
-            .send_message(id, message)
+            .send_message_with_handle_and_blocks(
+                id,
+                message,
+                handle,
+                None,
+                None,
+                None,
+                None,
+                false,
+                TurnTrigger::AgentCall,
+            )
             .await
             .map_err(|e| format!("Send failed: {e}"))?;
         Ok(result.response)
@@ -7578,6 +8232,8 @@ impl KernelHandle for OpenFangKernel {
         agent_id: &str,
         tool_name: &str,
         action_summary: &str,
+        origin: Option<&openfang_types::approval::ApprovalOrigin>,
+        cache_binary: Option<&str>,
     ) -> Result<bool, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
@@ -7602,6 +8258,8 @@ impl KernelHandle for OpenFangKernel {
             risk_level: crate::approval::ApprovalManager::classify_risk(tool_name),
             requested_at: chrono::Utc::now(),
             timeout_secs: policy.timeout_secs,
+            origin: origin.cloned(),
+            cache_binary: cache_binary.map(str::to_string),
         };
 
         let decision = self.approval_manager.request_approval(req).await;
@@ -7657,6 +8315,7 @@ impl KernelHandle for OpenFangKernel {
         recipient: &str,
         message: &str,
         thread_id: Option<&str>,
+        workspace_root: Option<&std::path::Path>,
     ) -> Result<String, String> {
         let adapter = self
             .channel_adapters
@@ -7674,40 +8333,57 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55: turn the free-form recipient string into a platform-native
+        // ChannelUser via the adapter's resolver. Discord overrides this to
+        // accept snowflakes, `<#…>` / `<@…>` mentions, `#channel-name` (when
+        // unambiguous across guilds), and `@username`. Bare names are refused.
+        // Every other adapter still uses the trait's default passthrough.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
-        let formatted = if channel == "wecom" {
-            let output_format = self
-                .config
+        // Pick the same default OutputFormat the bridge reply-path uses for
+        // this channel, with the wecom-specific config override applied.
+        let output_format = if channel == "wecom" {
+            self.config
                 .channels
                 .wecom
                 .as_ref()
                 .and_then(|c| c.overrides.output_format)
-                .unwrap_or(OutputFormat::PlainText);
-            openfang_channels::formatter::format_for_wecom(message, output_format)
+                .unwrap_or(OutputFormat::PlainText)
         } else {
-            message.to_string()
+            openfang_channels::bridge::default_output_format_for_channel(channel)
         };
 
-        let content = openfang_channels::types::ChannelContent::Text(formatted);
+        // Delegate to the shared parse+format+dispatch helper so that
+        // `<openfang:attach .../>` markers in proactive sends are handled
+        // identically to bridge reply-path responses. The workspace_root
+        // (when supplied by the caller — typically the channel_send tool)
+        // scopes outbound attachments to the calling agent's workspace.
+        let skipped = openfang_channels::bridge::send_parsed(
+            adapter.as_ref(),
+            &user,
+            message.to_string(),
+            thread_id,
+            output_format,
+            openfang_channels::bridge::SendOptions {
+                workspace_root: workspace_root.map(|p| p.to_path_buf()),
+            },
+        )
+        .await;
 
-        if let Some(tid) = thread_id {
-            adapter
-                .send_in_thread(&user, content, tid)
-                .await
-                .map_err(|e| format!("Channel send failed: {e}"))?;
-        } else {
-            adapter
-                .send(&user, content)
-                .await
-                .map_err(|e| format!("Channel send failed: {e}"))?;
+        let mut out = format!("Message sent to {} via {}", recipient, channel);
+        if !skipped.is_empty() {
+            // Surface dropped attachments so the agent can react. The
+            // message body still sent; the underlying WARN log in
+            // outbound_attach::parse remains the operator-facing record.
+            out.push_str("\n\nSkipped attachments:");
+            for (path, reason) in &skipped {
+                out.push_str(&format!("\n- {}: {}", path, reason));
+            }
         }
-
-        Ok(format!("Message sent to {} via {}", recipient, channel))
+        Ok(out)
     }
 
     async fn send_channel_media(
@@ -7736,11 +8412,11 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55 — see send_channel_message for rationale.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
         let content = match media_type {
             "image" => openfang_channels::types::ChannelContent::Image {
@@ -7803,11 +8479,11 @@ impl KernelHandle for OpenFangKernel {
             })?
             .clone();
 
-        let user = openfang_channels::types::ChannelUser {
-            platform_id: recipient.to_string(),
-            display_name: recipient.to_string(),
-            openfang_user: None,
-        };
+        // ANAI-55 — see send_channel_message for rationale.
+        let user = adapter
+            .resolve_recipient(recipient)
+            .await
+            .map_err(|e| crate::tool_error::ToolError::RecipientUnresolved(e).to_string())?;
 
         let content = openfang_channels::types::ChannelContent::FileData {
             data,
@@ -7897,7 +8573,26 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
                 .ok_or_else(|| format!("Agent not found: {agent}"))?
         };
 
-        match self.send_message(agent_id, message).await {
+        // ANAI-84: inter-agent sends are agent-call-origin, not user-origin.
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        match self
+            .send_message_with_handle_and_blocks(
+                agent_id,
+                message,
+                handle,
+                None,
+                None,
+                None,
+                None,
+                false,
+                TurnTrigger::AgentCall,
+            )
+            .await
+        {
             Ok(result) => Ok(result.response),
             Err(e) => Err(format!("{e}")),
         }
@@ -7942,6 +8637,7 @@ mod tests {
     #[test]
     fn test_manifest_to_capabilities() {
         let mut manifest = AgentManifest {
+            file_policy: None,
             name: "test".to_string(),
             version: "0.1.0".to_string(),
             description: "test".to_string(),
@@ -7986,6 +8682,7 @@ mod tests {
     #[test]
     fn test_merge_preserves_workspace_when_disk_omits_it() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "old".to_string(),
@@ -8037,6 +8734,7 @@ mod tests {
     #[test]
     fn test_merge_respects_explicit_disk_workspace() {
         let entry = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8094,6 +8792,7 @@ mod tests {
             ..Default::default()
         };
         let mut restored_manifest = AgentManifest {
+            file_policy: None,
             name: "demo".to_string(),
             version: "0.1.0".to_string(),
             description: "x".to_string(),
@@ -8208,6 +8907,7 @@ mod tests {
 
     fn test_manifest(name: &str, description: &str, tags: Vec<String>) -> AgentManifest {
         AgentManifest {
+            file_policy: None,
             name: name.to_string(),
             version: "0.1.0".to_string(),
             description: description.to_string(),
@@ -9411,5 +10111,85 @@ system_prompt = "You are a test agent."
         let contents = std::fs::read_to_string(user_workspace.path().join("pre-existing.txt"))
             .expect("read pre-existing");
         assert_eq!(contents, "hello", "must not overwrite user files");
+    }
+
+    /// Phase E: `boot_with_config_and_issuer` populates the kernel's
+    /// `token_issuer` slot *before* the boot driver chain is built, so
+    /// post-boot accessors (and any boot-time `create_driver` call) see the
+    /// issuer immediately. Without this wiring, autostart/persisted agents
+    /// whose drivers were built at boot would forever emit legacy UUID
+    /// tokens rather than authority-issued hardened tokens.
+    #[test]
+    fn boot_with_config_and_issuer_populates_token_issuer_slot() {
+        use openfang_runtime::bridge_auth::{SpawnGuard, TokenIssuer};
+        use openfang_types::agent::AgentId;
+        use openfang_types::bridge_auth::Token;
+
+        struct FakeIssuer;
+        impl TokenIssuer for FakeIssuer {
+            fn issue(&self, _agent_id: AgentId) -> SpawnGuard {
+                // Unused in this test — default config uses a non-claude
+                // provider so `create_driver` never reaches the issuer path.
+                // If it ever did, `SpawnGuard::new` is still a safe
+                // construction; the panic below would surface a misuse.
+                unreachable!("FakeIssuer::issue should not be called during boot")
+            }
+            fn revoke(&self, _token: &Token) {
+                // No-op — the fake holds no spawn table.
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-phase-e-test");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let issuer: Arc<dyn TokenIssuer> = Arc::new(FakeIssuer);
+        let kernel = OpenFangKernel::boot_with_config_and_issuer(config, Some(issuer.clone()))
+            .expect("kernel boots with issuer");
+
+        assert!(
+            kernel.token_issuer().is_some(),
+            "boot_with_config_and_issuer must populate the token_issuer slot before boot completes"
+        );
+
+        // Same `Arc` identity round-trip — proves we stored the exact issuer
+        // the daemon handed us, not a fresh one constructed elsewhere.
+        let stored = kernel.token_issuer().unwrap();
+        assert!(
+            Arc::ptr_eq(&stored, &issuer),
+            "kernel must store the daemon-provided issuer, not a substitute"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Phase E back-compat: the wrapper `boot_with_config` still works for
+    /// non-daemon callers (tests, CLI one-shots, desktop embeds) and leaves
+    /// the `token_issuer` slot empty.
+    #[test]
+    fn boot_with_config_leaves_token_issuer_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-phase-e-noissuer");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        assert!(
+            kernel.token_issuer().is_none(),
+            "boot_with_config (no issuer) must leave the token_issuer slot empty"
+        );
+
+        kernel.shutdown();
     }
 }

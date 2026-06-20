@@ -69,12 +69,107 @@ pub struct KernelBridgeAdapter {
     started_at: Instant,
 }
 
+/// #2a (ANAI-81) authz decision for resolving a channel approval.
+///
+/// Returns `Ok((audit_label, channel_echo))` for an authorized resolver, or
+/// `Err(message)` carrying the channel-facing rejection text. Extracted
+/// verbatim from `resolve_approval_text` so the gate's branching is
+/// unit-testable against a cheap `AuthManager` fixture without standing up a
+/// full kernel (see the `classify_approver_*` tests below).
+///
+/// - `audit_label` is the stable `uid:name` recorded in `decided_by` (UUID
+///   anchor, name as decoration).
+/// - `channel_echo` is the name only — we never leak the internal UserId UUID
+///   back to the channel.
+fn classify_approver(
+    auth: &openfang_kernel::auth::AuthManager,
+    channel_type: &str,
+    approver_user_id: &str,
+    approver_display: &str,
+) -> Result<(String, String), String> {
+    if auth.is_enabled() {
+        match auth.identify(channel_type, approver_user_id) {
+            Some(uid) => {
+                if let Err(e) =
+                    auth.authorize(uid, &openfang_kernel::auth::Action::ApproveExecution)
+                {
+                    return Err(format!("Not authorized to resolve approvals: {e}"));
+                }
+                // M1 (ANAI-81): anchor decided_by on the stable UserId (UUID),
+                // not the mutable display name. Names are non-unique and change
+                // across reloads; anchoring the audit record on uid preserves
+                // correlation. Format `uid:name` for a human-readable record
+                // without losing the stable key.
+                let name = auth
+                    .get_user(uid)
+                    .map(|u| u.name)
+                    .unwrap_or_else(|| approver_display.to_string());
+                Ok((format!("{uid}:{name}"), name))
+            }
+            None => {
+                Err("Unrecognized user — not authorized to resolve approvals.".to_string())
+            }
+        }
+    } else {
+        // RBAC disabled: fail-open-but-recorded (security-openfang verdict A).
+        // We record the real channel identity but do NOT gate, matching the
+        // bridge's allow-when-unconfigured posture. WARN so operators see an
+        // approval was resolved without identity verification on a possibly
+        // shared channel. (True shared-vs-DM discrimination would need a
+        // channel-scope signal threaded here; tracked as follow-up.)
+        warn!(
+            channel_type = %channel_type,
+            approver = %approver_user_id,
+            "Approval resolved with RBAC disabled — resolver identity \
+             unverified; enable users/RBAC to gate /approve on shared channels"
+        );
+        Ok((
+            format!("{channel_type}:{approver_user_id} ({approver_display})"),
+            approver_display.to_string(),
+        ))
+    }
+}
+
+/// Map a button/command cache-scope token to a concrete [`CacheScope`] for
+/// the resolved request, applying defense-in-depth guards that mirror which
+/// buttons the surfacer offers:
+/// - `"similar"`: shell_exec only, requires a parsed `cache_binary`, and is
+///   refused for the destructive denylist even if a crafted custom_id asks.
+/// - `"tool"`: refused for shell_exec (that blanket trust is
+///   `exec_policy.mode = full`, not a per-prompt cache).
+/// Any other token (incl. `"once"` / None / unknown) yields `None`.
+fn cache_scope_from_token(
+    token: Option<&str>,
+    req: &openfang_types::approval::ApprovalRequest,
+) -> Option<openfang_types::approval::CacheScope> {
+    use openfang_types::approval::{is_similar_denylisted, CacheScope};
+    match token {
+        Some("similar") => {
+            if req.tool_name != "shell_exec" {
+                return None;
+            }
+            let bin = req.cache_binary.as_deref()?;
+            if is_similar_denylisted(bin) {
+                return None;
+            }
+            Some(CacheScope::SimilarBinary(bin.to_string()))
+        }
+        Some("tool") => {
+            if req.tool_name == "shell_exec" {
+                return None;
+            }
+            Some(CacheScope::Tool)
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl ChannelBridgeHandle for KernelBridgeAdapter {
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String> {
         let result = self
             .kernel
-            .send_message(agent_id, message)
+            .send_message_channel_reply(agent_id, message)
             .await
             .map_err(|e| format!("{e}"))?;
         // Silent/NO_REPLY responses should not be forwarded to channels
@@ -105,7 +200,53 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         };
         let result = self
             .kernel
-            .send_message_with_blocks(agent_id, &text, blocks)
+            .send_message_channel_reply_with_blocks(agent_id, &text, blocks)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
+    async fn send_message_with_origin(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_channel_reply_with_origin(agent_id, message, origin)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        // Silent/NO_REPLY responses should not be forwarded to channels
+        if result.silent {
+            return Ok(String::new());
+        }
+        Ok(result.response)
+    }
+
+    async fn send_message_with_blocks_and_origin(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+        origin: openfang_types::approval::ApprovalOrigin,
+    ) -> Result<String, String> {
+        // Extract text for the message parameter (used for memory recall / logging)
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                openfang_types::message::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "[Image]".to_string()
+        } else {
+            text
+        };
+        let result = self
+            .kernel
+            .send_message_channel_reply_with_blocks_and_origin(agent_id, &text, blocks, origin)
             .await
             .map_err(|e| format!("{e}"))?;
         Ok(result.response)
@@ -620,33 +761,36 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     }
 
     async fn list_approvals_text(&self) -> String {
-        let pending = self.kernel.approval_manager.list_pending();
-        if pending.is_empty() {
-            return "No pending approvals.".to_string();
-        }
-        let mut msg = format!("Pending approvals ({}):\n", pending.len());
-        for req in &pending {
-            let id_str = req.id.to_string();
-            let id_short = safe_truncate_str(&id_str, 8);
-            let age_secs = (chrono::Utc::now() - req.requested_at).num_seconds();
-            let age = if age_secs >= 60 {
-                format!("{}m", age_secs / 60)
-            } else {
-                format!("{age_secs}s")
-            };
-            msg.push_str(&format!(
-                "  [{}] {} — {} ({:?}) age:{}\n",
-                id_short, req.agent_id, req.tool_name, req.risk_level, age,
-            ));
-            if !req.action_summary.is_empty() {
-                msg.push_str(&format!("    {}\n", req.action_summary));
-            }
-        }
-        msg.push_str("\nUse /approve <id> or /reject <id>");
-        msg
+        render_pending_approvals(&self.kernel.approval_manager.list_pending())
     }
 
-    async fn resolve_approval_text(&self, id_prefix: &str, approve: bool) -> String {
+    async fn resolve_approval_text(
+        &self,
+        id_prefix: &str,
+        approve: bool,
+        channel_type: &str,
+        approver_user_id: &str,
+        approver_display: &str,
+        scope_token: Option<&str>,
+    ) -> String {
+        // ── #2a authz gate ──────────────────────────────
+        // Pre-#2a this stamped `decided_by = "channel"` with NO identity check:
+        // any user on a bound channel could resolve another agent's approval and
+        // the audit trail recorded only the literal "channel". The gate now
+        // requires an identified, authorized operator and records the REAL
+        // approver. Branching logic + the RBAC-disabled fail-open posture
+        // (security-openfang verdict A) live in `classify_approver`, which is
+        // unit-tested below.
+        let (approver_label, approver_echo): (String, String) = match classify_approver(
+            &self.kernel.auth,
+            channel_type,
+            approver_user_id,
+            approver_display,
+        ) {
+            Ok(pair) => pair,
+            Err(msg) => return msg,
+        };
+
         let pending = self.kernel.approval_manager.list_pending();
         let matched: Vec<_> = pending
             .iter()
@@ -664,17 +808,68 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 match self.kernel.approval_manager.resolve(
                     req.id,
                     decision,
-                    Some("channel".to_string()),
+                    Some(approver_label.clone()),
                 ) {
                     Ok(_) => {
                         let verb = if approve { "Approved" } else { "Rejected" };
                         let id_str = req.id.to_string();
+                        // ANAI-82 edit-on-resolve: stamp the surfaced prompt in
+                        // place (strip buttons, record outcome + command). Only
+                        // fires now that the decision is authorized + resolved,
+                        // so the stamp can never lie under RBAC. No-op when no
+                        // prompt was surfaced with editable coordinates. This
+                        // unifies the button and text `/approve` paths: both
+                        // stamp the prompt.
+                        let stamp_verb = if approve { "✅ Approved" } else { "❌ Rejected" };
+                        // ANAI-82: stamp the command being resolved (not the
+                        // `/approve <id>` slash echo) so chat keeps a record of
+                        // what was approved/rejected. For shell_exec this is the
+                        // literal command line; for other tools it's the action
+                        // description. Both approve and reject paths append it.
+                        // action_summary is agent-controlled, so the kernel
+                        // neutralizes `<openfang:attach …/>` markers before render.
+                        // Approval caching (opt-in via the chosen button /
+                        // `/approve <id> <scope>`): on an approve carrying a
+                        // caching scope, populate the cache and annotate the
+                        // stamp. Reject never caches (scope_token is None).
+                        let mut stamp_command =
+                            safe_truncate_str(&req.action_summary, 160).to_string();
+                        if approve {
+                            if let Some(scope) = cache_scope_from_token(scope_token, req) {
+                                let policy = self.kernel.approval_manager.policy();
+                                if policy.cache_ttl_secs > 0 && policy.cache_max_uses > 0 {
+                                    self.kernel
+                                        .approval_manager
+                                        .cache_decision(req, scope.clone());
+                                    let label = match &scope {
+                                        openfang_types::approval::CacheScope::SimilarBinary(b) => {
+                                            format!("cached: {b}")
+                                        }
+                                        openfang_types::approval::CacheScope::Tool => {
+                                            format!("cached: {} tool", req.tool_name)
+                                        }
+                                    };
+                                    // The whole string (incl. agent-controlled
+                                    // binary) is neutralized by edit_approval_prompt.
+                                    stamp_command = format!(
+                                        "{} · {label} ({}s/{})",
+                                        safe_truncate_str(&req.action_summary, 110),
+                                        policy.cache_ttl_secs,
+                                        policy.cache_max_uses
+                                    );
+                                }
+                            }
+                        }
+                        self.kernel
+                            .edit_approval_prompt(req.id, stamp_verb, &stamp_command)
+                            .await;
                         format!(
-                            "{} [{}] {} — {}",
+                            "{} [{}] {} — {} (by {})",
                             verb,
                             safe_truncate_str(&id_str, 8),
                             req.tool_name,
-                            req.agent_id
+                            req.agent_id,
+                            approver_echo
                         )
                     }
                     Err(e) => format!("Failed to resolve approval: {e}"),
@@ -906,6 +1101,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             channel_type,
             recipient,
             message,
+            None,
             None,
         )
         .await
@@ -1831,6 +2027,49 @@ pub async fn start_channel_bridge_with_config(
     if started_names.is_empty() {
         (None, Vec::new())
     } else {
+        // §8 step 5 — emit consumer. Subscribe to the approval lifecycle event
+        // stream and push a prompt back to the originating conversation when a
+        // request is submitted. This is the ONLY place `ApprovalRequest.origin`
+        // goes live, and it is a pure side-effect: the surfacer never resolves
+        // a request (resolution stays on the text `/approve` and button paths,
+        // which re-authorize from the platform-attested interaction identity)
+        // and never feeds `origin`/`recipient` into authorization.
+        let mut approval_rx = kernel.approval_manager.subscribe();
+        let mut surfacer_shutdown = manager.shutdown_receiver();
+        let surfacer_kernel = kernel.clone();
+        let surfacer = tokio::spawn(async move {
+            use openfang_kernel::approval::ApprovalEvent;
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                tokio::select! {
+                    ev = approval_rx.recv() => match ev {
+                        Ok(ApprovalEvent::Submitted(req)) => {
+                            surfacer_kernel.surface_approval_prompt(&req).await;
+                        }
+                        // Resolved / TimedOut carry no proactive push in this step.
+                        Ok(_) => {}
+                        // Lossy broadcast: a dropped/lagged event means "no
+                        // proactive prompt", never "no approval". The decision
+                        // path (await/timeout in request_approval) is wholly
+                        // independent of this listener. Log and keep going.
+                        Err(RecvError::Lagged(n)) => {
+                            warn!(
+                                missed = n,
+                                "approval surfacer lagged; {n} prompt(s) not pushed (approvals unaffected)"
+                            );
+                        }
+                        Err(RecvError::Closed) => break,
+                    },
+                    _ = surfacer_shutdown.changed() => {
+                        if *surfacer_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            info!("approval surfacer task stopped");
+        });
+        manager.attach_task(surfacer);
         (Some(manager), started_names)
     }
 }
@@ -1903,8 +2142,78 @@ pub async fn reload_channels_from_disk(
     Ok(started)
 }
 
+/// Render the `/approvals` listing text from a pending snapshot.
+///
+/// Pure (no kernel/IO) so the marker-neutralization invariant is unit-testable.
+/// Agent-controlled fields (`agent_id`, `tool_name`, `action_summary`) are run
+/// through `neutralize_markers` because this text returns through `send_parsed`
+/// → `outbound_attach::parse` (ANAI-82): without it a queued request's
+/// `<openfang:attach …/>` marker would be stripped and its caption promoted at
+/// the exact moment an operator inspects the queue to decide.
+fn render_pending_approvals(pending: &[openfang_types::approval::ApprovalRequest]) -> String {
+    if pending.is_empty() {
+        return "No pending approvals.".to_string();
+    }
+    let n = openfang_channels::outbound_attach::neutralize_markers;
+    let mut msg = format!("Pending approvals ({}):\n", pending.len());
+    for req in pending {
+        let id_str = req.id.to_string();
+        let id_short = safe_truncate_str(&id_str, 8);
+        let age_secs = (chrono::Utc::now() - req.requested_at).num_seconds();
+        let age = if age_secs >= 60 {
+            format!("{}m", age_secs / 60)
+        } else {
+            format!("{age_secs}s")
+        };
+        msg.push_str(&format!(
+            "  [{}] {} — {} ({:?}) age:{}\n",
+            id_short,
+            n(&req.agent_id),
+            n(&req.tool_name),
+            req.risk_level,
+            age,
+        ));
+        if !req.action_summary.is_empty() {
+            msg.push_str(&format!("    {}\n", n(&req.action_summary)));
+        }
+    }
+    msg.push_str("\nUse /approve <id> or /reject <id>");
+    msg
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn approvals_listing_neutralizes_attach_markers() {
+        use openfang_channels::outbound_attach::{parse, ParseOptions, Parsed};
+        use openfang_types::approval::{ApprovalRequest, RiskLevel};
+
+        let req = ApprovalRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "agent-x".to_string(),
+            tool_name: "shell_exec".to_string(),
+            description: "d".to_string(),
+            action_summary:
+                "rm -rf /important <openfang:attach path=\"/dev/null\" caption=\"(dry-run only)\"/>"
+                    .to_string(),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: 300,
+            origin: None,
+            cache_binary: None,
+        };
+
+        // An operator running /approvals must see the request verbatim, never a
+        // stripped + caption-promoted version: the composed text carries no
+        // parseable attach marker.
+        let listing = super::render_pending_approvals(std::slice::from_ref(&req));
+        assert!(matches!(
+            parse(&listing, ParseOptions::default()).await,
+            Parsed::NoMarkers
+        ));
+        assert!(listing.contains("&lt;openfang:attach"));
+    }
+
     #[tokio::test]
     async fn test_bridge_skips_when_no_config() {
         let config = openfang_types::config::KernelConfig::default();
@@ -1982,5 +2291,160 @@ mod tests {
 
         let feishu = config.channels.feishu.expect("feishu config should exist");
         assert_eq!(feishu.mode, openfang_types::config::FeishuMode::Websocket);
+    }
+
+    // ── #2a (ANAI-81) classify_approver gate ────────────────────────────
+    // The kernel-layer authorize() matrix (admin floor, unrecognized-denied)
+    // is covered in openfang-kernel's auth.rs tests. These cover the bridge
+    // glue that the kernel tests can't see: the RBAC-enabled/disabled
+    // branching, the stable `uid:name` audit label, the name-only channel echo
+    // (no UserId UUID leak), and the rejection strings — all without standing
+    // up a full OpenFangKernel fixture.
+    use super::classify_approver;
+    use openfang_kernel::auth::AuthManager;
+    use openfang_types::config::UserConfig;
+    use std::collections::HashMap;
+
+    /// One user per role, each bound on discord. Mirrors the kernel auth.rs
+    /// fixture so the two layers exercise the same role matrix.
+    fn rbac_role_configs() -> Vec<UserConfig> {
+        let bind = |id: &str| {
+            let mut m = HashMap::new();
+            m.insert("discord".to_string(), id.to_string());
+            m
+        };
+        vec![
+            UserConfig {
+                name: "Owner".to_string(),
+                role: "owner".to_string(),
+                channel_bindings: bind("owner-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Admin".to_string(),
+                role: "admin".to_string(),
+                channel_bindings: bind("admin-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Member".to_string(),
+                role: "user".to_string(),
+                channel_bindings: bind("user-1"),
+                api_key_hash: None,
+            },
+            UserConfig {
+                name: "Viewer".to_string(),
+                role: "viewer".to_string(),
+                channel_bindings: bind("viewer-1"),
+                api_key_hash: None,
+            },
+        ]
+    }
+
+    // Authorized resolvers (Admin floor) get Ok((uid:name, name)). The audit
+    // label is anchored on the stable UserId; the channel echo is name-only.
+    #[test]
+    fn test_classify_approver_admin_floor_records_uid_name() {
+        let auth = AuthManager::new(&rbac_role_configs());
+
+        for (bind_id, name) in [("admin-1", "Admin"), ("owner-1", "Owner")] {
+            let uid = auth
+                .identify("discord", bind_id)
+                .expect("bound user resolves");
+            let (label, echo) = classify_approver(&auth, "discord", bind_id, "ignored-display")
+                .expect("authorized resolver");
+            assert_eq!(label, format!("{uid}:{name}"), "audit label is uid:name");
+            assert_eq!(echo, name, "channel echo is name-only");
+            assert!(!echo.contains(':'), "echo must not leak the UserId UUID");
+        }
+    }
+
+    // Recognized-but-below-floor roles (user, viewer) are denied.
+    #[test]
+    fn test_classify_approver_below_floor_denied() {
+        let auth = AuthManager::new(&rbac_role_configs());
+        for bind_id in ["user-1", "viewer-1"] {
+            let err = classify_approver(&auth, "discord", bind_id, "d")
+                .expect_err("below-floor role denied");
+            assert!(err.contains("Not authorized"), "got: {err}");
+        }
+    }
+
+    // An unrecognized channel identity is rejected before authorize().
+    #[test]
+    fn test_classify_approver_unrecognized_denied() {
+        let auth = AuthManager::new(&rbac_role_configs());
+        let err = classify_approver(&auth, "discord", "stranger", "d")
+            .expect_err("unrecognized user denied");
+        assert!(err.contains("Unrecognized"), "got: {err}");
+    }
+
+    // RBAC disabled (no users configured): fail-open-but-recorded. No gate,
+    // but the real channel identity is stamped into the audit label and the
+    // display name is echoed. (security-openfang verdict A.)
+    #[test]
+    fn test_classify_approver_rbac_disabled_fail_open_records_channel_identity() {
+        let auth = AuthManager::new(&[]);
+        assert!(!auth.is_enabled(), "no users => RBAC disabled");
+
+        let (label, echo) = classify_approver(&auth, "discord", "raw-123", "Ben")
+            .expect("fail-open records without gating");
+        assert_eq!(label, "discord:raw-123 (Ben)");
+        assert_eq!(echo, "Ben");
+    }
+
+    // ── approval-cache scope resolution guards ──────────────────────────
+    use super::cache_scope_from_token;
+    use openfang_types::approval::{ApprovalRequest, CacheScope, RiskLevel};
+
+    fn req(tool: &str, binary: Option<&str>) -> ApprovalRequest {
+        ApprovalRequest {
+            id: uuid::Uuid::new_v4(),
+            agent_id: "a".to_string(),
+            tool_name: tool.to_string(),
+            description: "d".to_string(),
+            action_summary: "s".to_string(),
+            risk_level: RiskLevel::High,
+            requested_at: chrono::Utc::now(),
+            timeout_secs: 60,
+            origin: None,
+            cache_binary: binary.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn scope_similar_ok_for_safe_shell_binary() {
+        let r = req("shell_exec", Some("grep"));
+        assert_eq!(
+            cache_scope_from_token(Some("similar"), &r),
+            Some(CacheScope::SimilarBinary("grep".into()))
+        );
+    }
+
+    #[test]
+    fn scope_similar_refused_for_denylisted_binary() {
+        // defense-in-depth: even a crafted `as:` custom_id can't cache `rm`
+        let r = req("shell_exec", Some("rm"));
+        assert_eq!(cache_scope_from_token(Some("similar"), &r), None);
+    }
+
+    #[test]
+    fn scope_similar_refused_without_binary_or_non_shell() {
+        assert_eq!(cache_scope_from_token(Some("similar"), &req("shell_exec", None)), None);
+        assert_eq!(cache_scope_from_token(Some("similar"), &req("file_write", Some("grep"))), None);
+    }
+
+    #[test]
+    fn scope_tool_ok_for_non_shell_but_refused_for_shell() {
+        assert_eq!(cache_scope_from_token(Some("tool"), &req("file_write", None)), Some(CacheScope::Tool));
+        // Approve Tool for shell_exec is policy-forbidden (use exec mode=full)
+        assert_eq!(cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep"))), None);
+    }
+
+    #[test]
+    fn scope_once_and_unknown_never_cache() {
+        assert_eq!(cache_scope_from_token(None, &req("file_write", None)), None);
+        assert_eq!(cache_scope_from_token(Some("once"), &req("file_write", None)), None);
+        assert_eq!(cache_scope_from_token(Some("bogus"), &req("file_write", None)), None);
     }
 }

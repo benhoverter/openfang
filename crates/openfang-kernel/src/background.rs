@@ -8,6 +8,7 @@
 use crate::triggers::TriggerPattern;
 use dashmap::DashMap;
 use openfang_types::agent::{AgentId, ScheduleMode};
+use openfang_types::turn::TurnTrigger;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -52,7 +53,7 @@ impl BackgroundExecutor {
         schedule: &ScheduleMode,
         send_message: F,
     ) where
-        F: Fn(AgentId, String) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
+        F: Fn(AgentId, String, TurnTrigger) -> tokio::task::JoinHandle<()> + Send + Sync + 'static,
     {
         match schedule {
             ScheduleMode::Reactive => {} // nothing to do
@@ -106,7 +107,7 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Continuous loop: sending self-prompt");
                         let busy_clone = busy.clone();
-                        let jh = (send_message)(agent_id, prompt);
+                        let jh = (send_message)(agent_id, prompt, TurnTrigger::Heartbeat);
                         // Spawn a watcher that clears the busy flag and drops permit when done
                         tokio::spawn(async move {
                             let _ = jh.await;
@@ -166,7 +167,7 @@ impl BackgroundExecutor {
                         );
                         debug!(agent = %name, "Periodic loop: sending scheduled prompt");
                         let busy_clone = busy.clone();
-                        let jh = (send_message)(agent_id, prompt);
+                        let jh = (send_message)(agent_id, prompt, TurnTrigger::Cron);
                         tokio::spawn(async move {
                             let _ = jh.await;
                             drop(permit);
@@ -375,12 +376,17 @@ mod tests {
             check_interval_secs: 1, // 1 second for fast test
         };
 
-        executor.start_agent(agent_id, "test-agent", &schedule, move |_id, _msg| {
-            let tc = tick_clone.clone();
-            tokio::spawn(async move {
-                tc.fetch_add(1, Ordering::SeqCst);
-            })
-        });
+        executor.start_agent(
+            agent_id,
+            "test-agent",
+            &schedule,
+            move |_id, _msg, _trigger| {
+                let tc = tick_clone.clone();
+                tokio::spawn(async move {
+                    tc.fetch_add(1, Ordering::SeqCst);
+                })
+            },
+        );
 
         assert_eq!(executor.active_count(), 1);
 
@@ -412,13 +418,18 @@ mod tests {
         };
 
         // Each tick takes 3 seconds — should cause subsequent ticks to be skipped
-        executor.start_agent(agent_id, "slow-agent", &schedule, move |_id, _msg| {
-            let tc = tick_clone.clone();
-            tokio::spawn(async move {
-                tc.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            })
-        });
+        executor.start_agent(
+            agent_id,
+            "slow-agent",
+            &schedule,
+            move |_id, _msg, _trigger| {
+                let tc = tick_clone.clone();
+                tokio::spawn(async move {
+                    tc.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                })
+            },
+        );
 
         // Wait 2.5 seconds: 1 tick should fire at t=1s, second at t=2s should be skipped (busy)
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -437,9 +448,12 @@ mod tests {
 
         // Reactive mode → no background task
         let id = AgentId::new();
-        executor.start_agent(id, "reactive", &ScheduleMode::Reactive, |_id, _msg| {
-            tokio::spawn(async {})
-        });
+        executor.start_agent(
+            id,
+            "reactive",
+            &ScheduleMode::Reactive,
+            |_id, _msg, _trigger| tokio::spawn(async {}),
+        );
         assert_eq!(executor.active_count(), 0);
 
         // Proactive mode → no dedicated task
@@ -450,7 +464,7 @@ mod tests {
             &ScheduleMode::Proactive {
                 conditions: vec!["event:agent_spawned".to_string()],
             },
-            |_id, _msg| tokio::spawn(async {}),
+            |_id, _msg, _trigger| tokio::spawn(async {}),
         );
         assert_eq!(executor.active_count(), 0);
     }

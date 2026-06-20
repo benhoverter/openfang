@@ -28,6 +28,37 @@ const MIN_TIMEOUT_SECS: u64 = 10;
 /// Maximum approval timeout in seconds.
 const MAX_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum length of an origin routing field (channel_id / thread_id / recipient), chars.
+const MAX_ORIGIN_FIELD_LEN: usize = 256;
+
+/// Default approval-cache entry lifetime (seconds).
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+
+/// Default approval-cache max uses per cached entry.
+pub const DEFAULT_CACHE_MAX_USES: u32 = 50;
+
+/// Upper bound on a configured cache TTL (seconds). 24h — a daemon bounce
+/// clears the in-memory cache anyway, so this just rejects absurd values.
+const MAX_CACHE_TTL_SECS: u64 = 86_400;
+
+/// Upper bound on a configured per-entry use count.
+const MAX_CACHE_MAX_USES: u32 = 100_000;
+
+/// Binaries for which the "Approve Similar" button is suppressed. The binary
+/// alone carries no risk signal — the args do — so caching a whole binary here
+/// (`rm`, `dd`, …) would hand back the very gate it exists to enforce. These
+/// always collapse to a per-command human decision (Once / [Tool] / Deny).
+pub const SIMILAR_DENYLIST: &[&str] = &[
+    "rm", "dd", "mkfs", "kill", "killall", "chmod", "chown", "mv", "shutdown", "reboot",
+];
+
+/// Returns true if `binary` (argv\[0\], exact spelling) is on the
+/// Approve-Similar denylist. Spelling-sensitive by design: `rm` and `/bin/rm`
+/// are distinct keys, which only ever narrows the cached radius.
+pub fn is_similar_denylisted(binary: &str) -> bool {
+    SIMILAR_DENYLIST.contains(&binary)
+}
+
 // ---------------------------------------------------------------------------
 // RiskLevel
 // ---------------------------------------------------------------------------
@@ -68,6 +99,31 @@ pub enum ApprovalDecision {
 }
 
 // ---------------------------------------------------------------------------
+// ApprovalOrigin
+// ---------------------------------------------------------------------------
+
+/// Where an agent run originated — carried so an approval prompt can be pushed
+/// back to the exact channel/conversation that triggered the run.
+///
+/// `None` on [`ApprovalRequest::origin`] ⇒ a non-channel trigger (cron, API
+/// direct, agent_send): the emit site must fall back to the text
+/// `/approve <id>` path (no proactive push).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalOrigin {
+    /// Adapter key, e.g. `"discord"`, `"slack"`. Maps to `channel_type_str()`.
+    pub channel_type: String,
+    /// Per-channel/conversation routing ID (Discord channel/thread, Slack
+    /// conversation, Telegram chat). Sourced from `ChannelMessage::channel_id()`.
+    pub channel_id: Option<String>,
+    /// Thread/sub-conversation, if the trigger arrived inside one.
+    pub thread_id: Option<String>,
+    /// Platform user identity of the triggering sender (peer_id). Used ONLY for
+    /// audit/recipient targeting — NEVER as an authz carrier (the clicker is
+    /// re-authorized from the platform-attested interaction identity).
+    pub recipient: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // ApprovalRequest
 // ---------------------------------------------------------------------------
 
@@ -84,6 +140,14 @@ pub struct ApprovalRequest {
     pub requested_at: DateTime<Utc>,
     /// Auto-deny timeout in seconds.
     pub timeout_secs: u64,
+    /// Origin of the triggering run. `None` ⇒ fall back to the text approve path.
+    #[serde(default)]
+    pub origin: Option<ApprovalOrigin>,
+    /// argv[0] of a `shell_exec` command (exact spelling), extracted once at
+    /// the gate. Drives the "Approve Similar" cache key and button. `None` for
+    /// non-shell tools and for commands with no parseable first token.
+    #[serde(default)]
+    pub cache_binary: Option<String>,
 }
 
 impl ApprovalRequest {
@@ -141,6 +205,40 @@ impl ApprovalRequest {
             ));
         }
 
+        // -- origin (optional) --
+        if let Some(origin) = &self.origin {
+            if origin.channel_type.len() > MAX_ORIGIN_FIELD_LEN {
+                return Err(format!(
+                    "origin.channel_type too long ({} chars, max {MAX_ORIGIN_FIELD_LEN})",
+                    origin.channel_type.len()
+                ));
+            }
+            for (label, value) in [
+                ("origin.channel_id", &origin.channel_id),
+                ("origin.thread_id", &origin.thread_id),
+                ("origin.recipient", &origin.recipient),
+            ] {
+                if let Some(v) = value {
+                    if v.len() > MAX_ORIGIN_FIELD_LEN {
+                        return Err(format!(
+                            "{label} too long ({} chars, max {MAX_ORIGIN_FIELD_LEN})",
+                            v.len()
+                        ));
+                    }
+                }
+            }
+        }
+
+        // -- cache_binary (optional) --
+        if let Some(b) = &self.cache_binary {
+            if b.len() > MAX_ORIGIN_FIELD_LEN {
+                return Err(format!(
+                    "cache_binary too long ({} chars, max {MAX_ORIGIN_FIELD_LEN})",
+                    b.len()
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -156,6 +254,27 @@ pub struct ApprovalResponse {
     pub decision: ApprovalDecision,
     pub decided_at: DateTime<Utc>,
     pub decided_by: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// CacheScope
+// ---------------------------------------------------------------------------
+
+/// The caching intent an operator selected when resolving an approval. This is
+/// a *resolution* concept — it never reaches the requesting agent, which only
+/// ever sees `Approved` / `Denied`.
+///
+/// - `SimilarBinary(argv0)` — "Approve Similar": cache all `shell_exec` calls
+///   whose first token equals `argv0` (exact spelling). Only offered for
+///   `shell_exec` and only when `argv0` is not [`is_similar_denylisted`].
+/// - `Tool` — "Approve Tool": cache all calls to the request's tool. Never
+///   offered for `shell_exec` (that blanket trust is `exec_policy.mode = full`
+///   territory, set in `agent.toml`, not a per-prompt button).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheScope {
+    SimilarBinary(String),
+    Tool,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +299,12 @@ pub struct ApprovalPolicy {
     /// Alias: if `auto_approve = true`, clears the require list at boot.
     #[serde(default, alias = "auto_approve")]
     pub auto_approve: bool,
+    /// Approval-cache entry lifetime in seconds. Default: 3600 (1h). A daemon
+    /// bounce clears the in-memory cache regardless. `0` disables caching.
+    pub cache_ttl_secs: u64,
+    /// Max times a single cached approval may be reused before it is evicted.
+    /// Default: 50. `0` disables caching.
+    pub cache_max_uses: u32,
 }
 
 impl Default for ApprovalPolicy {
@@ -189,6 +314,8 @@ impl Default for ApprovalPolicy {
             timeout_secs: 60,
             auto_approve_autonomous: false,
             auto_approve: false,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+            cache_max_uses: DEFAULT_CACHE_MAX_USES,
         }
     }
 }
@@ -275,6 +402,20 @@ impl ApprovalPolicy {
             }
         }
 
+        // -- cache bounds --
+        if self.cache_ttl_secs > MAX_CACHE_TTL_SECS {
+            return Err(format!(
+                "cache_ttl_secs too large ({}, max {MAX_CACHE_TTL_SECS})",
+                self.cache_ttl_secs
+            ));
+        }
+        if self.cache_max_uses > MAX_CACHE_MAX_USES {
+            return Err(format!(
+                "cache_max_uses too large ({}, max {MAX_CACHE_MAX_USES})",
+                self.cache_max_uses
+            ));
+        }
+
         Ok(())
     }
 }
@@ -299,6 +440,8 @@ mod tests {
             risk_level: RiskLevel::High,
             requested_at: Utc::now(),
             timeout_secs: 60,
+            origin: None,
+            cache_binary: None,
         }
     }
 
@@ -389,6 +532,20 @@ mod tests {
         let mut req = valid_request();
         req.tool_name = "a".repeat(65);
         let err = req.validate().unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn request_origin_channel_type_too_long_rejected() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "a".repeat(257),
+            channel_id: None,
+            thread_id: None,
+            recipient: None,
+        });
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("origin.channel_type"), "{err}");
         assert!(err.contains("too long"), "{err}");
     }
 
@@ -678,6 +835,82 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ApprovalOrigin
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn origin_serde_roundtrip() {
+        let origin = ApprovalOrigin {
+            channel_type: "discord".into(),
+            channel_id: Some("123456789".into()),
+            thread_id: Some("987654321".into()),
+            recipient: Some("user-42".into()),
+        };
+        let json = serde_json::to_string(&origin).unwrap();
+        let back: ApprovalOrigin = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, origin);
+    }
+
+    #[test]
+    fn request_with_origin_roundtrip() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "discord".into(),
+            channel_id: Some("chan-1".into()),
+            thread_id: None,
+            recipient: Some("peer-1".into()),
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, req.origin);
+    }
+
+    #[test]
+    fn request_legacy_json_without_origin_defaults_none() {
+        // A persisted/in-flight request from before the `origin` field existed
+        // must still deserialize (→ None) via #[serde(default)].
+        let legacy = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "agent_id": "agent-001",
+            "tool_name": "shell_exec",
+            "description": "legacy",
+            "action_summary": "rm -rf /tmp/x",
+            "risk_level": "high",
+            "requested_at": "2026-06-14T00:00:00Z",
+            "timeout_secs": 60
+        }"#;
+        let req: ApprovalRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(req.origin, None);
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_origin_channel_id_too_long_rejected() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "discord".into(),
+            channel_id: Some("a".repeat(257)),
+            thread_id: None,
+            recipient: None,
+        });
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("origin.channel_id"), "{err}");
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn request_origin_field_max_len_ok() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "discord".into(),
+            channel_id: Some("a".repeat(256)),
+            thread_id: Some("b".repeat(256)),
+            recipient: Some("c".repeat(256)),
+        });
+        assert!(req.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // Full serde roundtrip — ApprovalPolicy
     // -----------------------------------------------------------------------
 
@@ -688,11 +921,66 @@ mod tests {
             timeout_secs: 120,
             auto_approve_autonomous: true,
             auto_approve: false,
+            cache_ttl_secs: 1800,
+            cache_max_uses: 25,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(back.require_approval, policy.require_approval);
         assert_eq!(back.timeout_secs, 120);
         assert!(back.auto_approve_autonomous);
+        assert_eq!(back.cache_ttl_secs, 1800);
+        assert_eq!(back.cache_max_uses, 25);
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval cache: scope, denylist, policy defaults + bounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cache_scope_serde_roundtrip() {
+        for scope in [CacheScope::SimilarBinary("rm".into()), CacheScope::Tool] {
+            let json = serde_json::to_string(&scope).unwrap();
+            let back: CacheScope = serde_json::from_str(&json).unwrap();
+            assert_eq!(scope, back);
+        }
+    }
+
+    #[test]
+    fn similar_denylist_membership() {
+        assert!(is_similar_denylisted("rm"));
+        assert!(is_similar_denylisted("dd"));
+        assert!(is_similar_denylisted("chmod"));
+        // spelling-sensitive: an absolute path is a different key
+        assert!(!is_similar_denylisted("/bin/rm"));
+        assert!(!is_similar_denylisted("grep"));
+        assert!(!is_similar_denylisted("ls"));
+    }
+
+    #[test]
+    fn policy_default_cache_fields() {
+        let p = ApprovalPolicy::default();
+        assert_eq!(p.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(p.cache_max_uses, DEFAULT_CACHE_MAX_USES);
+    }
+
+    #[test]
+    fn policy_cache_bounds_rejected() {
+        let mut p = ApprovalPolicy::default();
+        p.cache_ttl_secs = MAX_CACHE_TTL_SECS + 1;
+        assert!(p.validate().unwrap_err().contains("cache_ttl_secs"));
+
+        let mut p = ApprovalPolicy::default();
+        p.cache_max_uses = MAX_CACHE_MAX_USES + 1;
+        assert!(p.validate().unwrap_err().contains("cache_max_uses"));
+    }
+
+    #[test]
+    fn policy_cache_fields_default_when_absent() {
+        // older agent.toml / serialized policy without the new keys
+        let json = r#"{"require_approval":["shell_exec"],"timeout_secs":60,"auto_approve_autonomous":false,"auto_approve":false}"#;
+        let p: ApprovalPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(p.cache_max_uses, DEFAULT_CACHE_MAX_USES);
     }
 }

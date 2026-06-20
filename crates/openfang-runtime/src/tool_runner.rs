@@ -13,10 +13,36 @@ use openfang_types::tool_compat::normalize_tool_name;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+
+/// Tools whose invocation **must** be scoped to the calling agent's
+/// `workspace_root`. Canonical source of truth, consumed by both bridge
+/// surfaces (IPC + HTTP `/mcp`) to decide whether a given call's path
+/// arguments require workspace-rewriting and whether the call should
+/// fail-closed when no workspace is registered.
+///
+/// History: this list was duplicated in `openfang_api::bridge_ipc` and
+/// `openfang_api::routes`, drifted (5 vs 4 tools), and missed
+/// `create_directory` on the IPC side + `shell_exec`/`apply_patch` on the
+/// HTTP side — both real sandbox gaps. Unified here so additions land in
+/// one place.
+///
+/// Membership criteria: the tool touches the filesystem via a path arg
+/// (or, for `shell_exec`, uses `workspace_root` as cwd). Tools that do
+/// not touch the FS (`web_fetch`, `agent_*`, `memory_*`, `web_search`,
+/// `channel_send`) are intentionally absent.
+pub const FS_SANDBOXED_TOOLS: &[&str] = &[
+    "file_read",
+    "file_list",
+    "file_write",
+    "create_directory",
+    "shell_exec",
+    "apply_patch",
+    "file_convert",
+];
 
 /// Check if a tool name refers to a shell execution tool.
 ///
@@ -26,6 +52,30 @@ const MAX_AGENT_CALL_DEPTH: u32 = 5;
 /// by the same approval rules as `shell_exec`.
 fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
+}
+
+/// Extract argv[0] (the binary) from a `shell_exec` command for approval
+/// caching's "Approve Similar" scope. Skips leading `VAR=value` environment
+/// assignments, then returns the first whitespace-delimited token. Returns
+/// `None` if nothing remains. shell_exec's input filter already bans shell
+/// metacharacters, so the first token is an unambiguous binary name.
+fn extract_cache_binary(command: &str) -> Option<String> {
+    for tok in command.split_whitespace() {
+        if let Some(eq) = tok.find('=') {
+            let name = &tok[..eq];
+            let looks_like_env = !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if looks_like_env {
+                continue;
+            }
+        }
+        return Some(tok.to_string());
+    }
+    None
 }
 
 /// Check if a shell command should be blocked by taint tracking.
@@ -121,9 +171,11 @@ pub async fn execute_tool(
     workspace_root: Option<&Path>,
     media_engine: Option<&crate::media_understanding::MediaEngine>,
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
     tts_engine: Option<&crate::tts::TtsEngine>,
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    origin: Option<&openfang_types::approval::ApprovalOrigin>,
 ) -> ToolResult {
     // Normalize the tool name through compat mappings so LLM-hallucinated aliases
     // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
@@ -163,8 +215,70 @@ pub async fn execute_tool(
         );
     }
 
+    // #772 follow-up: in allowlist mode, suppress the approval prompt when
+    // every base command is pre-approved via safe_bins or trusted_commands.
+    // Uses the SAME extraction as the allowlist wall (fail-closed): an
+    // unapproved, empty, or unparseable command yields None and falls through
+    // to the prompt, where the wall re-validates. Logged, never surfaced to
+    // Discord.
+    let auto_approved = (!exec_policy_bypasses_approval && is_shell_tool(tool_name))
+        .then_some(exec_policy)
+        .flatten()
+        .and_then(|p| {
+            input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|c| (p, c))
+        })
+        .and_then(|(p, c)| crate::subprocess_sandbox::command_approval_report(c, p));
+
+    if let Some(report) = &auto_approved {
+        let bases: Vec<String> = report
+            .iter()
+            .map(|b| format!("{}={:?}", b.base, b.via))
+            .collect();
+        info!(
+            tool_name,
+            bases = %bases.join(","),
+            "Approval auto-granted: all command bases pre-approved (safe_bins/trusted_commands)"
+        );
+    }
+
+    // SECURITY: For shell_exec, enforce the exec allowlist BEFORE the approval
+    // gate. A command the allowlist wall will reject must never surface an
+    // approval prompt or populate the approve-similar cache — otherwise the
+    // operator sees an "Approved · cached" stamp for a command the very next
+    // layer hard-denies (the `whoami` incident, 2026-06-17). Full mode is
+    // unaffected: validate_command_allowlist returns Ok(()) immediately in Full,
+    // so control falls through and the no-prompt guarantee still comes solely
+    // from `exec_policy_bypasses_approval` above (which this block does not
+    // touch). The canonical wall in the shell_exec match arm is retained as
+    // idempotent defense-in-depth.
+    if tool_name == "shell_exec" {
+        if let Some(policy) = exec_policy {
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if let Err(reason) =
+                crate::subprocess_sandbox::validate_command_allowlist(command, policy)
+            {
+                let reason = reason.trim_end_matches('.');
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: format!(
+                        "shell_exec blocked: {reason}. Current exec_policy.mode = '{:?}'. \
+                         To allow shell commands, set exec_policy.mode = 'full' in the agent manifest or config.toml.",
+                        policy.mode
+                    ),
+                    is_error: true,
+                };
+            }
+        }
+    }
+
     if let Some(kh) = kernel {
-        if !exec_policy_bypasses_approval && kh.requires_approval(tool_name) {
+        if !exec_policy_bypasses_approval
+            && auto_approved.is_none()
+            && kh.requires_approval(tool_name)
+        {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
             let input_str = input.to_string();
             let summary = format!(
@@ -172,7 +286,27 @@ pub async fn execute_tool(
                 tool_name,
                 openfang_types::truncate_str(&input_str, 200)
             );
-            match kh.request_approval(agent_id_str, tool_name, &summary).await {
+            // Approve-Similar cache key source: argv[0] of a shell_exec
+            // command, extracted once here where structured input still
+            // exists (never re-parsed from the mangled action_summary).
+            let cache_binary = if tool_name == "shell_exec" {
+                input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .and_then(extract_cache_binary)
+            } else {
+                None
+            };
+            match kh
+                .request_approval(
+                    agent_id_str,
+                    tool_name,
+                    &summary,
+                    origin,
+                    cache_binary.as_deref(),
+                )
+                .await
+            {
                 Ok(true) => {
                     debug!(tool_name, "Approval granted — proceeding with execution");
                 }
@@ -199,14 +333,111 @@ pub async fn execute_tool(
         }
     }
 
+    // file_policy prompt-tier pre-pass (D1-a / Q1=B): for single-path fs tools
+    // whose resolved path falls under a `prompt` rule, route through the same
+    // approval primitive the shell path uses. Approve => proceed (the path
+    // helper treats an already-approved prompt as write); deny / timeout /
+    // no-kernel => fail closed. apply_patch is multi-path and is governed
+    // per-target in its helper (prompt-tier fails closed there for v1).
+    let mut prevalidated_path: Option<PathBuf> = None;
+    if let Some(fp) = file_policy {
+        if fp.is_active() {
+            if let Some((_needs_write, raw_path)) = fs_tool_single_path(tool_name, input) {
+                if let Some(root) = workspace_root {
+                    if let (Ok(canon), Ok(canon_root)) = (
+                        crate::workspace_sandbox::sandbox_floor(raw_path, root),
+                        root.canonicalize(),
+                    ) {
+                        if fp.tier_for(&canon, &canon_root)
+                            == openfang_types::config::FileAccessTier::Prompt
+                        {
+                            let approved = match kernel {
+                                Some(kh) => {
+                                    let summary = format!(
+                                        "{} -> {} (file_policy prompt tier)",
+                                        tool_name,
+                                        canon.display()
+                                    );
+                                    matches!(
+                                        kh.request_approval(
+                                            caller_agent_id.unwrap_or("unknown"),
+                                            tool_name,
+                                            &summary,
+                                            None,
+                                            None,
+                                        )
+                                        .await,
+                                        Ok(true)
+                                    )
+                                }
+                                None => false,
+                            };
+                            if !approved {
+                                warn!(tool_name, "file_policy prompt tier denied or unapproved");
+                                return ToolResult {
+                                    tool_use_id: tool_use_id.to_string(),
+                                    content: format!(
+                                        "Execution denied: '{}' targets a prompt-tier path and approval was denied, timed out, or was unavailable.",
+                                        tool_name
+                                    ),
+                                    is_error: true,
+                                };
+                            }
+                        }
+                        // F5: remember the canonical path validated (and prompt-
+                        // approved) here so the tool can assert its own I/O
+                        // target matches — a swap during the approval window
+                        // makes them differ and fails closed.
+                        prevalidated_path = Some(canon);
+                    }
+                }
+            }
+        }
+    }
+
     debug!(tool_name, "Executing tool");
     let result = match tool_name {
         // Filesystem tools
-        "file_read" => tool_file_read(input, workspace_root).await,
-        "file_write" => tool_file_write(input, workspace_root).await,
-        "file_list" => tool_file_list(input, workspace_root).await,
-        "create_directory" => tool_create_directory(input, workspace_root).await,
-        "apply_patch" => tool_apply_patch(input, workspace_root).await,
+        "file_read" => {
+            tool_file_read(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "file_write" => {
+            tool_file_write(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "file_list" => {
+            tool_file_list(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "create_directory" => {
+            tool_create_directory(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+        "apply_patch" => tool_apply_patch(input, workspace_root, file_policy).await,
+
+        // File conversion tool (recipe-driven, allowlisted formats)
+        "file_convert" => tool_file_convert(input, workspace_root).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
@@ -263,6 +494,7 @@ pub async fn execute_tool(
                 if let Err(reason) =
                     crate::subprocess_sandbox::validate_command_allowlist(command, policy)
                 {
+                    let reason = reason.trim_end_matches('.');
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
                         content: format!(
@@ -624,6 +856,20 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["patch"]
+            }),
+        },
+        ToolDefinition {
+            name: "file_convert".to_string(),
+            description: "Convert a workspace file from one format to another using an allowlisted recipe table (e.g. Markdown to PDF). The source format is inferred from the input file extension; the target format is the 'format' argument. Only conversions defined in the recipe manifest are permitted. Paths are relative to the agent workspace.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
+                    "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
+                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
+                    "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
+                },
+                "required": ["format", "input"]
             }),
         },
         // --- Web tools ---
@@ -1107,7 +1353,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use `attachments` to send one or more local files alongside the message (workspace-relative paths preferred). Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1119,6 +1365,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
                     "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of file paths to attach alongside the message. Workspace-relative paths are preferred (resolved against the agent's workspace root); absolute paths are also accepted. Routes through the outbound attachment parser with the same `allow_roots` security gating as inline `<openfang:attach path=\"...\"/>` directives. Composes with inline directives in `message`."
+                    },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
                 "required": ["channel", "recipient"]
@@ -1366,10 +1617,41 @@ fn validate_path(path: &str) -> Result<&str, String> {
     Ok(path)
 }
 
-/// Resolve a file path through the workspace sandbox (if available) or legacy validation.
-fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<PathBuf, String> {
+/// For single-path filesystem tools, return `(needs_write, path)` so the
+/// file_policy prompt pre-pass can evaluate the target's tier. Multi-path
+/// tools (apply_patch) return None and are governed per-target in their helper.
+fn fs_tool_single_path<'a>(
+    tool_name: &str,
+    input: &'a serde_json::Value,
+) -> Option<(bool, &'a str)> {
+    let needs_write = match tool_name {
+        "file_read" | "file_list" => false,
+        "file_write" | "create_directory" => true,
+        _ => return None,
+    };
+    input["path"].as_str().map(|p| (needs_write, p))
+}
+
+/// Resolve a file path through the workspace sandbox (if available) or legacy
+/// validation. When a `file_policy` is active it governs the resolved path via
+/// tier evaluation; otherwise the legacy workspace clamp applies. `needs_write`
+/// distinguishes read verbs from mutating verbs for the `read` tier. The prompt
+/// tier is pre-approved by execute_tool's pre-pass for single-path tools, so
+/// `prompt_preapproved = true` here.
+fn resolve_file_path(
+    raw_path: &str,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    needs_write: bool,
+) -> Result<PathBuf, String> {
     if let Some(root) = workspace_root {
-        crate::workspace_sandbox::resolve_sandbox_path(raw_path, root)
+        crate::workspace_sandbox::resolve_with_policy(
+            raw_path,
+            root,
+            file_policy,
+            needs_write,
+            true,
+        )
     } else {
         let _ = validate_path(raw_path)?;
         Ok(PathBuf::from(raw_path))
@@ -1379,9 +1661,12 @@ fn resolve_file_path(raw_path: &str, workspace_root: Option<&Path>) -> Result<Pa
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     tokio::fs::read_to_string(&resolved)
         .await
         .map_err(|e| format!("Failed to read file: {e}"))
@@ -1390,9 +1675,12 @@ async fn tool_file_read(
 async fn tool_file_write(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, true)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     let content = input["content"]
         .as_str()
         .ok_or("Missing 'content' parameter")?;
@@ -1475,12 +1763,57 @@ fn resolve_directory_path_for_create(
 async fn tool_create_directory(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     if raw_path.is_empty() {
         return Err("'path' parameter is empty".to_string());
     }
     let resolved = resolve_directory_path_for_create(raw_path, workspace_root)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
+    // Sensitive-path floor parity: resolve_directory_path_for_create has its own
+    // clamp and does not run sandbox_floor, so apply the sensitive-path deny here.
+    if let Some(reason) = crate::workspace_sandbox::is_sensitive_openfang_path(&resolved)
+        .or_else(|| crate::workspace_sandbox::is_sensitive_home_path(&resolved))
+    {
+        return Err(format!(
+            "Access denied: path '{}' resolves to a protected resource ({reason}). \
+             These paths are never accessible to agents.",
+            resolved.display()
+        ));
+    }
+    // file_policy governs directory creation as a write verb (prompt-tier is
+    // pre-approved by execute_tool's pre-pass for this single-path tool).
+    // F4: enforce via is_active() (so a disabled per-agent override cannot
+    // escape an enabled global floor) and fail closed when an active policy has
+    // no workspace root to evaluate against — previously this path fell open.
+    if let Some(fp) = file_policy {
+        if fp.is_active() {
+            let Some(root) = workspace_root else {
+                return Err("Access denied: create_directory requires a workspace root when a file_policy is active".to_string());
+            };
+            let canon_root = root
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve workspace root: {e}"))?;
+            match fp.tier_for(&resolved, &canon_root) {
+                openfang_types::config::FileAccessTier::Write
+                | openfang_types::config::FileAccessTier::Prompt => {}
+                openfang_types::config::FileAccessTier::Read => {
+                    return Err(format!(
+                        "Access denied by file_policy: '{}' is read-only",
+                        resolved.display()
+                    ));
+                }
+                openfang_types::config::FileAccessTier::Deny => {
+                    return Err(format!(
+                        "Access denied by file_policy: '{}' (deny tier)",
+                        resolved.display()
+                    ));
+                }
+            }
+        }
+    }
     tokio::fs::create_dir_all(&resolved)
         .await
         .map_err(|e| format!("Failed to create directory: {e}"))?;
@@ -1490,9 +1823,12 @@ async fn tool_create_directory(
 async fn tool_file_list(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     let mut entries = tokio::fs::read_dir(&resolved)
         .await
         .map_err(|e| format!("Failed to list directory: {e}"))?;
@@ -1515,17 +1851,363 @@ async fn tool_file_list(
 }
 
 // ---------------------------------------------------------------------------
+// File conversion tool
+// ---------------------------------------------------------------------------
+
+/// `file_convert` — render a workspace file to another format via an
+/// allowlisted recipe table (see [`crate::convert`]).
+///
+/// `file_convert` dispatcher (ANAI-67..71): the load-bearing security seam.
+/// Resolves the request against the allowlisted recipe table (fail-closed),
+/// clamps both paths into the caller's workspace, substitutes the argv template
+/// with resolved paths only, pins the launcher to an absolute file, preflights
+/// the recipe's external `needs`, then spawns via an argv array (never a shell
+/// string) with a guaranteed PATH. Every conversion outcome — success and the
+/// four failure codes (UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED) —
+/// is returned as the structured envelope from `convert_ok` / `convert_err`.
+async fn tool_file_convert(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    tool_file_convert_in(input, workspace_root, &crate::convert::openfang_home_dir()).await
+}
+
+/// Inner `file_convert` dispatcher with an injectable OpenFang home directory,
+/// so hermetic tests can supply their own `scripts/` + `convert/recipes.toml`
+/// without mutating process-global env. Production calls this via the wrapper
+/// above with the real resolved home.
+async fn tool_file_convert_in(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    home: &Path,
+) -> Result<String, String> {
+    // Request-shape validation (a malformed call, not a conversion outcome):
+    // these stay plain Err. Everything from the recipe lookup onward speaks the
+    // structured envelope so callers can branch on `ok` + `error.code`.
+    let to = input["format"]
+        .as_str()
+        .ok_or("Missing 'format' parameter (target format, e.g. \"pdf\")")?;
+    let input_path = input["input"]
+        .as_str()
+        .ok_or("Missing 'input' parameter (workspace-relative source file)")?;
+    if input_path.trim().is_empty() {
+        return Err("'input' parameter is empty".to_string());
+    }
+
+    // Derive the source format from the input file extension (pure string op).
+    let from = match Path::new(input_path).extension().and_then(|e| e.to_str()) {
+        Some(ext) => ext,
+        None => {
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_FORMAT",
+                &format!(
+                    "input '{input_path}' has no file extension; cannot determine source format"
+                ),
+            ));
+        }
+    };
+
+    // §5.2 allowlist (fail-closed): resolve the (from, to) pair against the
+    // recipe table. An unknown pair is UNKNOWN_FORMAT, never a silent fallback,
+    // and is rejected before any filesystem access or spawn.
+    let recipes = crate::convert::load_recipes(home)
+        .map_err(|e| format!("Failed to load conversion recipes: {e}"))?;
+    let recipe = match recipes.lookup(from, to) {
+        Some(r) => r,
+        None => {
+            let supported = recipes
+                .recipes()
+                .iter()
+                .map(|r| format!("{}->{}", r.from, r.to))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_FORMAT",
+                &format!("no conversion recipe for '{from}'->'{to}'. Supported: {supported}"),
+            ));
+        }
+    };
+
+    // Default the output next to the input, with the recipe's output extension.
+    let output_path = input["output"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            Path::new(input_path)
+                .with_extension(&recipe.out_ext)
+                .to_string_lossy()
+                .into_owned()
+        });
+
+    // Resolve the render preset (if any) into a trusted var map. The caller
+    // supplies only a preset *key*; the dimension/scale strings that reach argv
+    // are manifest-authored. Fail-closed on an unknown or unexpected preset,
+    // mirroring the UNKNOWN_FORMAT pattern above (no spawn, no filesystem
+    // access yet).
+    let requested_preset = input["preset"].as_str().filter(|s| !s.trim().is_empty());
+    let empty_vars = std::collections::BTreeMap::new();
+    let preset_vars: &std::collections::BTreeMap<String, String> = if recipe.presets.is_empty() {
+        if requested_preset.is_some() {
+            return Ok(convert_err(
+                to,
+                "UNKNOWN_PRESET",
+                &format!("conversion '{from}'->'{to}' takes no presets"),
+            ));
+        }
+        &empty_vars
+    } else {
+        let chosen = match requested_preset.or(recipe.default_preset.as_deref()) {
+            Some(c) => c,
+            None => {
+                return Ok(convert_err(
+                    to,
+                    "UNKNOWN_PRESET",
+                    &format!(
+                        "conversion '{from}'->'{to}' requires a preset but none was given and no default is set"
+                    ),
+                ));
+            }
+        };
+        match recipe.presets.get(chosen) {
+            Some(vars) => vars,
+            None => {
+                let offered = recipe
+                    .presets
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(convert_err(
+                    to,
+                    "UNKNOWN_PRESET",
+                    &format!("unknown preset '{chosen}' for '{from}'->'{to}'. Offered: {offered}"),
+                ));
+            }
+        }
+    };
+
+
+    // §5.1 path validation: both paths must resolve INSIDE the workspace.
+    // resolve_sandbox_path rejects `..`, absolute escape, and symlink escape;
+    // the input must exist and the output's parent directory must exist.
+    let root = workspace_root.ok_or("file_convert requires a workspace root")?;
+    let resolved_input = match crate::workspace_sandbox::resolve_sandbox_path(input_path, root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(convert_err(
+                to,
+                "BAD_PATH",
+                &format!("input path rejected: {e}"),
+            ))
+        }
+    };
+    let resolved_output = match crate::workspace_sandbox::resolve_sandbox_path(&output_path, root) {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(convert_err(
+                to,
+                "BAD_PATH",
+                &format!("output path rejected: {e}"),
+            ))
+        }
+    };
+
+    // §5.3 argv-template substitution: tokens -> resolved literal paths only.
+    let scripts_dir = home.join("scripts");
+    let argv = match recipe.resolve_argv(&crate::convert::ArgvTokens {
+        script_dir: &scripts_dir,
+        input: &resolved_input,
+        output: &resolved_output,
+        vars: preset_vars,
+    }) {
+        Ok(a) => a,
+        // A bad token is a manifest-authoring defect, not a conversion outcome.
+        Err(e) => return Err(format!("recipe argv template invalid: {e}")),
+    };
+
+    // §5.5 absolute-binary resolution: the launcher (argv[0]) must be an
+    // absolute path. We never trust the daemon's bare PATH to find it.
+    let program = argv[0].clone();
+    crate::subprocess_sandbox::validate_executable_path(&program)?;
+    let program_path = Path::new(&program);
+    if !program_path.is_absolute() {
+        return Err(format!(
+            "recipe launcher '{program}' did not resolve to an absolute path \
+             (argv[0] must begin with the {{script}} token or an absolute path)"
+        ));
+    }
+
+    // Compose the child PATH once: a guaranteed tool-dir prefix ahead of the
+    // daemon's own PATH. Used for BOTH the preflight and the spawn, so what we
+    // verify is exactly what the child resolves against.
+    let child_path = convert_path_with_prefix();
+
+    // §5.4 call-time preflight (the §4.3 drift backstop): the launcher and every
+    // external `need` must be resolvable BEFORE we spawn. A missing binary is
+    // MISSING_DEP — never a partial invocation.
+    if !program_path.is_file() {
+        return Ok(convert_err(
+            to,
+            "MISSING_DEP",
+            &format!(
+                "file_convert {from}->{to} launcher '{program}' not found. Recipe present, launcher missing."
+            ),
+        ));
+    }
+    for need in &recipe.needs {
+        if find_on_path(need, &child_path).is_none() {
+            return Ok(convert_err(
+                to,
+                "MISSING_DEP",
+                &format!(
+                    "file_convert {from}->{to} needs '{need}', not found on PATH. Recipe present, binary missing."
+                ),
+            ));
+        }
+    }
+
+    // Spawn via argv array -- no shell, so substituted paths cannot inject shell
+    // syntax. Env is cleared then repopulated with the daemon's safe vars, then
+    // PATH is replaced with the guaranteed-prefixed PATH we just preflighted.
+    let mut cmd = tokio::process::Command::new(program_path);
+    cmd.args(&argv[1..]);
+    cmd.current_dir(root);
+    crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
+    cmd.env("PATH", &child_path);
+    cmd.stdin(std::process::Stdio::null());
+
+    let proc = cmd
+        .output()
+        .await
+        .map_err(|e| format!("failed to spawn conversion launcher '{program}': {e}"))?;
+
+    if !proc.status.success() {
+        let stderr = String::from_utf8_lossy(&proc.stderr);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&proc.stdout).trim().to_string()
+        } else {
+            detail.to_string()
+        };
+        return Ok(convert_err(
+            to,
+            "CONVERT_FAILED",
+            &format!(
+                "conversion command exited with {}: {}",
+                proc.status,
+                openfang_types::truncate_str(&detail, 600)
+            ),
+        ));
+    }
+
+    if !resolved_output.exists() {
+        return Ok(convert_err(
+            to,
+            "CONVERT_FAILED",
+            "conversion command reported success but produced no output file",
+        ));
+    }
+
+    Ok(convert_ok(to, &output_path))
+}
+
+/// Build the `file_convert` success envelope:
+/// `{ "ok": true, "format": "<fmt>", "output_path": "<path>" }`. The path is the
+/// workspace-relative form the caller passed (or the derived default) — the path
+/// a follow-up `file_read` can use directly.
+fn convert_ok(format: &str, output_path: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "format": format,
+        "output_path": output_path
+    })
+    .to_string()
+}
+
+/// Build the structured `file_convert` error envelope (§4.3):
+/// `{ "ok": false, "format": "<fmt>", "error": { "code": "<CODE>", "message": "<msg>" } }`.
+/// `code` is one of UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED.
+fn convert_err(format: &str, code: &str, message: &str) -> String {
+    serde_json::json!({
+        "ok": false,
+        "format": format,
+        "error": { "code": code, "message": message }
+    })
+    .to_string()
+}
+
+/// Resolve a bare binary name against a composed PATH, returning the first
+/// matching executable. Close enough to `command -v` for a preflight backstop:
+/// on Unix it requires an executable bit; elsewhere an existing regular file.
+/// A name that already contains a path separator is checked as-is, not searched.
+fn find_on_path(bin: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    if bin.contains('/') || bin.contains('\\') {
+        let p = PathBuf::from(bin);
+        return if is_executable_file(&p) {
+            Some(p)
+        } else {
+            None
+        };
+    }
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join(bin);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether `path` is a regular file that is executable (Unix checks the exec
+/// bit; other platforms fall back to file existence).
+fn is_executable_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(md) if md.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+/// Compose the child PATH for a conversion spawn: a guaranteed prefix of common
+/// tool directories (which launchd may omit) ahead of the daemon's own PATH,
+/// de-duplicated and joined with the platform separator. This is the ANAI-67
+/// "inject a guaranteed PATH prefix" half of the hybrid launcher/PATH decision.
+fn convert_path_with_prefix() -> std::ffi::OsString {
+    let guaranteed = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"];
+    let mut dirs: Vec<PathBuf> = guaranteed.iter().map(|d| PathBuf::from(*d)).collect();
+    if let Some(existing) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&existing) {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
 // Patch tool
 // ---------------------------------------------------------------------------
 
 async fn tool_apply_patch(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
 ) -> Result<String, String> {
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
-    let result = crate::apply_patch::apply_patch(&ops, root).await;
+    let result = crate::apply_patch::apply_patch(&ops, root, file_policy).await;
     if result.is_ok() {
         Ok(result.summary())
     } else {
@@ -2520,7 +3202,7 @@ async fn tool_channel_send(
 
     // Local file attachment: read from disk and send as FileData
     if let Some(raw_path) = file_path {
-        let resolved = resolve_file_path(raw_path, workspace_root)?;
+        let resolved = resolve_file_path(raw_path, workspace_root, None, false)?;
         let data = tokio::fs::read(&resolved)
             .await
             .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;
@@ -2573,13 +3255,26 @@ async fn tool_channel_send(
             .await;
     }
 
-    // Text-only message
-    let message = input["message"]
-        .as_str()
-        .ok_or("Missing 'message' parameter (required for text messages)")?;
+    // Text + optional `attachments: string[]` (ANAI-53). The attachments
+    // array is sugar over the inline `<openfang:attach .../>` directive
+    // mechanism — we synthesize directives here, prepend them to the
+    // message body, and let `kernel::send_channel_message` →
+    // `bridge::send_parsed` → `outbound_attach::parse` handle resolution,
+    // workspace allow-root gating, and multipart construction. Composes
+    // with any inline directives the agent already wrote into `message`.
+    let message_raw = input["message"].as_str().unwrap_or("");
+    let attachments_raw = input.get("attachments");
+    let has_attachments = attachments_raw
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
 
-    if message.is_empty() {
-        return Err("Message cannot be empty".to_string());
+    if message_raw.is_empty() && !has_attachments {
+        return Err(
+            "Missing 'message' parameter (required for text-only sends; \
+             pass non-empty 'attachments' to send files without a body)"
+                .to_string(),
+        );
     }
 
     // For email channels, validate email format and prepend subject
@@ -2589,19 +3284,101 @@ async fn tool_channel_send(
         }
         if let Some(subject) = input["subject"].as_str() {
             if !subject.is_empty() {
-                format!("Subject: {subject}\n\n{message}")
+                format!("Subject: {subject}\n\n{message_raw}")
             } else {
-                message.to_string()
+                message_raw.to_string()
             }
         } else {
-            message.to_string()
+            message_raw.to_string()
         }
     } else {
-        message.to_string()
+        message_raw.to_string()
     };
 
-    kh.send_channel_message(&channel, recipient, &final_message, thread_id)
-        .await
+    let final_message = synthesize_attach_directives(&final_message, attachments_raw)?;
+
+    kh.send_channel_message(
+        &channel,
+        recipient,
+        &final_message,
+        thread_id,
+        workspace_root,
+    )
+    .await
+}
+
+/// Prepend synthesized `<openfang:attach path="…"/>` directives from an
+/// `attachments` JSON array to the message body.
+///
+/// The outbound parser downstream extracts the directives, resolves each
+/// path against the calling agent's `workspace_root`, applies the same
+/// `allow_roots` security gating used by inline directives, and dispatches
+/// multipart payloads on the wire. This helper is pure sugar over that
+/// mechanism — no security policy here, just text synthesis.
+///
+/// Behavior:
+/// - `None` or `Null` `attachments` → returns `message` unchanged.
+/// - `attachments` present but not a JSON array → error (caller passed
+///   wrong shape).
+/// - Empty array → returns `message` unchanged (explicit no-op).
+/// - Each element must be a non-empty string. Path characters that would
+///   break the directive boundary (`"`, `<`, `>`, `\n`, `\r`) are
+///   rejected outright rather than silently escaped — these are
+///   pathological in filenames and silent escaping would obscure the
+///   failure mode.
+/// - Synthesized directives are prepended to `message` (one per line,
+///   followed by the original body). Composes additively with any inline
+///   directives the caller already embedded in `message`.
+///
+/// Path resolution and authorisation happen entirely downstream in
+/// `outbound_attach::resolve_directive` — this helper does not touch the
+/// filesystem.
+fn synthesize_attach_directives(
+    message: &str,
+    attachments: Option<&serde_json::Value>,
+) -> Result<String, String> {
+    let arr = match attachments {
+        Some(v) if v.is_null() => return Ok(message.to_string()),
+        Some(v) => v
+            .as_array()
+            .ok_or("'attachments' must be an array of file path strings")?,
+        None => return Ok(message.to_string()),
+    };
+    if arr.is_empty() {
+        return Ok(message.to_string());
+    }
+
+    let mut directives = String::new();
+    for (i, item) in arr.iter().enumerate() {
+        let path = item
+            .as_str()
+            .ok_or_else(|| format!("'attachments[{i}]' must be a string"))?;
+        if path.is_empty() {
+            return Err(format!("'attachments[{i}]' is an empty string"));
+        }
+        if let Some(bad) = path
+            .chars()
+            .find(|c| matches!(c, '"' | '<' | '>' | '\n' | '\r'))
+        {
+            return Err(format!(
+                "'attachments[{i}]' contains character {bad:?} which would break \
+                 the directive boundary; use an inline `<openfang:attach .../>` \
+                 directive or the `file_path` parameter instead"
+            ));
+        }
+        directives.push_str("<openfang:attach path=\"");
+        directives.push_str(path);
+        directives.push_str("\"/>\n");
+    }
+
+    if message.is_empty() {
+        // Trim the trailing newline so an attachments-only send doesn't
+        // emit a phantom blank line through the formatter.
+        Ok(directives.trim_end().to_string())
+    } else {
+        directives.push_str(message);
+        Ok(directives)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3223,7 +4000,7 @@ async fn tool_speech_to_text(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let _language = input["language"].as_str();
 
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    let resolved = resolve_file_path(raw_path, workspace_root, None, false)?;
 
     // Read the audio file
     let data = tokio::fs::read(&resolved)
@@ -3382,6 +4159,7 @@ async fn tool_process_start(
     if let Some(policy) = exec_policy {
         if let Err(reason) = crate::subprocess_sandbox::validate_command_allowlist(command, policy)
         {
+            let reason = reason.trim_end_matches('.');
             return Err(format!(
                 "process_start blocked: {reason}. Current exec_policy.mode = '{:?}'. \
                  To allow this command, add it to exec_policy.allowed_commands or \
@@ -3741,6 +4519,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn extract_cache_binary_basic() {
+        assert_eq!(extract_cache_binary("grep -r foo ."), Some("grep".into()));
+        assert_eq!(extract_cache_binary("rm -rf /tmp/x"), Some("rm".into()));
+        assert_eq!(extract_cache_binary("/bin/ls"), Some("/bin/ls".into()));
+    }
+
+    #[test]
+    fn extract_cache_binary_skips_leading_env_assignments() {
+        assert_eq!(
+            extract_cache_binary("RUST_LOG=debug cargo build"),
+            Some("cargo".into())
+        );
+        assert_eq!(
+            extract_cache_binary("A=1 B=2 ./run.sh"),
+            Some("./run.sh".into())
+        );
+    }
+
+    #[test]
+    fn extract_cache_binary_edge_cases() {
+        assert_eq!(extract_cache_binary(""), None);
+        assert_eq!(extract_cache_binary("   "), None);
+        // all-env produces no binary token
+        assert_eq!(extract_cache_binary("FOO=bar"), None);
+        // a token whose pre-'=' part is not a valid var name is treated as argv0
+        assert_eq!(extract_cache_binary("1bad=x cmd"), Some("1bad=x".into()));
+    }
+
+    #[test]
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
@@ -3922,9 +4729,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(
@@ -3951,9 +4760,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -3977,9 +4788,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4003,9 +4816,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4016,7 +4831,13 @@ mod tests {
     async fn test_create_directory_creates_nested() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
-        let result = tool_create_directory(&serde_json::json!({"path": "a/b/c"}), Some(root)).await;
+        let result = tool_create_directory(
+            &serde_json::json!({"path": "a/b/c"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "Expected Ok, got: {:?}", result);
         let expected = root.join("a").join("b").join("c");
         assert!(
@@ -4031,16 +4852,71 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         // First create
-        let r1 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root)).await;
+        let r1 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(r1.is_ok());
         // Second create on existing dir should also succeed
-        let r2 = tool_create_directory(&serde_json::json!({"path": "data/logs"}), Some(root)).await;
+        let r2 = tool_create_directory(
+            &serde_json::json!({"path": "data/logs"}),
+            Some(root),
+            None,
+            None,
+        )
+        .await;
         assert!(r2.is_ok(), "Expected idempotent success, got: {:?}", r2);
     }
 
     #[tokio::test]
+    async fn test_create_directory_f4_denied_tier_blocks() {
+        use openfang_types::config::{FileAccessTier, FilePolicy, FileRule};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let policy = FilePolicy::new(
+            true,
+            FileAccessTier::Write,
+            vec![FileRule {
+                path: "secret".to_string(),
+                tier: FileAccessTier::Deny,
+            }],
+        );
+        let r = tool_create_directory(
+            &serde_json::json!({"path": "secret/sub"}),
+            Some(root),
+            Some(&policy),
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "deny-tier directory must be refused: {:?}", r);
+        assert!(!root.join("secret").join("sub").exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_directory_f4_active_policy_no_root_fails_closed() {
+        use openfang_types::config::{FileAccessTier, FilePolicy};
+        let policy = FilePolicy::new(true, FileAccessTier::Write, vec![]);
+        let r = tool_create_directory(
+            &serde_json::json!({"path": "anywhere"}),
+            None,
+            Some(&policy),
+            None,
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "active policy with no workspace root must fail closed: {:?}",
+            r
+        );
+        assert!(r.unwrap_err().contains("workspace root"));
+    }
+
+    #[tokio::test]
     async fn test_create_directory_missing_path_param() {
-        let result = tool_create_directory(&serde_json::json!({}), None).await;
+        let result = tool_create_directory(&serde_json::json!({}), None, None, None).await;
         assert!(result.is_err());
         let msg = result.unwrap_err();
         assert!(msg.contains("Missing 'path'"), "got: {msg}");
@@ -4065,9 +4941,11 @@ mod tests {
             Some(root.as_path()), // workspace_root
             None,                 // media_engine
             None,                 // exec_policy
+            None,                 // file_policy
             None,                 // tts_engine
             None,                 // docker_config
             None,                 // process_manager
+            None,                 // origin
         )
         .await;
         assert!(
@@ -4095,9 +4973,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4121,9 +5001,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // web_search now attempts a real fetch; may succeed or fail depending on network
@@ -4147,9 +5029,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4173,9 +5057,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4200,9 +5086,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4231,9 +5119,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
@@ -4276,9 +5166,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         // Should NOT be the capability-enforcement "Permission denied" — it should
@@ -4311,9 +5203,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4480,9 +5374,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4525,9 +5421,11 @@ mod tests {
             None,
             None, // media_engine
             None, // exec_policy
+            None, // file_policy
             None, // tts_engine
             None, // docker_config
             None, // process_manager
+            None, // origin
         )
         .await;
         assert!(result.is_error);
@@ -4786,6 +5684,9 @@ mod tests {
         created: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
         cancelled: std::sync::Mutex<Vec<String>>,
         jobs: std::sync::Mutex<Vec<serde_json::Value>>,
+        // Flips true if the approval gate ever called request_approval. Used to
+        // prove the allowlist wall short-circuits BEFORE the gate for shell_exec.
+        approval_requested: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -4794,6 +5695,7 @@ mod tests {
                 created: std::sync::Mutex::new(Vec::new()),
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
+                approval_requested: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -4898,6 +5800,26 @@ mod tests {
             self.cancelled.lock().unwrap().push(job_id.to_string());
             Ok(())
         }
+
+        // Mark this kernel as "approval is configured" so the gate at
+        // execute_tool would fire for any tool — unless something short-circuits
+        // ahead of it.
+        fn requires_approval(&self, _tool_name: &str) -> bool {
+            true
+        }
+
+        async fn request_approval(
+            &self,
+            _agent_id: &str,
+            _tool_name: &str,
+            _action_summary: &str,
+            _origin: Option<&openfang_types::approval::ApprovalOrigin>,
+            _cache_binary: Option<&str>,
+        ) -> Result<bool, String> {
+            self.approval_requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
     }
 
     #[tokio::test]
@@ -4933,6 +5855,130 @@ mod tests {
         assert_eq!(job["action"]["message"], "Daily report");
         assert!(job["schedule"]["expr"].is_string());
         assert_eq!(job["one_shot"], false);
+    }
+
+    /// The allowlist wall must run BEFORE the approval gate for shell_exec.
+    /// A non-allowlisted command in Allowlist mode must be hard-denied without
+    /// ever firing the approval gate — no prompt, no approve-similar cache
+    /// population, and therefore no misleading "Approved · cached" stamp for a
+    /// command the next layer rejects (the `whoami` incident, 2026-06-17).
+    #[tokio::test]
+    async fn test_allowlist_wall_precedes_approval_gate_for_shell_exec() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["grep".to_string()],
+            ..ExecPolicy::default()
+        };
+        let input = serde_json::json!({ "command": "whoami" });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(&handle),
+            None, // allowed_tools (capability check skipped)
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,          // media_engine
+            Some(&policy), // exec_policy
+            None,          // file_policy
+            None,          // tts_engine
+            None,          // docker_config
+            None,          // process_manager
+            None,          // origin
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "non-allowlisted shell_exec must be blocked, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("not in the exec allowlist"),
+            "block must come from the allowlist wall, got: {}",
+            result.content
+        );
+        assert!(
+            !fake
+                .approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "approval gate must NOT fire for a command the allowlist wall rejects \
+             (no prompt, no cache, no misleading Approved stamp)"
+        );
+    }
+
+    /// Positive control for the wall-before-gate ordering. An *allowlisted*
+    /// command in Allowlist mode must CLEAR the wall, reach the approval gate,
+    /// and fire it. This makes the negative test above a true negative: it
+    /// proves the spy's `request_approval` is wired as the `KernelHandle`
+    /// trait impl (not a dead inherent method) and that it *does* record a
+    /// call when the gate is actually reached. Without this, an un-fired spy
+    /// in the negative test could be a false pass (e.g. a mis-wired spy that
+    /// never records regardless of gate firing).
+    #[tokio::test]
+    async fn test_allowlisted_command_reaches_approval_gate_for_shell_exec() {
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            allowed_commands: vec!["grep".to_string()],
+            ..ExecPolicy::default()
+        };
+        // `grep` IS allowlisted, so it clears the wall and reaches the gate.
+        // `--version` exits 0 immediately, so the post-approval execution is
+        // fast and side-effect-free.
+        let input = serde_json::json!({ "command": "grep --version" });
+
+        let result = execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(&handle),
+            None, // allowed_tools (capability check skipped)
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,          // media_engine
+            Some(&policy), // exec_policy
+            None,          // file_policy
+            None,          // tts_engine
+            None,          // docker_config
+            None,          // process_manager
+            None,          // origin
+        )
+        .await;
+
+        // The gate MUST have fired — this is the positive control.
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "approval gate MUST fire for an allowlisted command that clears the \
+             wall — proves the spy records gate calls and the negative test is \
+             a true negative"
+        );
+        // And the wall did NOT block it (independent of the command's exit
+        // code, so this assertion is robust across grep implementations).
+        assert!(
+            !result.content.contains("not in the exec allowlist"),
+            "an allowlisted command must clear the wall, got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -5010,5 +6056,500 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_lowercase().contains("kernel"));
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-53: synthesize_attach_directives — pure helper tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn synth_attach_none_is_noop() {
+        let out = super::synthesize_attach_directives("hello", None).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_null_is_noop() {
+        let v = serde_json::Value::Null;
+        let out = super::synthesize_attach_directives("hello", Some(&v)).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_empty_array_is_noop() {
+        let v = serde_json::json!([]);
+        let out = super::synthesize_attach_directives("hello", Some(&v)).unwrap();
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn synth_attach_single_relative_path() {
+        let v = serde_json::json!(["report.pdf"]);
+        let out = super::synthesize_attach_directives("see attached", Some(&v)).unwrap();
+        assert_eq!(out, "<openfang:attach path=\"report.pdf\"/>\nsee attached");
+    }
+
+    #[test]
+    fn synth_attach_single_absolute_path() {
+        let v = serde_json::json!(["/tmp/file.png"]);
+        let out = super::synthesize_attach_directives("", Some(&v)).unwrap();
+        // Empty message → trailing newline trimmed.
+        assert_eq!(out, "<openfang:attach path=\"/tmp/file.png\"/>");
+    }
+
+    #[test]
+    fn synth_attach_multiple_paths_preserve_order() {
+        let v = serde_json::json!(["a.pdf", "b.png", "c.opus"]);
+        let out = super::synthesize_attach_directives("caption", Some(&v)).unwrap();
+        assert_eq!(
+            out,
+            "<openfang:attach path=\"a.pdf\"/>\n<openfang:attach path=\"b.png\"/>\n<openfang:attach path=\"c.opus\"/>\ncaption"
+        );
+    }
+
+    #[test]
+    fn synth_attach_composes_with_inline_directive() {
+        // Caller wrote one inline directive, then also passed an
+        // attachments param. Both must survive; downstream parser sees
+        // two directives in the final message.
+        let v = serde_json::json!(["b.pdf"]);
+        let msg = "<openfang:attach path=\"a.pdf\"/>\nhere are two files";
+        let out = super::synthesize_attach_directives(msg, Some(&v)).unwrap();
+        assert_eq!(
+            out,
+            "<openfang:attach path=\"b.pdf\"/>\n<openfang:attach path=\"a.pdf\"/>\nhere are two files"
+        );
+        // And the parser regex finds both.
+        let re = regex_lite::Regex::new(r#"<openfang:attach\s+([^>]*?)/>"#).unwrap();
+        assert_eq!(re.find_iter(&out).count(), 2);
+    }
+
+    #[test]
+    fn synth_attach_rejects_non_array() {
+        let v = serde_json::json!("not-an-array");
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("must be an array"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_non_string_element() {
+        let v = serde_json::json!(["ok.pdf", 42]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("attachments[1]"), "err = {err}");
+        assert!(err.contains("must be a string"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_empty_path_element() {
+        let v = serde_json::json!(["ok.pdf", ""]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("attachments[1]"), "err = {err}");
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_quote_in_path() {
+        let v = serde_json::json!(["weird\".pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_newline_in_path() {
+        let v = serde_json::json!(["line1\nline2.pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_rejects_angle_bracket_in_path() {
+        let v = serde_json::json!(["foo<bar>.pdf"]);
+        let err = super::synthesize_attach_directives("hi", Some(&v)).unwrap_err();
+        assert!(err.contains("directive boundary"), "err = {err}");
+    }
+
+    #[test]
+    fn synth_attach_traversal_path_still_synthesized() {
+        // Synthesis is pure — no path policy here. The downstream
+        // outbound_attach parser is what rejects traversal/escape paths
+        // (covered by its own test suite). This test pins down that the
+        // helper does NOT pre-filter — security is downstream.
+        let v = serde_json::json!(["../../../etc/hosts"]);
+        let out = super::synthesize_attach_directives("hi", Some(&v)).unwrap();
+        assert!(out.contains("<openfang:attach path=\"../../../etc/hosts\"/>"));
+        // Defence in depth lives in outbound_attach::resolve_directive,
+        // which canonicalises and applies allow_roots — see its tests.
+    }
+
+    #[test]
+    fn test_trusted_commands_auto_approve_parity_shell_and_process_start() {
+        // Parity: both shell_exec and process_start carry the command in
+        // input["command"], and the gate uses command_approval_report for both.
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["git".to_string()],
+            ..ExecPolicy::default()
+        };
+
+        // shell_exec-shaped input.
+        let shell_input = serde_json::json!({ "command": "git status" });
+        let cmd = shell_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(cmd, &policy).is_some(),
+            "git must auto-approve via trusted_commands for shell_exec"
+        );
+
+        // process_start-shaped input (same "command" key — is_shell_tool covers both).
+        let ps_input = serde_json::json!({ "command": "git", "args": ["status"] });
+        let ps_cmd = ps_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(ps_cmd, &policy).is_some(),
+            "git must auto-approve via trusted_commands for process_start"
+        );
+
+        // A non-trusted command must NOT auto-approve (prompt still fires).
+        let deny_input = serde_json::json!({ "command": "curl https://x" });
+        let deny_cmd = deny_input.get("command").and_then(|v| v.as_str()).unwrap();
+        assert!(
+            crate::subprocess_sandbox::command_approval_report(deny_cmd, &policy).is_none(),
+            "curl must not auto-approve"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convert_dispatch_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+
+    /// Build a hermetic OpenFang home: `scripts/stub.sh` + `convert/recipes.toml`
+    /// defining md->txt. The stub is a 2-arg `INPUT OUTPUT` copier that also
+    /// records its raw argv to `<output>.argv`, so a test can prove a
+    /// metachar-laden path arrived as ONE literal argument (no shell expansion).
+    #[cfg(unix)]
+    fn hermetic_home(needs: &str) -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(
+            &stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$2.argv\"\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        let needs_line = if needs.is_empty() {
+            String::new()
+        } else {
+            format!("needs = [\"{needs}\"]\n")
+        };
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            format!(
+                "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{{script}}/stub.sh\", \"{{input}}\", \"{{output}}\"]\n{needs_line}out_ext = \"txt\"\n"
+            ),
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(unix)]
+    fn parse(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_happy_path_md_to_txt() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "# hi").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(v["format"], "txt");
+        assert_eq!(v["output_path"], "note.txt");
+        assert!(ws.path().join("note.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_input_traversal_blocked() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "../escape.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_output_traversal_blocked() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "output": "../escape.txt" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_absolute_input_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "/tmp/outside-abs.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_absolute_output_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "output": "/tmp/escape.txt" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "BAD_PATH", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_unknown_format_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "pdf", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "UNKNOWN_FORMAT", "envelope: {out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_missing_dep_no_partial_run() {
+        let home = hermetic_home("totally-absent-binary-xyz");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "MISSING_DEP", "envelope: {out}");
+        // No partial run: the stub never executed, so no output file exists.
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_injection_reaches_recipe_as_literal_arg() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        // A filename loaded with shell metacharacters. If ANY layer evaluated it
+        // through a shell, `pwned`/`pwned2` would be created.
+        let evil = "evil; $(touch pwned) `touch pwned2`.md";
+        fs::write(ws.path().join(evil), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": evil }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {out}");
+        // No shell expansion occurred anywhere in the pipeline.
+        assert!(!ws.path().join("pwned").exists(), "injection executed!");
+        assert!(!ws.path().join("pwned2").exists(), "injection executed!");
+        // The stub received the metachar path as ONE literal argv entry.
+        let expected_out = Path::new(evil).with_extension("txt");
+        assert!(ws.path().join(&expected_out).is_file());
+        let mut argv_log = ws.path().join(&expected_out).into_os_string();
+        argv_log.push(".argv");
+        let logged = fs::read_to_string(&argv_log).unwrap();
+        assert!(
+            logged.lines().any(|l| l.ends_with(evil)),
+            "metachar path not a single literal arg; argv log: {logged}"
+        );
+    }
+
+    #[test]
+    fn convert_ok_envelope_shape() {
+        let s = convert_ok("pdf", "out/doc.pdf");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true));
+        assert_eq!(v["format"], "pdf");
+        assert_eq!(v["output_path"], "out/doc.pdf");
+        assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn convert_err_envelope_shape() {
+        let s = convert_err("pdf", "MISSING_DEP", "needs 'typst'");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["format"], "pdf");
+        assert_eq!(v["error"]["code"], "MISSING_DEP");
+        assert_eq!(v["error"]["message"], "needs 'typst'");
+        assert!(v.get("output_path").is_none());
+    }
+
+    #[cfg(unix)]
+    fn hermetic_home_presets() -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(
+            &stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$2.argv\"\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{script}/stub.sh\", \"{input}\", \"{output}\", \"{viewport}\"]\nout_ext = \"txt\"\ndefault_preset = \"desktop\"\n\n[recipe.presets.mobile]\nviewport = \"MOBILEVP\"\n\n[recipe.presets.desktop]\nviewport = \"DESKTOPVP\"\n",
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(unix)]
+    fn read_argv_log(ws: &Path, out_rel: &str) -> String {
+        let mut p = ws.join(out_rel).into_os_string();
+        p.push(".argv");
+        fs::read_to_string(&p).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_selects_named_vars() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "mobile" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        assert!(log.lines().any(|l| l == "MOBILEVP"), "argv log: {log}");
+        assert!(!log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_omitted_uses_default() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        assert!(log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_unknown_preset_rejected() {
+        let home = hermetic_home_presets();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "phone" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_preset_on_presetless_recipe_rejected() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "preset": "mobile" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
+    }
+
+    #[test]
+    fn find_on_path_locates_executable() {
+        #[cfg(unix)]
+        {
+            let path = std::ffi::OsString::from("/usr/bin:/bin");
+            assert!(find_on_path("sh", &path).is_some());
+            assert!(find_on_path("definitely-not-a-real-binary-xyz", &path).is_none());
+        }
     }
 }
