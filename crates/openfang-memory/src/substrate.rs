@@ -467,6 +467,16 @@ impl MemorySubstrate {
     // Task queue operations
     // -----------------------------------------------------------------
 
+    // CONTRACT — shared task-queue payload (memory <-> agent_send_async):
+    //   `payload` is OPAQUE BYTES. The queue imposes NO schema: each owner
+    //   frames its own record/envelope. Encoding: raw `&[u8]` at this Rust
+    //   boundary, base64-STANDARD on the JSON surface.
+    //   Two invariants neither owner may move without a cross-agent heads-up:
+    //     1. the base64-STANDARD convention, and
+    //     2. the payload SELECT column index: idx 6 on claim, idx 9 on list.
+    //   Owners: memory subsystem (this crate) + coder-openfang-tools
+    //   (agent_send_async). Touch a column index -> ping the other owner first.
+
     /// Post a new task to the shared queue. Returns the task ID.
     pub async fn task_post(
         &self,
