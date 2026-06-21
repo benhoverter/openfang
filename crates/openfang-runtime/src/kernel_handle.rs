@@ -71,6 +71,7 @@ pub trait KernelHandle: Send + Sync {
         description: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
+        payload: &[u8],
     ) -> Result<String, String>;
 
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.

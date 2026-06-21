@@ -2626,8 +2626,17 @@ async fn tool_task_post(
         .as_str()
         .ok_or("Missing 'description' parameter")?;
     let assigned_to = input["assigned_to"].as_str();
+    let payload = match input["payload"].as_str() {
+        Some(s) if !s.is_empty() => {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|e| format!("Invalid base64 'payload': {e}"))?
+        }
+        _ => Vec::new(),
+    };
     let task_id = kh
-        .task_post(title, description, assigned_to, caller_agent_id)
+        .task_post(title, description, assigned_to, caller_agent_id, &payload)
         .await?;
     Ok(format!("Task created with ID: {task_id}"))
 }
@@ -5744,6 +5753,7 @@ mod tests {
             _description: &str,
             _assigned_to: Option<&str>,
             _created_by: Option<&str>,
+            _payload: &[u8],
         ) -> Result<String, String> {
             Err("not used".into())
         }

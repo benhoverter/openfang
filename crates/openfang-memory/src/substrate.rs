@@ -23,6 +23,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use base64::Engine;
 use tracing::{info, warn};
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
@@ -473,12 +474,14 @@ impl MemorySubstrate {
         description: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
+        payload: &[u8],
     ) -> OpenFangResult<String> {
         let conn = Arc::clone(&self.conn);
         let title = title.to_string();
         let description = description.to_string();
         let assigned_to = assigned_to.unwrap_or("").to_string();
         let created_by = created_by.unwrap_or("").to_string();
+        let payload = payload.to_vec();
 
         tokio::task::spawn_blocking(move || {
             let id = uuid::Uuid::new_v4().to_string();
@@ -487,7 +490,7 @@ impl MemorySubstrate {
             db.execute(
                 "INSERT INTO task_queue (id, agent_id, task_type, payload, status, priority, created_at, title, description, assigned_to, created_by)
                  VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![id, &created_by, &title, b"", now, title, description, assigned_to, created_by],
+                rusqlite::params![id, &created_by, &title, payload, now, title, description, assigned_to, created_by],
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
             Ok(id)
@@ -505,7 +508,7 @@ impl MemorySubstrate {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             // Find first pending task assigned to this agent, or any unassigned pending task
             let mut stmt = db.prepare(
-                "SELECT id, title, description, assigned_to, created_by, created_at
+                "SELECT id, title, description, assigned_to, created_by, created_at, payload
                  FROM task_queue
                  WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
                  ORDER BY priority DESC, created_at ASC
@@ -520,11 +523,12 @@ impl MemorySubstrate {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
                 ))
             });
 
             match result {
-                Ok((id, title, description, assigned, created_by, created_at)) => {
+                Ok((id, title, description, assigned, created_by, created_at, payload)) => {
                     // Update status to in_progress
                     db.execute(
                         "UPDATE task_queue SET status = 'in_progress', assigned_to = ?2 WHERE id = ?1",
@@ -539,6 +543,7 @@ impl MemorySubstrate {
                         "assigned_to": if assigned.is_empty() { &agent_id } else { &assigned },
                         "created_by": created_by,
                         "created_at": created_at,
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
                     })))
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -580,11 +585,11 @@ impl MemorySubstrate {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match &status {
                 Some(s) => (
-                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result FROM task_queue WHERE status = ?1 ORDER BY created_at DESC",
+                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result, payload FROM task_queue WHERE status = ?1 ORDER BY created_at DESC",
                     vec![Box::new(s.clone())],
                 ),
                 None => (
-                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result FROM task_queue ORDER BY created_at DESC",
+                    "SELECT id, title, description, status, assigned_to, created_by, created_at, completed_at, result, payload FROM task_queue ORDER BY created_at DESC",
                     vec![],
                 ),
             };
@@ -602,6 +607,7 @@ impl MemorySubstrate {
                     "created_at": row.get::<_, String>(6).unwrap_or_default(),
                     "completed_at": row.get::<_, Option<String>>(7).unwrap_or(None),
                     "result": row.get::<_, Option<String>>(8).unwrap_or(None),
+                    "payload": base64::engine::general_purpose::STANDARD.encode(row.get::<_, Vec<u8>>(9).unwrap_or_default()),
                 }))
             }).map_err(|e| OpenFangError::Memory(e.to_string()))?;
 

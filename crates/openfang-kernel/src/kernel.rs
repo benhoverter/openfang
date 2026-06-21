@@ -8031,9 +8031,10 @@ impl KernelHandle for OpenFangKernel {
         description: &str,
         assigned_to: Option<&str>,
         created_by: Option<&str>,
+        payload: &[u8],
     ) -> Result<String, String> {
         self.memory
-            .task_post(title, description, assigned_to, created_by)
+            .task_post(title, description, assigned_to, created_by, payload)
             .await
             .map_err(|e| format!("Task post failed: {e}"))
     }
