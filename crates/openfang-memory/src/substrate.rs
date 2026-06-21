@@ -777,6 +777,7 @@ mod tests {
                 "Check the auth module for issues",
                 Some("auditor"),
                 Some("orchestrator"),
+                b"",
             )
             .await
             .unwrap();
@@ -798,6 +799,7 @@ mod tests {
                 "Security audit the /api/login endpoint",
                 Some("auditor"),
                 None,
+                b"",
             )
             .await
             .unwrap();
