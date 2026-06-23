@@ -529,6 +529,7 @@ pub async fn execute_tool(
 
         // Inter-agent tools (require kernel handle)
         "agent_send" => tool_agent_send(input, kernel).await,
+        "agent_send_async" => tool_agent_send_async(input, kernel, caller_agent_id).await,
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
@@ -921,6 +922,24 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
                     "message": { "type": "string", "description": "The message to send to the agent" }
+                },
+                "required": ["agent_id", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_send_async".to_string(),
+            description: "Wake another agent asynchronously (fire-and-forget). Queues the \
+                          message for the target and returns immediately — the caller does NOT \
+                          block on the target's loop and receives NO inline reply. Use this \
+                          instead of agent_send when you want to hand off work without waiting, \
+                          or to avoid the head-of-line blocking of a synchronous A->B call. \
+                          Accepts UUID or agent name."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
+                    "message": { "type": "string", "description": "The message delivered to the target when it runs" }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -2498,6 +2517,84 @@ async fn tool_agent_send(
             kh.send_to_agent(agent_id, message).await
         })
         .await
+}
+
+/// Queue an asynchronous wake for another agent (fire-and-forget).
+///
+/// Unlike [`tool_agent_send`], this does **not** block on the target's loop. It
+/// frames a [`WakeEnvelope`](openfang_types::wake::WakeEnvelope) — target,
+/// sender, message, lineage, typed `TurnTrigger` — into the task-queue payload
+/// and returns as soon as the wake is enqueued. The kernel's wake-consumer
+/// claims the task on its own task and re-enters the send funnel for the
+/// target, so the caller never holds the target's per-agent lock. That
+/// eliminates the `A -> B -> A` head-of-line block the synchronous path has.
+///
+/// Capability: gated by the standard `capabilities.tools` allowlist — the
+/// boolean cap enforced in [`execute_tool`]. An agent without
+/// `agent_send_async` in its declared tools is rejected before reaching here,
+/// so no second gate is needed.
+async fn tool_agent_send_async(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    use openfang_types::turn::TurnTrigger;
+    use openfang_types::wake::{WakeEnvelope, WakeLineage, DEFAULT_MAX_WAKE_DEPTH, WAKE_TASK_PREFIX};
+
+    let kh = require_kernel(kernel)?;
+    let target = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let message = input["message"]
+        .as_str()
+        .ok_or("Missing 'message' parameter")?;
+    let sender = caller_agent_id.ok_or("agent_send_async requires a caller identity (sender)")?;
+
+    // Lineage: root the chain at the sender for v1 (the inbound wake lineage is
+    // not yet threaded into tool context — tracked as a follow-up). Cycle and
+    // depth are still enforced against this chain, so a self-wake or an
+    // over-deep extension is refused before the task is ever enqueued.
+    let lineage = WakeLineage::root_at(sender);
+    if lineage.would_cycle(target) {
+        return Err(format!(
+            "Refusing async wake: '{target}' is already in the call chain (cycle)."
+        ));
+    }
+    let next_lineage = lineage.extended(target);
+    if next_lineage.exceeds_depth(DEFAULT_MAX_WAKE_DEPTH) {
+        return Err(format!(
+            "Refusing async wake: chain depth would exceed {DEFAULT_MAX_WAKE_DEPTH}."
+        ));
+    }
+
+    let envelope = WakeEnvelope {
+        target: target.to_string(),
+        sender: sender.to_string(),
+        message: message.to_string(),
+        lineage: next_lineage,
+        // Genuine delegated peer content → AgentCall. Survives capture; never
+        // Heartbeat (which would make the woken turn capture-droppable).
+        trigger: TurnTrigger::AgentCall,
+        // origin threading is a documented follow-up (audit finding #3): a wake
+        // that raises an approval prompt has no inbound route yet.
+        origin: None,
+    };
+
+    let payload = envelope
+        .to_payload()
+        .map_err(|e| format!("Failed to serialize wake envelope: {e}"))?;
+
+    // Reserved title prefix marks this as a wake task so the kernel's
+    // wake-consumer claims it (and ordinary task_claim skips it).
+    let title = format!("{WAKE_TASK_PREFIX}{target}");
+    let task_id = kh
+        .task_post(&title, message, Some(target), Some(sender), &payload)
+        .await?;
+
+    Ok(format!(
+        "Async wake queued for '{target}' (task {task_id}). \
+         The target runs on its own; no reply is returned inline."
+    ))
 }
 
 async fn tool_agent_spawn(
@@ -4578,6 +4675,7 @@ mod tests {
         assert!(names.contains(&"create_directory"));
         assert!(names.contains(&"shell_exec"));
         assert!(names.contains(&"agent_send"));
+        assert!(names.contains(&"agent_send_async"));
         assert!(names.contains(&"agent_spawn"));
         assert!(names.contains(&"agent_list"));
         assert!(names.contains(&"agent_kill"));

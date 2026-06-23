@@ -34,6 +34,18 @@ use crate::turn::TurnTrigger;
 /// default). Enforced against [`WakeLineage::depth`] at the wake entrypoint.
 pub const DEFAULT_MAX_WAKE_DEPTH: usize = 5;
 
+/// Reserved task-queue title/`task_type` prefix that marks a queued task as an
+/// `agent_send_async` wake. Single source of truth shared by three sites:
+///
+/// * the **producer** (`agent_send_async` tool) stamps the task title with it,
+/// * the **wake-consumer** claims only tasks bearing it (`task_claim_wake`), and
+/// * ordinary `task_claim` **excludes** it, so a wake never gets pulled as a
+///   regular collaboration task (and a regular task never runs as a wake).
+///
+/// Keeping the literal here means a future rename can't silently desync the
+/// producer from the consumer.
+pub const WAKE_TASK_PREFIX: &str = "wake:";
+
 /// The ordered cross-agent call chain for a wake, carried in the task payload.
 ///
 /// Stored root-first: `agents[0]` is the lineage root, the last element is the
