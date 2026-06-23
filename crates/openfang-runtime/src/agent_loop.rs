@@ -17,6 +17,7 @@ use crate::tool_runner;
 use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
+use openfang_memory::capture::should_capture_turn;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -25,7 +26,7 @@ use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
-use openfang_types::turn::{should_capture_turn, TurnEffects, TurnTrigger};
+use openfang_types::turn::{TurnEffects, TurnTrigger};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;

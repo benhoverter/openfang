@@ -125,42 +125,6 @@ impl TurnEffects {
     }
 }
 
-/// Verdict of the capture predicate ([`should_capture_turn`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CaptureDecision {
-    /// Write the episodic row as normal.
-    Keep,
-    /// Skip the episodic write: a heartbeat turn that did nothing durable.
-    Drop,
-}
-
-impl CaptureDecision {
-    /// True for [`CaptureDecision::Drop`].
-    pub fn is_drop(&self) -> bool {
-        matches!(self, CaptureDecision::Drop)
-    }
-}
-
-/// The conservative tick/heartbeat drop predicate (ANAI-76).
-///
-/// ```text
-/// drop  ⇔  (trigger == Heartbeat)  ∧  (turn is inert)
-/// ```
-///
-/// Pure, total, panic-free, allocation-free. Only [`TurnTrigger::Heartbeat`] is
-/// eligible to drop — `Cron`/`Proactive` carry scheduled/triggered intent and
-/// are always kept, as is every human (`User`) or peer-agent (`AgentCall`) turn.
-/// Inertness is judged purely by side-effect provenance ([`TurnEffects`]), never
-/// by reply content. Biases hard toward keep: anything not provably a heartbeat
-/// with zero durable side-effects is captured.
-pub fn should_capture_turn(trigger: TurnTrigger, effects: &TurnEffects) -> CaptureDecision {
-    if trigger == TurnTrigger::Heartbeat && effects.is_inert() {
-        CaptureDecision::Drop
-    } else {
-        CaptureDecision::Keep
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,36 +204,5 @@ mod tests {
             !e.is_inert(),
             "unknown tools are conservatively side-effecting"
         );
-    }
-
-    #[test]
-    fn drops_only_inert_heartbeats() {
-        let inert = TurnEffects::new();
-        let mut active = TurnEffects::new();
-        active.observe_tool("agent_send");
-
-        // The one droppable case: heartbeat with no durable side-effect.
-        assert_eq!(
-            should_capture_turn(TurnTrigger::Heartbeat, &inert),
-            CaptureDecision::Drop
-        );
-        // Heartbeat that did real work is kept.
-        assert_eq!(
-            should_capture_turn(TurnTrigger::Heartbeat, &active),
-            CaptureDecision::Keep
-        );
-        // Every non-heartbeat trigger is kept even when inert.
-        for trig in [
-            TurnTrigger::User,
-            TurnTrigger::AgentCall,
-            TurnTrigger::Cron,
-            TurnTrigger::Proactive,
-        ] {
-            assert_eq!(
-                should_capture_turn(trig, &inert),
-                CaptureDecision::Keep,
-                "{trig} must never be dropped"
-            );
-        }
     }
 }
