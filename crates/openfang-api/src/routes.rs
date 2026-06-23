@@ -12687,6 +12687,7 @@ pub async fn comms_task(
             &req.description,
             req.assigned_to.as_deref(),
             Some("ui-user"),
+            b"",
         )
         .await
     {
