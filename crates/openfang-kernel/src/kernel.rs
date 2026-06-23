@@ -5238,6 +5238,14 @@ impl OpenFangKernel {
         /// Cap on wakes drained per tick, so a flood can't starve the shutdown
         /// check at the top of the loop.
         const MAX_WAKES_PER_TICK: usize = 32;
+        /// Max concurrently in-flight woken agent loops. Each dispatch runs a
+        /// FULL agent loop, so without this a non-empty wake queue would spawn
+        /// unbounded detached loops (concurrency/memory amplification). A permit
+        /// is reserved BEFORE each claim, so a wake is never flipped to
+        /// in_progress unless a slot is free to dispatch it immediately.
+        /// Conservative default; revisit if throughput needs it.
+        const MAX_INFLIGHT_WAKES: usize = 8;
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_WAKES));
 
         let kernel = Arc::clone(self);
         tokio::spawn(async move {
@@ -5252,10 +5260,15 @@ impl OpenFangKernel {
                 }
                 // Drain currently-pending wakes this tick (bounded).
                 for _ in 0..MAX_WAKES_PER_TICK {
+                    let permit = match Arc::clone(&permits).try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => break, // at capacity; resume next tick
+                    };
                     match kernel.memory.claim_wake_for_dispatch().await {
                         Ok(Some((task_id, envelope))) => {
                             let k = Arc::clone(&kernel);
                             tokio::spawn(async move {
+                                let _permit = permit; // released when dispatch ends
                                 k.run_woken_agent_loop(task_id, envelope).await;
                             });
                         }
@@ -5268,7 +5281,7 @@ impl OpenFangKernel {
                 }
             }
         });
-        info!("Wake-consumer started (interval: 500ms)");
+        info!("Wake-consumer started (interval: 500ms, max in-flight: {MAX_INFLIGHT_WAKES})");
     }
 
     /// Dispatch one claimed wake: resolve the target (UUID then name, mirroring
@@ -5298,6 +5311,27 @@ impl OpenFangKernel {
                 }
             },
         };
+
+        // Defense-in-depth: even though the privileged producer enforces the
+        // depth bound at enqueue, re-check the claimed envelope's lineage before
+        // dispatch so a malformed or over-deep chain that reached the queue
+        // cannot drive an unbounded wake tree. (The forgery door is already shut
+        // by wake_post, but the consumer should not trust payload contents.)
+        if envelope
+            .lineage
+            .exceeds_depth(openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH)
+        {
+            warn!(
+                target = %envelope.target,
+                depth = envelope.lineage.depth(),
+                "Refusing woken dispatch: wake-chain depth exceeds bound"
+            );
+            let _ = self
+                .memory
+                .task_complete(&task_id, "wake refused: chain depth exceeds bound")
+                .await;
+            return;
+        }
 
         let handle: Option<Arc<dyn KernelHandle>> = self
             .self_handle
@@ -8151,6 +8185,22 @@ impl KernelHandle for OpenFangKernel {
             .task_post(title, description, assigned_to, created_by, payload)
             .await
             .map_err(|e| format!("Task post failed: {e}"))
+    }
+
+    async fn wake_post(
+        &self,
+        title: &str,
+        description: &str,
+        assigned_to: Option<&str>,
+        created_by: Option<&str>,
+        payload: &[u8],
+    ) -> Result<String, String> {
+        // Privileged path: the only writer permitted into the wake-queue title
+        // namespace. Ordinary task_post rejects WAKE_TASK_PREFIX titles.
+        self.memory
+            .task_post_wake(title, description, assigned_to, created_by, payload)
+            .await
+            .map_err(|e| format!("Wake post failed: {e}"))
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {

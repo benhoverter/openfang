@@ -2542,7 +2542,7 @@ async fn tool_agent_send_async(
     use openfang_types::wake::{WakeEnvelope, WakeLineage, DEFAULT_MAX_WAKE_DEPTH, WAKE_TASK_PREFIX};
 
     let kh = require_kernel(kernel)?;
-    let target = input["agent_id"]
+    let target_raw = input["agent_id"]
         .as_str()
         .ok_or("Missing 'agent_id' parameter")?;
     let message = input["message"]
@@ -2550,17 +2550,31 @@ async fn tool_agent_send_async(
         .ok_or("Missing 'message' parameter")?;
     let sender = caller_agent_id.ok_or("agent_send_async requires a caller identity (sender)")?;
 
+    // Canonicalize the target to a stable agent-id BEFORE the cycle check.
+    // `sender` is always a UUID (the caller's agent id); a caller may address
+    // `target` by NAME. would_cycle is a plain string compare, so without
+    // canonicalization a self-wake-by-name (name != uuid) slips the guard and
+    // run_woken_agent_loop resolves the name straight back to the same agent.
+    // Resolving to the registered id here makes self-wake/cycle detection sound
+    // and validates the target exists before anything is enqueued.
+    let target = kh
+        .list_agents()
+        .into_iter()
+        .find(|a| a.id == target_raw || a.name == target_raw)
+        .map(|a| a.id)
+        .ok_or_else(|| format!("Async wake target not found: {target_raw}"))?;
+
     // Lineage: root the chain at the sender for v1 (the inbound wake lineage is
     // not yet threaded into tool context — tracked as a follow-up). Cycle and
     // depth are still enforced against this chain, so a self-wake or an
     // over-deep extension is refused before the task is ever enqueued.
     let lineage = WakeLineage::root_at(sender);
-    if lineage.would_cycle(target) {
+    if lineage.would_cycle(&target) {
         return Err(format!(
             "Refusing async wake: '{target}' is already in the call chain (cycle)."
         ));
     }
-    let next_lineage = lineage.extended(target);
+    let next_lineage = lineage.extended(target.as_str());
     if next_lineage.exceeds_depth(DEFAULT_MAX_WAKE_DEPTH) {
         return Err(format!(
             "Refusing async wake: chain depth would exceed {DEFAULT_MAX_WAKE_DEPTH}."
@@ -2568,7 +2582,7 @@ async fn tool_agent_send_async(
     }
 
     let envelope = WakeEnvelope {
-        target: target.to_string(),
+        target: target.clone(),
         sender: sender.to_string(),
         message: message.to_string(),
         lineage: next_lineage,
@@ -2585,10 +2599,12 @@ async fn tool_agent_send_async(
         .map_err(|e| format!("Failed to serialize wake envelope: {e}"))?;
 
     // Reserved title prefix marks this as a wake task so the kernel's
-    // wake-consumer claims it (and ordinary task_claim skips it).
+    // wake-consumer claims it (and ordinary task_claim skips it). Enqueue via
+    // the PRIVILEGED wake_post path — ordinary task_post rejects this prefix, so
+    // a forged wake cannot enter the queue through the generic task tool.
     let title = format!("{WAKE_TASK_PREFIX}{target}");
     let task_id = kh
-        .task_post(&title, message, Some(target), Some(sender), &payload)
+        .wake_post(&title, message, Some(&target), Some(sender), &payload)
         .await?;
 
     Ok(format!(

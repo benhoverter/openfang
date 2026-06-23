@@ -486,6 +486,49 @@ impl MemorySubstrate {
         created_by: Option<&str>,
         payload: &[u8],
     ) -> OpenFangResult<String> {
+        // SECURITY: the WAKE_TASK_PREFIX title namespace is reserved for the
+        // capability-gated agent_send_async producer (via `task_post_wake`).
+        // Reject it on the ordinary path so an agent holding only `task_post`
+        // cannot forge a wake row (forged sender/target/trigger) that the
+        // kernel wake-consumer would dispatch — which would bypass both the
+        // agent_send_async allowlist and the cycle/depth guards.
+        if title.starts_with(openfang_types::wake::WAKE_TASK_PREFIX) {
+            return Err(OpenFangError::InvalidInput(format!(
+                "task title prefix '{}' is reserved for agent_send_async",
+                openfang_types::wake::WAKE_TASK_PREFIX
+            )));
+        }
+        self.task_post_raw(title, description, assigned_to, created_by, payload)
+            .await
+    }
+
+    /// Privileged wake enqueue — the ONLY writer permitted to use the
+    /// `WAKE_TASK_PREFIX` title namespace. Reached only from the kernel's
+    /// `wake_post`, which the capability-gated `agent_send_async` producer
+    /// calls; it is not exposed as an agent tool. Ordinary `task_post` rejects
+    /// the prefix, so this is the sole trusted path into the wake queue.
+    pub async fn task_post_wake(
+        &self,
+        title: &str,
+        description: &str,
+        assigned_to: Option<&str>,
+        created_by: Option<&str>,
+        payload: &[u8],
+    ) -> OpenFangResult<String> {
+        self.task_post_raw(title, description, assigned_to, created_by, payload)
+            .await
+    }
+
+    /// Shared INSERT for both task_post paths. Imposes no title policy — the
+    /// public wrappers own that.
+    async fn task_post_raw(
+        &self,
+        title: &str,
+        description: &str,
+        assigned_to: Option<&str>,
+        created_by: Option<&str>,
+        payload: &[u8],
+    ) -> OpenFangResult<String> {
         let conn = Arc::clone(&self.conn);
         let title = title.to_string();
         let description = description.to_string();
@@ -579,33 +622,39 @@ impl MemorySubstrate {
     pub async fn claim_wake_for_dispatch(
         &self,
     ) -> OpenFangResult<Option<(String, openfang_types::wake::WakeEnvelope)>> {
-        let Some(task) = self.task_claim_wake().await? else {
-            return Ok(None);
-        };
-        let task_id = task
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let payload_b64 = task.get("payload").and_then(|v| v.as_str()).unwrap_or("");
-        let bytes = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = self
-                    .task_complete(&task_id, &format!("wake payload base64 decode failed: {e}"))
-                    .await;
-                return Ok(None);
-            }
-        };
-        match openfang_types::wake::WakeEnvelope::from_payload(&bytes) {
-            Ok(env) => Ok(Some((task_id, env))),
-            Err(e) => {
-                let _ = self
-                    .task_complete(&task_id, &format!("wake envelope parse failed: {e}"))
-                    .await;
-                Ok(None)
+        // Bound on poison rows skipped per call, so a flood of malformed wakes
+        // can't spin this method indefinitely before yielding.
+        const MAX_POISON_SKIPS: usize = 64;
+        for _ in 0..MAX_POISON_SKIPS {
+            let Some(task) = self.task_claim_wake().await? else {
+                return Ok(None); // queue genuinely empty
+            };
+            let task_id = task
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let payload_b64 = task.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+            let bytes = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = self
+                        .task_complete(&task_id, &format!("wake payload base64 decode failed: {e}"))
+                        .await;
+                    continue; // poison — skip and claim the next
+                }
+            };
+            match openfang_types::wake::WakeEnvelope::from_payload(&bytes) {
+                Ok(env) => return Ok(Some((task_id, env))),
+                Err(e) => {
+                    let _ = self
+                        .task_complete(&task_id, &format!("wake envelope parse failed: {e}"))
+                        .await;
+                    continue; // poison — skip and claim the next
+                }
             }
         }
+        Ok(None) // hit the skip cap this call; next tick resumes the drain
     }
 
     /// Claim the next pending **wake** task — the consumer half of
@@ -981,7 +1030,7 @@ mod tests {
 
         let title = format!("{WAKE_TASK_PREFIX}worker-b");
         substrate
-            .task_post(&title, &env.message, Some("worker-b"), Some("orchestrator"), &payload)
+            .task_post_wake(&title, &env.message, Some("worker-b"), Some("orchestrator"), &payload)
             .await
             .unwrap();
 
@@ -1015,7 +1064,7 @@ mod tests {
             .await
             .unwrap();
         substrate
-            .task_post(
+            .task_post_wake(
                 &format!("{WAKE_TASK_PREFIX}worker-b"),
                 &env.message,
                 Some("worker-b"),
@@ -1044,7 +1093,7 @@ mod tests {
         for target in ["worker-b", "worker-c"] {
             let env = sample_wake_envelope(target, "orchestrator");
             substrate
-                .task_post(
+                .task_post_wake(
                     &format!("{WAKE_TASK_PREFIX}{target}"),
                     &env.message,
                     Some(target),
@@ -1060,5 +1109,39 @@ mod tests {
         let second = substrate.task_claim_wake().await.unwrap().unwrap();
         assert_ne!(first["id"], second["id"]);
         assert!(substrate.task_claim_wake().await.unwrap().is_none());
+    }
+
+    /// SECURITY: ordinary task_post must REJECT the reserved wake title prefix,
+    /// so an agent holding only the generic task_post tool cannot forge a wake
+    /// the kernel consumer would dispatch. Only the privileged task_post_wake
+    /// may write the namespace.
+    #[tokio::test]
+    async fn test_ordinary_task_post_rejects_forged_wake() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let env = sample_wake_envelope("victim", "attacker");
+        let forged = substrate
+            .task_post(
+                &format!("{WAKE_TASK_PREFIX}victim"),
+                "forged",
+                Some("victim"),
+                Some("attacker"),
+                &env.to_payload().unwrap(),
+            )
+            .await;
+        assert!(forged.is_err(), "ordinary task_post must reject a wake-prefixed title");
+        // And nothing reached the wake queue.
+        assert!(substrate.task_claim_wake().await.unwrap().is_none());
+        // The privileged path still works.
+        assert!(substrate
+            .task_post_wake(
+                &format!("{WAKE_TASK_PREFIX}victim"),
+                "legit",
+                Some("victim"),
+                Some("orchestrator"),
+                &env.to_payload().unwrap(),
+            )
+            .await
+            .is_ok());
+        assert!(substrate.task_claim_wake().await.unwrap().is_some());
     }
 }

@@ -74,6 +74,26 @@ pub trait KernelHandle: Send + Sync {
         payload: &[u8],
     ) -> Result<String, String>;
 
+    /// Privileged enqueue for an `agent_send_async` wake. Distinct from
+    /// [`Self::task_post`] because the wake-queue title namespace
+    /// (`WAKE_TASK_PREFIX`) is a trust boundary: the kernel wake-consumer
+    /// dispatches anything in it, so it must be writable ONLY through the
+    /// capability-gated `agent_send_async` producer — never the ordinary
+    /// `task_post` tool. The real kernel overrides this to call the substrate's
+    /// privileged `task_post_wake`; the default delegates to `task_post` so
+    /// mock/test handles keep working.
+    async fn wake_post(
+        &self,
+        title: &str,
+        description: &str,
+        assigned_to: Option<&str>,
+        created_by: Option<&str>,
+        payload: &[u8],
+    ) -> Result<String, String> {
+        self.task_post(title, description, assigned_to, created_by, payload)
+            .await
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 
