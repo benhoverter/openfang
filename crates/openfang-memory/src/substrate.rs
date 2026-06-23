@@ -513,6 +513,11 @@ impl MemorySubstrate {
     pub async fn task_claim(&self, agent_id: &str) -> OpenFangResult<Option<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let agent_id = agent_id.to_string();
+        // Wake tasks (title prefixed WAKE_TASK_PREFIX) belong to the kernel
+        // wake-consumer, claimed via `task_claim_wake`. Exclude them here so an
+        // agent's ordinary task_claim can never pull a wake out from under the
+        // consumer (and a regular collaboration task is never run as a wake).
+        let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
 
         tokio::task::spawn_blocking(move || {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
@@ -521,11 +526,12 @@ impl MemorySubstrate {
                 "SELECT id, title, description, assigned_to, created_by, created_at, payload
                  FROM task_queue
                  WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
+                   AND title NOT LIKE ?2
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1"
             ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![agent_id], |row| {
+            let result = stmt.query_row(rusqlite::params![agent_id, wake_like], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -551,6 +557,76 @@ impl MemorySubstrate {
                         "description": description,
                         "status": "in_progress",
                         "assigned_to": if assigned.is_empty() { &agent_id } else { &assigned },
+                        "created_by": created_by,
+                        "created_at": created_at,
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
+                    })))
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(OpenFangError::Memory(e.to_string())),
+            }
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Claim the next pending **wake** task — the consumer half of
+    /// `agent_send_async`.
+    ///
+    /// The inverse filter of [`Self::task_claim`]: returns ONLY tasks whose
+    /// title bears `WAKE_TASK_PREFIX`. It is **assignee-agnostic** by design —
+    /// a single central kernel wake-consumer drains the wake queue and routes
+    /// each task by the `target` carried in its `WakeEnvelope` payload (resolved
+    /// name-or-UUID at dispatch), so the row's `assigned_to` string never has to
+    /// match a particular query form. The flip to `in_progress` leaves
+    /// `assigned_to` untouched (the producer already recorded the target there).
+    /// Ordinary agents never call this; their `task_claim` excludes wake titles.
+    /// Same JSON shape as `task_claim` — payload stays at column idx 6 under the
+    /// base64-STANDARD convention.
+    pub async fn task_claim_wake(&self) -> OpenFangResult<Option<serde_json::Value>> {
+        let conn = Arc::clone(&self.conn);
+        let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
+
+        tokio::task::spawn_blocking(move || {
+            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let mut stmt = db
+                .prepare(
+                    "SELECT id, title, description, assigned_to, created_by, created_at, payload
+                     FROM task_queue
+                     WHERE status = 'pending' AND title LIKE ?1
+                     ORDER BY priority DESC, created_at ASC
+                     LIMIT 1",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let result = stmt.query_row(rusqlite::params![wake_like], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                ))
+            });
+
+            match result {
+                Ok((id, title, description, assigned, created_by, created_at, payload)) => {
+                    // Flip to in_progress; do NOT touch assigned_to — the producer
+                    // already recorded the wake target there.
+                    db.execute(
+                        "UPDATE task_queue SET status = 'in_progress' WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
+                    .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+                    Ok(Some(serde_json::json!({
+                        "id": id,
+                        "title": title,
+                        "description": description,
+                        "status": "in_progress",
+                        "assigned_to": assigned,
                         "created_by": created_by,
                         "created_at": created_at,
                         "payload": base64::engine::general_purpose::STANDARD.encode(&payload),
@@ -838,5 +914,113 @@ mod tests {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let claimed = substrate.task_claim("nobody").await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    // --- agent_send_async wake-queue invariants ---------------------------
+
+    use openfang_types::turn::TurnTrigger;
+    use openfang_types::wake::{WakeEnvelope, WakeLineage, WAKE_TASK_PREFIX};
+
+    fn sample_wake_envelope(target: &str, sender: &str) -> WakeEnvelope {
+        WakeEnvelope {
+            target: target.to_string(),
+            sender: sender.to_string(),
+            message: "do the thing — with an em dash \u{2014} and bytes".to_string(),
+            lineage: WakeLineage::root_at(sender).extended(target),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+        }
+    }
+
+    /// EDIT 5: pin the payload column index on BOTH claim (idx 6) and list
+    /// (idx 9). A future column reorder that silently shifts either index would
+    /// corrupt every wake; this round-trip catches it at the source.
+    #[tokio::test]
+    async fn test_wake_payload_roundtrip_column_index() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let env = sample_wake_envelope("worker-b", "orchestrator");
+        let payload = env.to_payload().unwrap();
+
+        let title = format!("{WAKE_TASK_PREFIX}worker-b");
+        substrate
+            .task_post(&title, &env.message, Some("worker-b"), Some("orchestrator"), &payload)
+            .await
+            .unwrap();
+
+        // idx 9 on list: payload survives base64 round-trip and deserializes.
+        let listed = substrate.task_list(Some("pending")).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let listed_bytes = base64::engine::general_purpose::STANDARD
+            .decode(listed[0]["payload"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(WakeEnvelope::from_payload(&listed_bytes).unwrap(), env);
+
+        // idx 6 on claim: same payload, recovered via the wake-scoped claim.
+        let claimed = substrate.task_claim_wake().await.unwrap().unwrap();
+        let claimed_bytes = base64::engine::general_purpose::STANDARD
+            .decode(claimed["payload"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(WakeEnvelope::from_payload(&claimed_bytes).unwrap(), env);
+    }
+
+    /// The core steal-prevention invariant: an ordinary `task_claim` must NEVER
+    /// pull a wake task, and `task_claim_wake` must NEVER pull a regular task —
+    /// even when both are pending and assigned to the same agent.
+    #[tokio::test]
+    async fn test_wake_and_regular_queues_do_not_cross() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let env = sample_wake_envelope("worker-b", "orchestrator");
+
+        // A regular collaboration task AND a wake, both assigned to worker-b.
+        substrate
+            .task_post("Regular job", "do normal work", Some("worker-b"), Some("orchestrator"), b"")
+            .await
+            .unwrap();
+        substrate
+            .task_post(
+                &format!("{WAKE_TASK_PREFIX}worker-b"),
+                &env.message,
+                Some("worker-b"),
+                Some("orchestrator"),
+                &env.to_payload().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Ordinary claim gets the regular task, never the wake.
+        let regular = substrate.task_claim("worker-b").await.unwrap().unwrap();
+        assert_eq!(regular["title"], "Regular job");
+
+        // Wake claim gets the wake, never the regular task.
+        let wake = substrate.task_claim_wake().await.unwrap().unwrap();
+        // assigned_to is preserved (the producer's target), not overwritten.
+        assert_eq!(wake["assigned_to"], "worker-b");
+        assert_eq!(wake["title"], format!("{WAKE_TASK_PREFIX}worker-b"));
+    }
+
+    /// The central consumer drains the wake queue regardless of target, and
+    /// each claim flips exactly one wake to in_progress (no double-claim).
+    #[tokio::test]
+    async fn test_wake_claim_drains_central_queue() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        for target in ["worker-b", "worker-c"] {
+            let env = sample_wake_envelope(target, "orchestrator");
+            substrate
+                .task_post(
+                    &format!("{WAKE_TASK_PREFIX}{target}"),
+                    &env.message,
+                    Some(target),
+                    Some("orchestrator"),
+                    &env.to_payload().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Two distinct wakes drained in two claims; the third claim is empty.
+        let first = substrate.task_claim_wake().await.unwrap().unwrap();
+        let second = substrate.task_claim_wake().await.unwrap().unwrap();
+        assert_ne!(first["id"], second["id"]);
+        assert!(substrate.task_claim_wake().await.unwrap().is_none());
     }
 }
