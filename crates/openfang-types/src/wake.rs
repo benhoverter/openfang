@@ -28,6 +28,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::turn::TurnTrigger;
+
 /// Default maximum wake-chain depth before a wake is refused (ANAI security
 /// default). Enforced against [`WakeLineage::depth`] at the wake entrypoint.
 pub const DEFAULT_MAX_WAKE_DEPTH: usize = 5;
@@ -118,6 +120,53 @@ impl WakeLineage {
     }
 }
 
+/// The full payload carried in an `agent_send_async` wake task.
+///
+/// This is the structured wrapper that serializes into the task-queue payload
+/// BLOB (the opaque `payload: &[u8]` carrier at the `task_post` surface). The
+/// wake-consumer decodes it with [`WakeEnvelope::from_payload`], reconstructs
+/// the [`TurnTrigger`], and re-enters the kernel send funnel.
+///
+/// The `trigger` is carried as a typed [`TurnTrigger`] rather than a bare
+/// string: serde round-trips the enum in its `snake_case` form as part of the
+/// one JSON blob, so the consumer recovers the typed provenance directly — no
+/// separate label-to-variant parse, and therefore no second source of truth to
+/// drift from the enum definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeEnvelope {
+    /// Agent-id of the wake target (the agent whose loop will run).
+    pub target: String,
+    /// Agent-id of the sender dispatching this wake.
+    pub sender: String,
+    /// The message content delivered to `target`.
+    pub message: String,
+    /// Cross-agent call lineage — the single source of truth for cycle
+    /// detection (req 4), depth bound (req 9), and per-tree budget (req 10).
+    pub lineage: WakeLineage,
+    /// Provenance to stamp on the woken turn. For timer/reconciliation wakes
+    /// this is [`TurnTrigger::Cron`]; for genuine delegated peer content it is
+    /// [`TurnTrigger::AgentCall`]. Never [`TurnTrigger::Heartbeat`] — that would
+    /// make the woken turn eligible for the capture-drop predicate.
+    pub trigger: TurnTrigger,
+    /// Optional originating route (e.g. channel id) for replies/approval
+    /// prompts raised by the woken agent. `None` means a prompt raised mid-wake
+    /// has nowhere to route back — a documented latent gap, not an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl WakeEnvelope {
+    /// Serialize to the opaque payload BLOB stored at the `task_post` surface.
+    pub fn to_payload(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    /// Decode an envelope from a task payload BLOB.
+    pub fn from_payload(bytes: &[u8]) -> Result<Self, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +237,43 @@ mod tests {
         let json = serde_json::to_string(&chain).unwrap();
         let back: WakeLineage = serde_json::from_str(&json).unwrap();
         assert_eq!(chain, back);
+    }
+
+    #[test]
+    fn envelope_round_trips_through_payload() {
+        let env = WakeEnvelope {
+            target: "worker-b".into(),
+            sender: "orchestrator".into(),
+            message: "do the thing — with an em dash \u{2014} inside".into(),
+            lineage: WakeLineage::root_at("orchestrator").extended("worker-a"),
+            trigger: TurnTrigger::AgentCall,
+            origin: Some("channel:1086446153098342510".into()),
+        };
+        let payload = env.to_payload().unwrap();
+        let back = WakeEnvelope::from_payload(&payload).unwrap();
+        assert_eq!(env, back);
+        // typed trigger survives the round trip — no label-to-variant parse.
+        assert_eq!(back.trigger, TurnTrigger::AgentCall);
+        assert_eq!(back.lineage.root(), Some("orchestrator"));
+        assert_eq!(back.lineage.current(), Some("worker-a"));
+    }
+
+    #[test]
+    fn envelope_origin_is_optional_and_omitted_when_none() {
+        let env = WakeEnvelope {
+            target: "worker-b".into(),
+            sender: "orchestrator".into(),
+            message: "tick".into(),
+            lineage: WakeLineage::empty(),
+            trigger: TurnTrigger::Cron,
+            origin: None,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        // origin is skipped on the wire when absent...
+        assert!(!json.contains("origin"), "None origin must be omitted: {json}");
+        // ...and a payload with no origin field decodes back to None.
+        let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
+        assert_eq!(back.origin, None);
+        assert_eq!(back.trigger, TurnTrigger::Cron);
     }
 }
