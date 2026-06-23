@@ -1,0 +1,26 @@
+# file_convert recipe manifest
+#
+# Canonical location at runtime: <openfang_home>/convert/recipes.toml
+#   (openfang_home = $OPENFANG_HOME, else ~/.openfang)
+#
+# This file IS the compiled-in default table (embedded via include_str!). If no
+# manifest exists at the runtime location, these recipes are used, so a fresh
+# install can convert md -> pdf with no config. To extend or override, copy this
+# file to <openfang_home>/convert/recipes.toml and add [[recipe]] rows.
+#
+# A present-but-malformed manifest is a hard error (fail-closed) -- it is never
+# silently replaced by this default.
+#
+# Token substitution (performed at dispatch time, NOT by a shell):
+#   {script}  -> <openfang_home>/scripts
+#   {input}   -> sandbox-resolved absolute path of the input file
+#   {output}  -> sandbox-resolved absolute path of the output file
+# argv[0] is the program; the remaining entries are literal arguments. There is
+# no shell parsing, globbing, or word-splitting -- each array element is one argv.
+
+[[recipe]]
+from    = "md"
+to      = "pdf"
+argv    = ["{script}/build-pdf.sh", "{input}", "-o", "{output}"]
+needs   = ["pandoc", "typst"]
+out_ext = "pdf"

@@ -4,6 +4,7 @@
 //! calling the LLM, executing tool calls, and saving the conversation.
 
 use crate::auth_cooldown::{CooldownVerdict, ProviderCooldown};
+use crate::bridge_auth::TokenIssuer;
 use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, ContextBudget};
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
@@ -24,6 +25,7 @@ use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
+use openfang_types::turn::{should_capture_turn, TurnEffects, TurnTrigger};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -285,6 +287,27 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
     }
 }
 
+/// ANAI-77: build the episodic capture metadata for a completed turn,
+/// stamping the **shadow** would-drop verdict when the conservative predicate
+/// (ANAI-76) would drop this turn (an inert heartbeat). Observe-only: callers
+/// always `remember`; nothing is skipped. The real skip is deferred to
+/// ANAI-85, which reads `metadata["would_drop"]` fleet-wide to size the change.
+fn capture_metadata(
+    base: &HashMap<String, serde_json::Value>,
+    trigger: TurnTrigger,
+    effects: &TurnEffects,
+) -> HashMap<String, serde_json::Value> {
+    let mut meta = base.clone();
+    if should_capture_turn(trigger, effects).is_drop() {
+        meta.insert("would_drop".to_string(), serde_json::json!(true));
+        meta.insert(
+            "would_drop_reason".to_string(),
+            serde_json::json!("heartbeat_inert"),
+        );
+    }
+    meta
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -312,8 +335,30 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    // When true, the calling context treats the agent's final text response
+    // as the user-visible delivery (e.g. Discord/Telegram channel-reply path,
+    // where the bridge sends the reply text back to the originating channel
+    // without the agent needing to call `channel_send`).  In that case the
+    // `phantom_action_detected` guard must be suppressed: text-only replies
+    // containing words like "sent" or "channel" are legitimately the action,
+    // not a fabricated tool call.  Default `false` for cron, agent_send,
+    // API direct, and other callers where text alone is NOT delivery.
+    text_reply_is_delivery: bool,
+    trigger: TurnTrigger,
 ) -> OpenFangResult<AgentLoopResult> {
-    info!(agent = %manifest.name, "Starting agent loop");
+    info!(
+        agent = %manifest.name,
+        text_reply_is_delivery,
+        "Starting agent loop"
+    );
+
+    // ANAI-84: typed turn provenance, captured into episodic metadata at Exit B.
+    let trigger_meta: HashMap<String, serde_json::Value> = {
+        let mut m = HashMap::new();
+        m.insert("trigger".to_string(), serde_json::json!(trigger.as_str()));
+        m
+    };
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -502,6 +547,9 @@ pub async fn run_agent_loop(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // ANAI-77: turn-scoped side-effect summary, fed by observe_tool per
+    // executed tool; drives the shadow would-drop verdict at Exit B.
+    let mut turn_effects = TurnEffects::new();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
@@ -535,6 +583,15 @@ pub async fn run_agent_loop(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            caller_agent_id: Some(agent_id_str.clone()),
+            // Per-agent allowlist for the bridge subprocess: the names of
+            // every tool this agent is currently permitted to invoke,
+            // derived from the kernel-resolved `available_tools` (sourced
+            // from `agent.toml`'s `[capabilities]`/`[exec_policy]`).
+            // Subprocess drivers thread this into `OPENFANG_BRIDGE_ALLOWED`
+            // so the bridge's advertised surface matches the agent's
+            // permissions instead of falling back to the static default.
+            allowed_tools: Some(available_tools.iter().map(|t| t.name.clone()).collect()),
         };
 
         // Notify phase: Thinking
@@ -556,6 +613,7 @@ pub async fn run_agent_loop(
             Some(provider_name),
             None,
             &manifest.fallback_models,
+            kernel.as_ref().and_then(|k| k.token_issuer()),
         )
         .await?;
 
@@ -687,7 +745,15 @@ pub async fn run_agent_loop(
                 // channel action (send, post, email, etc.) but never actually
                 // called the corresponding tool, re-prompt once to force real
                 // tool usage instead of hallucinated completion.
-                let text = if !any_tools_executed
+                //
+                // Suppressed when `text_reply_is_delivery` is true: in
+                // channel-reply paths the bridge delivers the agent's text
+                // verbatim back to the originating channel, so phrases like
+                // "I sent the message" are factually true descriptions of
+                // what's about to happen, not a hallucinated tool call.
+                //
+                let text = if !text_reply_is_delivery
+                    && !any_tools_executed
                     && iteration == 0
                     && phantom_action_detected(&text)
                 {
@@ -724,6 +790,11 @@ pub async fn run_agent_loop(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
+                // ANAI-77 (observe-only): stamp the shadow would-drop verdict
+                // into the capture metadata. Nothing is skipped here — ANAI-85
+                // will consume metadata["would_drop"] to gate real drops.
+                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
@@ -738,7 +809,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    capture_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -751,7 +822,7 @@ pub async fn run_agent_loop(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    capture_meta.clone(),
                                 )
                                 .await;
                         }
@@ -763,7 +834,7 @@ pub async fn run_agent_loop(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            HashMap::new(),
+                            capture_meta.clone(),
                         )
                         .await;
                 }
@@ -922,6 +993,7 @@ pub async fn run_agent_loop(
 
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
+                    let effective_file_policy = manifest.file_policy.as_ref();
 
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
@@ -945,9 +1017,11 @@ pub async fn run_agent_loop(
                         workspace_root,
                         media_engine,
                         effective_exec_policy,
+                        effective_file_policy,
                         tts_engine,
                         docker_config,
                         process_manager,
+                        origin,
                     );
                     let result = match timeout_opt {
                         Some(timeout) => {
@@ -1001,6 +1075,11 @@ pub async fn run_agent_loop(
                         content: final_content,
                         is_error: result.is_error,
                     });
+
+                    // ANAI-77: record the executed tool's side-effect class so an
+                    // inert heartbeat is recognizable at Exit B. Conservative:
+                    // unknown tools count as side-effecting (keep-bias).
+                    turn_effects.observe_tool(&tool_call.name);
                 }
 
                 append_tool_error_guidance(&mut tool_result_blocks);
@@ -1158,6 +1237,7 @@ async fn call_with_retry(
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
     fallback_models: &[FallbackModel],
+    token_issuer: Option<Arc<dyn TokenIssuer>>,
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1268,19 +1348,25 @@ async fn call_with_retry(
                             skip_permissions: true,
                             subprocess_timeout_secs: None,
                         };
-                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
-                            Ok(d) => d,
-                            Err(driver_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %driver_err,
-                                    "Failed to create fallback driver, skipping"
-                                );
-                                continue;
-                            }
-                        };
+                        // Fallback driver inherits the daemon's bridge
+                        // `TokenIssuer` (plumbed in from the caller via the
+                        // `token_issuer` arg, which the agent loop sources
+                        // from `KernelHandle::token_issuer()`) so these
+                        // sessions stay on the hardened bridge auth path.
+                        let fb_driver =
+                            match crate::drivers::create_driver(&fb_config, token_issuer.clone()) {
+                                Ok(d) => d,
+                                Err(driver_err) => {
+                                    warn!(
+                                        fallback_index = fb_idx,
+                                        provider = %fb.provider,
+                                        model = %fb.model,
+                                        error = %driver_err,
+                                        "Failed to create fallback driver, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
                         let mut fb_request = request.clone();
                         fb_request.model = fb.model.clone();
                         warn!(
@@ -1343,6 +1429,7 @@ async fn stream_with_retry(
     provider: Option<&str>,
     cooldown: Option<&ProviderCooldown>,
     fallback_models: &[FallbackModel],
+    token_issuer: Option<Arc<dyn TokenIssuer>>,
 ) -> OpenFangResult<crate::llm_driver::CompletionResponse> {
     // Check circuit breaker before calling
     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1452,19 +1539,25 @@ async fn stream_with_retry(
                             skip_permissions: true,
                             subprocess_timeout_secs: None,
                         };
-                        let fb_driver = match crate::drivers::create_driver(&fb_config) {
-                            Ok(d) => d,
-                            Err(driver_err) => {
-                                warn!(
-                                    fallback_index = fb_idx,
-                                    provider = %fb.provider,
-                                    model = %fb.model,
-                                    error = %driver_err,
-                                    "Failed to create fallback stream driver, skipping"
-                                );
-                                continue;
-                            }
-                        };
+                        // Fallback driver inherits the daemon's bridge
+                        // `TokenIssuer` (plumbed in from the caller via the
+                        // `token_issuer` arg, which the agent loop sources
+                        // from `KernelHandle::token_issuer()`) so these
+                        // sessions stay on the hardened bridge auth path.
+                        let fb_driver =
+                            match crate::drivers::create_driver(&fb_config, token_issuer.clone()) {
+                                Ok(d) => d,
+                                Err(driver_err) => {
+                                    warn!(
+                                        fallback_index = fb_idx,
+                                        provider = %fb.provider,
+                                        model = %fb.model,
+                                        error = %driver_err,
+                                        "Failed to create fallback stream driver, skipping"
+                                    );
+                                    continue;
+                                }
+                            };
                         let mut fb_request = request.clone();
                         fb_request.model = fb.model.clone();
                         warn!(
@@ -1540,8 +1633,17 @@ pub async fn run_agent_loop_streaming(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    trigger: TurnTrigger,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
+
+    // ANAI-84: typed turn provenance, captured into episodic metadata at Exit B.
+    let trigger_meta: HashMap<String, serde_json::Value> = {
+        let mut m = HashMap::new();
+        m.insert("trigger".to_string(), serde_json::json!(trigger.as_str()));
+        m
+    };
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
     let hand_allowed_env: Vec<String> = manifest
@@ -1721,6 +1823,9 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    // ANAI-77: turn-scoped side-effect summary, fed by observe_tool per
+    // executed tool; drives the shadow would-drop verdict at Exit B.
+    let mut turn_effects = TurnEffects::new();
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
@@ -1772,6 +1877,15 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            caller_agent_id: Some(agent_id_str.clone()),
+            // Per-agent allowlist for the bridge subprocess: the names of
+            // every tool this agent is currently permitted to invoke,
+            // derived from the kernel-resolved `available_tools` (sourced
+            // from `agent.toml`'s `[capabilities]`/`[exec_policy]`).
+            // Subprocess drivers thread this into `OPENFANG_BRIDGE_ALLOWED`
+            // so the bridge's advertised surface matches the agent's
+            // permissions instead of falling back to the static default.
+            allowed_tools: Some(available_tools.iter().map(|t| t.name.clone()).collect()),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -1800,6 +1914,7 @@ pub async fn run_agent_loop_streaming(
             Some(provider_name),
             None,
             &manifest.fallback_models,
+            kernel.as_ref().and_then(|k| k.token_issuer()),
         )
         .await?;
 
@@ -1940,6 +2055,11 @@ pub async fn run_agent_loop_streaming(
                     .await
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
+                // ANAI-77 (observe-only): stamp the shadow would-drop verdict
+                // into the capture metadata. Nothing is skipped here — ANAI-85
+                // will consume metadata["would_drop"] to gate real drops.
+                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
                     "User asked: {}\nI responded: {}",
@@ -1954,7 +2074,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    capture_meta.clone(),
                                     Some(&vec),
                                 )
                                 .await;
@@ -1967,7 +2087,7 @@ pub async fn run_agent_loop_streaming(
                                     &interaction_text,
                                     MemorySource::Conversation,
                                     "episodic",
-                                    HashMap::new(),
+                                    capture_meta.clone(),
                                 )
                                 .await;
                         }
@@ -1979,7 +2099,7 @@ pub async fn run_agent_loop_streaming(
                             &interaction_text,
                             MemorySource::Conversation,
                             "episodic",
-                            HashMap::new(),
+                            capture_meta.clone(),
                         )
                         .await;
                 }
@@ -2131,6 +2251,7 @@ pub async fn run_agent_loop_streaming(
 
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
+                    let effective_file_policy = manifest.file_policy.as_ref();
 
                     // Timeout-wrapped execution. `tool_timeout_for` returns None
                     // when the operator disabled the timeout (issue #1125).
@@ -2154,9 +2275,11 @@ pub async fn run_agent_loop_streaming(
                         workspace_root,
                         media_engine,
                         effective_exec_policy,
+                        effective_file_policy,
                         tts_engine,
                         docker_config,
                         process_manager,
+                        origin,
                     );
                     let result = match timeout_opt {
                         Some(timeout) => {
@@ -2225,6 +2348,11 @@ pub async fn run_agent_loop_streaming(
                         content: final_content,
                         is_error: result.is_error,
                     });
+
+                    // ANAI-77: record the executed tool's side-effect class so an
+                    // inert heartbeat is recognizable at Exit B. Conservative:
+                    // unknown tools count as side-effecting (keep-bias).
+                    turn_effects.observe_tool(&tool_call.name);
                 }
 
                 append_tool_error_guidance(&mut tool_result_blocks);
@@ -3602,6 +3730,7 @@ mod tests {
         ContentBlock::Image {
             media_type: "image/png".to_string(),
             data: "aGVsbG8=".to_string(),
+            source_url: None,
         }
     }
 
@@ -3821,6 +3950,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -3874,6 +4006,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -3929,6 +4064,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -3982,6 +4120,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete without error");
@@ -4028,6 +4169,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -4152,6 +4295,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should recover via retry");
@@ -4199,6 +4345,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Loop should complete with fallback");
@@ -4254,6 +4403,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -5230,6 +5381,9 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Agent loop should complete");
@@ -5300,6 +5454,9 @@ mod tests {
             None,
             None,
             None,
+            None, // origin
+            false,
+            TurnTrigger::User,
         )
         .await
         .expect("Agent loop should recover nested XML tool calls");
@@ -5372,6 +5529,9 @@ mod tests {
             None,
             None,
             None, // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
         )
         .await
         .expect("Normal loop should complete");
@@ -5435,6 +5595,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // origin
+            TurnTrigger::User,
         )
         .await
         .expect("Streaming loop should complete");
@@ -5489,5 +5651,161 @@ mod tests {
         assert!(!is_silent_token("Hello, how can I help?"));
         assert!(!is_silent_token("SILENT"));
         assert!(!is_silent_token(""));
+    }
+
+    // === phantom_action_detected gating by text_reply_is_delivery ===
+
+    /// Mock driver that, on iteration 0, returns phantom-action-shaped text
+    /// (matches `phantom_action_detected`) with no tool calls.  On iteration 1
+    /// (only reached if the phantom guard re-prompts) it returns a distinct
+    /// marker text so callers can tell whether a re-prompt occurred.
+    struct PhantomShapedDriver {
+        call_count: AtomicU32,
+    }
+
+    impl PhantomShapedDriver {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for PhantomShapedDriver {
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+            let text = if call == 0 {
+                // Matches phantom_action_detected: action verb + channel ref,
+                // and is exactly the legitimate "text-IS-delivery" shape we
+                // want to stop misfiring on in channel-reply contexts.
+                "I sent the message to the channel."
+            } else {
+                "REPROMPTED-FALLBACK"
+            };
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                },
+            })
+        }
+    }
+
+    /// When `text_reply_is_delivery == false` (cron / agent_send / API direct),
+    /// the phantom-action guard must still re-prompt on phantom-shaped text.
+    #[tokio::test]
+    async fn phantom_guard_fires_when_text_reply_is_delivery_false() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(PhantomShapedDriver::new());
+
+        let result = run_agent_loop(
+            &manifest,
+            "Send a message to #system-code",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None, // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            result.response.trim(),
+            "REPROMPTED-FALLBACK",
+            "phantom guard must re-prompt when text_reply_is_delivery=false; got {:?}",
+            result.response
+        );
+    }
+
+    /// When `text_reply_is_delivery == true` (Discord/Telegram channel-reply
+    /// path), the same phantom-shaped text is the legitimate delivery and
+    /// must pass through unmodified — the guard is suppressed.  This is the
+    /// behavior change this patch introduces.
+    #[tokio::test]
+    async fn phantom_guard_suppressed_when_text_reply_is_delivery_true() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(PhantomShapedDriver::new());
+
+        let result = run_agent_loop(
+            &manifest,
+            "Send a message to #system-code",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+            None, // origin
+            true, // text_reply_is_delivery — suppress phantom guard
+            TurnTrigger::User,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            result.response.trim(),
+            "I sent the message to the channel.",
+            "phantom guard must be suppressed when text_reply_is_delivery=true; got {:?}",
+            result.response
+        );
     }
 }
