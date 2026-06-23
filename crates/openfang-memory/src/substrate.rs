@@ -570,6 +570,44 @@ impl MemorySubstrate {
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Claim the next pending wake and hand the kernel consumer a ready-to-use
+    /// `(task_id, WakeEnvelope)` — base64 decode and envelope parsing stay
+    /// inside this crate (which already owns the payload contract), so the
+    /// kernel needs no base64 dependency. A claimed task whose payload fails to
+    /// decode is marked completed with an error result (so it is not re-claimed
+    /// forever) and `None` is returned, letting the consumer poll on.
+    pub async fn claim_wake_for_dispatch(
+        &self,
+    ) -> OpenFangResult<Option<(String, openfang_types::wake::WakeEnvelope)>> {
+        let Some(task) = self.task_claim_wake().await? else {
+            return Ok(None);
+        };
+        let task_id = task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let payload_b64 = task.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = self
+                    .task_complete(&task_id, &format!("wake payload base64 decode failed: {e}"))
+                    .await;
+                return Ok(None);
+            }
+        };
+        match openfang_types::wake::WakeEnvelope::from_payload(&bytes) {
+            Ok(env) => Ok(Some((task_id, env))),
+            Err(e) => {
+                let _ = self
+                    .task_complete(&task_id, &format!("wake envelope parse failed: {e}"))
+                    .await;
+                Ok(None)
+            }
+        }
+    }
+
     /// Claim the next pending **wake** task — the consumer half of
     /// `agent_send_async`.
     ///

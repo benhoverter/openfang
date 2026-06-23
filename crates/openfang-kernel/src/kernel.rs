@@ -4868,6 +4868,10 @@ impl OpenFangKernel {
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
 
+        // Start the agent_send_async wake-consumer: drains queued wakes and
+        // re-enters the send funnel for each target on its own task.
+        self.start_wake_consumer();
+
         // Start OFP peer node if network is enabled
         if self.config.network_enabled && !self.config.network.shared_secret.is_empty() {
             let kernel = Arc::clone(self);
@@ -5221,6 +5225,116 @@ impl OpenFangKernel {
     ///
     /// Periodically checks all running agents' last_active timestamps and
     /// publishes `HealthCheckFailed` events for unresponsive agents.
+    /// Start the background wake-consumer for `agent_send_async`.
+    ///
+    /// A single central poller drains the wake queue (tasks whose title bears
+    /// `WAKE_TASK_PREFIX`). For each claimed wake it spawns a **detached**
+    /// dispatch task that re-enters the kernel send funnel for the envelope's
+    /// target. The consumer therefore holds NO agent lock across a dispatch and
+    /// never head-of-line blocks behind a long-running woken loop — the very
+    /// blocking `agent_send_async` exists to eliminate. Lifecycle mirrors
+    /// [`Self::start_heartbeat_monitor`]: interval tick, exits on shutdown.
+    fn start_wake_consumer(self: &Arc<Self>) {
+        /// Cap on wakes drained per tick, so a flood can't starve the shutdown
+        /// check at the top of the loop.
+        const MAX_WAKES_PER_TICK: usize = 32;
+
+        let kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            // Poll faster than heartbeat — a queued wake should feel responsive.
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                if kernel.supervisor.is_shutting_down() {
+                    info!("Wake-consumer stopping (shutdown)");
+                    break;
+                }
+                // Drain currently-pending wakes this tick (bounded).
+                for _ in 0..MAX_WAKES_PER_TICK {
+                    match kernel.memory.claim_wake_for_dispatch().await {
+                        Ok(Some((task_id, envelope))) => {
+                            let k = Arc::clone(&kernel);
+                            tokio::spawn(async move {
+                                k.run_woken_agent_loop(task_id, envelope).await;
+                            });
+                        }
+                        Ok(None) => break, // queue drained for now
+                        Err(e) => {
+                            warn!(error = %e, "Wake-consumer claim failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        info!("Wake-consumer started (interval: 500ms)");
+    }
+
+    /// Dispatch one claimed wake: resolve the target (UUID then name, mirroring
+    /// [`Self::send_to_agent`]), re-enter the send funnel with the envelope's
+    /// reconstructed `TurnTrigger`, then mark the task complete. Runs on its own
+    /// task and holds no agent lock at entry, so the kernel-sink re-entry cannot
+    /// re-form the synchronous path's A->B->A deadlock.
+    async fn run_woken_agent_loop(
+        self: Arc<Self>,
+        task_id: String,
+        envelope: openfang_types::wake::WakeEnvelope,
+    ) {
+        let target_id: AgentId = match envelope.target.parse() {
+            Ok(id) => id,
+            Err(_) => match self.registry.find_by_name(&envelope.target) {
+                Some(e) => e.id,
+                None => {
+                    warn!(target = %envelope.target, "Wake target not found; dropping wake");
+                    let _ = self
+                        .memory
+                        .task_complete(
+                            &task_id,
+                            &format!("wake target not found: {}", envelope.target),
+                        )
+                        .await;
+                    return;
+                }
+            },
+        };
+
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+
+        // origin threading (audit finding #3) is a documented follow-up: a wake
+        // that raises an approval prompt has no inbound route yet, so pass None.
+        let result = self
+            .send_message_with_handle_and_blocks(
+                target_id,
+                &envelope.message,
+                handle,
+                None,
+                Some(envelope.sender.clone()),
+                None,
+                None,
+                false,
+                envelope.trigger.clone(),
+            )
+            .await;
+
+        match result {
+            Ok(_) => {
+                let _ = self.memory.task_complete(&task_id, "wake dispatched").await;
+            }
+            Err(e) => {
+                warn!(target = %envelope.target, error = %e, "Woken agent loop failed");
+                let _ = self
+                    .memory
+                    .task_complete(&task_id, &format!("wake dispatch failed: {e}"))
+                    .await;
+            }
+        }
+    }
+
     fn start_heartbeat_monitor(self: &Arc<Self>) {
         use crate::heartbeat::{
             check_agents, is_quiet_hours, should_exempt_idle_reactive_agent, HeartbeatConfig,
