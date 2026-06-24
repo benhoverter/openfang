@@ -2521,6 +2521,56 @@ async fn tool_agent_send(
 
 /// Queue an asynchronous wake for another agent (fire-and-forget).
 ///
+/// ---
+///
+/// Crude cross-tree wake-emission backstop (ANAI-100, v1 / review option 3).
+///
+/// In v1 the inbound wake lineage is NOT threaded into the producer's tool
+/// context, so [`WakeLineage`] is re-rooted at the sender every hop: the
+/// per-tree budget (req 10) and the cross-hop cycle/depth bounds (reqs 4/9)
+/// cannot be enforced from the chain alone. Until lineage threading lands
+/// (v2), this process-global sliding-window counter caps the *aggregate*
+/// wake-emission rate across ALL trees, so a self-sustaining `A -> B -> A`
+/// ring can only amplify load up to a fixed ceiling per window instead of
+/// unboundedly. It is deliberately coarse — a ceiling, not a per-tree
+/// accountant — and clears on its own once emissions go quiet.
+const WAKE_EMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const WAKE_EMIT_MAX: usize = 120;
+
+/// Record-and-test the wake-emission window. Returns `true` if the wake is
+/// admitted (and stamps it into the window), `false` if the trailing window is
+/// already at capacity — in which case the caller must refuse the wake.
+fn wake_emit_admit() -> bool {
+    use std::collections::VecDeque;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static WINDOW: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+    let slot = WINDOW.get_or_init(|| Mutex::new(VecDeque::new()));
+    let now = Instant::now();
+    // Recover rather than propagate: a poisoned lock means a prior caller
+    // panicked mid-update; the queue itself is still a valid bound to enforce.
+    let mut q = match slot.lock() {
+        Ok(q) => q,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Evict timestamps that have aged out of the trailing window.
+    while let Some(&front) = q.front() {
+        if now.duration_since(front) >= WAKE_EMIT_WINDOW {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    if q.len() >= WAKE_EMIT_MAX {
+        return false;
+    }
+    q.push_back(now);
+    true
+}
+
+/// (continued) Queue an asynchronous wake for another agent (fire-and-forget).
+///
 /// Unlike [`tool_agent_send`], this does **not** block on the target's loop. It
 /// frames a [`WakeEnvelope`](openfang_types::wake::WakeEnvelope) — target,
 /// sender, message, lineage, typed `TurnTrigger` — into the task-queue payload
@@ -2578,6 +2628,20 @@ async fn tool_agent_send_async(
     if next_lineage.exceeds_depth(DEFAULT_MAX_WAKE_DEPTH) {
         return Err(format!(
             "Refusing async wake: chain depth would exceed {DEFAULT_MAX_WAKE_DEPTH}."
+        ));
+    }
+
+    // Crude cross-tree backstop (v1): the cycle/depth checks above only catch
+    // self-wake and single-hop because lineage is re-rooted at the sender each
+    // hop. Until lineage threading lands (v2), cap the aggregate wake-emission
+    // rate so a runaway A -> B -> A ring self-limits instead of amplifying
+    // load without bound. See `wake_emit_admit`.
+    if !wake_emit_admit() {
+        return Err(format!(
+            "Refusing async wake: wake-emission budget exceeded \
+             ({WAKE_EMIT_MAX} wakes / {}s window). A runaway wake ring trips this \
+             crude cross-tree backstop; it clears once emissions go quiet.",
+            WAKE_EMIT_WINDOW.as_secs()
         ));
     }
 
@@ -4645,6 +4709,21 @@ async fn tool_skill_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_emit_admit_ceiling_trips_then_holds() {
+        // The first WAKE_EMIT_MAX emissions in a single window are admitted;
+        // the next is refused. All calls land inside the trailing window, so
+        // none age out — this exercises the ceiling, not eviction. (Uses the
+        // process-global window; no other code path calls `wake_emit_admit`.)
+        for i in 0..WAKE_EMIT_MAX {
+            assert!(wake_emit_admit(), "emission {i} should be admitted");
+        }
+        assert!(
+            !wake_emit_admit(),
+            "emission past the ceiling must be refused"
+        );
+    }
 
     #[test]
     fn extract_cache_binary_basic() {

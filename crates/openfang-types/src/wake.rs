@@ -23,6 +23,28 @@
 //!   (`created_by` is fresh each wake), so N-per-hop silently chains to N^k
 //!   "legal" wakes. Keying the budget on [`WakeLineage::root`] defeats that.
 //!
+//! ## v1 enforcement status (ANAI-100) — READ THIS
+//!
+//! The three properties above are the *design intent*. In v1 they are **not
+//! yet enforced cross-hop**: the inbound wake lineage is not threaded into the
+//! producer's tool context (see `tool_agent_send_async` in
+//! openfang-runtime/src/tool_runner.rs), so the chain is re-rooted at the
+//! sender on every hop. Consequence:
+//!
+//! * **req 4 (cycle):** enforced for **self-wake only** (`A -> A`). A multi-hop
+//!   ring `A -> B -> A` is *not* caught — each hop sees a fresh depth-1 chain.
+//! * **req 9 (depth):** enforced **single-hop only**; depth resets to 1 each
+//!   hop, so the bound never trips across agents.
+//! * **req 10 (per-tree budget):** **not implemented.** [`WakeLineage::root`]
+//!   has no production caller in v1. In the interim, a crude process-global
+//!   wake-emission ceiling in the producer (`wake_emit_admit`) bounds the
+//!   aggregate amplification of a runaway ring across all trees.
+//!
+//! Full cross-hop enforcement is deferred to v2 and requires threading the
+//! inbound lineage into the woken agent's turn/tool context. Until then, do
+//! **not** rely on reqs 4/9/10 holding across agents — only self-wake and
+//! single-hop are sound.
+//!
 //! The chain is ordered **root -> ... -> current**: `agents[0]` began the chain
 //! and the last element is the agent that emitted the current wake.
 
@@ -152,8 +174,11 @@ pub struct WakeEnvelope {
     pub sender: String,
     /// The message content delivered to `target`.
     pub message: String,
-    /// Cross-agent call lineage — the single source of truth for cycle
-    /// detection (req 4), depth bound (req 9), and per-tree budget (req 10).
+    /// Cross-agent call lineage. *Intended* to be the single source of truth
+    /// for cycle detection (req 4), depth bound (req 9), and per-tree budget
+    /// (req 10) — but see the module-level "v1 enforcement status" note: in v1
+    /// the chain is re-rooted at the sender each hop, so these hold only for
+    /// self-wake / single-hop. Full cross-hop enforcement is deferred to v2.
     pub lineage: WakeLineage,
     /// Provenance to stamp on the woken turn. For timer/reconciliation wakes
     /// this is [`TurnTrigger::Cron`]; for genuine delegated peer content it is
