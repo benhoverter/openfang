@@ -40,9 +40,11 @@
 use crate::bridge_auth::BridgeAuthority;
 use openfang_kernel::OpenFangKernel;
 use openfang_mcp_bridge::protocol::{
-    codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, PROTOCOL_VERSION,
+    codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
+    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     SOCKET_RELATIVE_PATH,
 };
+use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
 use openfang_types::bridge_auth::Token;
 use std::path::{Path, PathBuf};
@@ -322,40 +324,60 @@ async fn handle_connection(
             Err(e) => return Err(e),
         };
 
-        let call = match frame {
-            Frame::Call(c) => c,
+        match frame {
+            Frame::Call(call) => {
+                info!(
+                    request_id = call.request_id,
+                    tool = %call.tool_name,
+                    agent = %call.agent_id,
+                    "bridge IPC: dispatching call"
+                );
+
+                let result = dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await;
+                let result_kind = match &result {
+                    CallResult::Ok {
+                        is_error: false, ..
+                    } => "ok",
+                    CallResult::Ok { is_error: true, .. } => "tool_error",
+                    CallResult::Error { .. } => "dispatch_error",
+                };
+                info!(
+                    request_id = call.request_id,
+                    tool = %call.tool_name,
+                    outcome = result_kind,
+                    "bridge IPC: call complete"
+                );
+                let response = Frame::Response(CallResponse {
+                    request_id: call.request_id,
+                    result,
+                });
+                codec::write_frame(&mut write_half, &response).await?;
+            }
+            Frame::ListUpstream(req) => {
+                info!(
+                    request_id = req.request_id,
+                    "bridge IPC: dispatching list_upstream"
+                );
+                let response =
+                    handle_list_upstream(&req, &kernel, identity.agent_id.as_ref()).await;
+                let outcome = match &response.result {
+                    UpstreamListResult::Ok { tools } => {
+                        format!("ok({} tools)", tools.len())
+                    }
+                    UpstreamListResult::Error { .. } => "error".to_string(),
+                };
+                info!(
+                    request_id = response.request_id,
+                    outcome = %outcome,
+                    "bridge IPC: list_upstream complete"
+                );
+                codec::write_frame(&mut write_half, &Frame::UpstreamList(response)).await?;
+            }
             other => {
                 warn!(?other, "bridge IPC: unexpected frame in request loop");
                 continue;
             }
-        };
-
-        info!(
-            request_id = call.request_id,
-            tool = %call.tool_name,
-            agent = %call.agent_id,
-            "bridge IPC: dispatching call"
-        );
-
-        let result = dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await;
-        let result_kind = match &result {
-            CallResult::Ok {
-                is_error: false, ..
-            } => "ok",
-            CallResult::Ok { is_error: true, .. } => "tool_error",
-            CallResult::Error { .. } => "dispatch_error",
-        };
-        info!(
-            request_id = call.request_id,
-            tool = %call.tool_name,
-            outcome = result_kind,
-            "bridge IPC: call complete"
-        );
-        let response = Frame::Response(CallResponse {
-            request_id: call.request_id,
-            result,
-        });
-        codec::write_frame(&mut write_half, &response).await?;
+        }
     }
 }
 
@@ -378,6 +400,16 @@ async fn dispatch_call(
     kernel: &Arc<OpenFangKernel>,
     authenticated_agent_id: Option<&AgentId>,
 ) -> CallResult {
+    // --- Early branch: upstream MCP tool (mcp_*) ---------------------------
+    // Upstream MCP tools are not in `ALLOWED_TOOLS` and have a separate
+    // dispatch path: per-agent server allowlist (agent.toml `mcp_servers`,
+    // default-deny on empty), hardened-token lane only, and direct dispatch
+    // into `kernel.mcp_connections` rather than `execute_tool`. See
+    // `dispatch_upstream_mcp_call` for the gates.
+    if is_mcp_tool(&call.tool_name) {
+        return dispatch_upstream_mcp_call(call, kernel, authenticated_agent_id).await;
+    }
+
     // --- Gate 1: static bridge-surface allowlist ----------------------------
     // The hard ceiling on what the bridge will ever dispatch. Independent of
     // any agent's per-agent surface; an unknown tool never reaches identity
@@ -586,6 +618,320 @@ async fn dispatch_call(
     CallResult::Ok {
         content: result.content,
         is_error: result.is_error,
+    }
+}
+
+/// Dispatch an upstream MCP tool call (`mcp_{server}_{tool}`) over the
+/// kernel's `mcp_connections` registry.
+///
+/// Distinct from [`dispatch_call`]'s built-in tool path:
+///
+/// - **Hardened-token lane only.** Refuses the legacy
+///   self-claimed-`agent_id` lane. Upstream MCP servers can carry
+///   secrets (OAuth tokens, page contents, Linear issue bodies) and
+///   the legacy lane has no daemon-issued identity to authorize
+///   against — fail closed. The hardened lane is the only entry to
+///   this surface for v1.
+///
+/// - **Per-agent server allowlist with default-deny.** Reads
+///   `entry.manifest.mcp_servers` from the registry and rejects any
+///   tool whose server prefix is not on the list. **Empty list means
+///   no servers allowed** for the bridge path — this is a deliberate
+///   semantic departure from the in-process MCP path
+///   (`tool_runner.rs`), which historically treated `[]` as
+///   "all servers". v1 ships the new semantic for the bridge only;
+///   convergence is tracked as follow-up. See design doc §5.4.
+///
+/// - **Direct dispatch into `kernel.mcp_connections`.** Bypasses
+///   `execute_tool` entirely; the runtime's MCP routing already does
+///   what we need, and routing through `execute_tool` would require
+///   adding every namespaced tool to its allowlist parameter.
+///
+/// Truncation: results larger than the response frame budget are
+/// returned with `is_error=true` and an explicit truncation marker
+/// rather than silently dropped. Per design doc §6 mitigation table.
+async fn dispatch_upstream_mcp_call(
+    call: &CallRequest,
+    kernel: &Arc<OpenFangKernel>,
+    authenticated_agent_id: Option<&AgentId>,
+) -> CallResult {
+    // Refuse the legacy lane outright. Upstream MCP forwarding is
+    // hardened-path-only in v1.
+    let authed = match authenticated_agent_id {
+        Some(a) => a,
+        None => {
+            warn!(
+                request_id = call.request_id,
+                tool = %call.tool_name,
+                claimed = %call.agent_id,
+                "bridge IPC: refusing upstream MCP call on legacy token lane"
+            );
+            return CallResult::Error {
+                message: "upstream MCP tools require a daemon-issued (hex) auth token;                           legacy lane refused"
+                    .to_string(),
+            };
+        }
+    };
+
+    let resolved_agent_id = *authed;
+    let resolved_agent_id_string = resolved_agent_id.to_string();
+
+    // Log a mismatch but trust the authenticated identity, consistent
+    // with the built-in path in `dispatch_call`.
+    if resolved_agent_id_string != call.agent_id {
+        warn!(
+            request_id = call.request_id,
+            tool = %call.tool_name,
+            claimed = %call.agent_id,
+            authenticated = %resolved_agent_id_string,
+            "bridge IPC (upstream MCP): claimed agent_id disagrees with authenticated identity;              using authenticated identity"
+        );
+    }
+
+    let entry = match kernel.registry.get(resolved_agent_id) {
+        Some(e) => e,
+        None => {
+            warn!(
+                request_id = call.request_id,
+                tool = %call.tool_name,
+                agent = %resolved_agent_id_string,
+                "bridge IPC (upstream MCP): no registry entry for resolved agent"
+            );
+            return CallResult::Error {
+                message: format!(
+                    "agent '{resolved_agent_id_string}' has no registry entry;                      refusing upstream MCP call"
+                ),
+            };
+        }
+    };
+
+    // Default-deny: empty `mcp_servers` → no upstream tools allowed.
+    // This is the bridge-path semantic; the in-process path's
+    // `[] = all` convention is left undisturbed for now (see design
+    // doc §5.4).
+    if entry.manifest.mcp_servers.is_empty() {
+        warn!(
+            request_id = call.request_id,
+            tool = %call.tool_name,
+            agent = %resolved_agent_id_string,
+            "bridge IPC (upstream MCP): agent has no mcp_servers allowlist; refusing"
+        );
+        return CallResult::Error {
+            message: format!(
+                "agent '{resolved_agent_id_string}' has no MCP servers allowlisted                  (set `mcp_servers` in agent.toml)"
+            ),
+        };
+    }
+
+    // Match the tool's server prefix against the allowlist. Use the
+    // `from_known` helper so server names containing hyphens
+    // (normalized to underscores in tool names) match correctly.
+    let allowlist: Vec<&str> = entry
+        .manifest
+        .mcp_servers
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let server_name = match extract_mcp_server_from_known(&call.tool_name, &allowlist) {
+        Some(name) => name.to_string(),
+        None => {
+            warn!(
+                request_id = call.request_id,
+                tool = %call.tool_name,
+                agent = %resolved_agent_id_string,
+                allowlist = ?entry.manifest.mcp_servers,
+                "bridge IPC (upstream MCP): tool's server prefix not in agent allowlist"
+            );
+            return CallResult::Error {
+                message: format!(
+                    "upstream MCP tool '{}' is not allowlisted for agent '{}'                      (allowed servers: {:?})",
+                    call.tool_name, resolved_agent_id_string, entry.manifest.mcp_servers
+                ),
+            };
+        }
+    };
+
+    // Dispatch into the kernel's MCP registry. Hold the lock just
+    // long enough to issue the call; rmcp's `call_tool` awaits a
+    // network round-trip, so this *does* serialize concurrent calls
+    // against the same connection set. That matches the in-process
+    // path in `tool_runner.rs` and is acceptable for v1 — Linear /
+    // Notion calls are not hot-path. Revisit when latency complaints
+    // arrive.
+    let result_text = {
+        let mut conns = kernel.mcp_connections.lock().await;
+        let conn = conns.iter_mut().find(|c| c.name() == server_name);
+        let conn = match conn {
+            Some(c) => c,
+            None => {
+                warn!(
+                    request_id = call.request_id,
+                    tool = %call.tool_name,
+                    agent = %resolved_agent_id_string,
+                    server = %server_name,
+                    "bridge IPC (upstream MCP): server allowlisted but not connected"
+                );
+                return CallResult::Error {
+                    message: format!(
+                        "MCP server '{server_name}' is allowlisted for agent                          '{resolved_agent_id_string}' but not currently connected"
+                    ),
+                };
+            }
+        };
+        conn.call_tool(&call.tool_name, &call.args).await
+    };
+
+    match result_text {
+        Ok(content) => {
+            // Truncation: keep the framed response well under
+            // MAX_FRAME_BYTES so the JSON envelope (request_id,
+            // result tag, is_error, escapes) fits comfortably.
+            // Margin is conservative on purpose.
+            const CONTENT_BUDGET: usize = MAX_FRAME_BYTES.saturating_sub(16 * 1024);
+            if content.len() > CONTENT_BUDGET {
+                warn!(
+                    request_id = call.request_id,
+                    tool = %call.tool_name,
+                    agent = %resolved_agent_id_string,
+                    bytes = content.len(),
+                    budget = CONTENT_BUDGET,
+                    "bridge IPC (upstream MCP): truncating oversized result"
+                );
+                // UTF-8 invariant: each `char` encodes to ≤ 4 bytes, so
+                // `chars().take(N)` produces a `String` of ≤ 4N bytes.
+                // Taking `CONTENT_BUDGET / 4` chars therefore yields a
+                // string of ≤ CONTENT_BUDGET bytes, fitting the frame.
+                let mut truncated: String = content.chars().take(CONTENT_BUDGET / 4).collect();
+                truncated.push_str(
+                    "
+
+[openfang: upstream MCP result truncated —                      exceeded bridge frame budget]",
+                );
+                CallResult::Ok {
+                    content: truncated,
+                    is_error: true,
+                }
+            } else {
+                CallResult::Ok {
+                    content,
+                    is_error: false,
+                }
+            }
+        }
+        Err(e) => {
+            // Distinguish runtime tool errors from dispatch failures
+            // the same way the built-in path does: a tool that ran
+            // and reported error is `Ok { is_error: true }`; we
+            // can't easily tell the difference from rmcp's surface
+            // here, so we surface as `Ok { is_error: true }` to let
+            // the model see the message rather than killing the
+            // call frame.
+            warn!(
+                request_id = call.request_id,
+                tool = %call.tool_name,
+                agent = %resolved_agent_id_string,
+                error = %e,
+                "bridge IPC (upstream MCP): tool call failed"
+            );
+            CallResult::Ok {
+                content: format!("upstream MCP tool call failed: {e}"),
+                is_error: true,
+            }
+        }
+    }
+}
+
+/// Handle a `ListUpstream` request: enumerate the upstream MCP tools the
+/// authenticated agent is allowed to invoke.
+///
+/// Same security model as [`dispatch_upstream_mcp_call`]:
+/// - Hardened-token lane only.
+/// - Per-agent `mcp_servers` allowlist with default-deny.
+/// - Empty allowlist → empty tool list (not an error; the bridge will
+///   simply advertise no upstream tools to Claude Code).
+async fn handle_list_upstream(
+    req: &ListUpstreamRequest,
+    kernel: &Arc<OpenFangKernel>,
+    authenticated_agent_id: Option<&AgentId>,
+) -> UpstreamListResponse {
+    let authed = match authenticated_agent_id {
+        Some(a) => a,
+        None => {
+            warn!(
+                request_id = req.request_id,
+                "bridge IPC: refusing list_upstream on legacy token lane"
+            );
+            return UpstreamListResponse {
+                request_id: req.request_id,
+                result: UpstreamListResult::Error {
+                    message: "upstream MCP listing requires a daemon-issued (hex) auth token;                               legacy lane refused"
+                        .to_string(),
+                },
+            };
+        }
+    };
+
+    let resolved_agent_id = *authed;
+    let resolved_agent_id_string = resolved_agent_id.to_string();
+
+    let entry = match kernel.registry.get(resolved_agent_id) {
+        Some(e) => e,
+        None => {
+            warn!(
+                request_id = req.request_id,
+                agent = %resolved_agent_id_string,
+                "bridge IPC: list_upstream — no registry entry for resolved agent"
+            );
+            return UpstreamListResponse {
+                request_id: req.request_id,
+                result: UpstreamListResult::Error {
+                    message: format!("agent '{resolved_agent_id_string}' has no registry entry"),
+                },
+            };
+        }
+    };
+
+    // Empty allowlist → empty list (advertise nothing). This is the
+    // natural representation of `mcp_servers = []` with the new
+    // default-deny semantic.
+    if entry.manifest.mcp_servers.is_empty() {
+        return UpstreamListResponse {
+            request_id: req.request_id,
+            result: UpstreamListResult::Ok { tools: Vec::new() },
+        };
+    }
+
+    let allowlist: std::collections::HashSet<&str> = entry
+        .manifest
+        .mcp_servers
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    let conns = kernel.mcp_connections.lock().await;
+    let mut tools: Vec<UpstreamToolDef> = Vec::new();
+    for conn in conns.iter() {
+        let server_name = conn.name();
+        if !allowlist.contains(server_name) {
+            continue;
+        }
+        for tool in conn.tools() {
+            tools.push(UpstreamToolDef {
+                name: tool.name.clone(),
+                server: server_name.to_string(),
+                description: if tool.description.is_empty() {
+                    None
+                } else {
+                    Some(tool.description.clone())
+                },
+                input_schema: tool.input_schema.clone(),
+            });
+        }
+    }
+
+    UpstreamListResponse {
+        request_id: req.request_id,
+        result: UpstreamListResult::Ok { tools },
     }
 }
 
@@ -809,37 +1155,216 @@ mod tests {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
-            let call = match frame {
-                Frame::Call(c) => c,
+            match frame {
+                Frame::Call(call) => {
+                    // Mirror production allowlist + mcp_* early-branch logic.
+                    let result = if openfang_runtime::mcp::is_mcp_tool(&call.tool_name) {
+                        // Twin can't reach real mcp_connections; canned
+                        // upstream-style ok lets list+invoke round-trip in tests.
+                        CallResult::Ok {
+                            content: format!(
+                                "[test-twin canned upstream ok for {}]",
+                                call.tool_name
+                            ),
+                            is_error: false,
+                        }
+                    } else if !ALLOWED_TOOLS.iter().any(|t| *t == call.tool_name) {
+                        CallResult::Error {
+                            message: format!(
+                                "tool '{}' not in bridge allowlist (permitted: {:?})",
+                                call.tool_name, ALLOWED_TOOLS
+                            ),
+                        }
+                    } else {
+                        // Canned Ok stand-in for `execute_tool` — kernel-free tests
+                        // can't exercise the real dispatch path.
+                        CallResult::Ok {
+                            content: format!("[test-twin canned ok for {}]", call.tool_name),
+                            is_error: false,
+                        }
+                    };
+
+                    codec::write_frame(
+                        &mut write_half,
+                        &Frame::Response(CallResponse {
+                            request_id: call.request_id,
+                            result,
+                        }),
+                    )
+                    .await?;
+                }
+                Frame::ListUpstream(req) => {
+                    // Canned upstream-tools list. Real handler walks
+                    // `kernel.mcp_connections`; twin returns a fixed
+                    // shape so wire round-trip can be exercised.
+                    let response = UpstreamListResponse {
+                        request_id: req.request_id,
+                        result: UpstreamListResult::Ok {
+                            tools: vec![UpstreamToolDef {
+                                name: "mcp_twinsrv_ping".to_string(),
+                                server: "twinsrv".to_string(),
+                                description: Some("canned twin tool".to_string()),
+                                input_schema: serde_json::json!({"type": "object"}),
+                            }],
+                        },
+                    };
+                    codec::write_frame(&mut write_half, &Frame::UpstreamList(response)).await?;
+                }
                 _ => continue,
-            };
-
-            // Mirror production allowlist logic.
-            let result = if !ALLOWED_TOOLS.iter().any(|t| *t == call.tool_name) {
-                CallResult::Error {
-                    message: format!(
-                        "tool '{}' not in bridge allowlist (permitted: {:?})",
-                        call.tool_name, ALLOWED_TOOLS
-                    ),
-                }
-            } else {
-                // Canned Ok stand-in for `execute_tool` — kernel-free tests
-                // can't exercise the real dispatch path.
-                CallResult::Ok {
-                    content: format!("[test-twin canned ok for {}]", call.tool_name),
-                    is_error: false,
-                }
-            };
-
-            codec::write_frame(
-                &mut write_half,
-                &Frame::Response(CallResponse {
-                    request_id: call.request_id,
-                    result,
-                }),
-            )
-            .await?;
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn ipc_list_upstream_roundtrip() {
+        // End-to-end: handshake, send ListUpstream, expect UpstreamList
+        // response with the twin's canned tool. Locks the wire shape of
+        // the new variants and ensures the request loop dispatches them
+        // alongside CallRequest without breaking the existing path.
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let authority = BridgeAuthority::new();
+        let agent_id = AgentId::new();
+        let guard = authority.issue(agent_id);
+        let presented_token = guard.token().to_hex();
+
+        let server_authority = authority.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_test_twin(stream, server_authority)
+                .await
+                .unwrap();
+        });
+
+        let mut client = ClientStream::connect(&sock).await.unwrap();
+        let (cr, mut cw) = client.split();
+        let mut cr = BufReader::new(cr);
+
+        let hello = Frame::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            token: presented_token,
+            bridge_version: "test".into(),
+        });
+        codec::write_frame(&mut cw, &hello).await.unwrap();
+        match codec::read_frame(&mut cr).await.unwrap() {
+            Frame::HelloAck(HelloAck::Ok { .. }) => {}
+            other => panic!("expected HelloAck::Ok, got {other:?}"),
+        }
+
+        codec::write_frame(
+            &mut cw,
+            &Frame::ListUpstream(ListUpstreamRequest { request_id: 42 }),
+        )
+        .await
+        .unwrap();
+        match codec::read_frame(&mut cr).await.unwrap() {
+            Frame::UpstreamList(UpstreamListResponse {
+                request_id: 42,
+                result: UpstreamListResult::Ok { tools },
+            }) => {
+                assert_eq!(tools.len(), 1, "twin advertises one canned tool");
+                assert_eq!(tools[0].name, "mcp_twinsrv_ping");
+                assert_eq!(tools[0].server, "twinsrv");
+            }
+            other => panic!("unexpected response to ListUpstream: {other:?}"),
+        }
+
+        // Confirm the request loop still handles a Call after a
+        // ListUpstream (no state corruption between message kinds).
+        codec::write_frame(
+            &mut cw,
+            &Frame::Call(CallRequest {
+                request_id: 43,
+                agent_id: agent_id.to_string(),
+                tool_name: "file_read".into(),
+                args: serde_json::json!({"path": "x"}),
+            }),
+        )
+        .await
+        .unwrap();
+        match codec::read_frame(&mut cr).await.unwrap() {
+            Frame::Response(CallResponse {
+                request_id: 43,
+                result: CallResult::Ok {
+                    is_error: false, ..
+                },
+            }) => {}
+            other => panic!("unexpected response after ListUpstream: {other:?}"),
+        }
+
+        drop(client);
+        server.await.unwrap();
+        drop(guard);
+        assert_eq!(authority.live_spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_mcp_call_through_twin_returns_canned_ok() {
+        // The twin's mcp_* branch returns a canned ok rather than the
+        // allowlist error, exercising the production early-branch shape:
+        // mcp_* tools bypass the static ALLOWED_TOOLS gate.
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("bridge.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let authority = BridgeAuthority::new();
+        let agent_id = AgentId::new();
+        let guard = authority.issue(agent_id);
+        let presented_token = guard.token().to_hex();
+
+        let server_authority = authority.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection_test_twin(stream, server_authority)
+                .await
+                .unwrap();
+        });
+
+        let mut client = ClientStream::connect(&sock).await.unwrap();
+        let (cr, mut cw) = client.split();
+        let mut cr = BufReader::new(cr);
+
+        let hello = Frame::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            token: presented_token,
+            bridge_version: "test".into(),
+        });
+        codec::write_frame(&mut cw, &hello).await.unwrap();
+        match codec::read_frame(&mut cr).await.unwrap() {
+            Frame::HelloAck(HelloAck::Ok { .. }) => {}
+            other => panic!("expected HelloAck::Ok, got {other:?}"),
+        }
+
+        codec::write_frame(
+            &mut cw,
+            &Frame::Call(CallRequest {
+                request_id: 7,
+                agent_id: agent_id.to_string(),
+                tool_name: "mcp_linear_getteams".into(),
+                args: serde_json::json!({}),
+            }),
+        )
+        .await
+        .unwrap();
+        match codec::read_frame(&mut cr).await.unwrap() {
+            Frame::Response(CallResponse {
+                request_id: 7,
+                result:
+                    CallResult::Ok {
+                        content,
+                        is_error: false,
+                    },
+            }) => {
+                assert!(content.contains("mcp_linear_getteams"));
+            }
+            other => panic!("unexpected response to mcp_* call: {other:?}"),
+        }
+
+        drop(client);
+        server.await.unwrap();
+        drop(guard);
     }
 
     #[test]
@@ -1146,5 +1671,46 @@ mod tests {
             identity.token_fingerprint.is_none(),
             "legacy path has no fingerprint"
         );
+    }
+
+    /// Drift detection: `RESERVED_BUILTIN_NAMES` (the collision-check list
+    /// used at MCP discovery in `openfang-runtime`) MUST equal
+    /// `ALLOWED_TOOLS` (this crate). If a new built-in tool is added to
+    /// `ALLOWED_TOOLS` and `built_in_tools()` but the reservation list
+    /// drifts, an upstream MCP server could shadow the new built-in.
+    ///
+    /// Owner contract: any addition to `ALLOWED_TOOLS` must also be added
+    /// to `openfang_runtime::mcp::RESERVED_BUILTIN_NAMES`.
+    #[test]
+    fn reserved_builtin_names_matches_allowed_tools() {
+        use openfang_runtime::mcp::RESERVED_BUILTIN_NAMES;
+        use std::collections::BTreeSet;
+        let allowed: BTreeSet<&str> = ALLOWED_TOOLS.iter().copied().collect();
+        let reserved: BTreeSet<&str> = RESERVED_BUILTIN_NAMES.iter().copied().collect();
+        assert_eq!(
+            allowed, reserved,
+            "drift: openfang_runtime::mcp::RESERVED_BUILTIN_NAMES ≠ ALLOWED_TOOLS. \
+            Built-ins added to ALLOWED_TOOLS must also be added to \
+            RESERVED_BUILTIN_NAMES so upstream MCP servers cannot shadow them."
+        );
+    }
+    /// Drift catcher: no built-in tool may use the `mcp_` prefix.
+    ///
+    /// The dispatch gate `is_mcp_tool(name) = name.starts_with("mcp_")`
+    /// in `openfang_runtime::mcp` short-circuits BEFORE the static
+    /// `ALLOWED_TOOLS` check at the top of `dispatch_tool_call`. If a
+    /// future built-in were named `mcp_*`, calls to it would route to
+    /// `dispatch_upstream_mcp_call` instead of the built-in's real
+    /// handler. Structurally impossible today; this test locks the
+    /// invariant so a future addition doesn't silently subvert dispatch.
+    #[test]
+    fn no_builtin_uses_mcp_prefix() {
+        for name in ALLOWED_TOOLS {
+            assert!(
+                !name.starts_with("mcp_"),
+                "built-in '{name}' uses 'mcp_' prefix; conflicts with \
+                 is_mcp_tool dispatch gate in openfang_runtime::mcp"
+            );
+        }
     }
 }

@@ -109,6 +109,65 @@ pub enum CallResult {
     Error { message: String },
 }
 
+/// Bridge → daemon: request the list of upstream MCP tools the calling
+/// agent is permitted to invoke.
+///
+/// Sent once per session, immediately after a successful [`Hello`]/[`HelloAck::Ok`]
+/// handshake. The daemon answers with [`UpstreamListResponse`].
+///
+/// Identity is taken from the authenticated [`Hello::token`] (resolved
+/// server-side to an `agent_id`); the bridge does not name the agent in
+/// this frame. Per-agent gating is enforced server-side against the
+/// agent's `agent.toml mcp_servers` allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListUpstreamRequest {
+    /// Caller-assigned correlation id. Daemon echoes in
+    /// [`UpstreamListResponse::request_id`].
+    pub request_id: u64,
+}
+
+/// One forwarded upstream MCP tool, as advertised to the bridge.
+///
+/// The `name` is already namespaced (`mcp_{server}_{tool}`) by the daemon
+/// at MCP-discovery time; the bridge surfaces this name verbatim in its
+/// own `tools/list` and routes invocations of the same name back across
+/// the IPC.
+///
+/// `input_schema` is the upstream server's JSON Schema for the tool, passed
+/// through opaquely — the daemon does not validate it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamToolDef {
+    /// Already-namespaced tool name (e.g. `mcp_linear_getteams`).
+    pub name: String,
+    /// Logical server name from `config.toml` (e.g. `linear`). Used by
+    /// the bridge for grouping/debug; not parsed from `name` on receive.
+    pub server: String,
+    /// Human-readable description, forwarded from the upstream MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Opaque JSON Schema for the tool's input. Forwarded verbatim.
+    pub input_schema: serde_json::Value,
+}
+
+/// Daemon → bridge: response to [`ListUpstreamRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamListResponse {
+    pub request_id: u64,
+    pub result: UpstreamListResult,
+}
+
+/// Outcome of an upstream tool-list dispatch.
+///
+/// `Error` is reserved for protocol-layer failures (agent identity not
+/// resolvable, registry unavailable). An agent that simply has no upstream
+/// servers configured receives `Ok { tools: vec![] }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpstreamListResult {
+    Ok { tools: Vec<UpstreamToolDef> },
+    Error { message: String },
+}
+
 /// Top-level frame type, for connections that may carry multiple message kinds.
 ///
 /// At present we only multiplex Hello/HelloAck on connection start and
@@ -122,6 +181,15 @@ pub enum Frame {
     HelloAck(HelloAck),
     Call(CallRequest),
     Response(CallResponse),
+    /// Bridge → daemon: request the per-agent upstream MCP tool list.
+    ///
+    /// Added in protocol v1 as a non-breaking variant; older builds that
+    /// predate this variant reject the frame as an unknown tag and close
+    /// the connection. Daemon and bridge ship from the same workspace,
+    /// so version skew here would indicate a build-system error.
+    ListUpstream(ListUpstreamRequest),
+    /// Daemon → bridge: response to [`Frame::ListUpstream`].
+    UpstreamList(UpstreamListResponse),
 }
 
 #[cfg(feature = "ipc-codec")]
@@ -220,5 +288,120 @@ mod tests {
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains("rejected"));
         assert!(s.contains("bad token"));
+    }
+
+    #[test]
+    fn frame_roundtrip_list_upstream_request() {
+        let frame = Frame::ListUpstream(ListUpstreamRequest { request_id: 99 });
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("list_upstream"));
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        match back {
+            Frame::ListUpstream(r) => assert_eq!(r.request_id, 99),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip_upstream_list_ok() {
+        let frame = Frame::UpstreamList(UpstreamListResponse {
+            request_id: 99,
+            result: UpstreamListResult::Ok {
+                tools: vec![UpstreamToolDef {
+                    name: "mcp_linear_getteams".into(),
+                    server: "linear".into(),
+                    description: Some("List Linear teams".into()),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                }],
+            },
+        });
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("upstream_list"));
+        assert!(json.contains("mcp_linear_getteams"));
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        match back {
+            Frame::UpstreamList(r) => {
+                assert_eq!(r.request_id, 99);
+                match r.result {
+                    UpstreamListResult::Ok { tools } => {
+                        assert_eq!(tools.len(), 1);
+                        assert_eq!(tools[0].server, "linear");
+                    }
+                    _ => panic!("wrong result variant"),
+                }
+            }
+            _ => panic!("wrong frame variant"),
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip_upstream_list_empty() {
+        // Agent with no upstream MCP servers configured receives an empty
+        // Ok list, not an Error. Guards against the bridge treating
+        // "no servers" as a fatal handshake failure.
+        let frame = Frame::UpstreamList(UpstreamListResponse {
+            request_id: 1,
+            result: UpstreamListResult::Ok { tools: vec![] },
+        });
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        if let Frame::UpstreamList(r) = back {
+            match r.result {
+                UpstreamListResult::Ok { tools } => assert!(tools.is_empty()),
+                _ => panic!("wrong result variant"),
+            }
+        } else {
+            panic!("wrong frame variant");
+        }
+    }
+
+    #[test]
+    fn frame_roundtrip_upstream_list_error() {
+        let frame = Frame::UpstreamList(UpstreamListResponse {
+            request_id: 7,
+            result: UpstreamListResult::Error {
+                message: "agent identity not resolvable".into(),
+            },
+        });
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("error"));
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        if let Frame::UpstreamList(r) = back {
+            match r.result {
+                UpstreamListResult::Error { message } => {
+                    assert!(message.contains("not resolvable"));
+                }
+                _ => panic!("wrong result variant"),
+            }
+        } else {
+            panic!("wrong frame variant");
+        }
+    }
+
+    #[test]
+    fn upstream_tool_def_omits_none_description() {
+        let def = UpstreamToolDef {
+            name: "mcp_notion_search".into(),
+            server: "notion".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        // skip_serializing_if drops the field entirely when None.
+        assert!(!json.contains("description"));
+        // And it round-trips back as None.
+        let back: UpstreamToolDef = serde_json::from_str(&json).unwrap();
+        assert!(back.description.is_none());
+    }
+
+    #[test]
+    fn frame_unknown_variant_is_rejected_cleanly() {
+        // Forward-compat guard: a frame with an unknown `type` tag must
+        // produce a serde error, not a panic. The IPC reader maps this
+        // to an io::Error and closes the connection — but the test here
+        // is just that decode fails without unwinding.
+        let json = r#"{"type":"future_kind","payload":{}}"#;
+        let result: Result<Frame, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "expected decode failure on unknown tag");
     }
 }
