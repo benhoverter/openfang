@@ -208,8 +208,8 @@ impl SemanticStore {
 
         // Build SQL: fetch candidates (broader than limit for vector re-ranking)
         let fetch_limit = if query_embedding.is_some() {
-            // Fetch more candidates for vector search re-ranking
-            (limit * 10).max(100)
+            // Candidate window for in-process vector re-ranking. Floor raised from 100 to 5000 [ANAI-60] so large agent corpora (e.g. orchestrator ~1k) are fully re-ranked, not just the 100 most-recently-accessed rows.
+            (limit * 10).max(5000)
         } else {
             limit
         };
