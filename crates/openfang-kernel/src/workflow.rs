@@ -399,6 +399,20 @@ impl WorkflowEngine {
                         Ok(Ok(result)) => return Ok(Some(result)),
                         Ok(Err(e)) => {
                             last_err = e.to_string();
+                            // Provider stall (ANAI-109) is terminal: retrying the
+                            // step just re-issues against the same stalled
+                            // provider. Stop now and surface the failure instead
+                            // of burning the remaining retries on a guaranteed
+                            // re-stall. (Other errors retry as before.)
+                            if last_err
+                                .contains(openfang_types::watchdog::PROVIDER_STALL_MARKER)
+                            {
+                                warn!(
+                                    "Step '{}' hit a provider stall; not retrying (terminal)",
+                                    step.name
+                                );
+                                break;
+                            }
                             if attempt < *max_retries {
                                 warn!(
                                     "Step '{}' attempt {} failed: {e}, retrying",
@@ -1203,6 +1217,51 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "finally worked");
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_error_mode_retry_provider_stall_is_terminal() {
+        // ANAI-109: a provider stall must NOT be retried even under
+        // ErrorMode::Retry — re-running just re-issues against the same stalled
+        // provider. Expect exactly one call and a failed run.
+        let engine = WorkflowEngine::new();
+        let wf = Workflow {
+            id: WorkflowId::new(),
+            name: "stall-test".to_string(),
+            description: "".to_string(),
+            steps: vec![WorkflowStep {
+                name: "stalls".to_string(),
+                agent: StepAgent::ByName {
+                    name: "a".to_string(),
+                },
+                prompt_template: "{{input}}".to_string(),
+                mode: StepMode::Sequential,
+                timeout_secs: 10,
+                error_mode: ErrorMode::Retry { max_retries: 2 },
+                output_var: None,
+            }],
+            created_at: Utc::now(),
+        };
+        let wf_id = engine.register(wf).await;
+        let run_id = engine.create_run(wf_id, "data".to_string()).await.unwrap();
+
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let sender = move |_id: AgentId, _msg: String| {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(format!(
+                    "{}: no response within 600s",
+                    openfang_types::watchdog::PROVIDER_STALL_MARKER
+                ))
+            }
+        };
+
+        let result = engine.execute_run(run_id, mock_resolver, sender).await;
+        assert!(result.is_err(), "provider stall should fail the run");
+        // Exactly one attempt — the gate broke out before burning retries.
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -1590,6 +1590,30 @@ default_timeout_secs = 300
 |-------|---------|-------------|
 | `default_timeout_secs` | `180` | Seconds of inactivity before marking an agent as unresponsive. Per-agent `heartbeat_interval_secs` in autonomous config overrides this. |
 
+### Turn Watchdog
+
+Global turn-watchdog ceilings in `[watchdog]`. These bound how long a single
+LLM call or MCP tool call may run before the runtime aborts it — distinct from
+the heartbeat monitor, which only *detects* inactivity and never kills a turn.
+
+```toml
+[watchdog]
+# Ceiling for a single LLM complete/stream call before the turn watchdog
+# aborts it as a provider stall. A single completion should land well inside
+# a few minutes; raise it only for slow local inference (e.g. vLLM on old GPUs).
+# Clamped up to a 30s floor. Default: 240
+llm_call_timeout_secs = 240
+# Ceiling for a single MCP tool call. Remote SSE transports (mcp-remote) can
+# wedge differently than local tools, so they get their own knob. 0 = unbounded.
+# Default: 120
+mcp_tool_timeout_secs = 120
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `llm_call_timeout_secs` | `240` | Seconds a single LLM `complete`/`stream` call may run before the turn watchdog aborts it as a provider stall. Clamped up to a 30s floor. Env override: `OPENFANG_LLM_CALL_TIMEOUT_SECS`. Always on — no disable path. |
+| `mcp_tool_timeout_secs` | `120` | Seconds a single MCP tool call may run before the per-tool timeout aborts it. `0` disables the bound. Env override: `OPENFANG_MCP_TIMEOUT_SECS`. |
+
 ### Autonomous Guardrails (per-agent manifest)
 
 Configured in agent manifests via `AutonomousConfig`:

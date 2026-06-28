@@ -74,6 +74,11 @@ fn tool_timeout_for(tool_name: &str) -> Option<Duration> {
         "agent_send" | "agent_spawn" => {
             env_timeout_secs("OPENFANG_AGENT_TOOL_TIMEOUT_SECS").unwrap_or(AGENT_TOOL_TIMEOUT_SECS)
         }
+        // MCP tools (esp. remote SSE) get their own ceiling, distinct from the
+        // generic tool default. Resolver layers env > [watchdog] config > default.
+        name if crate::mcp::is_mcp_tool(name) => {
+            openfang_types::watchdog::mcp_tool_timeout_secs()
+        }
         _ => env_timeout_secs("OPENFANG_TOOL_TIMEOUT_SECS").unwrap_or(TOOL_TIMEOUT_SECS),
     };
     if secs == 0 {
@@ -1261,7 +1266,35 @@ async fn call_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
-        match driver.complete(request.clone()).await {
+        // Turn watchdog (ANAI-109): bound a single completion call so a hung
+        // provider socket can't stall the turn forever while holding the
+        // per-agent message lock. On elapse this is a *provider stall* —
+        // re-issuing against the same endpoint would just re-stall — so we
+        // return a terminal `Err` that rides the `?` at the call site straight
+        // out of the loop. We never self-inject a tool error and re-infer.
+        let call_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
+            driver.complete(request.clone()),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                    cooldown.record_failure(provider, false);
+                }
+                warn!(
+                    timeout_secs = openfang_types::watchdog::llm_call_timeout_secs(),
+                    "LLM completion exceeded watchdog ceiling; aborting turn (provider stall)"
+                );
+                return Err(OpenFangError::LlmDriver(format!(
+                    "{}: no response within {}s",
+                    openfang_types::watchdog::PROVIDER_STALL_MARKER,
+                    openfang_types::watchdog::llm_call_timeout_secs()
+                )));
+            }
+        };
+        match call_result {
             Ok(response) => {
                 // Record success with circuit breaker
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -1376,8 +1409,18 @@ async fn call_with_retry(
                             model = %fb.model,
                             "Trying fallback model"
                         );
-                        match fb_driver.complete(fb_request).await {
-                            Ok(response) => {
+                        // Watchdog also bounds fallback calls (ANAI-109). A
+                        // stall here is non-terminal: warn and try the next
+                        // fallback, matching the existing continue-on-error path.
+                        let fb_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(
+                                openfang_types::watchdog::llm_call_timeout_secs(),
+                            ),
+                            fb_driver.complete(fb_request),
+                        )
+                        .await;
+                        match fb_result {
+                            Ok(Ok(response)) => {
                                 info!(
                                     fallback_index = fb_idx,
                                     provider = %fb.provider,
@@ -1386,13 +1429,23 @@ async fn call_with_retry(
                                 );
                                 return Ok(response);
                             }
-                            Err(fb_err) => {
+                            Ok(Err(fb_err)) => {
                                 warn!(
                                     fallback_index = fb_idx,
                                     provider = %fb.provider,
                                     model = %fb.model,
                                     error = %fb_err,
                                     "Fallback model failed"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    timeout_secs =
+                                        openfang_types::watchdog::llm_call_timeout_secs(),
+                                    "Fallback model timed out (watchdog), trying next"
                                 );
                             }
                         }
@@ -1456,7 +1509,34 @@ async fn stream_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
-        match driver.stream(request.clone(), tx.clone()).await {
+        // Turn watchdog (ANAI-109): see `call_with_retry`. A total-duration
+        // ceiling on the whole stream future — coarse but it closes the
+        // "hangs forever holding the lock" hole for the streaming path too.
+        // (A finer per-chunk inactivity watchdog inside the driver SSE loop is
+        // the planned cut-2 refinement.) Terminal on elapse: provider stall.
+        let stream_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
+            driver.stream(request.clone(), tx.clone()),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                    cooldown.record_failure(provider, false);
+                }
+                warn!(
+                    timeout_secs = openfang_types::watchdog::llm_call_timeout_secs(),
+                    "LLM stream exceeded watchdog ceiling; aborting turn (provider stall)"
+                );
+                return Err(OpenFangError::LlmDriver(format!(
+                    "{}: no response within {}s",
+                    openfang_types::watchdog::PROVIDER_STALL_MARKER,
+                    openfang_types::watchdog::llm_call_timeout_secs()
+                )));
+            }
+        };
+        match stream_result {
             Ok(response) => {
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                     cooldown.record_success(provider);
@@ -1567,8 +1647,18 @@ async fn stream_with_retry(
                             model = %fb.model,
                             "Trying fallback model (stream)"
                         );
-                        match fb_driver.stream(fb_request, tx.clone()).await {
-                            Ok(response) => {
+                        // Watchdog also bounds fallback calls (ANAI-109). A
+                        // stall here is non-terminal: warn and try the next
+                        // fallback, matching the existing continue-on-error path.
+                        let fb_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(
+                                openfang_types::watchdog::llm_call_timeout_secs(),
+                            ),
+                            fb_driver.stream(fb_request, tx.clone()),
+                        )
+                        .await;
+                        match fb_result {
+                            Ok(Ok(response)) => {
                                 info!(
                                     fallback_index = fb_idx,
                                     provider = %fb.provider,
@@ -1577,13 +1667,23 @@ async fn stream_with_retry(
                                 );
                                 return Ok(response);
                             }
-                            Err(fb_err) => {
+                            Ok(Err(fb_err)) => {
                                 warn!(
                                     fallback_index = fb_idx,
                                     provider = %fb.provider,
                                     model = %fb.model,
                                     error = %fb_err,
                                     "Fallback model failed (stream)"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                warn!(
+                                    fallback_index = fb_idx,
+                                    provider = %fb.provider,
+                                    model = %fb.model,
+                                    timeout_secs =
+                                        openfang_types::watchdog::llm_call_timeout_secs(),
+                                    "Fallback model timed out (watchdog), trying next"
                                 );
                             }
                         }
@@ -3658,6 +3758,22 @@ mod tests {
             tool_timeout_for("file_read"),
             Some(Duration::from_secs(120))
         );
+
+        // MCP tools resolve through their own ceiling (default 120s), distinct
+        // from the generic tool default and tunable via OPENFANG_MCP_TIMEOUT_SECS.
+        std::env::remove_var("OPENFANG_MCP_TIMEOUT_SECS");
+        assert_eq!(
+            tool_timeout_for("mcp_linear_getissues"),
+            Some(Duration::from_secs(120))
+        );
+        std::env::set_var("OPENFANG_MCP_TIMEOUT_SECS", "0");
+        assert_eq!(tool_timeout_for("mcp_linear_getissues"), None);
+        std::env::set_var("OPENFANG_MCP_TIMEOUT_SECS", "45");
+        assert_eq!(
+            tool_timeout_for("mcp_notion_search"),
+            Some(Duration::from_secs(45))
+        );
+        std::env::remove_var("OPENFANG_MCP_TIMEOUT_SECS");
 
         std::env::remove_var("OPENFANG_AGENT_TOOL_TIMEOUT_SECS");
         std::env::remove_var("OPENFANG_TOOL_TIMEOUT_SECS");

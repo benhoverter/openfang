@@ -1515,6 +1515,9 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Turn-watchdog ceilings (LLM-call and MCP-tool timeouts).
+    #[serde(default)]
+    pub watchdog: WatchdogConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1531,6 +1534,33 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+}
+
+/// Turn-watchdog ceilings exposed in the `[watchdog]` config section.
+///
+/// Runtime reads go through `openfang_types::watchdog::{llm_call_timeout_secs,
+/// mcp_tool_timeout_secs}`, which layer env-var overrides on top of whatever the
+/// kernel installs from this section at boot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WatchdogConfig {
+    /// Ceiling, in seconds, for a single LLM `complete`/`stream` call before the
+    /// turn watchdog aborts it as a provider stall. Default: 240. Clamped up to a
+    /// 30s floor at read time. Raise for slow local inference (vLLM on old GPUs).
+    pub llm_call_timeout_secs: u64,
+    /// Ceiling, in seconds, for a single MCP tool call. Default: 120. Set to `0`
+    /// to disable (unbounded). Remote SSE transports can wedge differently than
+    /// local tools, so they get their own knob.
+    pub mcp_tool_timeout_secs: u64,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            llm_call_timeout_secs: crate::watchdog::LLM_CALL_TIMEOUT_SECS,
+            mcp_tool_timeout_secs: crate::watchdog::MCP_TOOL_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1773,6 +1803,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            watchdog: WatchdogConfig::default(),
             skills: HashMap::new(),
         }
     }
@@ -1893,6 +1924,13 @@ impl std::fmt::Debug for KernelConfig {
                 &format!("{} mapping(s)", self.provider_api_keys.len()),
             )
             .field("auth", &format!("enabled={}", self.auth.enabled))
+            .field(
+                "watchdog",
+                &format!(
+                    "llm={}s mcp={}s",
+                    self.watchdog.llm_call_timeout_secs, self.watchdog.mcp_tool_timeout_secs
+                ),
+            )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
             .finish()
     }
@@ -4833,6 +4871,25 @@ mod tests {
             config.provider_api_keys.get("azure").unwrap(),
             "AZURE_OPENAI_KEY"
         );
+    }
+
+    #[test]
+    fn test_watchdog_config_defaults() {
+        let c = KernelConfig::default();
+        assert_eq!(c.watchdog.llm_call_timeout_secs, 240);
+        assert_eq!(c.watchdog.mcp_tool_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_watchdog_config_from_toml() {
+        let toml_str = r#"
+            [watchdog]
+            llm_call_timeout_secs = 180
+            mcp_tool_timeout_secs = 0
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.watchdog.llm_call_timeout_secs, 180);
+        assert_eq!(c.watchdog.mcp_tool_timeout_secs, 0);
     }
 
     #[test]

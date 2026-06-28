@@ -91,7 +91,13 @@ impl VertexAIDriver {
             project_id,
             region,
             token_cache: Arc::new(RwLock::new(TokenCache::new())),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                // Watchdog (ANAI-109): connect-phase ceiling; see other drivers.
+                .connect_timeout(std::time::Duration::from_secs(
+                    openfang_types::watchdog::PROVIDER_CONNECT_TIMEOUT_SECS,
+                ))
+                .build()
+                .unwrap_or_default(),
         }
     }
 

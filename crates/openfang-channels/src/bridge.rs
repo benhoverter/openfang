@@ -1843,6 +1843,15 @@ fn sanitize_agent_error(raw: &str) -> String {
         return "The AI service is temporarily overloaded, please try again shortly.".to_string();
     }
 
+    // Turn watchdog (ANAI-109): a provider stall is its own failure class — the
+    // model accepted the request then stopped responding. Checked as a standalone
+    // branch ABOVE the generic timeout check: the marker contains no
+    // "timeout"/"timed out"/"deadline" token, so nesting it under that guard made
+    // it unreachable (the raw marker then leaked to users).
+    if lower.contains(openfang_types::watchdog::PROVIDER_STALL_MARKER) {
+        return "The agent's turn was stopped because the model provider stopped responding. Please try again.".to_string();
+    }
+
     if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {
         return "Request timed out, please try again.".to_string();
     }
@@ -2586,6 +2595,28 @@ mod tests {
     use super::*;
     use crate::types::{ButtonStyle, ChannelType, InteractiveButton};
     use std::sync::Mutex;
+
+    #[test]
+    fn test_sanitize_agent_error_provider_stall() {
+        // ANAI-109 regression: the real producer string
+        // ("LLM driver error: <marker>: no response within 600s") must render the
+        // clean stall message, not leak the raw marker. Catches the false-negative
+        // where the check was nested under the generic timeout guard (the marker
+        // has no "timeout"/"deadline" token, so that branch was never entered).
+        let raw = format!(
+            "LLM driver error: {}: no response within 600s",
+            openfang_types::watchdog::PROVIDER_STALL_MARKER
+        );
+        let msg = sanitize_agent_error(&raw);
+        assert!(
+            msg.contains("model provider stopped responding"),
+            "expected clean stall message, got: {msg}"
+        );
+        assert!(
+            !msg.contains(openfang_types::watchdog::PROVIDER_STALL_MARKER),
+            "raw watchdog marker must not leak to users: {msg}"
+        );
+    }
 
     /// Mock kernel handle for testing.
     struct MockHandle {

@@ -29,6 +29,15 @@ impl AnthropicDriver {
             base_url,
             client: reqwest::Client::builder()
                 .user_agent(crate::USER_AGENT)
+                // Bound the TCP/TLS connect phase only — NOT the response body —
+                // so a dead/half-open socket can't hang the connect forever while
+                // leaving long-lived streaming responses untouched. The total-call
+                // ceiling is enforced upstream by the turn watchdog in
+                // `agent_loop` (ANAI-109); putting a `.timeout()` here would
+                // strangle legitimately long streams.
+                .connect_timeout(std::time::Duration::from_secs(
+                    openfang_types::watchdog::PROVIDER_CONNECT_TIMEOUT_SECS,
+                ))
                 .build()
                 .unwrap_or_default(),
         }

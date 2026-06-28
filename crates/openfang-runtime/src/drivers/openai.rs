@@ -34,6 +34,12 @@ impl OpenAIDriver {
             base_url,
             client: reqwest::Client::builder()
                 .user_agent(crate::USER_AGENT)
+                // Watchdog (ANAI-109): bound the connect phase only — never the
+                // response body — so a dead socket fails fast without strangling
+                // long streams. Total-call ceiling lives in the agent loop.
+                .connect_timeout(std::time::Duration::from_secs(
+                    openfang_types::watchdog::PROVIDER_CONNECT_TIMEOUT_SECS,
+                ))
                 .build()
                 .unwrap_or_default(),
             extra_headers: Vec::new(),
@@ -52,6 +58,12 @@ impl OpenAIDriver {
             base_url,
             client: reqwest::Client::builder()
                 .user_agent(crate::USER_AGENT)
+                // Watchdog (ANAI-109): bound the connect phase only — never the
+                // response body — so a dead socket fails fast without strangling
+                // long streams. Total-call ceiling lives in the agent loop.
+                .connect_timeout(std::time::Duration::from_secs(
+                    openfang_types::watchdog::PROVIDER_CONNECT_TIMEOUT_SECS,
+                ))
                 .build()
                 .unwrap_or_default(),
             extra_headers: Vec::new(),

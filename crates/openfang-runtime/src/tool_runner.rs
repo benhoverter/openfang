@@ -2410,6 +2410,12 @@ async fn tool_shell_exec(
     // Prevent child from inheriting stdin (avoids blocking on Windows)
     cmd.stdin(std::process::Stdio::null());
 
+    // Kill the child if this future is dropped (notably on the timeout below) so a
+    // hung command can't outlive its tool call as an orphaned process. Covers the
+    // direct child only — a command that backgrounds its own grandchildren is not
+    // reaped here (would need a process group; out of scope).
+    cmd.kill_on_drop(true);
+
     let result =
         tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
 
@@ -2449,7 +2455,7 @@ async fn tool_shell_exec(
             ))
         }
         Ok(Err(e)) => Err(format!("Failed to execute command: {e}")),
-        Err(_) => Err(format!("Command timed out after {timeout_secs}s")),
+        Err(_) => Err(format!("Command timed out after {timeout_secs}s (process killed)")),
     }
 }
 

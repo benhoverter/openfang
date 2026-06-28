@@ -498,7 +498,27 @@ async fn summarize_messages(
     // Retry logic for transient failures
     let mut last_error = String::new();
     for attempt in 0..config.max_retries {
-        match driver.complete(request.clone()).await {
+        // Turn watchdog (ANAI-109): bound the summarization call so a stalled
+        // provider can't hang /compact, and break (not retry) on a stall —
+        // retrying just re-issues against the same stalled endpoint.
+        let summary_call = match tokio::time::timeout(
+            std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
+            driver.complete(request.clone()),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                last_error = format!(
+                    "{}: no response within {}s",
+                    openfang_types::watchdog::PROVIDER_STALL_MARKER,
+                    openfang_types::watchdog::llm_call_timeout_secs()
+                );
+                warn!(attempt, "Summarization call hit provider stall; aborting");
+                break;
+            }
+        };
+        match summary_call {
             Ok(response) => {
                 let summary = response.text();
                 if summary.is_empty() {
@@ -616,7 +636,21 @@ async fn summarize_in_chunks(
         allowed_tools: None,
     };
 
-    match driver.complete(merge_request).await {
+    // Turn watchdog (ANAI-109): bound the merge call; on stall fall back to
+    // concatenating the per-chunk summaries (same as the existing error path).
+    let merge_call = match tokio::time::timeout(
+        std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
+        driver.complete(merge_request),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            warn!("Merge summarization hit provider stall, concatenating chunks");
+            return Ok(summaries.join("\n\n"));
+        }
+    };
+    match merge_call {
         Ok(response) => {
             let merged = response.text();
             if merged.is_empty() {

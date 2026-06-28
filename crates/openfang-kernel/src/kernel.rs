@@ -4781,6 +4781,13 @@ impl OpenFangKernel {
             });
         }
 
+        // Install operator-configured turn-watchdog ceilings ([watchdog] config)
+        // so the runtime resolvers pick them up. Idempotent: first call at boot wins.
+        openfang_types::watchdog::install_timeouts(openfang_types::watchdog::WatchdogTimeouts {
+            llm_call_timeout_secs: self.config.watchdog.llm_call_timeout_secs,
+            mcp_tool_timeout_secs: self.config.watchdog.mcp_tool_timeout_secs,
+        });
+
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
 
