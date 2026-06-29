@@ -100,6 +100,16 @@ pub struct TurnEffects {
     /// Set once any state-mutating / outbound tool ran (anything outside
     /// [`READ_ONLY_TOOLS`]). Read-only tool calls never set this.
     ran_side_effecting_tool: bool,
+    /// Count of all executed tools observed this turn (read-only and
+    /// side-effecting alike). ANAI-77 field-confirmation notch: stamped onto
+    /// heartbeat episodic rows so the shadow window can prove the
+    /// tool-observation pipeline actually runs on the heartbeat path even when
+    /// no heartbeat turn ever runs a side-effecting tool.
+    tools_observed: u32,
+    /// Count of executed tools that perform a durable side-effect (anything
+    /// outside [`READ_ONLY_TOOLS`], including unknown tools). Read-only tool
+    /// calls never increment this. Zero count means the turn is inert.
+    side_effecting_tools: u32,
 }
 
 impl TurnEffects {
@@ -112,8 +122,9 @@ impl TurnEffects {
     /// Record one executed tool by name, updating the side-effect summary.
     /// Conservative: unknown tools count as side-effecting.
     pub fn observe_tool(&mut self, tool_name: &str) {
+        self.tools_observed = self.tools_observed.saturating_add(1);
         if !tool_is_read_only(tool_name) {
-            self.ran_side_effecting_tool = true;
+            self.side_effecting_tools = self.side_effecting_tools.saturating_add(1);
         }
     }
 
@@ -121,7 +132,21 @@ impl TurnEffects {
     /// outbound tool ran). A turn that ran zero tools, or only read-only tools,
     /// is inert by this measure.
     pub fn is_inert(&self) -> bool {
-        !self.ran_side_effecting_tool
+        self.side_effecting_tools == 0
+    }
+
+    /// Count of side-effecting tools executed this turn. Content-free signal
+    /// for the ANAI-77 shadow confirmation notch: on a `would_drop` heartbeat
+    /// row this must be 0 -- the safety property the enforce-gate relies on.
+    pub fn side_effecting_tool_count(&self) -> u32 {
+        self.side_effecting_tools
+    }
+
+    /// Count of all tools observed this turn (read-only + side-effecting).
+    /// Pairs with [`Self::side_effecting_tool_count`] in the ANAI-77 notch to
+    /// show the observation pipeline ran even when the side-effect count is 0.
+    pub fn tools_observed_count(&self) -> u32 {
+        self.tools_observed
     }
 }
 
@@ -204,5 +229,31 @@ mod tests {
             !e.is_inert(),
             "unknown tools are conservatively side-effecting"
         );
+    }
+
+    #[test]
+    fn effects_count_tools_for_notch() {
+        // ANAI-77 notch: counts back the would_drop verdict with content-free
+        // numbers. Read-only tools advance tools_observed but not the
+        // side-effecting count; the latter is the safety signal.
+        let mut e = TurnEffects::new();
+        assert_eq!(e.tools_observed_count(), 0);
+        assert_eq!(e.side_effecting_tool_count(), 0);
+
+        e.observe_tool("file_read");
+        e.observe_tool("memory_recall");
+        assert_eq!(e.tools_observed_count(), 2);
+        assert_eq!(
+            e.side_effecting_tool_count(),
+            0,
+            "read-only tools are observed but not side-effecting"
+        );
+        assert!(e.is_inert());
+
+        e.observe_tool("agent_send");
+        e.observe_tool("memory_store");
+        assert_eq!(e.tools_observed_count(), 4);
+        assert_eq!(e.side_effecting_tool_count(), 2);
+        assert!(!e.is_inert());
     }
 }

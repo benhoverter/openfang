@@ -298,6 +298,11 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
 /// (ANAI-76) would drop this turn (an inert heartbeat). Observe-only: callers
 /// always `remember`; nothing is skipped. The real skip is deferred to
 /// ANAI-85, which reads `metadata["would_drop"]` fleet-wide to size the change.
+///
+/// On heartbeat turns it also stamps the ANAI-77 confirmation notch: the
+/// content-free `side_effecting_tools` / `tools_observed` counts that let the
+/// shadow window prove the drop classifier partitions correctly before the
+/// enforce flip.
 fn capture_metadata(
     base: &HashMap<String, serde_json::Value>,
     trigger: TurnTrigger,
@@ -309,6 +314,26 @@ fn capture_metadata(
         meta.insert(
             "would_drop_reason".to_string(),
             serde_json::json!("heartbeat_inert"),
+        );
+    }
+    // ANAI-77 field-confirmation notch (enforce-gate evidence before the
+    // shadow->enforce flip): on every heartbeat turn, stamp two content-free
+    // counts. `side_effecting_tools` MUST be 0 on every `would_drop` row --
+    // that is the safety property the drop depends on; any heartbeat that ran
+    // a side-effecting tool gets a non-zero count and is therefore *not*
+    // dropped. `tools_observed` proves the observation pipeline ran on the
+    // heartbeat path even when the side-effect count is 0, so a window of
+    // all-zero drops is positive evidence the classifier partitions correctly
+    // rather than the observer silently never firing. Numbers only -- no turn
+    // content is recorded.
+    if trigger == TurnTrigger::Heartbeat {
+        meta.insert(
+            "side_effecting_tools".to_string(),
+            serde_json::json!(effects.side_effecting_tool_count()),
+        );
+        meta.insert(
+            "tools_observed".to_string(),
+            serde_json::json!(effects.tools_observed_count()),
         );
     }
     meta
@@ -3466,6 +3491,37 @@ mod tests {
     #[test]
     fn test_max_iterations_constant() {
         assert_eq!(MAX_ITERATIONS, 50);
+    }
+
+    /// ANAI-77 notch: heartbeat rows carry the content-free tool counts, and the
+    /// `would_drop` safety property (inert heartbeat => side_effecting_tools == 0)
+    /// holds in the stamped metadata. Non-heartbeat turns carry neither key.
+    #[test]
+    fn capture_metadata_stamps_heartbeat_notch() {
+        use openfang_types::turn::{TurnEffects, TurnTrigger};
+        let base = HashMap::new();
+
+        // Inert heartbeat: dropped, and the notch records zero side-effects.
+        let inert = TurnEffects::new();
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert);
+        assert_eq!(m.get("would_drop"), Some(&serde_json::json!(true)));
+        assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
+        assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
+
+        // Active heartbeat: kept (no would_drop), notch counts the side-effect.
+        let mut active = TurnEffects::new();
+        active.observe_tool("memory_recall"); // read-only
+        active.observe_tool("agent_send"); // side-effecting
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active);
+        assert!(m.get("would_drop").is_none(), "active heartbeat is kept");
+        assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(1)));
+        assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(2)));
+
+        // Non-heartbeat turn: no notch keys, no would_drop.
+        let m = capture_metadata(&base, TurnTrigger::User, &inert);
+        assert!(m.get("side_effecting_tools").is_none());
+        assert!(m.get("tools_observed").is_none());
+        assert!(m.get("would_drop").is_none());
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted
