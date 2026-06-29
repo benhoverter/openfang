@@ -34,6 +34,21 @@ pub const PROVIDER_STALL_MARKER: &str = "provider unresponsive (watchdog)";
 /// `OPENFANG_LLM_CALL_TIMEOUT_SECS` env var; read through [`llm_call_timeout_secs`].
 pub const LLM_CALL_TIMEOUT_SECS: u64 = 240;
 
+/// Default idle window, in seconds, for a *streaming* LLM call: the maximum
+/// gap between two consecutive stream events (text deltas, tool events, the
+/// terminal usage event) before the turn watchdog treats the stream as a dead
+/// provider and aborts it.
+///
+/// Unlike [`LLM_CALL_TIMEOUT_SECS`] — a *total* wall-clock ceiling that cannot
+/// tell a slow-but-alive turn from a hung one — this resets on every event, so
+/// a long turn that keeps streaming survives indefinitely while a genuinely
+/// silent socket dies within one idle window. With it in place the absolute
+/// ceiling can be raised for long turns without re-opening the
+/// "hang for the whole ceiling" hole (ANAI-114). Tune via `[watchdog]
+/// stream_idle_timeout_secs` or `OPENFANG_STREAM_IDLE_TIMEOUT_SECS`; read
+/// through [`stream_idle_timeout_secs`].
+pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
+
 /// Default ceiling, in seconds, for establishing the TCP/TLS connection to a
 /// provider. Bounds the connect phase only — never the response body — so it is
 /// safe for long-lived streaming responses.
@@ -51,6 +66,13 @@ pub const MCP_TOOL_TIMEOUT_SECS: u64 = 120;
 /// `0` or single-digit value silently turning the backstop into a turn-killer.
 const LLM_CALL_TIMEOUT_FLOOR_SECS: u64 = 30;
 
+/// Lower bound for the resolved stream idle window. Must comfortably exceed the
+/// longest legitimate gap between stream events — notably an in-subprocess MCP
+/// tool call, which emits no stdout events while it runs — so the idle watchdog
+/// never false-kills a live-but-quiet turn. Guards against a fat-fingered tiny
+/// value (ANAI-114).
+const STREAM_IDLE_TIMEOUT_FLOOR_SECS: u64 = 30;
+
 /// Operator-configured watchdog ceilings, sourced from the `[watchdog]` config
 /// section and installed once at kernel boot via [`install_timeouts`].
 #[derive(Clone, Copy, Debug)]
@@ -59,6 +81,10 @@ pub struct WatchdogTimeouts {
     pub llm_call_timeout_secs: u64,
     /// Seconds for a single MCP tool call (`0` = unbounded).
     pub mcp_tool_timeout_secs: u64,
+    /// Seconds of stream silence (no events) before a streaming call is aborted
+    /// as a provider stall. Resets on every event — see
+    /// [`STREAM_IDLE_TIMEOUT_SECS`].
+    pub stream_idle_timeout_secs: u64,
 }
 
 static INSTALLED: std::sync::OnceLock<WatchdogTimeouts> = std::sync::OnceLock::new();
@@ -100,6 +126,20 @@ pub fn mcp_tool_timeout_secs() -> u64 {
         .unwrap_or(MCP_TOOL_TIMEOUT_SECS)
 }
 
+/// Resolved idle window, in seconds, between events on a streaming LLM call
+/// before the turn watchdog aborts it as a provider stall.
+///
+/// Precedence: `OPENFANG_STREAM_IDLE_TIMEOUT_SECS` env var > installed
+/// `[watchdog]` config > compiled default ([`STREAM_IDLE_TIMEOUT_SECS`]).
+/// Clamped up to [`STREAM_IDLE_TIMEOUT_FLOOR_SECS`] so a tiny value can never
+/// turn the idle watchdog into a false-kill on a live-but-quiet turn.
+pub fn stream_idle_timeout_secs() -> u64 {
+    env_u64("OPENFANG_STREAM_IDLE_TIMEOUT_SECS")
+        .or_else(|| INSTALLED.get().map(|t| t.stream_idle_timeout_secs))
+        .unwrap_or(STREAM_IDLE_TIMEOUT_SECS)
+        .max(STREAM_IDLE_TIMEOUT_FLOOR_SECS)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -131,11 +171,23 @@ mod tests {
         std::env::set_var("OPENFANG_MCP_TIMEOUT_SECS", "90");
         assert_eq!(mcp_tool_timeout_secs(), 90);
         std::env::remove_var("OPENFANG_MCP_TIMEOUT_SECS");
+
+        // Stream idle: default, explicit override, floor clamp, unparseable.
+        std::env::remove_var("OPENFANG_STREAM_IDLE_TIMEOUT_SECS");
+        assert_eq!(stream_idle_timeout_secs(), 180);
+        std::env::set_var("OPENFANG_STREAM_IDLE_TIMEOUT_SECS", "300");
+        assert_eq!(stream_idle_timeout_secs(), 300);
+        std::env::set_var("OPENFANG_STREAM_IDLE_TIMEOUT_SECS", "5"); // below floor
+        assert_eq!(stream_idle_timeout_secs(), STREAM_IDLE_TIMEOUT_FLOOR_SECS);
+        std::env::set_var("OPENFANG_STREAM_IDLE_TIMEOUT_SECS", "junk");
+        assert_eq!(stream_idle_timeout_secs(), 180);
+        std::env::remove_var("OPENFANG_STREAM_IDLE_TIMEOUT_SECS");
     }
 
     #[test]
     fn test_compiled_defaults() {
         assert_eq!(LLM_CALL_TIMEOUT_SECS, 240);
         assert_eq!(MCP_TOOL_TIMEOUT_SECS, 120);
+        assert_eq!(STREAM_IDLE_TIMEOUT_SECS, 180);
     }
 }

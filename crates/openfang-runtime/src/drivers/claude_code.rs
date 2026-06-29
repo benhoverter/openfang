@@ -1515,38 +1515,85 @@ impl LlmDriver for ClaudeCodeDriver {
             output_tokens: 0,
         };
 
-        let timeout_duration = std::time::Duration::from_secs(self.message_timeout_secs);
-        let stream_result = tokio::time::timeout(timeout_duration, async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
+        // ANAI-114: per-event idle watchdog. The old form bounded the whole
+        // read loop with a single *total* duration — it could not tell a
+        // slow-but-alive turn from a dead socket. Here each `next_line().await`
+        // is bounded by an idle window that resets on every event, so a turn
+        // that keeps streaming survives indefinitely while a genuinely silent
+        // stream trips the window. `message_timeout_secs` is retained as a
+        // coarse *absolute* backstop so a pathological flood of no-op events
+        // cannot keep the loop alive past the operator's hard ceiling. With
+        // idle in place the absolute caps can be raised for long turns without
+        // re-opening the "hang for the whole ceiling" hole.
+        let idle_window =
+            std::time::Duration::from_secs(openfang_types::watchdog::stream_idle_timeout_secs());
+        let absolute_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(self.message_timeout_secs);
 
-                // Reassemble incrementally via the shared fold. Extracted
-                // into `fold_stream_line` so this streaming reassembly is
-                // diffed against the non-streaming `parse_complete_stdout`
-                // in tests — the ANAI-113 fidelity gate. Behavior unchanged:
-                // it returns the text chunk to surface as a TextDelta, if any.
-                if let Some(delta) = fold_stream_line(&line, &mut full_text, &mut final_usage) {
-                    let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
+        // Read-loop outcome: clean EOF (`None`) or which watchdog fired.
+        enum StreamStall {
+            Idle,
+            Absolute,
+        }
+        let stall: Option<StreamStall> = loop {
+            // Bound this read by whichever fires first — the idle window or
+            // the absolute backstop — then disambiguate by clock.
+            let read_deadline = (tokio::time::Instant::now() + idle_window).min(absolute_deadline);
+            match tokio::time::timeout_at(read_deadline, lines.next_line()).await {
+                // A line arrived before either deadline.
+                Ok(Ok(Some(line))) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    // Reassemble incrementally via the shared fold. Extracted
+                    // into `fold_stream_line` so this streaming reassembly is
+                    // diffed against the non-streaming `parse_complete_stdout`
+                    // in tests — the ANAI-113 fidelity gate. Returns the text
+                    // chunk to surface as a TextDelta, if any.
+                    if let Some(delta) =
+                        fold_stream_line(&line, &mut full_text, &mut final_usage)
+                    {
+                        let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
+                    }
+                }
+                // Clean EOF — stream finished; exit status checked below.
+                Ok(Ok(None)) => break None,
+                // Reader error — preserve the prior `while let Ok(Some(_))`
+                // behavior, which swallowed it and let the post-loop exit-status
+                // check surface any real failure.
+                Ok(Err(_)) => break None,
+                // Deadline tripped — disambiguate idle vs absolute by clock.
+                Err(_elapsed) => {
+                    if tokio::time::Instant::now() >= absolute_deadline {
+                        break Some(StreamStall::Absolute);
+                    }
+                    break Some(StreamStall::Idle);
                 }
             }
-        })
-        .await;
+        };
 
         // Clear PID tracking
         self.active_pids.remove(&pid_label);
 
-        if stream_result.is_err() {
+        if let Some(kind) = stall {
+            let (secs, reason) = match kind {
+                StreamStall::Idle => (
+                    openfang_types::watchdog::stream_idle_timeout_secs(),
+                    "no stream events within idle window",
+                ),
+                StreamStall::Absolute => {
+                    (self.message_timeout_secs, "exceeded absolute stream backstop")
+                }
+            };
             warn!(
-                timeout_secs = self.message_timeout_secs,
+                timeout_secs = secs,
                 model = %pid_label,
-                "Claude Code CLI streaming subprocess timed out, killing process"
+                reason,
+                "Claude Code CLI streaming subprocess stalled, killing process"
             );
             let _ = child.kill().await;
             return Err(LlmError::Http(format!(
-                "Claude Code CLI streaming subprocess timed out after {}s — process killed",
-                self.message_timeout_secs
+                "Claude Code CLI streaming subprocess timed out after {secs}s ({reason}) — process killed"
             )));
         }
 

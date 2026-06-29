@@ -4786,6 +4786,7 @@ impl OpenFangKernel {
         openfang_types::watchdog::install_timeouts(openfang_types::watchdog::WatchdogTimeouts {
             llm_call_timeout_secs: self.config.watchdog.llm_call_timeout_secs,
             mcp_tool_timeout_secs: self.config.watchdog.mcp_tool_timeout_secs,
+            stream_idle_timeout_secs: self.config.watchdog.stream_idle_timeout_secs,
         });
 
         // Start heartbeat monitor for agent health checking

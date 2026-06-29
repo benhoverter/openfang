@@ -1552,6 +1552,11 @@ pub struct WatchdogConfig {
     /// to disable (unbounded). Remote SSE transports can wedge differently than
     /// local tools, so they get their own knob.
     pub mcp_tool_timeout_secs: u64,
+    /// Idle window, in seconds, between events on a *streaming* LLM call before
+    /// the turn watchdog aborts it as a provider stall. Default: 180. Resets on
+    /// every event, so it distinguishes a slow-but-alive turn from a dead one
+    /// (ANAI-114). Clamped up to a 30s floor at read time.
+    pub stream_idle_timeout_secs: u64,
 }
 
 impl Default for WatchdogConfig {
@@ -1559,6 +1564,7 @@ impl Default for WatchdogConfig {
         Self {
             llm_call_timeout_secs: crate::watchdog::LLM_CALL_TIMEOUT_SECS,
             mcp_tool_timeout_secs: crate::watchdog::MCP_TOOL_TIMEOUT_SECS,
+            stream_idle_timeout_secs: crate::watchdog::STREAM_IDLE_TIMEOUT_SECS,
         }
     }
 }
@@ -1927,8 +1933,10 @@ impl std::fmt::Debug for KernelConfig {
             .field(
                 "watchdog",
                 &format!(
-                    "llm={}s mcp={}s",
-                    self.watchdog.llm_call_timeout_secs, self.watchdog.mcp_tool_timeout_secs
+                    "llm={}s mcp={}s idle={}s",
+                    self.watchdog.llm_call_timeout_secs,
+                    self.watchdog.mcp_tool_timeout_secs,
+                    self.watchdog.stream_idle_timeout_secs
                 ),
             )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
@@ -4878,6 +4886,7 @@ mod tests {
         let c = KernelConfig::default();
         assert_eq!(c.watchdog.llm_call_timeout_secs, 240);
         assert_eq!(c.watchdog.mcp_tool_timeout_secs, 120);
+        assert_eq!(c.watchdog.stream_idle_timeout_secs, 180);
     }
 
     #[test]
@@ -4886,10 +4895,12 @@ mod tests {
             [watchdog]
             llm_call_timeout_secs = 180
             mcp_tool_timeout_secs = 0
+            stream_idle_timeout_secs = 90
         "#;
         let c: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(c.watchdog.llm_call_timeout_secs, 180);
         assert_eq!(c.watchdog.mcp_tool_timeout_secs, 0);
+        assert_eq!(c.watchdog.stream_idle_timeout_secs, 90);
     }
 
     #[test]
