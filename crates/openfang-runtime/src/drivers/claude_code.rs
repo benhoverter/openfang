@@ -1057,6 +1057,117 @@ struct ClaudeStreamEvent {
     usage: Option<ClaudeUsage>,
 }
 
+/// Reassemble `(text, usage)` from the stdout of
+/// `claude -p --output-format json` — the non-streaming `complete()` path.
+///
+/// Extracted verbatim from `complete()` so the streaming reassembly
+/// (`fold_stream_line`) can be diffed against this exact logic in tests —
+/// the ANAI-113 fidelity gate. Tries `result -> content -> text` for the
+/// body and `usage` for tokens; on non-JSON stdout, falls back to trimmed
+/// raw text with zeroed usage. Behavior is unchanged from the inline form.
+fn parse_complete_stdout(stdout: &str) -> (String, TokenUsage) {
+    if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(stdout) {
+        let text = parsed
+            .result
+            .or(parsed.content)
+            .or(parsed.text)
+            .unwrap_or_default();
+        let usage = parsed.usage.unwrap_or_default();
+        return (
+            text,
+            TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            },
+        );
+    }
+    (
+        stdout.trim().to_string(),
+        TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    )
+}
+
+/// Fold one line of `claude -p --output-format stream-json --verbose` stdout
+/// into the running `(full_text, final_usage)` accumulators, returning the
+/// text chunk (if any) to surface as a `StreamEvent::TextDelta`.
+///
+/// Extracted verbatim from `stream()` so the streaming reassembly can be
+/// diffed against `parse_complete_stdout` in tests — the ANAI-113 fidelity
+/// gate. Mirrors the original event handling exactly: `assistant` / `content`
+/// / `text` / `content_block_delta` events append flat-or-nested text;
+/// `result` / `done` / `complete` events backfill text only when empty and
+/// capture usage; unknown events fall back to their `content` field; and
+/// non-JSON lines are appended raw. Behavior is unchanged from the inline form.
+fn fold_stream_line(
+    line: &str,
+    full_text: &mut String,
+    final_usage: &mut TokenUsage,
+) -> Option<String> {
+    let event = match serde_json::from_str::<ClaudeStreamEvent>(line) {
+        Ok(event) => event,
+        Err(e) => {
+            // Not valid JSON — treat as raw text.
+            warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
+            full_text.push_str(line);
+            return Some(line.to_string());
+        }
+    };
+
+    match event.r#type.as_str() {
+        "content" | "text" | "assistant" | "content_block_delta" => {
+            // Older CLI: flat `content` string.
+            // CLI >=2.x (type=assistant): text is nested in
+            // `message.content[].text`; the flat `content` field is absent.
+            let chunk = event.content.clone().unwrap_or_default();
+            let nested: String = event
+                .message
+                .as_ref()
+                .map(|msg| {
+                    msg.content
+                        .iter()
+                        .filter(|b| b.block_type == "text")
+                        .map(|b| b.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            let text_chunk = if !chunk.is_empty() { chunk } else { nested };
+            if !text_chunk.is_empty() {
+                full_text.push_str(&text_chunk);
+                return Some(text_chunk);
+            }
+            None
+        }
+        "result" | "done" | "complete" => {
+            let mut emit = None;
+            if let Some(ref result) = event.result {
+                if full_text.is_empty() {
+                    *full_text = result.clone();
+                    emit = Some(result.clone());
+                }
+            }
+            if let Some(usage) = event.usage {
+                *final_usage = TokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                };
+            }
+            emit
+        }
+        _ => {
+            // Unknown event type — try content field as fallback.
+            if let Some(ref content) = event.content {
+                full_text.push_str(content);
+                return Some(content.clone());
+            }
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
@@ -1277,30 +1388,11 @@ impl LlmDriver for ClaudeCodeDriver {
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
 
-        // Try JSON parse first
-        if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(&stdout) {
-            let text = parsed
-                .result
-                .or(parsed.content)
-                .or(parsed.text)
-                .unwrap_or_default();
-            let usage = parsed.usage.unwrap_or_default();
-            return Ok(CompletionResponse {
-                content: vec![ContentBlock::Text {
-                    text: text.clone(),
-                    provider_metadata: None,
-                }],
-                stop_reason: StopReason::EndTurn,
-                tool_calls: Vec::new(),
-                usage: TokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            });
-        }
-
-        // Fallback: treat entire stdout as plain text
-        let text = stdout.trim().to_string();
+        // Reassemble the response from CC's `--output-format json` stdout.
+        // Extracted into `parse_complete_stdout` so the streaming path's
+        // reassembly (`fold_stream_line`) can be diffed against this exact
+        // logic in tests — the ANAI-113 fidelity gate. Behavior unchanged.
+        let (text, usage) = parse_complete_stdout(&stdout);
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -1308,10 +1400,7 @@ impl LlmDriver for ClaudeCodeDriver {
             }],
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
-            usage: TokenUsage {
-                input_tokens: 0,
-                output_tokens: 0,
-            },
+            usage,
         })
     }
 
@@ -1433,71 +1522,13 @@ impl LlmDriver for ClaudeCodeDriver {
                     continue;
                 }
 
-                match serde_json::from_str::<ClaudeStreamEvent>(&line) {
-                    Ok(event) => {
-                        match event.r#type.as_str() {
-                            "content" | "text" | "assistant" | "content_block_delta" => {
-                                // Older CLI: flat `content` string.
-                                // CLI ≥2.x (type=assistant): text is nested in
-                                // `message.content[].text`; the flat `content`
-                                // field is absent or null.
-                                let chunk = event.content.clone().unwrap_or_default();
-                                let nested: String = event
-                                    .message
-                                    .as_ref()
-                                    .map(|msg| {
-                                        msg.content
-                                            .iter()
-                                            .filter(|b| b.block_type == "text")
-                                            .map(|b| b.text.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join("")
-                                    })
-                                    .unwrap_or_default();
-                                let text_chunk = if !chunk.is_empty() { chunk } else { nested };
-                                if !text_chunk.is_empty() {
-                                    full_text.push_str(&text_chunk);
-                                    let _ =
-                                        tx.send(StreamEvent::TextDelta { text: text_chunk }).await;
-                                }
-                            }
-                            "result" | "done" | "complete" => {
-                                if let Some(ref result) = event.result {
-                                    if full_text.is_empty() {
-                                        full_text = result.clone();
-                                        let _ = tx
-                                            .send(StreamEvent::TextDelta {
-                                                text: result.clone(),
-                                            })
-                                            .await;
-                                    }
-                                }
-                                if let Some(usage) = event.usage {
-                                    final_usage = TokenUsage {
-                                        input_tokens: usage.input_tokens,
-                                        output_tokens: usage.output_tokens,
-                                    };
-                                }
-                            }
-                            _ => {
-                                // Unknown event type — try content field as fallback
-                                if let Some(ref content) = event.content {
-                                    full_text.push_str(content);
-                                    let _ = tx
-                                        .send(StreamEvent::TextDelta {
-                                            text: content.clone(),
-                                        })
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Not valid JSON — treat as raw text
-                        warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
-                        full_text.push_str(&line);
-                        let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
-                    }
+                // Reassemble incrementally via the shared fold. Extracted
+                // into `fold_stream_line` so this streaming reassembly is
+                // diffed against the non-streaming `parse_complete_stdout`
+                // in tests — the ANAI-113 fidelity gate. Behavior unchanged:
+                // it returns the text chunk to surface as a TextDelta, if any.
+                if let Some(delta) = fold_stream_line(&line, &mut full_text, &mut final_usage) {
+                    let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
                 }
             }
         })
@@ -2320,5 +2351,177 @@ mod tests {
         assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
+    }
+
+    // ===== ANAI-113: complete() vs stream() reassembly fidelity gate =====
+    //
+    // Acceptance gate for routing background agents onto the streaming path
+    // (the `complete()` -> `stream()` dispatch flip). For the same logical CC
+    // turn, the non-streaming `parse_complete_stdout` and the streaming
+    // `fold_stream_line` reassembly must agree on `{text, usage}`.
+    //
+    // tool_use is intentionally OUT of scope: the CC driver never emits it —
+    // both paths hardcode `tool_calls: Vec::new()` and `StopReason::EndTurn`,
+    // because tools execute inside the CC subprocess via the MCP bridge and
+    // only the final text round-trips back. So the entire fidelity surface is
+    // these two fields, which is what this corpus pins.
+
+    /// Drive a sequence of stream-json lines through the shared fold and
+    /// return the reassembled `(text, usage)` — the streaming-path twin of
+    /// `parse_complete_stdout`.
+    fn reassemble_stream(lines: &[&str]) -> (String, TokenUsage) {
+        let mut full_text = String::new();
+        let mut final_usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        for line in lines {
+            let _ = fold_stream_line(line, &mut full_text, &mut final_usage);
+        }
+        (full_text, final_usage)
+    }
+
+    /// Assert the non-streaming and streaming paths reassemble an identical
+    /// `{text, usage}` for the same logical turn.
+    fn assert_fidelity(json_stdout: &str, stream_lines: &[&str]) {
+        let (c_text, c_usage) = parse_complete_stdout(json_stdout);
+        let (s_text, s_usage) = reassemble_stream(stream_lines);
+        assert_eq!(
+            c_text, s_text,
+            "text diverged:\n  complete = {c_text:?}\n  stream   = {s_text:?}"
+        );
+        assert_eq!(
+            (c_usage.input_tokens, c_usage.output_tokens),
+            (s_usage.input_tokens, s_usage.output_tokens),
+            "usage diverged: complete = ({},{}) stream = ({},{})",
+            c_usage.input_tokens,
+            c_usage.output_tokens,
+            s_usage.input_tokens,
+            s_usage.output_tokens
+        );
+    }
+
+    #[test]
+    fn fidelity_simple_text_with_usage() {
+        // Single assistant chunk + a terminal result event carrying usage —
+        // the common case. Both paths must agree on text and tokens.
+        let json =
+            r#"{"result":"Hello, world.","usage":{"input_tokens":12,"output_tokens":4}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, world."}]}}"#,
+            r#"{"type":"result","result":"Hello, world.","usage":{"input_tokens":12,"output_tokens":4}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_text_split_across_deltas() {
+        // Streaming arrives in multiple assistant deltas; the non-streaming
+        // blob is the concatenation. Reassembly must concatenate identically.
+        let json =
+            r#"{"result":"The quick brown fox.","usage":{"input_tokens":20,"output_tokens":6}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The quick "}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"brown fox."}]}}"#,
+            r#"{"type":"result","usage":{"input_tokens":20,"output_tokens":6}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_flat_content_legacy_shape() {
+        // Older CLI emits a flat `content` string rather than a nested
+        // message. Both `parse_complete_stdout` and `fold_stream_line` handle
+        // the legacy shape; results must match.
+        let json = r#"{"content":"legacy path","usage":{"input_tokens":3,"output_tokens":2}}"#;
+        let stream = [
+            r#"{"type":"content","content":"legacy path"}"#,
+            r#"{"type":"result","usage":{"input_tokens":3,"output_tokens":2}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_result_only_text_backfill() {
+        // No incremental text events — only a terminal result carries the
+        // body. The stream path must backfill text from the result event,
+        // matching the single-blob non-streaming output.
+        let json = r#"{"result":"only at the end","usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let stream = [
+            r#"{"type":"result","result":"only at the end","usage":{"input_tokens":7,"output_tokens":3}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_result_text_not_double_appended() {
+        // Deltas already produced the full text AND the result event repeats
+        // it. The `full_text.is_empty()` guard must prevent a double-append,
+        // keeping parity with the single-blob output.
+        let json = r#"{"result":"no echo","usage":{"input_tokens":5,"output_tokens":2}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"no echo"}]}}"#,
+            r#"{"type":"result","result":"no echo","usage":{"input_tokens":5,"output_tokens":2}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_blank_and_unknown_lines_ignored() {
+        // Blank lines are skipped by the loop (not passed to the fold) and an
+        // unknown event with no content contributes nothing. Folding only the
+        // meaningful lines must still match the non-streaming blob.
+        let json = r#"{"result":"survives noise","usage":{"input_tokens":8,"output_tokens":4}}"#;
+        let stream = [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"survives noise"}]}}"#,
+            r#"{"type":"result","usage":{"input_tokens":8,"output_tokens":4}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_gap_usage_absent_from_stream_terminal() {
+        // KNOWN DIVERGENCE — the gate this whole effort exists to close.
+        // `complete()` reads usage from the single JSON blob, but the stream
+        // path captures usage ONLY from a `result`/`done`/`complete` event.
+        // If CC's terminal stream event omits usage (or shapes it
+        // differently), the streaming reassembly silently reports 0 tokens
+        // while the non-streaming path reports the real count. This test
+        // DOCUMENTS the gap by asserting the CURRENT divergence; when the fix
+        // lands (usage backfill on the stream path), flip the body to
+        // `assert_fidelity(json, &stream)` and delete the divergence asserts.
+        let json = r#"{"result":"counted","usage":{"input_tokens":99,"output_tokens":42}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"counted"}]}}"#,
+            r#"{"type":"result","result":"counted"}"#,
+        ];
+        let (c_text, c_usage) = parse_complete_stdout(json);
+        let (s_text, s_usage) = reassemble_stream(&stream);
+        // Text still agrees — only usage drifts.
+        assert_eq!(c_text, s_text, "text should still match across paths");
+        assert_eq!(
+            (c_usage.input_tokens, c_usage.output_tokens),
+            (99, 42),
+            "non-streaming path reads usage from the blob"
+        );
+        assert_eq!(
+            (s_usage.input_tokens, s_usage.output_tokens),
+            (0, 0),
+            "documents the usage-source gap: the stream path loses token \
+             counts when the terminal event omits usage"
+        );
+    }
+
+    #[test]
+    fn fidelity_non_json_line_raw_fallback() {
+        // A non-JSON stdout line is appended raw on the stream path; the
+        // non-streaming path treats non-JSON stdout as trimmed raw text. With
+        // no surrounding whitespace the two must agree on the body.
+        let json = "plain text not json";
+        let stream = ["plain text not json"];
+        let (c_text, _) = parse_complete_stdout(json);
+        let (s_text, _) = reassemble_stream(&stream);
+        assert_eq!(c_text, s_text);
     }
 }
