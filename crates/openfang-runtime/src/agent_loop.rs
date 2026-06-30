@@ -1525,6 +1525,76 @@ fn stream_idle_retry_delay_ms(attempt: u32) -> u64 {
     base - band / 2 + offset
 }
 
+/// Driver-agnostic per-event idle watchdog (ANAI-116).
+///
+/// Runs `driver.stream()` against a private channel and forwards every event to
+/// `out_tx`. The idle deadline is reset *after* each event is forwarded, so a
+/// slow downstream consumer (backpressure on `out_tx`) cannot be mistaken for a
+/// dead upstream. If no event arrives within `idle_window`, the driver future is
+/// dropped — cancelling it — and a typed `StreamIdleStall` is returned for
+/// `stream_with_retry` to retry on. Cancellation reaps the subprocess drivers
+/// via `kill_on_drop` (claude_code, qwen_code) and closes the socket for the
+/// HTTP SSE drivers. This is the lift of the formerly CC-only inline idle loop
+/// to a home that covers all drivers uniformly.
+///
+/// The *absolute* backstop is intentionally NOT here — it stays as the
+/// `llm_call_timeout_secs` wrapper in `stream_with_retry`, which is terminal
+/// (no retry). Only the idle stall is retryable.
+async fn stream_with_idle_watchdog(
+    driver: &dyn LlmDriver,
+    request: CompletionRequest,
+    out_tx: mpsc::Sender<StreamEvent>,
+    idle_window: Duration,
+) -> Result<crate::llm_driver::CompletionResponse, LlmError> {
+    // Private channel between the driver and this forwarder. Cap mirrors the
+    // consumer-side buffers used elsewhere in the loop.
+    let (in_tx, mut in_rx) = mpsc::channel::<StreamEvent>(64);
+    let driver_fut = driver.stream(request, in_tx);
+    tokio::pin!(driver_fut);
+
+    let mut idle_deadline = tokio::time::Instant::now() + idle_window;
+    loop {
+        tokio::select! {
+            // Prioritise driver completion and event draining over the idle
+            // timer so a simultaneously-ready event/deadline never false-trips.
+            biased;
+
+            // Driver returned (Ok or Err). Drain anything still buffered to the
+            // consumer, then surface the driver's own result verbatim.
+            res = &mut driver_fut => {
+                while let Ok(ev) = in_rx.try_recv() {
+                    let _ = out_tx.send(ev).await;
+                }
+                return res;
+            }
+
+            // An event arrived: forward it, then reset the idle window.
+            // Resetting *after* the (possibly blocking) forward keeps consumer
+            // backpressure from counting against the upstream's liveness.
+            maybe = in_rx.recv() => {
+                match maybe {
+                    Some(ev) => {
+                        let _ = out_tx.send(ev).await;
+                        idle_deadline = tokio::time::Instant::now() + idle_window;
+                    }
+                    // in_tx dropped without the future resolving yet — let the
+                    // driver future settle.
+                    None => return (&mut driver_fut).await,
+                }
+            }
+
+            // No event within the idle window: cancel the driver (dropping the
+            // pinned future on return) and surface the typed, retryable stall.
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                return Err(LlmError::StreamIdleStall(format!(
+                    "stream produced no events within idle window ({}s) — driver cancelled",
+                    idle_window.as_secs()
+                )));
+            }
+        }
+    }
+}
+
 async fn stream_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
@@ -1571,14 +1641,23 @@ async fn stream_with_retry(
     let mut last_error = None;
 
     for attempt in 0..=MAX_RETRIES {
-        // Turn watchdog (ANAI-109): see `call_with_retry`. A total-duration
-        // ceiling on the whole stream future — coarse but it closes the
-        // "hangs forever holding the lock" hole for the streaming path too.
-        // (A finer per-chunk inactivity watchdog inside the driver SSE loop is
-        // the planned cut-2 refinement.) Terminal on elapse: provider stall.
+        // Turn watchdog (ANAI-109): a total-duration *absolute* ceiling on the
+        // whole stream future — the coarse backstop that closes the "hangs
+        // forever holding the lock" hole. ANAI-116: the finer *per-event* idle
+        // watchdog now lives at this driver-agnostic channel layer, inside
+        // `stream_with_idle_watchdog`, so every driver (not just CC) gets
+        // slow-but-alive-vs-dead discrimination and the bounded `StreamIdleStall`
+        // retry below. Terminal on absolute elapse: provider stall.
         let stream_result = match tokio::time::timeout(
             std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
-            driver.stream(request.clone(), tx.clone()),
+            stream_with_idle_watchdog(
+                driver,
+                request.clone(),
+                tx.clone(),
+                std::time::Duration::from_secs(
+                    openfang_types::watchdog::stream_idle_timeout_secs(),
+                ),
+            ),
         )
         .await
         {
@@ -3700,6 +3779,116 @@ mod tests {
         );
         // Hard error -> single attempt, no idle-stall retry loop.
         assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- ANAI-116: driver-agnostic channel-layer idle watchdog ----
+
+    /// Mock driver whose `stream()` never emits an event and never returns — a
+    /// genuinely dead socket that reports *nothing*. The channel-layer watchdog
+    /// must synthesize the idle stall itself, proving it no longer depends on a
+    /// driver-internal timer (the CC-only inline loop is gone).
+    struct SilentHangDriver;
+    #[async_trait]
+    impl LlmDriver for SilentHangDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("ANAI-116 test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            _tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            // Hold `_tx` open (no None on the channel) and never produce.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    /// Mock driver that emits two deltas — each within the idle window — then
+    /// completes. Proves a slow-but-alive stream survives and its events are
+    /// forwarded to the consumer.
+    struct AliveStreamDriver;
+    #[async_trait]
+    impl LlmDriver for AliveStreamDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("ANAI-116 test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            for chunk in ["hel", "lo"] {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let _ = tx
+                    .send(StreamEvent::TextDelta {
+                        text: chunk.to_string(),
+                    })
+                    .await;
+            }
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            })
+        }
+    }
+
+    /// A silent, never-returning stream trips the channel-layer idle window and
+    /// surfaces the typed `StreamIdleStall` — the driver reported nothing, so the
+    /// watchdog now lives above the driver (ANAI-116) and covers every backend.
+    #[tokio::test(start_paused = true)]
+    async fn channel_idle_watchdog_trips_on_silent_stream() {
+        let driver = SilentHangDriver;
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_with_idle_watchdog(
+            &driver,
+            idle_test_request(),
+            tx,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("a silent stream must trip the idle window");
+        assert!(
+            matches!(err, LlmError::StreamIdleStall(_)),
+            "channel-layer stall must be the typed StreamIdleStall"
+        );
+    }
+
+    /// A slow-but-alive stream whose events each arrive within the idle window
+    /// survives to completion, and every event is forwarded to the consumer in
+    /// order — the watchdog discriminates slow-but-alive from dead.
+    #[tokio::test(start_paused = true)]
+    async fn channel_idle_watchdog_passes_through_alive_stream() {
+        let driver = AliveStreamDriver;
+        let (tx, mut rx) = mpsc::channel(64);
+        let resp = stream_with_idle_watchdog(
+            &driver,
+            idle_test_request(),
+            tx,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("an alive stream must not be killed");
+        assert_eq!(resp.text(), "hello");
+        let mut got = String::new();
+        while let Ok(StreamEvent::TextDelta { text }) = rx.try_recv() {
+            got.push_str(&text);
+        }
+        assert_eq!(got, "hello", "all deltas must be forwarded in order");
     }
 
     /// The idle-stall backoff stays inside the documented ±25% jitter band and

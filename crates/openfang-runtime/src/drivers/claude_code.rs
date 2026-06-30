@@ -1470,6 +1470,10 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // ANAI-116: the idle watchdog now lives at the channel layer and cancels
+        // this future on an idle stall by dropping it. Without kill_on_drop the
+        // CC subprocess would outlive the cancelled turn — so reap on drop.
+        cmd.kill_on_drop(true);
 
         debug!(cli = %self.cli_path, bridge_wired, native_deny_wired, "Spawning Claude Code CLI (streaming)");
 
@@ -1487,6 +1491,22 @@ impl LlmDriver for ClaudeCodeDriver {
             self.active_pids.insert(pid_label.clone(), pid);
             debug!(pid = pid, model = %pid_label, "Claude Code CLI streaming subprocess started");
         }
+
+        // ANAI-116: clear the PID entry even if this future is cancelled
+        // (dropped) mid-stream by the upstream channel-layer idle watchdog.
+        struct PidCleanup {
+            pids: std::sync::Arc<dashmap::DashMap<String, u32>>,
+            label: String,
+        }
+        impl Drop for PidCleanup {
+            fn drop(&mut self) {
+                self.pids.remove(&self.label);
+            }
+        }
+        let _pid_guard = PidCleanup {
+            pids: std::sync::Arc::clone(&self.active_pids),
+            label: pid_label.clone(),
+        };
 
         let stdout = child.stdout.take().ok_or_else(|| {
             self.active_pids.remove(&pid_label);
@@ -1515,97 +1535,38 @@ impl LlmDriver for ClaudeCodeDriver {
             output_tokens: 0,
         };
 
-        // ANAI-114: per-event idle watchdog. The old form bounded the whole
-        // read loop with a single *total* duration — it could not tell a
-        // slow-but-alive turn from a dead socket. Here each `next_line().await`
-        // is bounded by an idle window that resets on every event, so a turn
-        // that keeps streaming survives indefinitely while a genuinely silent
-        // stream trips the window. `message_timeout_secs` is retained as a
-        // coarse *absolute* backstop so a pathological flood of no-op events
-        // cannot keep the loop alive past the operator's hard ceiling. With
-        // idle in place the absolute caps can be raised for long turns without
-        // re-opening the "hang for the whole ceiling" hole.
-        let idle_window =
-            std::time::Duration::from_secs(openfang_types::watchdog::stream_idle_timeout_secs());
-        let absolute_deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(self.message_timeout_secs);
-
-        // Read-loop outcome: clean EOF (`None`) or which watchdog fired.
-        #[derive(Clone, Copy)]
-        enum StreamStall {
-            Idle,
-            Absolute,
-        }
-        let stall: Option<StreamStall> = loop {
-            // Bound this read by whichever fires first — the idle window or
-            // the absolute backstop — then disambiguate by clock.
-            let read_deadline = (tokio::time::Instant::now() + idle_window).min(absolute_deadline);
-            match tokio::time::timeout_at(read_deadline, lines.next_line()).await {
-                // A line arrived before either deadline.
-                Ok(Ok(Some(line))) => {
+        // ANAI-116: the per-event idle watchdog and the absolute backstop both
+        // moved up to the driver-agnostic channel layer (`stream_with_idle_watchdog`
+        // plus the `llm_call_timeout_secs` wrapper in `stream_with_retry`), so
+        // this read loop is now a plain drain: pull lines until EOF, fold each
+        // into the shared reassembly, and surface text deltas. An idle stall is
+        // detected upstream by the absence of events on the channel and cancels
+        // this future by dropping it — `kill_on_drop` (set above) reaps the
+        // subprocess and the PID guard clears tracking.
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    // Reassemble incrementally via the shared fold. Extracted
-                    // into `fold_stream_line` so this streaming reassembly is
-                    // diffed against the non-streaming `parse_complete_stdout`
-                    // in tests — the ANAI-113 fidelity gate. Returns the text
-                    // chunk to surface as a TextDelta, if any.
-                    if let Some(delta) =
-                        fold_stream_line(&line, &mut full_text, &mut final_usage)
-                    {
+                    // Reassemble incrementally via the shared fold — diffed
+                    // against the non-streaming `parse_complete_stdout` by the
+                    // ANAI-113 fidelity gate. Returns the text chunk to surface
+                    // as a TextDelta, if any.
+                    if let Some(delta) = fold_stream_line(&line, &mut full_text, &mut final_usage) {
                         let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
                     }
                 }
                 // Clean EOF — stream finished; exit status checked below.
-                Ok(Ok(None)) => break None,
-                // Reader error — preserve the prior `while let Ok(Some(_))`
-                // behavior, which swallowed it and let the post-loop exit-status
-                // check surface any real failure.
-                Ok(Err(_)) => break None,
-                // Deadline tripped — disambiguate idle vs absolute by clock.
-                Err(_elapsed) => {
-                    if tokio::time::Instant::now() >= absolute_deadline {
-                        break Some(StreamStall::Absolute);
-                    }
-                    break Some(StreamStall::Idle);
-                }
+                Ok(None) => break,
+                // Reader error — preserve the prior swallow semantics; the
+                // post-loop exit-status check surfaces any real failure.
+                Err(_) => break,
             }
-        };
-
-        // Clear PID tracking
-        self.active_pids.remove(&pid_label);
-
-        if let Some(kind) = stall {
-            let (secs, reason) = match kind {
-                StreamStall::Idle => (
-                    openfang_types::watchdog::stream_idle_timeout_secs(),
-                    "no stream events within idle window",
-                ),
-                StreamStall::Absolute => {
-                    (self.message_timeout_secs, "exceeded absolute stream backstop")
-                }
-            };
-            warn!(
-                timeout_secs = secs,
-                model = %pid_label,
-                reason,
-                "Claude Code CLI streaming subprocess stalled, killing process"
-            );
-            let _ = child.kill().await;
-            let msg = format!(
-                "Claude Code CLI streaming subprocess timed out after {secs}s ({reason}) — process killed"
-            );
-            // ANAI-115: an *idle* stall is a silent socket we just killed before
-            // any terminal event — safe to re-issue — so surface it as the typed
-            // `StreamIdleStall` that `stream_with_retry` retries on specifically.
-            // An *absolute* stall means the operator's hard ceiling was hit; keep
-            // it as an opaque `Http` error (not a retry candidate).
-            return Err(match kind {
-                StreamStall::Idle => LlmError::StreamIdleStall(msg),
-                StreamStall::Absolute => LlmError::Http(msg),
-            });
         }
+
+        // Clear PID tracking (also cleared on cancel by the guard above).
+        self.active_pids.remove(&pid_label);
 
         // Wait for process to finish
         let status = child

@@ -306,6 +306,9 @@ impl LlmDriver for QwenCodeDriver {
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // ANAI-116: cancelled (dropped) by the channel-layer idle watchdog on an
+        // idle stall — reap the subprocess on drop instead of orphaning it.
+        cmd.kill_on_drop(true);
 
         debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, "Spawning Qwen Code CLI (streaming)");
 
