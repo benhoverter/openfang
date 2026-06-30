@@ -1545,6 +1545,7 @@ async fn stream_with_idle_watchdog(
     request: CompletionRequest,
     out_tx: mpsc::Sender<StreamEvent>,
     idle_window: Duration,
+    tool_window: Option<Duration>,
 ) -> Result<crate::llm_driver::CompletionResponse, LlmError> {
     // Private channel between the driver and this forwarder. Cap mirrors the
     // consumer-side buffers used elsewhere in the loop.
@@ -1552,7 +1553,35 @@ async fn stream_with_idle_watchdog(
     let driver_fut = driver.stream(request, in_tx);
     tokio::pin!(driver_fut);
 
-    let mut idle_deadline = tokio::time::Instant::now() + idle_window;
+    // ANAI-119: while >=1 tool is in flight inside the subprocess, the model is
+    // legitimately silent (e.g. a `cargo build` that emits nothing on stdout
+    // for minutes). Counting that silence against the short idle window
+    // false-kills coding turns, so during tool execution we swap the active
+    // window to `tool_window` — the `mcp_tool_timeout_secs` bound. `None` means
+    // that bound is disabled (knob == 0): the tool then runs with no idle
+    // deadline at all. Either way the absolute `llm_call_timeout_secs` ceiling
+    // wrapping this call in `stream_with_retry` remains the coarse backstop.
+    // Tool boundaries are the `ToolUseStart` / `ToolUseEnd` events the driver
+    // emits from the stream-json block taxonomy.
+    let mut tools_in_flight: usize = 0;
+
+    // Next idle deadline for the current in-flight state. A `None` window (the
+    // tool bound is disabled while a tool runs) parks the deadline far in the
+    // future so the `sleep_until` arm effectively never fires.
+    let deadline_for = |in_flight: usize| -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let window = if in_flight > 0 {
+            tool_window
+        } else {
+            Some(idle_window)
+        };
+        match window {
+            Some(w) => now + w,
+            None => now + Duration::from_secs(365 * 24 * 3600),
+        }
+    };
+
+    let mut idle_deadline = deadline_for(tools_in_flight);
     loop {
         tokio::select! {
             // Prioritise driver completion and event draining over the idle
@@ -1568,14 +1597,26 @@ async fn stream_with_idle_watchdog(
                 return res;
             }
 
-            // An event arrived: forward it, then reset the idle window.
-            // Resetting *after* the (possibly blocking) forward keeps consumer
-            // backpressure from counting against the upstream's liveness.
+            // An event arrived: update tool-bracket state, forward it, then
+            // reset the active window. Resetting *after* the (possibly blocking)
+            // forward keeps consumer backpressure from counting against the
+            // upstream's liveness.
             maybe = in_rx.recv() => {
                 match maybe {
                     Some(ev) => {
+                        // Bracket BEFORE forwarding so the new window governs the
+                        // silence that follows this event.
+                        match &ev {
+                            StreamEvent::ToolUseStart { .. } => {
+                                tools_in_flight += 1;
+                            }
+                            StreamEvent::ToolUseEnd { .. } => {
+                                tools_in_flight = tools_in_flight.saturating_sub(1);
+                            }
+                            _ => {}
+                        }
                         let _ = out_tx.send(ev).await;
-                        idle_deadline = tokio::time::Instant::now() + idle_window;
+                        idle_deadline = deadline_for(tools_in_flight);
                     }
                     // in_tx dropped without the future resolving yet — let the
                     // driver future settle.
@@ -1583,12 +1624,21 @@ async fn stream_with_idle_watchdog(
                 }
             }
 
-            // No event within the idle window: cancel the driver (dropping the
+            // No event within the active window: cancel the driver (dropping the
             // pinned future on return) and surface the typed, retryable stall.
+            // The label/seconds reflect whether a tool was in flight when it
+            // tripped, so logs tell idle-stall from tool-timeout apart.
             _ = tokio::time::sleep_until(idle_deadline) => {
+                let (label, secs) = if tools_in_flight > 0 {
+                    (
+                        "tool-execution",
+                        tool_window.map(|w| w.as_secs()).unwrap_or(0),
+                    )
+                } else {
+                    ("idle", idle_window.as_secs())
+                };
                 return Err(LlmError::StreamIdleStall(format!(
-                    "stream produced no events within idle window ({}s) — driver cancelled",
-                    idle_window.as_secs()
+                    "stream produced no events within {label} window ({secs}s) — driver cancelled"
                 )));
             }
         }
@@ -1657,6 +1707,14 @@ async fn stream_with_retry(
                 std::time::Duration::from_secs(
                     openfang_types::watchdog::stream_idle_timeout_secs(),
                 ),
+                // ANAI-119: active window while a tool runs in the subprocess.
+                // `mcp_tool_timeout_secs == 0` disables the bound (None) -> the
+                // tool runs without an idle deadline, capped only by the
+                // absolute `llm_call_timeout_secs` ceiling wrapping this call.
+                match openfang_types::watchdog::mcp_tool_timeout_secs() {
+                    0 => None,
+                    secs => Some(std::time::Duration::from_secs(secs)),
+                },
             ),
         )
         .await
@@ -3859,6 +3917,7 @@ mod tests {
             idle_test_request(),
             tx,
             std::time::Duration::from_millis(50),
+            None,
         )
         .await
         .expect_err("a silent stream must trip the idle window");
@@ -3880,6 +3939,7 @@ mod tests {
             idle_test_request(),
             tx,
             std::time::Duration::from_millis(50),
+            None,
         )
         .await
         .expect("an alive stream must not be killed");
@@ -3889,6 +3949,121 @@ mod tests {
             got.push_str(&text);
         }
         assert_eq!(got, "hello", "all deltas must be forwarded in order");
+    }
+
+    // ---- ANAI-119: tool-execution suspends the short idle window ----
+
+    /// Opens a tool (ToolUseStart), stays silent far longer than the idle
+    /// window — as a real `cargo build` does — then closes it (ToolUseEnd) and
+    /// completes. The longer tool window must govern that silence.
+    struct ToolInFlightDriver;
+    #[async_trait]
+    impl LlmDriver for ToolInFlightDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("tool-in-flight test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let _ = tx
+                .send(StreamEvent::ToolUseStart {
+                    id: String::new(),
+                    name: "build".to_string(),
+                })
+                .await;
+            // Silent for 10x the idle window while the "tool" runs.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = tx
+                .send(StreamEvent::ToolUseEnd {
+                    id: String::new(),
+                    name: "build".to_string(),
+                    input: serde_json::Value::Null,
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    text: "done".to_string(),
+                })
+                .await;
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            })
+        }
+    }
+
+    /// In-flight tool silence is governed by the (longer) tool window, not the
+    /// short idle window — a quiet build is not mistaken for a dead stream.
+    #[tokio::test(start_paused = true)]
+    async fn channel_idle_watchdog_suspends_during_tool_execution() {
+        let driver = ToolInFlightDriver;
+        let (tx, _rx) = mpsc::channel(64);
+        let resp = stream_with_idle_watchdog(
+            &driver,
+            idle_test_request(),
+            tx,
+            std::time::Duration::from_millis(50),
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect("a tool in flight must suspend the short idle window");
+        assert_eq!(resp.text(), "done");
+    }
+
+    /// The SAME silent gap WITHOUT a tool bracket trips the idle window —
+    /// proving the suspension above is the bracket's doing, not luck.
+    struct SilentGapDriver;
+    #[async_trait]
+    impl LlmDriver for SilentGapDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("silent-gap test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    text: "start".to_string(),
+                })
+                .await;
+            // Silence past the idle window with no tool open — must be killed.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            unreachable!("idle window should have cancelled this future")
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_idle_watchdog_trips_on_untooled_silence() {
+        let driver = SilentGapDriver;
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_with_idle_watchdog(
+            &driver,
+            idle_test_request(),
+            tx,
+            std::time::Duration::from_millis(50),
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .await
+        .expect_err("untooled silence past the idle window must trip");
+        assert!(matches!(err, LlmError::StreamIdleStall(_)));
     }
 
     /// The idle-stall backoff stays inside the documented ±25% jitter band and

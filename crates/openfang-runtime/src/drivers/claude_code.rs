@@ -1025,6 +1025,12 @@ struct ClaudeMessageBlock {
     block_type: String,
     #[serde(default)]
     text: String,
+    /// ANAI-119: extended-thinking blocks carry their body in `thinking`, not
+    /// `text`. Captured so a thinking block can be surfaced as a liveness
+    /// signal (which resets the upstream idle watchdog) WITHOUT ever being
+    /// appended to the reply body — the root of the thinking-leak bug.
+    #[serde(default)]
+    thinking: String,
 }
 
 /// Nested `message` object carried by `type=assistant` stream-json events.
@@ -1090,63 +1096,130 @@ fn parse_complete_stdout(stdout: &str) -> (String, TokenUsage) {
     )
 }
 
+/// Outcome of folding one stream-json line: the reply-body text to surface
+/// (already appended to `full_text`) plus the non-text liveness signals seen
+/// on the line. ANAI-119: the signals never reach the reply body — they exist
+/// so the driver can keep the upstream idle watchdog alive during thinking and
+/// bracket in-subprocess tool execution, without leaking thinking/tool noise
+/// into the channel reply (which is assembled from `full_text`).
+#[derive(Debug, Default, PartialEq)]
+struct FoldOutcome {
+    /// Reply text appended this line — surfaced as `StreamEvent::TextDelta`.
+    text: Option<String>,
+    /// Thinking text seen this line — surfaced as a liveness `ThinkingDelta`,
+    /// never appended to the reply body.
+    thinking: Option<String>,
+    /// `tool_use` blocks opened this line — each becomes a `ToolUseStart` so
+    /// the watchdog enters its tool-execution window.
+    tool_starts: usize,
+    /// `tool_result` blocks closed this line — each becomes a `ToolUseEnd` so
+    /// the watchdog leaves the tool-execution window.
+    tool_ends: usize,
+    /// A non-text lifecycle/unknown event (system init, ping, stream wrapper)
+    /// — surfaced as a bare liveness ping so a quiet-but-alive stream still
+    /// resets the idle window.
+    lifecycle: bool,
+}
+
 /// Fold one line of `claude -p --output-format stream-json --verbose` stdout
-/// into the running `(full_text, final_usage)` accumulators, returning the
-/// text chunk (if any) to surface as a `StreamEvent::TextDelta`.
+/// into the running `(full_text, final_usage)` accumulators, returning a
+/// `FoldOutcome` describing the reply text and liveness signals on the line.
 ///
-/// Extracted verbatim from `stream()` so the streaming reassembly can be
-/// diffed against `parse_complete_stdout` in tests — the ANAI-113 fidelity
-/// gate. Mirrors the original event handling exactly: `assistant` / `content`
-/// / `text` / `content_block_delta` events append flat-or-nested text;
-/// `result` / `done` / `complete` events backfill text only when empty and
-/// capture usage; unknown events fall back to their `content` field; and
-/// non-JSON lines are appended raw. Behavior is unchanged from the inline form.
+/// Extracted from `stream()` so the streaming reassembly can be diffed against
+/// `parse_complete_stdout` in tests — the ANAI-113 fidelity gate, which checks
+/// only `full_text`/`final_usage` and ignores the returned outcome.
+///
+/// ANAI-119: text is now extracted on a strict allowlist — only confirmed
+/// `block_type == "text"` blocks (nested) or a flat `content` string on the
+/// legacy text-bearing event types ever reach `full_text`. `thinking` blocks
+/// are captured as a liveness signal but never appended (this closes the
+/// thinking-leak door); `tool_use` / `tool_result` blocks become tool-bracket
+/// signals; `user` events (tool-result echoes / prompt echo) are scanned for
+/// brackets only, never text; and unknown events are bare liveness pings
+/// instead of having their raw `content` appended (the second leak door).
+/// Text-path behavior is unchanged from the prior form, so the gate holds.
 fn fold_stream_line(
     line: &str,
     full_text: &mut String,
     final_usage: &mut TokenUsage,
-) -> Option<String> {
+) -> FoldOutcome {
+    let mut outcome = FoldOutcome::default();
     let event = match serde_json::from_str::<ClaudeStreamEvent>(line) {
         Ok(event) => event,
         Err(e) => {
-            // Not valid JSON — treat as raw text.
+            // Not valid JSON — treat as raw text (legacy behavior).
             warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
             full_text.push_str(line);
-            return Some(line.to_string());
+            outcome.text = Some(line.to_string());
+            return outcome;
         }
     };
 
     match event.r#type.as_str() {
         "content" | "text" | "assistant" | "content_block_delta" => {
-            // Older CLI: flat `content` string.
-            // CLI >=2.x (type=assistant): text is nested in
-            // `message.content[].text`; the flat `content` field is absent.
-            let chunk = event.content.clone().unwrap_or_default();
-            let nested: String = event
-                .message
-                .as_ref()
-                .map(|msg| {
-                    msg.content
-                        .iter()
-                        .filter(|b| b.block_type == "text")
-                        .map(|b| b.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-                .unwrap_or_default();
-            let text_chunk = if !chunk.is_empty() { chunk } else { nested };
-            if !text_chunk.is_empty() {
-                full_text.push_str(&text_chunk);
-                return Some(text_chunk);
+            // Newer CLI (>=2.x) nests typed blocks in `message.content[]`;
+            // classify each by `type`. Only `text` blocks reach the reply body.
+            if let Some(msg) = event.message.as_ref() {
+                for b in &msg.content {
+                    match b.block_type.as_str() {
+                        "text" => {
+                            if !b.text.is_empty() {
+                                full_text.push_str(&b.text);
+                                outcome
+                                    .text
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&b.text);
+                            }
+                        }
+                        "thinking" => {
+                            if !b.thinking.is_empty() {
+                                outcome
+                                    .thinking
+                                    .get_or_insert_with(String::new)
+                                    .push_str(&b.thinking);
+                            }
+                        }
+                        "tool_use" => outcome.tool_starts += 1,
+                        "tool_result" => outcome.tool_ends += 1,
+                        // Unknown block type — ignore (never append unfiltered).
+                        _ => {}
+                    }
+                }
             }
-            None
+            // Legacy CLI: flat `content` string. Used only when the nested path
+            // produced no text, and only for these text-bearing event types —
+            // never appended unfiltered for unknown event types.
+            if outcome.text.is_none() {
+                if let Some(chunk) = event.content.clone() {
+                    if !chunk.is_empty() {
+                        full_text.push_str(&chunk);
+                        outcome.text = Some(chunk);
+                    }
+                }
+            }
+            outcome
+        }
+        "user" => {
+            // Tool results echo back as a `user` message (as does the initial
+            // prompt). Bracket any tool blocks for the watchdog but NEVER append
+            // text — that would leak tool output or the echoed prompt into the
+            // reply body.
+            if let Some(msg) = event.message.as_ref() {
+                for b in &msg.content {
+                    match b.block_type.as_str() {
+                        "tool_result" => outcome.tool_ends += 1,
+                        "tool_use" => outcome.tool_starts += 1,
+                        _ => {}
+                    }
+                }
+            }
+            outcome
         }
         "result" | "done" | "complete" => {
-            let mut emit = None;
             if let Some(ref result) = event.result {
                 if full_text.is_empty() {
                     *full_text = result.clone();
-                    emit = Some(result.clone());
+                    outcome.text = Some(result.clone());
                 }
             }
             if let Some(usage) = event.usage {
@@ -1155,15 +1228,15 @@ fn fold_stream_line(
                     output_tokens: usage.output_tokens,
                 };
             }
-            emit
+            outcome
         }
         _ => {
-            // Unknown event type — try content field as fallback.
-            if let Some(ref content) = event.content {
-                full_text.push_str(content);
-                return Some(content.clone());
-            }
-            None
+            // Unknown/lifecycle event (system init, ping, stream_event
+            // wrapper). ANAI-119: do NOT append its `content` to the reply body
+            // — that was the second thinking-leak door. Treat it as a bare
+            // liveness ping so the idle watchdog still sees the stream is alive.
+            outcome.lifecycle = true;
+            outcome
         }
     }
 }
@@ -1553,8 +1626,47 @@ impl LlmDriver for ClaudeCodeDriver {
                     // against the non-streaming `parse_complete_stdout` by the
                     // ANAI-113 fidelity gate. Returns the text chunk to surface
                     // as a TextDelta, if any.
-                    if let Some(delta) = fold_stream_line(&line, &mut full_text, &mut final_usage) {
+                    let outcome = fold_stream_line(&line, &mut full_text, &mut final_usage);
+                    // Reply text -> TextDelta (also accumulated into full_text).
+                    if let Some(delta) = outcome.text {
                         let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
+                    }
+                    // ANAI-119 liveness/bracket signals. None of these reach the
+                    // channel reply (assembled from full_text) — they exist to
+                    // keep the upstream idle watchdog informed: thinking and
+                    // lifecycle pings reset the idle window; tool_use/tool_result
+                    // bracket the in-subprocess tool-execution window so a long,
+                    // silent build is not mistaken for a dead stream.
+                    if let Some(thinking) = outcome.thinking {
+                        let _ = tx
+                            .send(StreamEvent::ThinkingDelta { text: thinking })
+                            .await;
+                    }
+                    for _ in 0..outcome.tool_starts {
+                        let _ = tx
+                            .send(StreamEvent::ToolUseStart {
+                                id: String::new(),
+                                name: String::new(),
+                            })
+                            .await;
+                    }
+                    for _ in 0..outcome.tool_ends {
+                        let _ = tx
+                            .send(StreamEvent::ToolUseEnd {
+                                id: String::new(),
+                                name: String::new(),
+                                input: serde_json::Value::Null,
+                            })
+                            .await;
+                    }
+                    if outcome.lifecycle {
+                        // Bare liveness ping (empty thinking delta) — resets the
+                        // idle window without contributing reply text.
+                        let _ = tx
+                            .send(StreamEvent::ThinkingDelta {
+                                text: String::new(),
+                            })
+                            .await;
                     }
                 }
                 // Clean EOF — stream finished; exit status checked below.
@@ -2541,5 +2653,109 @@ mod tests {
         let (c_text, _) = parse_complete_stdout(json);
         let (s_text, _) = reassemble_stream(&stream);
         assert_eq!(c_text, s_text);
+    }
+
+    // ===== ANAI-119: thinking + tool block taxonomy =====
+
+    #[test]
+    fn fidelity_thinking_block_not_leaked() {
+        // An extended-thinking block rides alongside the text block in the same
+        // turn. `complete()` only ever sees the final `result` text; the stream
+        // fold must likewise surface ONLY the text block and never the thinking
+        // body. This is the fixture the gate lacked while the leak shipped.
+        let json =
+            r#"{"result":"The answer is 42.","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"Let me reason at length about the meaning of everything."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The answer is 42."}]}}"#,
+            r#"{"type":"result","result":"The answer is 42.","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fold_reports_thinking_as_signal_not_reply_text() {
+        // A thinking-only line contributes a `thinking` liveness signal and
+        // leaves the reply body (`full_text`) untouched.
+        let mut full_text = String::new();
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"private reasoning"}]}}"#;
+        let outcome = fold_stream_line(line, &mut full_text, &mut usage);
+        assert_eq!(outcome.thinking.as_deref(), Some("private reasoning"));
+        assert_eq!(outcome.text, None);
+        assert!(
+            full_text.is_empty(),
+            "thinking must never reach the reply body"
+        );
+    }
+
+    #[test]
+    fn fold_brackets_tool_use_and_result() {
+        // tool_use (assistant) opens and tool_result (user) closes a tool — the
+        // fold reports the brackets so the watchdog can suspend the idle window,
+        // and neither contributes reply text.
+        let mut full_text = String::new();
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+
+        let open = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#;
+        let o1 = fold_stream_line(open, &mut full_text, &mut usage);
+        assert_eq!(o1.tool_starts, 1);
+        assert_eq!(o1.tool_ends, 0);
+        assert_eq!(o1.text, None);
+
+        let close = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+        let o2 = fold_stream_line(close, &mut full_text, &mut usage);
+        assert_eq!(o2.tool_ends, 1);
+        assert_eq!(o2.tool_starts, 0);
+        assert_eq!(o2.text, None);
+
+        assert!(
+            full_text.is_empty(),
+            "tool blocks must never reach the reply body"
+        );
+    }
+
+    #[test]
+    fn fold_user_text_block_never_appended() {
+        // A `user` event echoing prompt text must NOT contribute to the reply
+        // body — only its tool brackets matter.
+        let mut full_text = String::new();
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let line = r#"{"type":"user","message":{"content":[{"type":"text","text":"the original prompt"}]}}"#;
+        let outcome = fold_stream_line(line, &mut full_text, &mut usage);
+        assert_eq!(outcome.text, None);
+        assert!(
+            full_text.is_empty(),
+            "echoed user prompt must not leak into the reply"
+        );
+    }
+
+    #[test]
+    fn fold_unknown_event_is_lifecycle_not_text() {
+        // An unknown event type carrying a `content` field used to be appended
+        // raw (the second thinking-leak door). It must now be a bare liveness
+        // ping with no reply-text contribution.
+        let mut full_text = String::new();
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let line = r#"{"type":"stream_event","content":"leaked reasoning fragment"}"#;
+        let outcome = fold_stream_line(line, &mut full_text, &mut usage);
+        assert!(outcome.lifecycle, "unknown event must be a liveness ping");
+        assert_eq!(outcome.text, None);
+        assert!(
+            full_text.is_empty(),
+            "unknown-event content must never reach the reply body"
+        );
     }
 }
