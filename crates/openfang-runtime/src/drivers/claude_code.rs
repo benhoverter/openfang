@@ -1531,6 +1531,7 @@ impl LlmDriver for ClaudeCodeDriver {
             + std::time::Duration::from_secs(self.message_timeout_secs);
 
         // Read-loop outcome: clean EOF (`None`) or which watchdog fired.
+        #[derive(Clone, Copy)]
         enum StreamStall {
             Idle,
             Absolute,
@@ -1592,9 +1593,18 @@ impl LlmDriver for ClaudeCodeDriver {
                 "Claude Code CLI streaming subprocess stalled, killing process"
             );
             let _ = child.kill().await;
-            return Err(LlmError::Http(format!(
+            let msg = format!(
                 "Claude Code CLI streaming subprocess timed out after {secs}s ({reason}) — process killed"
-            )));
+            );
+            // ANAI-115: an *idle* stall is a silent socket we just killed before
+            // any terminal event — safe to re-issue — so surface it as the typed
+            // `StreamIdleStall` that `stream_with_retry` retries on specifically.
+            // An *absolute* stall means the operator's hard ceiling was hit; keep
+            // it as an opaque `Http` error (not a retry candidate).
+            return Err(match kind {
+                StreamStall::Idle => LlmError::StreamIdleStall(msg),
+                StreamStall::Absolute => LlmError::Http(msg),
+            });
         }
 
         // Wait for process to finish

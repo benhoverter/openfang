@@ -1501,6 +1501,30 @@ async fn call_with_retry(
 ///
 /// When the primary model returns a `ModelNotFound` error and `fallback_models`
 /// is non-empty, each fallback is tried in order before propagating the error.
+/// Exponential backoff with per-process jitter for stream idle-stall retries
+/// (ANAI-115).
+///
+/// Base is the shared `BASE_RETRY_DELAY_MS * 2^attempt`. The jitter band is
+/// ±25% of base; its phase is derived deterministically from the process id so
+/// a fleet of agents that all idle-stalled on the same dead backend spread
+/// their reconnects across the band instead of reconnecting in lockstep. No
+/// `rand` dependency — the pid supplies cross-process variance while the result
+/// stays reproducible *within* a process, which keeps it unit-testable. The
+/// `attempt` is mixed in so successive retries in one process do not all share
+/// the same offset.
+fn stream_idle_retry_delay_ms(attempt: u32) -> u64 {
+    let base = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+    // Full jitter band = 50% of base, applied as base ± 25%.
+    let band = base / 2;
+    let seed = (std::process::id() as u64)
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(u64::from(attempt).wrapping_mul(40_503));
+    let offset = seed % (band + 1); // 0..=band
+    // base - band/2 == 0.75*base (no underflow) + offset in 0..=band
+    // => result in [0.75*base, 1.25*base].
+    base - band / 2 + offset
+}
+
 async fn stream_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
@@ -1530,6 +1554,19 @@ async fn stream_with_retry(
             CooldownVerdict::Allow => {}
         }
     }
+
+    // ANAI-115 invariant: the driver's per-event idle window must trip
+    // *before* this outer total-budget wrapper (`llm_call_timeout_secs`), or the
+    // wrapper fires first and returns the terminal PROVIDER_STALL_MARKER path
+    // below — the typed `StreamIdleStall` never surfaces and the bounded
+    // idle-stall retry is a silent no-op. Holds at defaults (idle 180 < total
+    // 240); pinned here so a config that inverts them trips in debug instead of
+    // quietly disabling retry.
+    debug_assert!(
+        openfang_types::watchdog::stream_idle_timeout_secs()
+            < openfang_types::watchdog::llm_call_timeout_secs(),
+        "stream idle window must be < llm_call total ceiling for idle-stall retry to engage"
+    );
 
     let mut last_error = None;
 
@@ -1605,6 +1642,43 @@ async fn stream_with_retry(
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
+            }
+            // ANAI-115: bounded, transparent retry on a *genuinely silent*
+            // stream only. The driver killed an idle CC subprocess before any
+            // terminal/result event, so nothing was committed server-side —
+            // re-issuing the stream is side-effect-safe. Keyed off the typed
+            // `StreamIdleStall` (not a log-string match) so it can never fire on
+            // an absolute-cap stall or a real API error. Exhausting the retries
+            // surfaces the terminal PROVIDER_STALL_MARKER so the workflow retry
+            // gate still refuses to re-run the step.
+            Err(LlmError::StreamIdleStall(detail)) => {
+                if attempt == MAX_RETRIES {
+                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                        cooldown.record_failure(provider, false);
+                    }
+                    warn!(
+                        attempt,
+                        "Stream idle-stalled after {} retries; aborting turn (provider stall)",
+                        MAX_RETRIES
+                    );
+                    return Err(OpenFangError::LlmDriver(format!(
+                        "{}: stream idle after {} retries — {}",
+                        openfang_types::watchdog::PROVIDER_STALL_MARKER,
+                        MAX_RETRIES,
+                        detail
+                    )));
+                }
+                // Backoff + per-process jitter so a fleet that all idle-stalled
+                // on the same dead backend spreads its reconnects instead of
+                // re-hammering in a synchronized thundering herd.
+                let delay = stream_idle_retry_delay_ms(attempt);
+                warn!(
+                    attempt,
+                    delay_ms = delay,
+                    "Stream idle stall, retrying after delay (ANAI-115)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                last_error = Some("Stream idle stall".to_string());
             }
             Err(e) => {
                 let raw_error = e.to_string();
@@ -3487,6 +3561,163 @@ mod tests {
     use async_trait::async_trait;
     use openfang_types::tool::ToolCall;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ---- ANAI-115: bounded idle-stall retry on the streaming path ----
+
+    /// Mock streaming driver: returns `StreamIdleStall` for the first `fail_n`
+    /// `stream()` calls, then a normal response. Counts invocations.
+    struct IdleStallThenOkDriver {
+        fail_n: u32,
+        calls: AtomicU32,
+    }
+    #[async_trait]
+    impl LlmDriver for IdleStallThenOkDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("ANAI-115 test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            _tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_n {
+                Err(LlmError::StreamIdleStall(format!("silent socket #{n}")))
+            } else {
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "recovered".to_string(),
+                        provider_metadata: None,
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    tool_calls: vec![],
+                    usage: TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                    },
+                })
+            }
+        }
+    }
+
+    /// Mock streaming driver that always returns a hard (non-idle) API error.
+    struct AlwaysApiErrorDriver {
+        calls: AtomicU32,
+    }
+    #[async_trait]
+    impl LlmDriver for AlwaysApiErrorDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("ANAI-115 test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            _tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LlmError::Api {
+                status: 400,
+                message: "bad request".to_string(),
+            })
+        }
+    }
+
+    fn idle_test_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "test/idle".to_string(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 256,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            caller_agent_id: None,
+            allowed_tools: None,
+        }
+    }
+
+    /// Idle stall retries transparently and succeeds once the socket recovers,
+    /// re-issuing the stream exactly as many times as it stalled.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_stall_retries_then_succeeds() {
+        let driver = IdleStallThenOkDriver {
+            fail_n: 2,
+            calls: AtomicU32::new(0),
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let resp = stream_with_retry(&driver, idle_test_request(), tx, None, None, &[], None)
+            .await
+            .expect("idle stall should be retried to success");
+        assert_eq!(resp.text(), "recovered");
+        // 2 idle stalls + 1 success = 3 stream() invocations.
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Idle stall that never recovers is bounded by MAX_RETRIES and surfaces the
+    /// terminal provider-stall marker (so the workflow retry gate refuses to
+    /// re-run the step) — it does NOT loop forever.
+    #[tokio::test(start_paused = true)]
+    async fn stream_idle_stall_exhausts_to_provider_stall_marker() {
+        let driver = IdleStallThenOkDriver {
+            fail_n: u32::MAX,
+            calls: AtomicU32::new(0),
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_with_retry(&driver, idle_test_request(), tx, None, None, &[], None)
+            .await
+            .expect_err("perpetual idle stall must terminate as an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(openfang_types::watchdog::PROVIDER_STALL_MARKER),
+            "exhausted idle retry must surface the provider-stall marker, got: {msg}"
+        );
+        // MAX_RETRIES retries + the initial attempt = MAX_RETRIES + 1 invocations.
+        assert_eq!(driver.calls.load(Ordering::SeqCst), MAX_RETRIES + 1);
+    }
+
+    /// A hard (non-idle) API error must NOT take the idle-stall retry path — it
+    /// terminates on the first attempt, proving the retry keys off the typed
+    /// `StreamIdleStall` variant, not on "any stream failure".
+    #[tokio::test(start_paused = true)]
+    async fn stream_non_idle_error_is_not_idle_retried() {
+        let driver = AlwaysApiErrorDriver {
+            calls: AtomicU32::new(0),
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let err = stream_with_retry(&driver, idle_test_request(), tx, None, None, &[], None)
+            .await
+            .expect_err("a 400 must surface as an error");
+        assert!(
+            !err.to_string()
+                .contains(openfang_types::watchdog::PROVIDER_STALL_MARKER),
+            "a hard API error must not masquerade as a provider stall"
+        );
+        // Hard error -> single attempt, no idle-stall retry loop.
+        assert_eq!(driver.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The idle-stall backoff stays inside the documented ±25% jitter band and
+    /// grows exponentially in the base, so a stalled fleet neither reconnects in
+    /// lockstep nor busy-loops.
+    #[test]
+    fn stream_idle_retry_delay_within_jitter_band() {
+        for attempt in 0..=2u32 {
+            let base = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+            let lo = base - base / 4; // -25%
+            let hi = base + base / 4; // +25%
+            let d = stream_idle_retry_delay_ms(attempt);
+            assert!(
+                (lo..=hi).contains(&d),
+                "attempt {attempt}: delay {d} outside [{lo}, {hi}] (base {base})"
+            );
+        }
+    }
 
     #[test]
     fn test_max_iterations_constant() {

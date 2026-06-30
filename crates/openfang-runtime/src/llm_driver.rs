@@ -46,6 +46,17 @@ pub enum LlmError {
     /// Model not found.
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    /// Streaming call went idle — no stream events arrived within the per-event
+    /// idle window (ANAI-114/115). Distinct from a *total-budget* stall: the
+    /// socket is **silent**, not merely slow, and the driver killed the
+    /// subprocess before any terminal/result event, so nothing was committed
+    /// server-side that a re-issue would duplicate. That makes an idle stall a
+    /// safe candidate for a bounded, transparent retry. `stream_with_retry`
+    /// keys its idle-stall retry off this variant *specifically* (ANAI-115);
+    /// every other `match` on `LlmError` falls through its existing `_ =>` arm
+    /// unchanged.
+    #[error("Stream idle stall: {0}")]
+    StreamIdleStall(String),
 }
 
 /// A request to an LLM for completion.
