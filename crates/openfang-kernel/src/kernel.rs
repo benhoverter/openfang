@@ -2857,6 +2857,23 @@ impl OpenFangKernel {
 
     /// Execute the default LLM-based agent loop.
     #[allow(clippy::too_many_arguments)]
+    /// ANAI-118 kill switch for channel-reply streaming. When enabled (the
+    /// default), channel-reply turns (`text_reply_is_delivery == true`) run
+    /// through the streaming agent loop so the per-event idle-stream watchdog
+    /// (ANAI-113/114/115/117) arms on background / channel agents. Set
+    /// `OPENFANG_CHANNEL_STREAMING` to `0`/`false`/`off`/`no` to fall back to the
+    /// non-streaming `complete()` path. Read per-turn so the switch flips without
+    /// a daemon restart.
+    fn channel_streaming_enabled() -> bool {
+        match std::env::var("OPENFANG_CHANNEL_STREAMING") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        }
+    }
+
     async fn execute_llm_agent(
         &self,
         entry: &AgentEntry,
@@ -3199,42 +3216,101 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let result = run_agent_loop(
-            &manifest,
-            &message_with_links,
-            &mut session,
-            &self.memory,
-            driver,
-            &tools,
-            kernel_handle,
-            Some(&skill_snapshot),
-            Some(&self.mcp_connections),
-            Some(&self.web_ctx),
-            Some(&self.browser_ctx),
-            self.embedding_driver.as_deref(),
-            manifest.workspace.as_deref(),
-            None, // on_phase callback
-            Some(&self.media_engine),
-            if self.config.tts.enabled {
-                Some(&self.tts_engine)
-            } else {
-                None
-            },
-            if self.config.docker.enabled {
-                Some(&self.config.docker)
-            } else {
-                None
-            },
-            Some(&self.hooks),
-            ctx_window,
-            Some(&self.process_manager),
-            content_blocks,
-            origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
-            text_reply_is_delivery,
-            trigger,
-        )
-        .await
-        .map_err(KernelError::OpenFang)?;
+        // ANAI-118: channel-reply turns route through the streaming agent loop
+        // so the per-event idle-stream watchdog arms on background / channel
+        // agents. The reassembled final text is identical to the complete()
+        // path (ANAI-113 fidelity gate), so the user-facing reply is unchanged.
+        // The phantom-action guard is intentionally absent from the streaming
+        // loop, which matches the channel-reply contract: on the non-streaming
+        // path `text_reply_is_delivery == true` already suppresses that guard,
+        // so behaviour is preserved. Non-channel sends (cron / agent_send / API,
+        // `text_reply_is_delivery == false`) keep the complete() path and its
+        // firing phantom guard.
+        let result = if text_reply_is_delivery && Self::channel_streaming_enabled() {
+            info!(agent_id = %agent_id, path = "stream", "ANAI-118 channel turn dispatch");
+            // No live client consumes the stream here; drain it so the bounded
+            // sender never back-pressures the watchdog's per-event liveness check.
+            let (stream_tx, mut stream_rx) =
+                tokio::sync::mpsc::channel::<StreamEvent>(256);
+            let drain =
+                tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
+            let streamed = run_agent_loop_streaming(
+                &manifest,
+                &message_with_links,
+                &mut session,
+                &self.memory,
+                driver,
+                &tools,
+                kernel_handle,
+                stream_tx,
+                Some(&skill_snapshot),
+                Some(&self.mcp_connections),
+                Some(&self.web_ctx),
+                Some(&self.browser_ctx),
+                self.embedding_driver.as_deref(),
+                manifest.workspace.as_deref(),
+                None, // on_phase — channel path has no live SSE/WS consumer
+                Some(&self.media_engine),
+                if self.config.tts.enabled {
+                    Some(&self.tts_engine)
+                } else {
+                    None
+                },
+                if self.config.docker.enabled {
+                    Some(&self.config.docker)
+                } else {
+                    None
+                },
+                Some(&self.hooks),
+                ctx_window,
+                Some(&self.process_manager),
+                content_blocks,
+                origin.as_ref(),
+                trigger,
+            )
+            .await
+            .map_err(KernelError::OpenFang);
+            drain.abort();
+            streamed?
+        } else {
+            info!(agent_id = %agent_id, path = "complete", "ANAI-118 channel turn dispatch");
+            run_agent_loop(
+                &manifest,
+                &message_with_links,
+                &mut session,
+                &self.memory,
+                driver,
+                &tools,
+                kernel_handle,
+                Some(&skill_snapshot),
+                Some(&self.mcp_connections),
+                Some(&self.web_ctx),
+                Some(&self.browser_ctx),
+                self.embedding_driver.as_deref(),
+                manifest.workspace.as_deref(),
+                None, // on_phase callback
+                Some(&self.media_engine),
+                if self.config.tts.enabled {
+                    Some(&self.tts_engine)
+                } else {
+                    None
+                },
+                if self.config.docker.enabled {
+                    Some(&self.config.docker)
+                } else {
+                    None
+                },
+                Some(&self.hooks),
+                ctx_window,
+                Some(&self.process_manager),
+                content_blocks,
+                origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
+                text_reply_is_delivery,
+                trigger,
+            )
+            .await
+            .map_err(KernelError::OpenFang)?
+        };
 
         // Append new messages to canonical session for cross-channel memory
         if session.messages.len() > messages_before {
