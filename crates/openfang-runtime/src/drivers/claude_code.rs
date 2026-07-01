@@ -1217,7 +1217,15 @@ fn fold_stream_line(
         }
         "result" | "done" | "complete" => {
             if let Some(ref result) = event.result {
-                if full_text.is_empty() {
+                // ANAI-120: the terminal `result` is AUTHORITATIVE. It carries
+                // the clean, thinking-free final answer — the same field
+                // complete() reads and trusts. The mid-stream accumulation can
+                // be tainted by reasoning the CLI tagged as a `text` block in
+                // stream mode, which per-block type filtering can't catch. So
+                // overwrite `full_text` with the result whenever it is present
+                // and non-empty; the accumulation survives only as a fallback
+                // for the (legacy) case where no result event ever ships.
+                if !result.is_empty() {
                     *full_text = result.clone();
                     outcome.text = Some(result.clone());
                 }
@@ -2671,6 +2679,56 @@ mod tests {
             r#"{"type":"result","result":"The answer is 42.","usage":{"input_tokens":10,"output_tokens":5}}"#,
         ];
         assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fidelity_result_authoritative_over_tainted_stream() {
+        // ANAI-120: the leak ANAI-119's per-block type filter could NOT catch.
+        // In stream mode the CLI may tag reasoning as a `text` block (not a
+        // `thinking` block), so the mid-stream accumulation gets tainted with
+        // reasoning that type-filtering cannot strip. The terminal `result`
+        // carries the clean, thinking-free final answer — exactly the field
+        // complete() reads. The stream path MUST surface the result and
+        // DISCARD the tainted accumulation, so both paths agree by identity.
+        // Pre-fix, `full_text` was the tainted accumulation and the result was
+        // dropped by the `is_empty()` guard — this fixture would fail.
+        let json =
+            r#"{"result":"The answer is 42.","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let stream = [
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me think step by step about this. "}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"The answer is 42."}]}}"#,
+            r#"{"type":"result","result":"The answer is 42.","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        ];
+        assert_fidelity(json, &stream);
+    }
+
+    #[test]
+    fn fold_result_overwrites_nonempty_accumulation() {
+        // Direct proof of the ANAI-120 lever: a non-empty terminal `result`
+        // overwrites a non-empty prior accumulation, rather than being dropped.
+        let mut full_text = String::from("tainted accumulation ");
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let line = r#"{"type":"result","result":"clean final answer","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let _ = fold_stream_line(line, &mut full_text, &mut usage);
+        assert_eq!(full_text, "clean final answer");
+    }
+
+    #[test]
+    fn fold_empty_result_leaves_accumulation_intact() {
+        // Fallback path: an absent/empty result must NOT wipe a legitimate
+        // accumulation — the stream path keeps what it reassembled.
+        let mut full_text = String::from("real streamed text");
+        let mut usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let line = r#"{"type":"result","usage":{"input_tokens":2,"output_tokens":1}}"#;
+        let _ = fold_stream_line(line, &mut full_text, &mut usage);
+        assert_eq!(full_text, "real streamed text");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (2, 1));
     }
 
     #[test]
