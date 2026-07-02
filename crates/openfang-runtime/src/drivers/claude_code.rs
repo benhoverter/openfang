@@ -1016,7 +1016,6 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
         Some(&read_hook_cmd),
         observe_hook_cmd.as_deref(),
     );
-        let _ = std::fs::remove_file(&observe_path);
     let serialized = serde_json::to_string(&cfg).ok()?;
     if let Err(e) = std::fs::write(&path, serialized) {
         warn!(error = %e, path = %path.display(), "failed to write CC --settings file");
