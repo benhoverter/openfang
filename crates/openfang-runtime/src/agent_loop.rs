@@ -307,9 +307,10 @@ fn capture_metadata(
     base: &HashMap<String, serde_json::Value>,
     trigger: TurnTrigger,
     effects: &TurnEffects,
+    observer_live: bool,
 ) -> HashMap<String, serde_json::Value> {
     let mut meta = base.clone();
-    if should_capture_turn(trigger, effects).is_drop() {
+    if should_capture_turn(trigger, effects, observer_live).is_drop() {
         meta.insert("would_drop".to_string(), serde_json::json!(true));
         meta.insert(
             "would_drop_reason".to_string(),
@@ -334,6 +335,15 @@ fn capture_metadata(
         meta.insert(
             "tools_observed".to_string(),
             serde_json::json!(effects.tools_observed_count()),
+        );
+        // ANAI-77 (c): stamp whether this driver's tool-observation
+        // pipeline is live. On a blind driver (subprocess CLI:
+        // claude-code / qwen-code) the zero counts above are vacuous, so
+        // would_drop is suppressed and the enforce gate can never
+        // over-delete. Recorded so the shadow window can see it in field.
+        meta.insert(
+            "observer_live".to_string(),
+            serde_json::json!(observer_live),
         );
     }
     meta
@@ -824,7 +834,10 @@ pub async fn run_agent_loop(
                 // ANAI-77 (observe-only): stamp the shadow would-drop verdict
                 // into the capture metadata. Nothing is skipped here — ANAI-85
                 // will consume metadata["would_drop"] to gate real drops.
-                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+                let observer_live =
+                    openfang_memory::capture::observer_is_live(&manifest.model.provider);
+                let capture_meta =
+                    capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
 
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
@@ -2429,7 +2442,10 @@ pub async fn run_agent_loop_streaming(
                 // ANAI-77 (observe-only): stamp the shadow would-drop verdict
                 // into the capture metadata. Nothing is skipped here — ANAI-85
                 // will consume metadata["would_drop"] to gate real drops.
-                let capture_meta = capture_metadata(&trigger_meta, trigger, &turn_effects);
+                let observer_live =
+                    openfang_memory::capture::observer_is_live(&manifest.model.provider);
+                let capture_meta =
+                    capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
 
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
@@ -4132,25 +4148,45 @@ mod tests {
 
         // Inert heartbeat: dropped, and the notch records zero side-effects.
         let inert = TurnEffects::new();
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert);
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true);
         assert_eq!(m.get("would_drop"), Some(&serde_json::json!(true)));
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
+        assert_eq!(m.get("observer_live"), Some(&serde_json::json!(true)));
 
         // Active heartbeat: kept (no would_drop), notch counts the side-effect.
         let mut active = TurnEffects::new();
         active.observe_tool("memory_recall"); // read-only
         active.observe_tool("agent_send"); // side-effecting
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active);
-        assert!(m.get("would_drop").is_none(), "active heartbeat is kept");
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active, true);
+        assert!(!m.contains_key("would_drop"), "active heartbeat is kept");
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(1)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(2)));
 
         // Non-heartbeat turn: no notch keys, no would_drop.
-        let m = capture_metadata(&base, TurnTrigger::User, &inert);
-        assert!(m.get("side_effecting_tools").is_none());
-        assert!(m.get("tools_observed").is_none());
-        assert!(m.get("would_drop").is_none());
+        let m = capture_metadata(&base, TurnTrigger::User, &inert, true);
+        assert!(!m.contains_key("side_effecting_tools"));
+        assert!(!m.contains_key("tools_observed"));
+        assert!(!m.contains_key("would_drop"));
+    }
+
+    /// ANAI-77 (c): an observer-blind driver (observer_live = false) must
+    /// never stamp would_drop on an inert heartbeat -- the enforce gate
+    /// depends on this so it can never over-delete a row whose work the
+    /// observer could not see. The content-free counts are still stamped.
+    #[test]
+    fn capture_metadata_observer_blind_suppresses_would_drop() {
+        use openfang_types::turn::{TurnEffects, TurnTrigger};
+        let base = HashMap::new();
+        let inert = TurnEffects::new();
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, false);
+        assert!(
+            !m.contains_key("would_drop"),
+            "blind-observer inert heartbeat must not be marked would_drop"
+        );
+        assert_eq!(m.get("observer_live"), Some(&serde_json::json!(false)));
+        assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
+        assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted
