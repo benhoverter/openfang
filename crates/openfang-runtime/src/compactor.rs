@@ -896,6 +896,7 @@ mod tests {
                         output_tokens: 50,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -959,6 +960,7 @@ mod tests {
                         output_tokens: 50,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -1055,6 +1057,7 @@ mod tests {
                         output_tokens: 100,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -1252,6 +1255,7 @@ mod tests {
                         output_tokens: 20,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }

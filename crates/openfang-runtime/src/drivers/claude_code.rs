@@ -1709,6 +1709,15 @@ impl LlmDriver for ClaudeCodeDriver {
         // and `complete()` is the path heartbeat turns take, so it's the one
         // the memory drop gate actually depends on.
         let observed_tools = read_cc_observed_tools(_cc_settings.as_ref());
+        // ANAI-77x: the observer was live for this spawn iff the observe
+        // hook actually materialized (sideband present). Empty
+        // `observed_tools` with `observer_live == true` means the observer
+        // ran and saw nothing (genuinely inert); with `false` it means no
+        // observer was wired (blind) — the drop gate keeps blind rows.
+        let observer_live = _cc_settings
+            .as_ref()
+            .and_then(CcSettingsFile::sideband)
+            .is_some();
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -1718,6 +1727,7 @@ impl LlmDriver for ClaudeCodeDriver {
             tool_calls: Vec::new(),
             usage,
             observed_tools,
+            observer_live,
         })
     }
 
@@ -1985,6 +1995,13 @@ impl LlmDriver for ClaudeCodeDriver {
         // signal uniform and future-proofs the drop gate if heartbeat
         // routing ever changes.
         let observed_tools = read_cc_observed_tools(_cc_settings.as_ref());
+        // ANAI-77x: observer-live mirrors `complete()` — live iff the observe
+        // hook materialized (sideband present); disambiguates an empty
+        // `observed_tools` between "inert" and "blind" for the drop gate.
+        let observer_live = _cc_settings
+            .as_ref()
+            .and_then(CcSettingsFile::sideband)
+            .is_some();
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: full_text,
@@ -1994,6 +2011,7 @@ impl LlmDriver for ClaudeCodeDriver {
             tool_calls: Vec::new(),
             usage: final_usage,
             observed_tools,
+            observer_live,
         })
     }
 }

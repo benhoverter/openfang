@@ -656,6 +656,7 @@ impl LlmDriver for AnthropicDriver {
                 tool_calls,
                 usage,
                 observed_tools: Vec::new(),
+                observer_live: false,
             });
         }
 
@@ -833,6 +834,7 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
             output_tokens: api.usage.output_tokens,
         },
         observed_tools: Vec::new(),
+        observer_live: false,
     }
 }
 

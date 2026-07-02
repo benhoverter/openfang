@@ -690,6 +690,7 @@ fn convert_response(resp: ConverseResponse) -> Result<CompletionResponse, LlmErr
             output_tokens: resp.usage.output_tokens,
         },
         observed_tools: Vec::new(),
+        observer_live: false,
     })
 }
 

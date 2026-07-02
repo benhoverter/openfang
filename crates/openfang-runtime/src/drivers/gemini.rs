@@ -666,6 +666,7 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
         tool_calls,
         usage,
         observed_tools: Vec::new(),
+        observer_live: false,
     })
 }
 
@@ -1184,6 +1185,7 @@ impl LlmDriver for GeminiDriver {
                 tool_calls,
                 usage,
                 observed_tools: Vec::new(),
+                observer_live: false,
             });
         }
 

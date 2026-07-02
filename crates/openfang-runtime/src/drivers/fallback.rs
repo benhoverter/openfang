@@ -149,6 +149,7 @@ mod tests {
                     output_tokens: 5,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }

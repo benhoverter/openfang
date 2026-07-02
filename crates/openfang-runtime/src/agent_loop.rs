@@ -3820,6 +3820,7 @@ mod tests {
                         output_tokens: 2,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -3987,6 +3988,7 @@ mod tests {
                     output_tokens: 1,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }
@@ -4088,6 +4090,7 @@ mod tests {
                     output_tokens: 1,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }
@@ -4728,6 +4731,7 @@ mod tests {
                         output_tokens: 5,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             } else {
                 // Second call: LLM returns EndTurn with EMPTY text (the bug)
@@ -4740,6 +4744,7 @@ mod tests {
                         output_tokens: 0,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -4764,6 +4769,7 @@ mod tests {
                     output_tokens: 0,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }
@@ -4789,6 +4795,7 @@ mod tests {
                     output_tokens: 8,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }
@@ -5099,6 +5106,7 @@ mod tests {
                         output_tokens: 0,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             } else {
                 // Second call (retry): normal response
@@ -5114,6 +5122,7 @@ mod tests {
                         output_tokens: 8,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -5138,6 +5147,7 @@ mod tests {
                     output_tokens: 0,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }
@@ -6158,6 +6168,7 @@ mod tests {
                         output_tokens: 10,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             } else {
                 Ok(CompletionResponse {
@@ -6172,6 +6183,7 @@ mod tests {
                         output_tokens: 8,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -6198,6 +6210,7 @@ mod tests {
                         output_tokens: 15,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             } else {
                 // After tool result, return normal response
@@ -6213,6 +6226,7 @@ mod tests {
                         output_tokens: 12,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
@@ -6587,6 +6601,7 @@ mod tests {
                     output_tokens: 8,
                 },
                 observed_tools: Vec::new(),
+                observer_live: false,
             })
         }
     }

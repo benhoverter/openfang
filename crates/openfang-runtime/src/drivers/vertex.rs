@@ -496,6 +496,7 @@ fn convert_response(resp: VertexResponse) -> Result<CompletionResponse, LlmError
         tool_calls,
         usage,
         observed_tools: Vec::new(),
+        observer_live: false,
     })
 }
 
@@ -730,6 +731,7 @@ impl LlmDriver for VertexAIDriver {
                 tool_calls: final_tool_calls,
                 usage,
                 observed_tools: Vec::new(),
+                observer_live: false,
             });
         }
 

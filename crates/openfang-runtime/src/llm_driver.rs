@@ -143,6 +143,28 @@ pub struct CompletionResponse {
     /// driver populates the same field — the name is deliberately
     /// driver-neutral so the capability isn't baked in as CC-only.
     pub observed_tools: Vec<String>,
+    /// Whether this driver actually wired a working in-subprocess tool
+    /// observer for the spawn that produced this response (ANAI-77x).
+    ///
+    /// This is the *runtime-evidence* companion to `observed_tools`: it
+    /// disambiguates an empty `observed_tools` between "genuinely inert
+    /// turn" and "observer blind". The memory drop gate reads it as its
+    /// `observer_live` signal instead of a static per-driver allowlist:
+    /// - `observer_live == true`, `observed_tools == []` → the observer was
+    ///   live and saw nothing → genuinely inert → droppable.
+    /// - `observer_live == false` → no observer this spawn (stale binary,
+    ///   observe hook failed to materialize, or a non-observing driver) →
+    ///   observer blind → the row must be hard-kept, never dropped.
+    ///
+    /// True only when a driver installed a functioning observer for *this*
+    /// spawn — today the Claude Code driver, iff the PreToolUse sideband
+    /// hook was wired (`sideband.is_some()`). `false` on every other driver
+    /// and on any CC spawn where the hook didn't materialize. Because a
+    /// binary that predates the observe feature reports `false`, the drop
+    /// gate stays in pure keep-mode until a deployed binary starts
+    /// reporting `true` — the enforce flip is live-evidence-gated by
+    /// construction and cannot over-delete pre-deploy.
+    pub observer_live: bool,
 }
 
 impl CompletionResponse {
@@ -326,6 +348,7 @@ mod tests {
             tool_calls: vec![],
             usage: TokenUsage::default(),
             observed_tools: Vec::new(),
+            observer_live: false,
         };
         assert_eq!(response.text(), "Hello world!");
     }
@@ -392,6 +415,7 @@ mod tests {
                         output_tokens: 3,
                     },
                     observed_tools: Vec::new(),
+                    observer_live: false,
                 })
             }
         }
