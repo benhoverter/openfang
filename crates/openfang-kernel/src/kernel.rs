@@ -5350,24 +5350,33 @@ impl OpenFangKernel {
 
         // origin threading (audit finding #3) is a documented follow-up: a wake
         // that raises an approval prompt has no inbound route yet, so pass None.
-        let result = self
-            .send_message_with_handle_and_blocks(
-                target_id,
-                &envelope.message,
-                handle,
-                None,
-                Some(envelope.sender.clone()),
-                None,
-                None,
-                // ANAI-118 step 2: the streaming loop now carries the phantom
-                // guard, so a woken turn can finally take the combination the
-                // overloaded bool could not express — stream (idle watchdog
-                // arms for fine-grained liveness) *and* keep the guard (a woken
-                // turn is autonomous, not a channel delivery). This is the flip
-                // the step-1 comment promised.
-                TurnPolicy::woken(),
-                envelope.trigger.clone(),
-            )
+        let send_fut = self.send_message_with_handle_and_blocks(
+            target_id,
+            &envelope.message,
+            handle,
+            None,
+            Some(envelope.sender.clone()),
+            None,
+            None,
+            // ANAI-118 step 2: the streaming loop now carries the phantom
+            // guard, so a woken turn can finally take the combination the
+            // overloaded bool could not express — stream (idle watchdog
+            // arms for fine-grained liveness) *and* keep the guard (a woken
+            // turn is autonomous, not a channel delivery). This is the flip
+            // the step-1 comment promised.
+            TurnPolicy::woken(),
+            envelope.trigger.clone(),
+        );
+        // ANAI-110: scope the inbound wake lineage into task-local context for
+        // the whole woken turn, so a nested `agent_send_async` extends the REAL
+        // chain (root->...->this) instead of re-rooting at the sender. This
+        // MUST be set here, inside run_woken_agent_loop: the wake-consumer
+        // spawns this on a fresh tokio task, and task-locals do NOT cross
+        // tokio::spawn — setting it at the spawn site would be severed. The
+        // send future awaits the agent loop inline (no intervening spawn), so
+        // the scope reaches execute_tool -> tool_agent_send_async.
+        let result = openfang_runtime::tool_runner::WAKE_LINEAGE
+            .scope(envelope.lineage.clone(), send_fut)
             .await;
 
         match result {

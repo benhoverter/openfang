@@ -139,12 +139,36 @@ tokio::task_local! {
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
     /// Canvas max HTML size in bytes (set from kernel config at loop start).
     pub static CANVAS_MAX_BYTES: usize;
+    /// Inbound wake lineage for the current woken turn (ANAI-110).
+    ///
+    /// Set by `Kernel::run_woken_agent_loop` around the woken send, scoped to
+    /// the claimed [`WakeEnvelope`](openfang_types::wake::WakeEnvelope)'s chain
+    /// (whose `current` is THIS agent). Read by `tool_agent_send_async` so a
+    /// nested wake extends the REAL root->...->this chain instead of re-rooting
+    /// at the sender every hop — the threading that makes cross-hop cycle
+    /// (req 4) and depth (req 9) enforce for real. Absent on origin turns
+    /// (channel / cron / API), which have no wake ancestry.
+    pub static WAKE_LINEAGE: openfang_types::wake::WakeLineage;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
+}
+
+/// Resolve the base wake lineage for a new `agent_send_async` (ANAI-110).
+///
+/// Inside a woken turn, `Kernel::run_woken_agent_loop` scopes [`WAKE_LINEAGE`]
+/// to the inbound chain — whose `current` is already this agent — so the new
+/// wake extends the REAL `root -> ... -> this` chain and cross-hop cycle
+/// (req 4) / depth (req 9) enforce against actual ancestry. On an origin turn
+/// (channel / cron / API) the task-local is unset and there is no ancestry, so
+/// the chain is rooted at `sender`, exactly as v1.
+fn resolve_wake_base_lineage(sender: &str) -> openfang_types::wake::WakeLineage {
+    WAKE_LINEAGE
+        .try_with(|l| l.clone())
+        .unwrap_or_else(|_| openfang_types::wake::WakeLineage::root_at(sender))
 }
 
 /// Execute a tool by name with the given input, returning a ToolResult.
@@ -2589,7 +2613,7 @@ async fn tool_agent_send_async(
     caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     use openfang_types::turn::TurnTrigger;
-    use openfang_types::wake::{WakeEnvelope, WakeLineage, DEFAULT_MAX_WAKE_DEPTH, WAKE_TASK_PREFIX};
+    use openfang_types::wake::{WakeEnvelope, DEFAULT_MAX_WAKE_DEPTH, WAKE_TASK_PREFIX};
 
     let kh = require_kernel(kernel)?;
     let target_raw = input["agent_id"]
@@ -2614,11 +2638,13 @@ async fn tool_agent_send_async(
         .map(|a| a.id)
         .ok_or_else(|| format!("Async wake target not found: {target_raw}"))?;
 
-    // Lineage: root the chain at the sender for v1 (the inbound wake lineage is
-    // not yet threaded into tool context — tracked as a follow-up). Cycle and
-    // depth are still enforced against this chain, so a self-wake or an
-    // over-deep extension is refused before the task is ever enqueued.
-    let lineage = WakeLineage::root_at(sender);
+    // Lineage (ANAI-110): thread the REAL inbound wake chain when this call is
+    // itself running inside a woken turn (see `resolve_wake_base_lineage`). The
+    // inbound chain's `current` is already THIS agent, so extending it below
+    // yields the true root->...->this->target chain — cross-hop cycle (req 4)
+    // and depth (req 9) now enforce for real, not just self-wake / single-hop.
+    // On an origin turn (no task-local) it roots at the sender, exactly as v1.
+    let lineage = resolve_wake_base_lineage(sender);
     if lineage.would_cycle(&target) {
         return Err(format!(
             "Refusing async wake: '{target}' is already in the call chain (cycle)."
@@ -4709,6 +4735,61 @@ async fn tool_skill_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ANAI-110: lineage threading via the WAKE_LINEAGE task-local. These prove
+    // `resolve_wake_base_lineage` reads the scoped inbound chain (the real read
+    // path a woken turn takes) and falls back to root-at-sender otherwise.
+
+    #[tokio::test]
+    async fn wake_lineage_absent_roots_at_sender() {
+        // Origin turn: no task-local scoped. Base = [sender]; only self-wake
+        // is a cycle — identical to v1 behavior for channel / cron / API turns.
+        let base = resolve_wake_base_lineage("agent-a");
+        assert_eq!(base.as_slice(), &["agent-a"]);
+        assert!(base.would_cycle("agent-a"), "self-wake must still be a cycle");
+        assert!(!base.would_cycle("agent-b"));
+    }
+
+    #[tokio::test]
+    async fn wake_lineage_present_extends_real_inbound_chain() {
+        // Woken turn A -> B: run_woken_agent_loop scoped the inbound chain
+        // [a, b] whose `current` (b) is this agent, which is also `sender`.
+        let inbound =
+            openfang_types::wake::WakeLineage::from_agents(vec!["a".into(), "b".into()]);
+        WAKE_LINEAGE
+            .scope(inbound, async {
+                let base = resolve_wake_base_lineage("b");
+                // The REAL chain is used, NOT re-rooted at the sender.
+                assert_eq!(base.as_slice(), &["a", "b"]);
+                // Cross-hop cycle now caught: B waking A (A -> B -> A) is refused.
+                assert!(base.would_cycle("a"), "cross-hop A->B->A must be a cycle");
+                assert!(base.would_cycle("b"), "self-wake must be a cycle");
+                // A genuine onward hop to a fresh agent is still allowed.
+                assert!(!base.would_cycle("c"));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn wake_lineage_present_enforces_depth_across_hops() {
+        // A four-deep inbound chain: extending it by one more hop reaches the
+        // bound, so the producer's `exceeds_depth` check refuses the wake —
+        // depth now accrues across agents instead of resetting to 1 each hop.
+        let inbound = openfang_types::wake::WakeLineage::from_agents(
+            vec!["a", "b", "c", "d"].into_iter().map(String::from).collect(),
+        );
+        WAKE_LINEAGE
+            .scope(inbound, async {
+                let base = resolve_wake_base_lineage("d");
+                assert_eq!(base.depth(), 4);
+                let next = base.extended("e");
+                assert!(
+                    next.exceeds_depth(openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH),
+                    "5th hop must trip the depth bound"
+                );
+            })
+            .await;
+    }
 
     #[test]
     fn wake_emit_admit_ceiling_trips_then_holds() {
