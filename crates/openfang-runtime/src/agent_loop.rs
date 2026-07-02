@@ -661,6 +661,23 @@ pub async fn run_agent_loop(
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
 
+        // ANAI-77x: fold subprocess-observed tool attempts (CC PreToolUse
+        // sideband) into the turn side-effect summary. Subprocess drivers
+        // (today only Claude Code) run tools inside the subprocess via the
+        // MCP bridge, so those tools never round-trip as `tool_calls` blocks
+        // and the per-`tool_call` fold below never fires for them —
+        // `observed_tools` is their only signal. Every other driver leaves
+        // this empty, so the fold is a no-op there (no double-count with the
+        // `tool_calls`-block fold). Names are bare bridge names; native CC
+        // tool names (e.g. `Read`) pass through as-is and, not being in
+        // READ_ONLY_TOOLS, count as side-effecting (over-keep, never
+        // over-delete — matches ANAI-76 keep-bias; see ANAI-77x follow-up).
+        // Runs once per model call; the CC sideband is per-spawn, so there
+        // is no cross-iteration carryover.
+        for observed_tool in &response.observed_tools {
+            turn_effects.observe_tool(observed_tool);
+        }
+
         // Recover tool calls output as text by models that don't use the tool_calls API field
         // (e.g. Groq/Llama, DeepSeek emit `<function=name>{json}</function>` in text)
         if matches!(
@@ -2277,6 +2294,23 @@ pub async fn run_agent_loop_streaming(
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
+
+        // ANAI-77x: fold subprocess-observed tool attempts (CC PreToolUse
+        // sideband) into the turn side-effect summary. Subprocess drivers
+        // (today only Claude Code) run tools inside the subprocess via the
+        // MCP bridge, so those tools never round-trip as `tool_calls` blocks
+        // and the per-`tool_call` fold below never fires for them —
+        // `observed_tools` is their only signal. Every other driver leaves
+        // this empty, so the fold is a no-op there (no double-count with the
+        // `tool_calls`-block fold). Names are bare bridge names; native CC
+        // tool names (e.g. `Read`) pass through as-is and, not being in
+        // READ_ONLY_TOOLS, count as side-effecting (over-keep, never
+        // over-delete — matches ANAI-76 keep-bias; see ANAI-77x follow-up).
+        // Runs once per model call; the CC sideband is per-spawn, so there
+        // is no cross-iteration carryover.
+        for observed_tool in &response.observed_tools {
+            turn_effects.observe_tool(observed_tool);
+        }
 
         // Recover tool calls output as text (streaming path)
         if matches!(
