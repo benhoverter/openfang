@@ -1971,6 +1971,13 @@ pub async fn run_agent_loop_streaming(
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
     origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    // ANAI-118: phantom-action guard axis, ported into the streaming loop so a
+    // woken turn can stream (idle watchdog arms) *and* keep its guard. Mirrors
+    // `run_agent_loop`'s `text_reply_is_delivery`, named for the axis it
+    // controls (`TurnPolicy::suppress_phantom_guard`): `true` suppresses the
+    // guard (channel-delivery text IS the action); `false` re-prompts a
+    // phantom-shaped, tool-less iteration-0 reply.
+    suppress_phantom_guard: bool,
     trigger: TurnTrigger,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
@@ -2372,6 +2379,33 @@ pub async fn run_agent_loop_streaming(
                             "[The model returned an empty response. This usually means the model is overloaded, the context is too large, or the API key lacks credits. Try again or check /status.]".to_string()
                         }
                     }
+                } else {
+                    text
+                };
+                // ANAI-118: phantom-action guard, ported from `run_agent_loop`.
+                // If the LLM claims a channel action (send, post, email, ...)
+                // but never called the corresponding tool, re-prompt once to
+                // force real tool usage instead of hallucinated completion.
+                //
+                // Suppressed when `suppress_phantom_guard` is true: on the
+                // channel-delivery / interactive-stream path the bridge sends
+                // the agent's text verbatim to the user, so "I sent the message"
+                // is a true description of what's about to happen, not a
+                // fabricated tool call. A woken turn passes `false` here, so its
+                // phantom guard fires through this same path.
+                let text = if !suppress_phantom_guard
+                    && !any_tools_executed
+                    && iteration == 0
+                    && phantom_action_detected(&text)
+                {
+                    warn!(agent = %manifest.name, "Phantom action detected (streaming) — re-prompting for real tool use");
+                    messages.push(Message::assistant(text));
+                    messages.push(Message::user(
+                        "[System: You claimed to perform an action but did not call any tools. \
+                         You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
+                         to actually perform the action. Do not claim completion without executing tools.]"
+                    ));
+                    continue;
                 } else {
                     text
                 };
@@ -4938,6 +4972,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            false, // suppress_phantom_guard
             TurnTrigger::User,
         )
         .await
@@ -5172,6 +5207,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            false, // suppress_phantom_guard
             TurnTrigger::User,
         )
         .await
@@ -6364,6 +6400,7 @@ mod tests {
             None, // process_manager
             None, // user_content_blocks
             None, // origin
+            false, // suppress_phantom_guard
             TurnTrigger::User,
         )
         .await
@@ -6573,6 +6610,176 @@ mod tests {
             result.response.trim(),
             "I sent the message to the channel.",
             "phantom guard must be suppressed when text_reply_is_delivery=true; got {:?}",
+            result.response
+        );
+    }
+
+    // === ANAI-118: phantom_action_detected gating in the STREAMING loop ===
+
+    /// Streaming analogue of `PhantomShapedDriver`: on iteration 0 the
+    /// `stream()` path emits phantom-action-shaped text (matches
+    /// `phantom_action_detected`) with no tool calls; on iteration 1 (only
+    /// reached if the ported guard re-prompts) it returns a distinct marker.
+    struct StreamingPhantomShapedDriver {
+        call_count: AtomicU32,
+    }
+
+    impl StreamingPhantomShapedDriver {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for StreamingPhantomShapedDriver {
+        async fn complete(
+            &self,
+            _r: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("ANAI-118 streaming guard test exercises the stream path only")
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let call = self.call_count.fetch_add(1, Ordering::Relaxed);
+            let text = if call == 0 {
+                "I sent the message to the channel."
+            } else {
+                "REPROMPTED-FALLBACK"
+            };
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    text: text.to_string(),
+                })
+                .await;
+            Ok(CompletionResponse {
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    provider_metadata: None,
+                }],
+                stop_reason: StopReason::EndTurn,
+                tool_calls: vec![],
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                },
+            })
+        }
+    }
+
+    /// A woken turn (`TurnPolicy::woken()` -> `suppress_phantom_guard == false`)
+    /// now routes through the streaming loop. The ported guard must re-prompt
+    /// on phantom-shaped, tool-less iteration-0 text -- the acceptance criterion
+    /// ANAI-118 adds: a woken turn streams *and* keeps its guard.
+    #[tokio::test]
+    async fn streaming_phantom_guard_fires_when_suppress_false() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(StreamingPhantomShapedDriver::new());
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = run_agent_loop_streaming(
+            &manifest,
+            "Send a message to #system-code",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+            None, // origin
+            false, // suppress_phantom_guard -- woken turn: guard must fire
+            TurnTrigger::User,
+        )
+        .await
+        .expect("streaming loop should complete");
+
+        assert_eq!(
+            result.response.trim(),
+            "REPROMPTED-FALLBACK",
+            "streaming phantom guard must re-prompt when suppress_phantom_guard=false; got {:?}",
+            result.response
+        );
+    }
+
+    /// Channel-delivery / interactive stream (`suppress_phantom_guard == true`):
+    /// the same phantom-shaped text is the legitimate delivery and must pass
+    /// through unmodified. Preserves pre-118 streaming behavior (no guard at all).
+    #[tokio::test]
+    async fn streaming_phantom_guard_suppressed_when_suppress_true() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = openfang_memory::session::Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        };
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(StreamingPhantomShapedDriver::new());
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = run_agent_loop_streaming(
+            &manifest,
+            "Send a message to #system-code",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // on_phase
+            None, // media_engine
+            None, // tts_engine
+            None, // docker_config
+            None, // hooks
+            None, // context_window_tokens
+            None, // process_manager
+            None, // user_content_blocks
+            None, // origin
+            true, // suppress_phantom_guard -- channel delivery: guard suppressed
+            TurnTrigger::User,
+        )
+        .await
+        .expect("streaming loop should complete");
+
+        assert_eq!(
+            result.response.trim(),
+            "I sent the message to the channel.",
+            "streaming phantom guard must be suppressed when suppress_phantom_guard=true; got {:?}",
             result.response
         );
     }

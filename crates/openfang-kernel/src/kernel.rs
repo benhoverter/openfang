@@ -2604,6 +2604,11 @@ impl OpenFangKernel {
                 Some(&kernel_clone.process_manager),
                 content_blocks,
                 None, // origin (Piece 2 plumbing — populated at gated emit step)
+                // ANAI-118: interactive SSE/WS path streams the agent's text
+                // live to the user — that IS the delivery, so the phantom guard
+                // stays suppressed here (preserving pre-118 behavior, where the
+                // streaming loop had no guard at all).
+                true, // suppress_phantom_guard
                 // Streaming entry is interactive-only; no autonomous minter routes
                 // through it, so it is always a user-origin turn. (ANAI-84)
                 TurnTrigger::User,
@@ -3269,6 +3274,7 @@ impl OpenFangKernel {
                 Some(&self.process_manager),
                 content_blocks,
                 origin.as_ref(),
+                turn_policy.suppress_phantom_guard,
                 trigger,
             )
             .await
@@ -5353,12 +5359,13 @@ impl OpenFangKernel {
                 Some(envelope.sender.clone()),
                 None,
                 None,
-                // ANAI-118 step 1: behaviour-preserving. A woken turn keeps the
-                // autonomous policy (complete() path, guard fires) exactly as
-                // before. The follow-up diff flips this to `TurnPolicy::woken()`
-                // so the turn streams (idle watchdog arms) once the streaming
-                // loop carries a phantom guard.
-                TurnPolicy::autonomous(),
+                // ANAI-118 step 2: the streaming loop now carries the phantom
+                // guard, so a woken turn can finally take the combination the
+                // overloaded bool could not express — stream (idle watchdog
+                // arms for fine-grained liveness) *and* keep the guard (a woken
+                // turn is autonomous, not a channel delivery). This is the flip
+                // the step-1 comment promised.
+                TurnPolicy::woken(),
                 envelope.trigger.clone(),
             )
             .await;
