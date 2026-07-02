@@ -66,6 +66,73 @@ impl std::fmt::Display for TurnTrigger {
     }
 }
 
+/// Independent routing axes for a single agent turn, threaded through the
+/// kernel send funnel (`send_message_with_handle_and_blocks`) alongside
+/// [`TurnTrigger`].
+///
+/// Before ANAI-118 a single `text_reply_is_delivery: bool` carried two
+/// unrelated meanings at the funnel:
+///
+/// * **(A)** "route this turn through `run_agent_loop_streaming` so the
+///   per-event idle-stream watchdog (ANAI-114/117) arms", and
+/// * **(B)** "this text is a user-visible channel delivery, so suppress the
+///   phantom-action guard".
+///
+/// The streaming merge welded both meanings to that one flag, so a **woken**
+/// turn — which wants streaming (A) *without* delivery's guard suppression (B)
+/// — had no representation. `TurnPolicy` makes the two axes explicit and
+/// orthogonal, killing the overloaded-flag footgun for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnPolicy {
+    /// Meaning A: route through `run_agent_loop_streaming` (arming the
+    /// ANAI-114/117 per-event idle watchdog) when `channel_streaming_enabled()`.
+    /// When `false`, the turn takes the `complete()` path (coarse total ceiling
+    /// only — ANAI-109).
+    pub stream: bool,
+    /// Meaning B: the agent's final text is delivered verbatim to a
+    /// user-visible channel, so the phantom-action guard must be suppressed
+    /// (phrases like "I sent the message" are the action, not a hallucinated
+    /// tool call). When `false`, the guard fires.
+    pub suppress_phantom_guard: bool,
+}
+
+impl TurnPolicy {
+    /// Channel-reply delivery: the bridge sends the agent's text back to the
+    /// originating channel. Streams (idle watchdog arms) and suppresses the
+    /// phantom-action guard. Replaces the pre-ANAI-118
+    /// `text_reply_is_delivery = true`.
+    pub const fn channel_delivery() -> Self {
+        Self {
+            stream: true,
+            suppress_phantom_guard: true,
+        }
+    }
+
+    /// Autonomous / non-delivery turn (cron, `agent_send`, API-direct,
+    /// proactive, heartbeat). Takes the `complete()` path and lets the
+    /// phantom-action guard fire. Replaces the pre-ANAI-118
+    /// `text_reply_is_delivery = false`.
+    pub const fn autonomous() -> Self {
+        Self {
+            stream: false,
+            suppress_phantom_guard: false,
+        }
+    }
+
+    /// Woken turn (async `agent_send` dispatch / wake-substrate re-entry).
+    /// Streams so the idle watchdog arms — the fine-grained liveness protection
+    /// ANAI-118 grants woken turns — while still letting the phantom-action
+    /// guard fire (a woken turn is autonomous, not a channel delivery). This is
+    /// the stream-on + guard-on combination the overloaded bool could not
+    /// express.
+    pub const fn woken() -> Self {
+        Self {
+            stream: true,
+            suppress_phantom_guard: false,
+        }
+    }
+}
+
 /// Tool names that perform **no durable side-effect** (read-only).
 ///
 /// Single source of truth: `AgentMode::filter_tools` (Assist mode) references
@@ -185,6 +252,32 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let back: TurnTrigger = serde_json::from_str(&json).unwrap();
         assert_eq!(t, back);
+    }
+
+    #[test]
+    fn turn_policy_axes_are_orthogonal() {
+        // Channel delivery: streams AND suppresses the guard — the old
+        // `text_reply_is_delivery = true` behaviour, now spelled out.
+        let d = TurnPolicy::channel_delivery();
+        assert!(d.stream);
+        assert!(d.suppress_phantom_guard);
+
+        // Autonomous: complete() path, guard fires — the old
+        // `text_reply_is_delivery = false` behaviour.
+        let a = TurnPolicy::autonomous();
+        assert!(!a.stream);
+        assert!(!a.suppress_phantom_guard);
+
+        // Woken: the combination the overloaded bool could not express —
+        // streams (idle watchdog arms) yet the phantom guard still fires.
+        let w = TurnPolicy::woken();
+        assert!(w.stream);
+        assert!(!w.suppress_phantom_guard);
+
+        // The two axes are genuinely independent: no constructor collapses
+        // them, and woken differs from both delivery and autonomous.
+        assert_ne!(w, d);
+        assert_ne!(w, a);
     }
 
     #[test]

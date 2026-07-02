@@ -448,7 +448,7 @@ pub async fn send_message(
             // origin: this HTTP route has no channel origin to push an
             // approval prompt back to — falls back to the text /approve path.
             None,
-            false,
+            openfang_types::turn::TurnPolicy::autonomous(),
             openfang_types::turn::TurnTrigger::User,
         )
         .await

@@ -35,7 +35,7 @@ use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
 use openfang_types::memory::Memory;
 use openfang_types::tool::ToolDefinition;
-use openfang_types::turn::TurnTrigger;
+use openfang_types::turn::{TurnPolicy, TurnTrigger};
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -1955,7 +1955,7 @@ impl OpenFangKernel {
             None,
             None,
             None,
-            false,
+            TurnPolicy::autonomous(),
             TurnTrigger::User,
         )
         .await
@@ -1977,7 +1977,7 @@ impl OpenFangKernel {
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
         self.send_message_with_handle_and_blocks(
-            agent_id, message, handle, None, None, None, None, true,
+            agent_id, message, handle, None, None, None, None, TurnPolicy::channel_delivery(),
             TurnTrigger::User,
         )
         .await
@@ -2008,7 +2008,7 @@ impl OpenFangKernel {
             None,
             None,
             Some(origin),
-            true,
+            TurnPolicy::channel_delivery(),
             TurnTrigger::User,
         )
         .await
@@ -2034,7 +2034,7 @@ impl OpenFangKernel {
             None,
             None,
             None,
-            true,
+            TurnPolicy::channel_delivery(),
             TurnTrigger::User,
         )
         .await
@@ -2063,7 +2063,7 @@ impl OpenFangKernel {
             None,
             None,
             Some(origin),
-            true,
+            TurnPolicy::channel_delivery(),
             TurnTrigger::User,
         )
         .await
@@ -2086,7 +2086,7 @@ impl OpenFangKernel {
             sender_id,
             sender_name,
             None,
-            false,
+            TurnPolicy::autonomous(),
             TurnTrigger::User,
         )
         .await
@@ -2114,7 +2114,7 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         origin: Option<openfang_types::approval::ApprovalOrigin>,
-        text_reply_is_delivery: bool,
+        turn_policy: TurnPolicy,
         trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
@@ -2154,7 +2154,7 @@ impl OpenFangKernel {
                 sender_id,
                 sender_name,
                 origin,
-                text_reply_is_delivery,
+                turn_policy,
                 trigger,
             )
             .await
@@ -2884,7 +2884,7 @@ impl OpenFangKernel {
         sender_id: Option<String>,
         sender_name: Option<String>,
         origin: Option<openfang_types::approval::ApprovalOrigin>,
-        text_reply_is_delivery: bool,
+        turn_policy: TurnPolicy,
         trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
         // Piece 3 (ANAI-82): stash this run's approval origin keyed by agent_id
@@ -3216,17 +3216,20 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        // ANAI-118: channel-reply turns route through the streaming agent loop
-        // so the per-event idle-stream watchdog arms on background / channel
-        // agents. The reassembled final text is identical to the complete()
-        // path (ANAI-113 fidelity gate), so the user-facing reply is unchanged.
-        // The phantom-action guard is intentionally absent from the streaming
-        // loop, which matches the channel-reply contract: on the non-streaming
-        // path `text_reply_is_delivery == true` already suppresses that guard,
-        // so behaviour is preserved. Non-channel sends (cron / agent_send / API,
-        // `text_reply_is_delivery == false`) keep the complete() path and its
-        // firing phantom guard.
-        let result = if text_reply_is_delivery && Self::channel_streaming_enabled() {
+        // ANAI-118: turns route through the streaming agent loop so the
+        // per-event idle-stream watchdog arms on background / channel agents.
+        // The reassembled final text is identical to the complete() path
+        // (ANAI-113 fidelity gate), so the user-facing reply is unchanged.
+        //
+        // Routing is now keyed off the orthogonal `turn_policy.stream` axis
+        // (not the overloaded `text_reply_is_delivery` bool). The phantom-action
+        // guard axis (`turn_policy.suppress_phantom_guard`) is passed separately
+        // into the complete() path below. In step 1 the streaming loop still has
+        // no phantom guard; that guard is preserved for every turn that reaches
+        // it today because the only turns routed to streaming
+        // (`channel_delivery`) also suppress the guard. The guard port that lets
+        // a woken turn stream *and* keep its guard lands in a follow-up diff.
+        let result = if turn_policy.stream && Self::channel_streaming_enabled() {
             info!(agent_id = %agent_id, path = "stream", "ANAI-118 channel turn dispatch");
             // No live client consumes the stream here; drain it so the bounded
             // sender never back-pressures the watchdog's per-event liveness check.
@@ -3305,7 +3308,7 @@ impl OpenFangKernel {
                 Some(&self.process_manager),
                 content_blocks,
                 origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
-                text_reply_is_delivery,
+                turn_policy.suppress_phantom_guard,
                 trigger,
             )
             .await
@@ -4603,7 +4606,7 @@ impl OpenFangKernel {
                                 None,
                                 None,
                                 None,
-                                false,
+                                TurnPolicy::autonomous(),
                                 TurnTrigger::Proactive,
                             )
                             .await
@@ -5350,7 +5353,12 @@ impl OpenFangKernel {
                 Some(envelope.sender.clone()),
                 None,
                 None,
-                false,
+                // ANAI-118 step 1: behaviour-preserving. A woken turn keeps the
+                // autonomous policy (complete() path, guard fires) exactly as
+                // before. The follow-up diff flips this to `TurnPolicy::woken()`
+                // so the turn streams (idle watchdog arms) once the streaming
+                // loop carries a phantom guard.
+                TurnPolicy::autonomous(),
                 envelope.trigger.clone(),
             )
             .await;
@@ -5570,7 +5578,7 @@ impl OpenFangKernel {
                     let handle = Some(Arc::clone(&k) as Arc<dyn KernelHandle>);
                     match k
                         .send_message_with_handle_and_blocks(
-                            aid, &msg, handle, None, None, None, None, false, trigger,
+                            aid, &msg, handle, None, None, None, None, TurnPolicy::autonomous(), trigger,
                         )
                         .await
                     {
@@ -7166,7 +7174,7 @@ impl OpenFangKernel {
                         None,
                         None,
                         None,
-                        false,
+                        TurnPolicy::autonomous(),
                         TurnTrigger::Cron,
                     ),
                 )
@@ -8078,7 +8086,7 @@ impl KernelHandle for OpenFangKernel {
                 None,
                 None,
                 None,
-                false,
+                TurnPolicy::autonomous(),
                 TurnTrigger::AgentCall,
             )
             .await
@@ -8837,7 +8845,7 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
                 None,
                 None,
                 None,
-                false,
+                TurnPolicy::autonomous(),
                 TurnTrigger::AgentCall,
             )
             .await
