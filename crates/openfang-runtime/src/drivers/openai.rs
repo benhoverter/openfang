@@ -905,6 +905,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                observed_tools: Vec::new(),
             });
         }
 
@@ -1521,6 +1522,7 @@ impl LlmDriver for OpenAIDriver {
                 stop_reason,
                 tool_calls,
                 usage,
+                observed_tools: Vec::new(),
             });
         }
 
@@ -1699,6 +1701,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
                     input_tokens: 0,
                     output_tokens: 0,
                 },
+                observed_tools: Vec::new(),
             });
         }
         return None;
@@ -1712,6 +1715,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
             input_tokens: 0,
             output_tokens: 0,
         },
+        observed_tools: Vec::new(),
     })
 }
 

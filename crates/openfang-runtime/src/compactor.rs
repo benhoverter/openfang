@@ -895,6 +895,7 @@ mod tests {
                         input_tokens: 100,
                         output_tokens: 50,
                     },
+                    observed_tools: Vec::new(),
                 })
             }
         }
@@ -957,6 +958,7 @@ mod tests {
                         input_tokens: 100,
                         output_tokens: 50,
                     },
+                    observed_tools: Vec::new(),
                 })
             }
         }
@@ -1052,6 +1054,7 @@ mod tests {
                         input_tokens: 500,
                         output_tokens: 100,
                     },
+                    observed_tools: Vec::new(),
                 })
             }
         }
@@ -1248,6 +1251,7 @@ mod tests {
                         input_tokens: 50,
                         output_tokens: 20,
                     },
+                    observed_tools: Vec::new(),
                 })
             }
         }

@@ -119,6 +119,30 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage statistics.
     pub usage: TokenUsage,
+    /// Bare tool names observed executing during this turn, in attempt
+    /// order (order-preserving multiset — 3 writes → 3 entries), no dedup.
+    ///
+    /// Populated only by subprocess drivers that can observe tool
+    /// execution happening *inside* the subprocess, out-of-band from the
+    /// text round-trip — today only the Claude Code driver, via a
+    /// PreToolUse sideband hook (ANAI-77x). For those drivers, tools run
+    /// in the CC subprocess through the MCP bridge and never surface as
+    /// `tool_calls` blocks in the round-tripped response, so this field is
+    /// the *only* signal that a heartbeat turn actually touched tools. The
+    /// memory subsystem's inert-heartbeat drop gate folds this into
+    /// `turn_effects.observe_tool()` so a genuinely-inert heartbeat is
+    /// distinguishable from an observer-blind one.
+    ///
+    /// Names are bare — the `mcp__openfang__` bridge prefix is stripped by
+    /// the driver — so downstream classifiers stay driver-agnostic.
+    /// Semantics are *attempted*, not completed: a tool that was entered
+    /// (even if later denied or errored) still stamps, because the drop
+    /// gate wants "was anything attempted" and over-keep is the safe bias.
+    ///
+    /// Every other driver leaves this `Vec::new()`. A future tool-observing
+    /// driver populates the same field — the name is deliberately
+    /// driver-neutral so the capability isn't baked in as CC-only.
+    pub observed_tools: Vec<String>,
 }
 
 impl CompletionResponse {
@@ -301,6 +325,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             tool_calls: vec![],
             usage: TokenUsage::default(),
+            observed_tools: Vec::new(),
         };
         assert_eq!(response.text(), "Hello world!");
     }
@@ -366,6 +391,7 @@ mod tests {
                         input_tokens: 5,
                         output_tokens: 3,
                     },
+                    observed_tools: Vec::new(),
                 })
             }
         }

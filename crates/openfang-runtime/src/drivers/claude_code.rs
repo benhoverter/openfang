@@ -287,6 +287,87 @@ if __name__ == "__main__":
     main()
 "#;
 
+/// PreToolUse hook matcher for the tool-observation sideband (ANAI-77x).
+///
+/// The empty string is CC's canonical **match-all** matcher — it fires the
+/// hook for every tool, native or `mcp__openfang__*` bridge tool alike. A
+/// literal `*` is NOT used: CC's matcher field is a regex, and bare `*` is
+/// an invalid pattern ("nothing to repeat") that either errors the settings
+/// file or matches nothing depending on CC version. `""` is the documented
+/// match-all. Both this token and the parallel-fire behavior against the
+/// Read-guard hook are verify-then-ship against the installed CC binary,
+/// not asserted — see the PR notes.
+const CC_OBSERVE_HOOK_MATCHER: &str = "";
+
+/// PreToolUse hook script for the tool-observation sideband. Materialized
+/// per-spawn (`0700`) alongside `settings.json` and referenced from a
+/// **second** `hooks.PreToolUse[]` matcher group (empty matcher → match-all)
+/// so CC invokes it before *every* tool call — including the
+/// `mcp__openfang__*` bridge tools that execute inside the CC subprocess and
+/// never round-trip as `tool_calls` blocks. Each invocation appends one JSON
+/// line `{"tool_name": "..."}` to the sideband file passed as `argv[1]`,
+/// under `O_APPEND` so concurrent CC tool calls interleave atomically
+/// (small-line appends are atomic on POSIX). The driver reads the sideband
+/// after subprocess EOF and the [`CcSettingsFile`] RAII handle removes it
+/// on drop.
+///
+/// Semantics are **attempted, not completed**: this is a PreToolUse hook, so
+/// it stamps when a tool is *entered*, before execution. That is deliberate
+/// — the memory drop gate wants "was anything attempted" and attempted is
+/// the safe (over-keep) bias for a keep-gate. A one-line additive `status`
+/// field is the reserved escape hatch if completed-semantics is ever wanted.
+///
+/// SAFETY INVARIANT: this hook must **never block a tool**. Unlike the Read
+/// guard (which exits 2 to deny), the observe hook exits `0`
+/// unconditionally — on missing arg, unparseable payload, missing tool name,
+/// or write failure. Observation is passive; it must not change what tools
+/// CC is allowed to run. The `tool_name` is written raw (namespaced); the
+/// driver strips the `mcp__openfang__` prefix on read so classifiers stay
+/// driver-agnostic.
+const CC_OBSERVE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env python3
+"""OpenFang CC PreToolUse observe hook — tool-attempt sideband appender.
+
+Invoked per tool call by Claude Code (match-all matcher). Reads the hook
+JSON payload from stdin, pulls `tool_name`, and appends one JSON line to the
+sideband file passed as argv[1]. ALWAYS exits 0 — observation must never
+block a tool, so every failure path is swallowed.
+"""
+import json
+import os
+import sys
+
+
+def main():
+    # No sideband path -> nothing to record. Never block.
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        return
+    sideband = sys.argv[1]
+
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return  # unparseable payload must not block the tool
+
+    tool_name = payload.get("tool_name") or ""
+    if not tool_name:
+        return
+
+    line = json.dumps({"tool_name": tool_name}, separators=(",", ":")) + "\n"
+    try:
+        fd = os.open(sideband, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass  # write failure must not block the tool
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)
+"#;
+
 /// Environment variable names (and suffixes) to strip from the subprocess
 /// to prevent leaking API keys from other providers. We keep the full env
 /// intact (so Node.js, NVM, SSL, proxies, etc. all work) and only remove
@@ -703,11 +784,26 @@ struct CcSettingsFile {
     /// Vec rather than a fixed field so future hook scripts (or other CC
     /// sidecars) slot in without another RAII rewrite.
     extras: Vec<PathBuf>,
+    /// Per-spawn tool-observation sideband (ANAI-77x). `Some(path)` when the
+    /// observe PreToolUse hook was installed; the appender writes one JSON
+    /// line per tool *attempt* and the driver reads it after subprocess EOF
+    /// via [`CcSettingsFile::sideband`]. `None` when the observe hook wasn't
+    /// wired (e.g. bridge disabled). Removed on drop with the other
+    /// artifacts. Distinct from `extras` because the driver must *locate and
+    /// read* it, not merely clean it up.
+    sideband: Option<PathBuf>,
 }
 
 impl CcSettingsFile {
     fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Path to the per-spawn tool-observation sideband, if the observe
+    /// hook was installed for this spawn. The driver reads it after the
+    /// CC subprocess reaches stdout EOF to recover `observed_tools`.
+    fn sideband(&self) -> Option<&std::path::Path> {
+        self.sideband.as_deref()
     }
 }
 
@@ -719,6 +815,11 @@ impl Drop for CcSettingsFile {
         let _ = std::fs::remove_file(&self.path);
         for p in &self.extras {
             let _ = std::fs::remove_file(p);
+        }
+        // Sideband is data, not policy, but same best-effort removal:
+        // per-spawn, re-created fresh next spawn, never secret-bearing.
+        if let Some(sb) = &self.sideband {
+            let _ = std::fs::remove_file(sb);
         }
     }
 }
@@ -739,7 +840,17 @@ impl Drop for CcSettingsFile {
 ///   emitted at all (the builder stays minimal so the settings file
 ///   merges as a pure subtraction of capability rather than introducing
 ///   sidecar process surface that wasn't there before).
-fn build_cc_settings_value(deny: &[&str], read_hook_cmd: Option<&str>) -> serde_json::Value {
+/// - When `observe_hook_cmd` is `Some(cmd)`, a second `hooks.PreToolUse`
+///   matcher group is appended with an empty (match-all) matcher running the
+///   given command — the tool-observation sideband appender (ANAI-77x). It
+///   stacks independently alongside the Read group. Either, both, or neither
+///   hook may be present; the `hooks` key is emitted iff at least one group
+///   exists.
+fn build_cc_settings_value(
+    deny: &[&str],
+    read_hook_cmd: Option<&str>,
+    observe_hook_cmd: Option<&str>,
+) -> serde_json::Value {
     let deny_arr = serde_json::Value::Array(
         deny.iter()
             .map(|s| serde_json::Value::String((*s).into()))
@@ -751,31 +862,40 @@ fn build_cc_settings_value(deny: &[&str], read_hook_cmd: Option<&str>) -> serde_
     let mut root = serde_json::Map::new();
     root.insert("permissions".into(), serde_json::Value::Object(perms));
 
-    if let Some(cmd) = read_hook_cmd {
-        // CC hook schema: hooks.<EventName> is an array of matcher groups,
-        // each with a `matcher` (tool-name string) and a `hooks` array of
-        // `{ type: "command", command: "..." }` entries. We emit a single
-        // matcher group targeting `Read` with a single command entry. See
-        // code.claude.com/docs/en/hooks for the spec.
+    // CC hook schema: hooks.<EventName> is an array of matcher groups, each
+    // with a `matcher` (tool-name regex; empty string = match-all) and a
+    // `hooks` array of command entries. See code.claude.com/docs/en/hooks
+    // for the spec. We build the PreToolUse array from whichever hooks are
+    // requested — the Read guard (matcher `Read`) and/or the observe
+    // sideband (empty match-all matcher) — and emit the `hooks` key only if
+    // at least one group is present. The groups stack: CC evaluates every
+    // matcher group independently, so the observe hook fires alongside the
+    // Read guard without clobbering it.
+    let build_group = |matcher: &str, cmd: &str| -> serde_json::Value {
         let mut hook_entry = serde_json::Map::new();
         hook_entry.insert("type".into(), serde_json::Value::String("command".into()));
         hook_entry.insert("command".into(), serde_json::Value::String(cmd.into()));
 
         let mut matcher_group = serde_json::Map::new();
-        matcher_group.insert(
-            "matcher".into(),
-            serde_json::Value::String(CC_READ_GUARD_HOOK_MATCHER.into()),
-        );
+        matcher_group.insert("matcher".into(), serde_json::Value::String(matcher.into()));
         matcher_group.insert(
             "hooks".into(),
             serde_json::Value::Array(vec![serde_json::Value::Object(hook_entry)]),
         );
+        serde_json::Value::Object(matcher_group)
+    };
 
-        let pre_tool_use = serde_json::Value::Array(vec![serde_json::Value::Object(matcher_group)]);
+    let mut pre_tool_use: Vec<serde_json::Value> = Vec::new();
+    if let Some(cmd) = read_hook_cmd {
+        pre_tool_use.push(build_group(CC_READ_GUARD_HOOK_MATCHER, cmd));
+    }
+    if let Some(cmd) = observe_hook_cmd {
+        pre_tool_use.push(build_group(CC_OBSERVE_HOOK_MATCHER, cmd));
+    }
 
+    if !pre_tool_use.is_empty() {
         let mut hooks = serde_json::Map::new();
-        hooks.insert("PreToolUse".into(), pre_tool_use);
-
+        hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre_tool_use));
         root.insert("hooks".into(), serde_json::Value::Object(hooks));
     }
 
@@ -811,6 +931,12 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     let spawn_uuid = uuid::Uuid::new_v4();
     let path = socket_dir.join(format!("cc-settings-{spawn_uuid}.json"));
     let guard_path = socket_dir.join(format!("cc-read-guard-{spawn_uuid}.py"));
+    // Tool-observation sideband (ANAI-77x): the appender script and the
+    // per-spawn sideband file it writes to. Both live under the same socket
+    // dir as the settings + guard and are cleaned by the same RAII handle.
+    // One spawn = one CC subprocess = one turn, so per-spawn is per-turn.
+    let observe_path = socket_dir.join(format!("cc-observe-{spawn_uuid}.py"));
+    let sideband_path = socket_dir.join(format!("cc-tools-{spawn_uuid}.jsonl"));
 
     // Write the guard script first; if this fails we don't want a
     // settings file pointing at a non-existent hook command. 0700 on
@@ -849,7 +975,48 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
         allowed_prefix.display(),
     );
 
-    let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(&read_hook_cmd));
+    // Write the tool-observation appender script (ANAI-77x). Same 0700 +
+    // explicit-python3 treatment as the guard. On failure we skip the
+    // observe hook entirely rather than abort the whole settings file: the
+    // deny set + Read guard are load-bearing for security; the observe
+    // sideband is a best-effort memory signal, so its absence must degrade
+    // to "observer blind on this spawn" (the (c) safety valve keeps such
+    // rows), never to a native-surface-open regression.
+    let observe_wired = match std::fs::write(&observe_path, CC_OBSERVE_HOOK_SCRIPT) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&observe_path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o700);
+                    let _ = std::fs::set_permissions(&observe_path, perms);
+                }
+            }
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, path = %observe_path.display(), "failed to write CC observe hook script; tool observation disabled for this spawn");
+            false
+        }
+    };
+
+    // Observe hook command: passes the sideband path as argv[1]. Only wired
+    // if the script materialized. Same single-quote hygiene as the guard.
+    let observe_hook_cmd = observe_wired.then(|| {
+        format!(
+            "python3 '{}' '{}'",
+            observe_path.display(),
+            sideband_path.display(),
+        )
+    });
+
+    let cfg = build_cc_settings_value(
+        CC_NATIVE_DENY,
+        Some(&read_hook_cmd),
+        observe_hook_cmd.as_deref(),
+    );
+        let _ = std::fs::remove_file(&observe_path);
     let serialized = serde_json::to_string(&cfg).ok()?;
     if let Err(e) = std::fs::write(&path, serialized) {
         warn!(error = %e, path = %path.display(), "failed to write CC --settings file");
@@ -876,13 +1043,75 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
         guard = %guard_path.display(),
         allowed_prefix = %allowed_prefix.display(),
         deny_count = CC_NATIVE_DENY.len(),
-        "materialized CC --settings deny set + Read guard hook"
+        observe_wired,
+        "materialized CC --settings deny set + Read guard hook + observe hook"
     );
+
+    // The observe script joins `extras` for cleanup; the sideband file it
+    // writes is tracked separately because the driver must *read* it after
+    // subprocess EOF. When the observe hook wasn't wired, no sideband is
+    // recorded (the appender was never installed, so the file never
+    // appears) — the driver then sees `observed_tools == []`, which the
+    // (c) safety valve treats as observer-blind, not inert.
+    let mut extras = vec![guard_path];
+    let sideband = if observe_wired {
+        extras.push(observe_path);
+        Some(sideband_path)
+    } else {
+        let _ = std::fs::remove_file(&observe_path);
+        None
+    };
 
     Some(CcSettingsFile {
         path,
-        extras: vec![guard_path],
+        extras,
+        sideband,
     })
+}
+
+/// Read the per-spawn tool-observation sideband and return the bare tool
+/// names observed during the turn, in attempt order (order-preserving
+/// multiset, no dedup). ANAI-77x.
+///
+/// Each line is a JSON object `{"tool_name": "..."}` appended by the observe
+/// PreToolUse hook. Names are normalized to bare form by stripping the
+/// `mcp__<server>__` bridge prefix so downstream classifiers stay
+/// driver-agnostic; a native CC tool name (e.g. `Read`) passes through
+/// unchanged.
+///
+/// Total and best-effort: a missing sideband (observe hook not wired, or no
+/// tool ever fired) yields an empty `Vec`; unparseable or malformed lines
+/// are skipped rather than failing the read. An empty result is
+/// indistinguishable *here* from "observer blind" — that distinction is
+/// drawn upstream by the per-driver `observer_live` capability flag, not by
+/// this function.
+fn read_cc_observed_tools(settings: Option<&CcSettingsFile>) -> Vec<String> {
+    let Some(sideband) = settings.and_then(CcSettingsFile::sideband) else {
+        return Vec::new();
+    };
+    let contents = match std::fs::read_to_string(sideband) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let prefix = format!("mcp__{BRIDGE_MCP_SERVER_NAME}__");
+    let mut observed = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(name) = value.get("tool_name").and_then(|v| v.as_str()) {
+            let bare = name.strip_prefix(&prefix).unwrap_or(name);
+            if !bare.is_empty() {
+                observed.push(bare.to_string());
+            }
+        }
+    }
+    observed
 }
 
 impl ClaudeCodeDriver {
@@ -1474,6 +1703,13 @@ impl LlmDriver for ClaudeCodeDriver {
         // reassembly (`fold_stream_line`) can be diffed against this exact
         // logic in tests — the ANAI-113 fidelity gate. Behavior unchanged.
         let (text, usage) = parse_complete_stdout(&stdout);
+        // ANAI-77x: recover the tools observed inside the CC subprocess from
+        // the per-spawn sideband before `_cc_settings` drops (which removes
+        // it). Bridge tools execute inside CC and never round-trip as
+        // `tool_calls` blocks, so this is the only tool signal on this path —
+        // and `complete()` is the path heartbeat turns take, so it's the one
+        // the memory drop gate actually depends on.
+        let observed_tools = read_cc_observed_tools(_cc_settings.as_ref());
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -1482,6 +1718,7 @@ impl LlmDriver for ClaudeCodeDriver {
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage,
+            observed_tools,
         })
     }
 
@@ -1743,6 +1980,12 @@ impl LlmDriver for ClaudeCodeDriver {
             })
             .await;
 
+        // ANAI-77x: same sideband recovery as `complete()` — read before
+        // `_cc_settings` drops. Heartbeats route through `complete()`, but
+        // channel-reply turns stream, so populating both paths keeps the
+        // signal uniform and future-proofs the drop gate if heartbeat
+        // routing ever changes.
+        let observed_tools = read_cc_observed_tools(_cc_settings.as_ref());
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text: full_text,
@@ -1751,6 +1994,7 @@ impl LlmDriver for ClaudeCodeDriver {
             stop_reason: StopReason::EndTurn,
             tool_calls: Vec::new(),
             usage: final_usage,
+            observed_tools,
         })
     }
 }
@@ -2173,7 +2417,7 @@ mod tests {
         // `permissions.deny` block — no `hooks` key, no other top-level
         // surface. This is the minimum-merge shape that subtracts
         // capability cleanly from any user/managed settings.
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None);
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None, None);
         let root = cfg.as_object().expect("root must be a JSON object");
         assert_eq!(root.len(), 1, "root must contain only `permissions`");
 
@@ -2212,7 +2456,7 @@ mod tests {
         // drifts, the hook silently no-ops at spawn and vision regresses
         // without a loud failure mode.
         let cmd = "python3 /tmp/guard.py /tmp/images";
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(cmd));
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(cmd), None);
 
         let root = cfg.as_object().expect("root must be a JSON object");
         assert_eq!(
@@ -2252,6 +2496,160 @@ mod tests {
             Some(cmd),
             "command string must round-trip unchanged"
         );
+    }
+
+    #[test]
+    fn test_build_cc_settings_observe_hook_stacks_with_read() {
+        // Both hooks present: PreToolUse carries two independent matcher
+        // groups — Read guard first, observe match-all second — so they
+        // stack without clobbering. This is the ANAI-77x wire shape.
+        let read = "python3 /tmp/guard.py /tmp/images";
+        let observe = "python3 /tmp/observe.py /tmp/run/cc-tools-x.jsonl";
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(read), Some(observe));
+
+        let groups = cfg
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .expect("PreToolUse array missing");
+        assert_eq!(
+            groups.len(),
+            2,
+            "both hooks must produce two matcher groups"
+        );
+
+        assert_eq!(
+            groups[0].pointer("/matcher").and_then(|v| v.as_str()),
+            Some("Read"),
+            "first group must be the Read guard"
+        );
+        assert_eq!(
+            groups[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            Some(read),
+        );
+
+        // Observe group uses the empty-string match-all matcher, NOT `*`.
+        assert_eq!(
+            groups[1].pointer("/matcher").and_then(|v| v.as_str()),
+            Some(""),
+            "observe matcher must be the empty-string match-all, not `*`"
+        );
+        assert_eq!(
+            groups[1].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            Some(observe),
+        );
+    }
+
+    #[test]
+    fn test_build_cc_settings_observe_hook_alone() {
+        // Observe hook without the Read guard: single match-all group. The
+        // `hooks` key must still appear (at least one group present).
+        let observe = "python3 /tmp/observe.py /tmp/sb.jsonl";
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None, Some(observe));
+        let groups = cfg
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .expect("PreToolUse array missing");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].pointer("/matcher").and_then(|v| v.as_str()),
+            Some(""),
+        );
+    }
+
+    #[test]
+    fn test_observe_matcher_is_empty_match_all() {
+        // Pin the match-all token: empty string, not `*` (an invalid regex
+        // in CC's matcher field that either errors the settings file or
+        // matches nothing depending on CC version).
+        assert_eq!(
+            CC_OBSERVE_HOOK_MATCHER, "",
+            "match-all matcher must be the empty string"
+        );
+    }
+
+    #[test]
+    fn test_observe_hook_script_never_blocks() {
+        // The observe hook must NEVER block a tool: unlike the Read guard it
+        // must not exit 2 on any path. Assert the load-bearing markers and
+        // the absence of a hard-block exit.
+        assert!(
+            CC_OBSERVE_HOOK_SCRIPT.starts_with("#!/usr/bin/env python3\n"),
+            "observe script must lead with a python3 shebang"
+        );
+        assert!(
+            CC_OBSERVE_HOOK_SCRIPT.contains("sys.argv[1]"),
+            "observe script must read the sideband path from argv[1]"
+        );
+        assert!(
+            CC_OBSERVE_HOOK_SCRIPT.contains("json.load(sys.stdin)"),
+            "observe script must parse the hook payload from stdin"
+        );
+        assert!(
+            CC_OBSERVE_HOOK_SCRIPT.contains("O_APPEND"),
+            "observe script must append atomically (O_APPEND)"
+        );
+        assert!(
+            !CC_OBSERVE_HOOK_SCRIPT.contains("exit(2)"),
+            "observe script must NEVER exit 2 — observation must not block a tool"
+        );
+    }
+
+    #[test]
+    fn test_read_cc_observed_tools_strips_prefix_and_preserves_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sb = dir.path().join("cc-tools-test.jsonl");
+        // Order-preserving multiset: repeated writes counted, native tool
+        // (Read) passes through un-stripped, malformed/blank lines skipped.
+        std::fs::write(
+            &sb,
+            "{\"tool_name\":\"mcp__openfang__file_write\"}\n\
+             {\"tool_name\":\"mcp__openfang__file_write\"}\n\
+             {\"tool_name\":\"Read\"}\n\
+             \n\
+             not json at all\n\
+             {\"tool_name\":\"mcp__openfang__memory_store\"}\n",
+        )
+        .expect("seed sideband");
+
+        let settings = CcSettingsFile {
+            path: dir.path().join("unused-settings.json"),
+            extras: vec![],
+            sideband: Some(sb.clone()),
+        };
+        let observed = read_cc_observed_tools(Some(&settings));
+        assert_eq!(
+            observed,
+            vec![
+                "file_write".to_string(),
+                "file_write".to_string(),
+                "Read".to_string(),
+                "memory_store".to_string(),
+            ],
+            "bare names, order-preserving multiset, malformed lines skipped"
+        );
+    }
+
+    #[test]
+    fn test_read_cc_observed_tools_empty_when_no_sideband() {
+        // No settings, settings without a sideband, or a sideband path whose
+        // file never materialized (no tool fired) → empty. The
+        // observer-blind case, disambiguated upstream by observer_live.
+        assert!(read_cc_observed_tools(None).is_empty());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = CcSettingsFile {
+            path: dir.path().join("s.json"),
+            extras: vec![],
+            sideband: None,
+        };
+        assert!(read_cc_observed_tools(Some(&settings)).is_empty());
+
+        let settings2 = CcSettingsFile {
+            path: dir.path().join("s2.json"),
+            extras: vec![],
+            sideband: Some(dir.path().join("does-not-exist.jsonl")),
+        };
+        assert!(read_cc_observed_tools(Some(&settings2)).is_empty());
     }
 
     #[test]
@@ -2401,6 +2799,7 @@ mod tests {
             let _g = CcSettingsFile {
                 path: path.clone(),
                 extras: vec![guard.clone()],
+                sideband: None,
             };
             assert!(path.exists(), "settings present while guard held");
             assert!(guard.exists(), "extras present while guard held");
