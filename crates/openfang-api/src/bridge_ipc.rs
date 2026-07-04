@@ -76,6 +76,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "agent_list",
     "channel_send",
     "agent_send",
+    "agent_send_async",
     "agent_spawn",
     "agent_kill",
     "memory_store",
@@ -1584,21 +1585,21 @@ mod tests {
     #[test]
     fn allowlist_cardinality_pin() {
         use openfang_mcp_bridge::{built_in_tools, DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
-        assert_eq!(ALLOWED_TOOLS.len(), 18, "ALLOWED_TOOLS surface cardinality");
+        assert_eq!(ALLOWED_TOOLS.len(), 19, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            18,
+            19,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
             PRIVILEGED_DEFAULT_DENY.len(),
-            3,
-            "PRIVILEGED_DEFAULT_DENY cardinality (agent_spawn/agent_kill/agent_activate)"
+            4,
+            "PRIVILEGED_DEFAULT_DENY cardinality (agent_spawn/agent_kill/agent_activate/agent_send_async)"
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
             15,
-            "DEFAULT_ALLOWED bridge-default cardinality (18 − 3 privileged)"
+            "DEFAULT_ALLOWED bridge-default cardinality (19 − 4 privileged)"
         );
     }
 
@@ -1608,7 +1609,7 @@ mod tests {
     #[test]
     fn privileged_lifecycle_tools_excluded_from_default() {
         use openfang_mcp_bridge::{DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
-        for tool in ["agent_spawn", "agent_kill", "agent_activate"] {
+        for tool in ["agent_spawn", "agent_kill", "agent_activate", "agent_send_async"] {
             assert!(
                 PRIVILEGED_DEFAULT_DENY.contains(&tool),
                 "{tool} must be in PRIVILEGED_DEFAULT_DENY",

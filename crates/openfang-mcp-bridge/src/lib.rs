@@ -187,7 +187,8 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
 /// Drift-pin: the `bridge_ipc::allowlist_*` tests assert that every entry
 /// here is **present** in `ALLOWED_TOOLS` and `built_in_tools()` and
 /// **absent** from `DEFAULT_ALLOWED`.
-pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &["agent_spawn", "agent_kill", "agent_activate"];
+pub const PRIVILEGED_DEFAULT_DENY: &[&str] =
+    &["agent_spawn", "agent_kill", "agent_activate", "agent_send_async"];
 
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
@@ -320,6 +321,27 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name" },
                     "message": { "type": "string", "description": "The message to send to the agent" }
+                },
+                "required": ["agent_id", "message"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` → `agent_send_async`.
+        // Privileged (fire-and-forget cross-agent wake). Advertised but
+        // excluded from `DEFAULT_ALLOWED` (see `PRIVILEGED_DEFAULT_DENY`);
+        // reaches a bridge only via manifest-derived `OPENFANG_BRIDGE_ALLOWED`.
+        Tool::new(
+            "agent_send_async",
+            "Wake another agent asynchronously (fire-and-forget). Queues the \
+             message for the target and returns immediately — the caller does NOT \
+             block on the target's loop and receives NO inline reply. Use this \
+             instead of agent_send when you want to hand off work without waiting, \
+             or to avoid the head-of-line blocking of a synchronous A->B call. \
+             Accepts UUID or agent name.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
+                    "message": { "type": "string", "description": "The message delivered to the target when it runs" }
                 },
                 "required": ["agent_id", "message"]
             })),
@@ -706,6 +728,7 @@ mod tests {
                 "agent_list",
                 "channel_send",
                 "agent_send",
+                "agent_send_async",
                 "agent_spawn",
                 "agent_kill",
                 "agent_activate",

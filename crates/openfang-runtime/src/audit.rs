@@ -21,6 +21,7 @@ pub enum AuditAction {
     AgentSpawn,
     AgentKill,
     AgentMessage,
+    AgentSendAsync,
     MemoryAccess,
     FileAccess,
     NetworkAccess,
@@ -124,6 +125,7 @@ impl AuditLog {
                         "AgentSpawn" => AuditAction::AgentSpawn,
                         "AgentKill" => AuditAction::AgentKill,
                         "AgentMessage" => AuditAction::AgentMessage,
+                        "AgentSendAsync" => AuditAction::AgentSendAsync,
                         "MemoryAccess" => AuditAction::MemoryAccess,
                         "FileAccess" => AuditAction::FileAccess,
                         "NetworkAccess" => AuditAction::NetworkAccess,
@@ -370,6 +372,58 @@ mod tests {
         let h2 = log.record("b", AuditAction::AgentKill, "kill", "ok");
         assert_eq!(log.tip_hash(), h2);
         assert_ne!(h2, h1);
+    }
+
+    #[test]
+    fn test_agent_send_async_audit_roundtrips_and_correlates() {
+        // ANAI-106: an AgentSendAsync entry must survive a reload as the
+        // SAME variant. If the load-time match arm is missing it falls back
+        // to ToolInvoke, whose to_string() != the stored "AgentSendAsync",
+        // so verify_integrity() would recompute a different hash and fail.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                seq INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                hash TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+        let db = Arc::new(Mutex::new(conn));
+
+        let log = AuditLog::with_db(Arc::clone(&db));
+        // dispatch (enqueue) leg + completion leg, correlated by task_id
+        log.record(
+            "orchestrator",
+            AuditAction::AgentSendAsync,
+            "enqueue target=worker correlation_id=wake-123",
+            "enqueued",
+        );
+        log.record(
+            "orchestrator",
+            AuditAction::AgentSendAsync,
+            "completion target=worker correlation_id=wake-123",
+            "dispatched",
+        );
+        assert_eq!(log.len(), 2);
+
+        // Simulate daemon restart: reload from the same DB.
+        let log2 = AuditLog::with_db(Arc::clone(&db));
+        assert_eq!(log2.len(), 2);
+        // Chain survives -> the variant round-tripped (guards the load arm).
+        assert!(log2.verify_integrity().is_ok());
+
+        let entries = log2.recent(2);
+        assert_eq!(entries[0].action.to_string(), "AgentSendAsync");
+        assert_eq!(entries[1].action.to_string(), "AgentSendAsync");
+        // Both legs join on one correlation id.
+        assert!(entries[0].detail.contains("correlation_id=wake-123"));
+        assert!(entries[1].detail.contains("correlation_id=wake-123"));
     }
 
     #[test]

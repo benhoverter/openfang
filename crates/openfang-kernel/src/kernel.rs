@@ -5313,6 +5313,23 @@ impl OpenFangKernel {
         info!("Wake-consumer started (interval: 500ms, max in-flight: {max_inflight})");
     }
 
+    /// ANAI-106: record an `agent_send_async` completion outcome, correlated
+    /// to the dispatch (enqueue) audit entry by `task_id`.
+    fn audit_wake_completion(
+        &self,
+        sender: &str,
+        target: &str,
+        task_id: &str,
+        outcome: impl Into<String>,
+    ) {
+        self.audit_log.record(
+            sender.to_string(),
+            openfang_runtime::audit::AuditAction::AgentSendAsync,
+            format!("completion target={target} correlation_id={task_id}"),
+            outcome,
+        );
+    }
+
     /// Dispatch one claimed wake: resolve the target (UUID then name, mirroring
     /// [`Self::send_to_agent`]), re-enter the send funnel with the envelope's
     /// reconstructed `TurnTrigger`, then mark the task complete. Runs on its own
@@ -5329,6 +5346,12 @@ impl OpenFangKernel {
                 Some(e) => e.id,
                 None => {
                     warn!(target = %envelope.target, "Wake target not found; dropping wake");
+                    self.audit_wake_completion(
+                        &envelope.sender,
+                        &envelope.target,
+                        &task_id,
+                        "target not found",
+                    );
                     let _ = self
                         .memory
                         .task_complete(
@@ -5354,6 +5377,12 @@ impl OpenFangKernel {
                 target = %envelope.target,
                 depth = envelope.lineage.depth(),
                 "Refusing woken dispatch: wake-chain depth exceeds bound"
+            );
+            self.audit_wake_completion(
+                &envelope.sender,
+                &envelope.target,
+                &task_id,
+                "refused: chain depth exceeds bound",
             );
             let _ = self
                 .memory
@@ -5401,10 +5430,22 @@ impl OpenFangKernel {
 
         match result {
             Ok(_) => {
+                self.audit_wake_completion(
+                    &envelope.sender,
+                    &envelope.target,
+                    &task_id,
+                    "dispatched",
+                );
                 let _ = self.memory.task_complete(&task_id, "wake dispatched").await;
             }
             Err(e) => {
                 warn!(target = %envelope.target, error = %e, "Woken agent loop failed");
+                self.audit_wake_completion(
+                    &envelope.sender,
+                    &envelope.target,
+                    &task_id,
+                    format!("dispatch failed: {e}"),
+                );
                 let _ = self
                     .memory
                     .task_complete(&task_id, &format!("wake dispatch failed: {e}"))
@@ -8241,10 +8282,25 @@ impl KernelHandle for OpenFangKernel {
     ) -> Result<String, String> {
         // Privileged path: the only writer permitted into the wake-queue title
         // namespace. Ordinary task_post rejects WAKE_TASK_PREFIX titles.
-        self.memory
+        let id = self
+            .memory
             .task_post_wake(title, description, assigned_to, created_by, payload)
             .await
-            .map_err(|e| format!("Wake post failed: {e}"))
+            .map_err(|e| format!("Wake post failed: {e}"))?;
+        // ANAI-106: audit the dispatch (enqueue) leg. correlation_id = the wake
+        // task_id, which the wake-consumer re-observes at completion, so the two
+        // legs join on one id. Recorded here at the kernel enqueue boundary
+        // because the runtime producer holds no audit_log by design.
+        self.audit_log.record(
+            created_by.unwrap_or("unknown").to_string(),
+            openfang_runtime::audit::AuditAction::AgentSendAsync,
+            format!(
+                "enqueue target={} correlation_id={id}",
+                assigned_to.unwrap_or("?")
+            ),
+            "enqueued",
+        );
+        Ok(id)
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
