@@ -2543,34 +2543,37 @@ async fn tool_agent_send(
         .await
 }
 
-/// Queue an asynchronous wake for another agent (fire-and-forget).
+/// Wake-emission rate backstops (ANAI-111).
 ///
-/// ---
+/// Two sliding-window counters guard two DIFFERENT amplification modes; both
+/// are tunable via the `[agent_wake]` config section / `OPENFANG_AGENT_WAKE_*`
+/// env vars (see [`openfang_types::agent_wake`]) and both self-GC once
+/// emissions go quiet:
 ///
-/// Crude cross-tree wake-emission backstop (ANAI-100, v1 / review option 3).
-///
-/// In v1 the inbound wake lineage is NOT threaded into the producer's tool
-/// context, so [`WakeLineage`] is re-rooted at the sender every hop: the
-/// per-tree budget (req 10) and the cross-hop cycle/depth bounds (reqs 4/9)
-/// cannot be enforced from the chain alone. Until lineage threading lands
-/// (v2), this process-global sliding-window counter caps the *aggregate*
-/// wake-emission rate across ALL trees, so a self-sustaining `A -> B -> A`
-/// ring can only amplify load up to a fixed ceiling per window instead of
-/// unboundedly. It is deliberately coarse — a ceiling, not a per-tree
-/// accountant — and clears on its own once emissions go quiet.
-const WAKE_EMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-const WAKE_EMIT_MAX: usize = 120;
+/// * [`wake_tree_admit`] — the **per-tree budget** (req 10), keyed on the
+///   lineage root. Since lineage threading landed (ANAI-110) the cross-hop
+///   cycle (req 4) and depth (req 9) bounds enforce for real — but neither
+///   catches *fan-out*: a tree that never repeats an agent and never exceeds
+///   the depth bound can still emit `F^k` wakes. Charging the root for its
+///   whole subtree's rate closes that hole.
+/// * [`wake_emit_admit`] — the coarse **aggregate ceiling** across ALL trees.
+///   N trees each under their own per-tree budget still sum to `N * budget` of
+///   fleet-wide load; this bounds that aggregate. It only ever refuses, never
+///   permits — harmless defense-in-depth the per-tree budget does not subsume.
 
-/// Record-and-test the wake-emission window. Returns `true` if the wake is
-/// admitted (and stamps it into the window), `false` if the trailing window is
-/// already at capacity — in which case the caller must refuse the wake.
+/// Record-and-test the process-global aggregate wake-emission window. Returns
+/// `true` if admitted (and stamps it into the window), `false` if the trailing
+/// window is already at [`emit_max`](openfang_types::agent_wake::emit_max)
+/// capacity — in which case the caller must refuse the wake.
 fn wake_emit_admit() -> bool {
     use std::collections::VecDeque;
     use std::sync::{Mutex, OnceLock};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     static WINDOW: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
     let slot = WINDOW.get_or_init(|| Mutex::new(VecDeque::new()));
+    let window = Duration::from_secs(openfang_types::agent_wake::window_secs());
+    let cap = openfang_types::agent_wake::emit_max();
     let now = Instant::now();
     // Recover rather than propagate: a poisoned lock means a prior caller
     // panicked mid-update; the queue itself is still a valid bound to enforce.
@@ -2580,16 +2583,61 @@ fn wake_emit_admit() -> bool {
     };
     // Evict timestamps that have aged out of the trailing window.
     while let Some(&front) = q.front() {
-        if now.duration_since(front) >= WAKE_EMIT_WINDOW {
+        if now.duration_since(front) >= window {
             q.pop_front();
         } else {
             break;
         }
     }
-    if q.len() >= WAKE_EMIT_MAX {
+    if q.len() >= cap {
         return false;
     }
     q.push_back(now);
+    true
+}
+
+/// Record-and-test the per-tree wake-emission window for one lineage `root`
+/// (req 10). Returns `true` if this tree is under its
+/// [`tree_budget_max`](openfang_types::agent_wake::tree_budget_max) for the
+/// trailing window (and stamps the emission), `false` if the root's window is
+/// already at capacity — in which case the caller must refuse the wake.
+///
+/// Keyed on the stable lineage root, so every hop of a tree charges the SAME
+/// budget no matter how wide the fan-out. A root's key is dropped once its
+/// window empties, so the map self-GCs and long-quiet trees leave no residue.
+fn wake_tree_admit(root: &str) -> bool {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static WINDOWS: OnceLock<Mutex<HashMap<String, VecDeque<Instant>>>> = OnceLock::new();
+    let slot = WINDOWS.get_or_init(|| Mutex::new(HashMap::new()));
+    let window = Duration::from_secs(openfang_types::agent_wake::window_secs());
+    let cap = openfang_types::agent_wake::tree_budget_max();
+    let now = Instant::now();
+    let mut map = match slot.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let q = map.entry(root.to_string()).or_default();
+    // Evict timestamps that have aged out of the trailing window.
+    while let Some(&front) = q.front() {
+        if now.duration_since(front) >= window {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    if q.len() >= cap {
+        // At capacity: leave the (non-empty) window in place for the next call.
+        return false;
+    }
+    q.push_back(now);
+    // Self-GC: an emptied window would only be created again on the next
+    // emission, so never leave a dead root's empty deque behind. (After a
+    // push the current root is non-empty, so this only reaps OTHER roots that
+    // aged fully out — bounded, and keeps the map from growing without limit.)
+    map.retain(|_, q| !q.is_empty());
     true
 }
 
@@ -2657,17 +2705,37 @@ async fn tool_agent_send_async(
         ));
     }
 
-    // Crude cross-tree backstop (v1): the cycle/depth checks above only catch
-    // self-wake and single-hop because lineage is re-rooted at the sender each
-    // hop. Until lineage threading lands (v2), cap the aggregate wake-emission
-    // rate so a runaway A -> B -> A ring self-limits instead of amplifying
-    // load without bound. See `wake_emit_admit`.
+    // Per-tree budget (ANAI-111, req 10): charge this wake to its lineage root.
+    // The cycle (req 4) and depth (req 9) checks above now enforce cross-hop
+    // for real (ANAI-110 threaded the inbound chain), but neither catches
+    // *fan-out* — a tree that never repeats an agent and never exceeds the
+    // depth bound can still emit F^k wakes. Keying a sliding-window budget on
+    // the stable root makes the root pay for its whole subtree's emission rate.
+    // `root()` is always Some here (the chain is non-empty after `extended`);
+    // on the impossible None we skip only the per-tree check, never the global.
+    if let Some(root) = next_lineage.root() {
+        if !wake_tree_admit(root) {
+            return Err(format!(
+                "Refusing async wake: per-tree wake budget exceeded for root \
+                 '{root}' ({} wakes / {}s window). One wake tree is fanning out \
+                 too fast; the budget clears once its emissions go quiet.",
+                openfang_types::agent_wake::tree_budget_max(),
+                openfang_types::agent_wake::window_secs()
+            ));
+        }
+    }
+
+    // Aggregate cross-tree ceiling (ANAI-111): a coarse fleet-wide backstop on
+    // top of the per-tree budget. N distinct trees each under their own budget
+    // still sum to N x budget of total load; this bounds that aggregate. It
+    // only ever refuses, never permits — defense-in-depth. See `wake_emit_admit`.
     if !wake_emit_admit() {
         return Err(format!(
-            "Refusing async wake: wake-emission budget exceeded \
-             ({WAKE_EMIT_MAX} wakes / {}s window). A runaway wake ring trips this \
-             crude cross-tree backstop; it clears once emissions go quiet.",
-            WAKE_EMIT_WINDOW.as_secs()
+            "Refusing async wake: aggregate wake-emission ceiling exceeded \
+             ({} wakes / {}s window across all trees). It clears once emissions \
+             go quiet.",
+            openfang_types::agent_wake::emit_max(),
+            openfang_types::agent_wake::window_secs()
         ));
     }
 
@@ -4793,16 +4861,40 @@ mod tests {
 
     #[test]
     fn wake_emit_admit_ceiling_trips_then_holds() {
-        // The first WAKE_EMIT_MAX emissions in a single window are admitted;
-        // the next is refused. All calls land inside the trailing window, so
-        // none age out — this exercises the ceiling, not eviction. (Uses the
-        // process-global window; no other code path calls `wake_emit_admit`.)
-        for i in 0..WAKE_EMIT_MAX {
+        // The first `emit_max` emissions in a single window are admitted; the
+        // next is refused. All calls land inside the trailing window, so none
+        // age out — this exercises the ceiling, not eviction. (Uses the
+        // process-global window; only `wake_emit_admit` touches this static.)
+        let cap = openfang_types::agent_wake::emit_max();
+        for i in 0..cap {
             assert!(wake_emit_admit(), "emission {i} should be admitted");
         }
         assert!(
             !wake_emit_admit(),
-            "emission past the ceiling must be refused"
+            "emission past the aggregate ceiling must be refused"
+        );
+    }
+
+    #[test]
+    fn wake_tree_admit_budget_trips_per_root() {
+        // ANAI-111: a single tree (one lineage root) fanning out is capped at
+        // `tree_budget_max` per window, independent of any other root. Uses a
+        // unique root so parallel tests can't cross-contaminate the per-root map.
+        let budget = openfang_types::agent_wake::tree_budget_max();
+        let root = "root-fanout-tree-under-test";
+        for i in 0..budget {
+            assert!(wake_tree_admit(root), "tree emission {i} should be admitted");
+        }
+        // Over budget for this root -> refused...
+        assert!(
+            !wake_tree_admit(root),
+            "emission past the per-tree budget must be refused"
+        );
+        // ...while a DIFFERENT root is unaffected (the budget is per-tree, not
+        // global): its first emission still admits.
+        assert!(
+            wake_tree_admit("a-different-root-entirely"),
+            "a distinct tree must have its own independent budget"
         );
     }
 

@@ -1518,6 +1518,9 @@ pub struct KernelConfig {
     /// Turn-watchdog ceilings (LLM-call and MCP-tool timeouts).
     #[serde(default)]
     pub watchdog: WatchdogConfig,
+    /// Agent-wake emission limits (`agent_send_async` amplification bounds).
+    #[serde(default)]
+    pub agent_wake: AgentWakeConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1565,6 +1568,42 @@ impl Default for WatchdogConfig {
             llm_call_timeout_secs: crate::watchdog::LLM_CALL_TIMEOUT_SECS,
             mcp_tool_timeout_secs: crate::watchdog::MCP_TOOL_TIMEOUT_SECS,
             stream_idle_timeout_secs: crate::watchdog::STREAM_IDLE_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// Agent-wake emission limits exposed in the `[agent_wake]` config section
+/// (ANAI-111). Bounds `agent_send_async` amplification along three axes.
+///
+/// Runtime reads go through
+/// `openfang_types::agent_wake::{emit_max, tree_budget_max, window_secs,
+/// max_inflight}`, which layer env-var overrides on top of whatever the kernel
+/// installs from this section at boot. Each value is clamped up to a floor of
+/// `1` at read time, so a `0` can never deadlock wake dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentWakeConfig {
+    /// Aggregate cross-tree wake-emission ceiling per `window_secs`. Default:
+    /// 120. The coarse fleet-wide backstop; only ever refuses.
+    pub emit_max: usize,
+    /// Per-tree (per-lineage-root) wake-emission budget per `window_secs`.
+    /// Default: 40. Stops one runaway ring/fan-out without touching healthy
+    /// trees.
+    pub tree_budget_max: usize,
+    /// Sliding-window width, in seconds, shared by both counters. Default: 60.
+    pub window_secs: u64,
+    /// Max concurrently in-flight woken agent loops in the wake-consumer.
+    /// Default: 8. Bounds concurrency/memory amplification of dispatch.
+    pub max_inflight: usize,
+}
+
+impl Default for AgentWakeConfig {
+    fn default() -> Self {
+        Self {
+            emit_max: crate::agent_wake::WAKE_EMIT_MAX,
+            tree_budget_max: crate::agent_wake::WAKE_TREE_BUDGET_MAX,
+            window_secs: crate::agent_wake::WAKE_WINDOW_SECS,
+            max_inflight: crate::agent_wake::MAX_INFLIGHT_WAKES,
         }
     }
 }
@@ -1810,6 +1849,7 @@ impl Default for KernelConfig {
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
             watchdog: WatchdogConfig::default(),
+            agent_wake: AgentWakeConfig::default(),
             skills: HashMap::new(),
         }
     }
@@ -1937,6 +1977,16 @@ impl std::fmt::Debug for KernelConfig {
                     self.watchdog.llm_call_timeout_secs,
                     self.watchdog.mcp_tool_timeout_secs,
                     self.watchdog.stream_idle_timeout_secs
+                ),
+            )
+            .field(
+                "agent_wake",
+                &format!(
+                    "emit={} tree={} window={}s inflight={}",
+                    self.agent_wake.emit_max,
+                    self.agent_wake.tree_budget_max,
+                    self.agent_wake.window_secs,
+                    self.agent_wake.max_inflight
                 ),
             )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
@@ -4901,6 +4951,31 @@ mod tests {
         assert_eq!(c.watchdog.llm_call_timeout_secs, 180);
         assert_eq!(c.watchdog.mcp_tool_timeout_secs, 0);
         assert_eq!(c.watchdog.stream_idle_timeout_secs, 90);
+    }
+
+    #[test]
+    fn test_agent_wake_config_defaults() {
+        let c = KernelConfig::default();
+        assert_eq!(c.agent_wake.emit_max, 120);
+        assert_eq!(c.agent_wake.tree_budget_max, 40);
+        assert_eq!(c.agent_wake.window_secs, 60);
+        assert_eq!(c.agent_wake.max_inflight, 8);
+    }
+
+    #[test]
+    fn test_agent_wake_config_from_toml() {
+        let toml_str = r#"
+            [agent_wake]
+            emit_max = 200
+            tree_budget_max = 80
+            window_secs = 30
+            max_inflight = 16
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.agent_wake.emit_max, 200);
+        assert_eq!(c.agent_wake.tree_budget_max, 80);
+        assert_eq!(c.agent_wake.window_secs, 30);
+        assert_eq!(c.agent_wake.max_inflight, 16);
     }
 
     #[test]

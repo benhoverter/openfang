@@ -23,27 +23,27 @@
 //!   (`created_by` is fresh each wake), so N-per-hop silently chains to N^k
 //!   "legal" wakes. Keying the budget on [`WakeLineage::root`] defeats that.
 //!
-//! ## v1 enforcement status (ANAI-100) — READ THIS
+//! ## Enforcement status — READ THIS
 //!
-//! The three properties above are the *design intent*. In v1 they are **not
-//! yet enforced cross-hop**: the inbound wake lineage is not threaded into the
-//! producer's tool context (see `tool_agent_send_async` in
-//! openfang-runtime/src/tool_runner.rs), so the chain is re-rooted at the
-//! sender on every hop. Consequence:
+//! All three properties are now enforced cross-hop:
 //!
-//! * **req 4 (cycle):** enforced for **self-wake only** (`A -> A`). A multi-hop
-//!   ring `A -> B -> A` is *not* caught — each hop sees a fresh depth-1 chain.
-//! * **req 9 (depth):** enforced **single-hop only**; depth resets to 1 each
-//!   hop, so the bound never trips across agents.
-//! * **req 10 (per-tree budget):** **not implemented.** [`WakeLineage::root`]
-//!   has no production caller in v1. In the interim, a crude process-global
-//!   wake-emission ceiling in the producer (`wake_emit_admit`) bounds the
-//!   aggregate amplification of a runaway ring across all trees.
+//! * **req 4 (cycle) & req 9 (depth):** enforced across agents since ANAI-110.
+//!   `run_woken_agent_loop` scopes the inbound lineage into a task-local that
+//!   `tool_agent_send_async` reads (`resolve_wake_base_lineage`), so a wake
+//!   extends the REAL `root -> ... -> this` chain instead of re-rooting at the
+//!   sender each hop. A multi-hop ring `A -> B -> A` is caught and depth accrues
+//!   across agents (5th hop trips [`DEFAULT_MAX_WAKE_DEPTH`]).
+//! * **req 10 (per-tree budget):** implemented since ANAI-111. The producer
+//!   charges each wake to its [`WakeLineage::root`] via a per-root sliding-window
+//!   budget (`wake_tree_admit` in openfang-runtime/src/tool_runner.rs), which
+//!   catches fan-out amplification that cycle/depth cannot. A coarse
+//!   process-global ceiling (`wake_emit_admit`) is retained on top as a
+//!   fleet-wide aggregate backstop. Both are tunable via the `[agent_wake]`
+//!   config section (see [`crate::agent_wake`]).
 //!
-//! Full cross-hop enforcement is deferred to v2 and requires threading the
-//! inbound lineage into the woken agent's turn/tool context. Until then, do
-//! **not** rely on reqs 4/9/10 holding across agents — only self-wake and
-//! single-hop are sound.
+//! Origin turns (channel / cron / API — no inbound lineage) root the chain at
+//! the sender, so only self-wake is a cycle for them; that is correct, not a
+//! gap — such a turn has no ancestry to inherit.
 //!
 //! The chain is ordered **root -> ... -> current**: `agents[0]` began the chain
 //! and the last element is the agent that emitted the current wake.
@@ -174,11 +174,11 @@ pub struct WakeEnvelope {
     pub sender: String,
     /// The message content delivered to `target`.
     pub message: String,
-    /// Cross-agent call lineage. *Intended* to be the single source of truth
-    /// for cycle detection (req 4), depth bound (req 9), and per-tree budget
-    /// (req 10) — but see the module-level "v1 enforcement status" note: in v1
-    /// the chain is re-rooted at the sender each hop, so these hold only for
-    /// self-wake / single-hop. Full cross-hop enforcement is deferred to v2.
+    /// Cross-agent call lineage — the single source of truth for cycle
+    /// detection (req 4), depth bound (req 9), and per-tree budget (req 10).
+    /// Threaded cross-hop since ANAI-110, so all three enforce against real
+    /// ancestry (see the module-level "Enforcement status" note); the per-tree
+    /// budget keys on [`WakeLineage::root`] (ANAI-111).
     pub lineage: WakeLineage,
     /// Provenance to stamp on the woken turn. For timer/reconciliation wakes
     /// this is [`TurnTrigger::Cron`]; for genuine delegated peer content it is

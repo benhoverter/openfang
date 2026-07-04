@@ -4874,6 +4874,17 @@ impl OpenFangKernel {
             stream_idle_timeout_secs: self.config.watchdog.stream_idle_timeout_secs,
         });
 
+        // Install operator-configured agent-wake limits ([agent_wake] config,
+        // ANAI-111) so the producer's rate backstops and the wake-consumer's
+        // concurrency cap resolve them. Idempotent; must precede
+        // start_wake_consumer() below so max_inflight() sees the installed value.
+        openfang_types::agent_wake::install_limits(openfang_types::agent_wake::AgentWakeLimits {
+            emit_max: self.config.agent_wake.emit_max,
+            tree_budget_max: self.config.agent_wake.tree_budget_max,
+            window_secs: self.config.agent_wake.window_secs,
+            max_inflight: self.config.agent_wake.max_inflight,
+        });
+
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
 
@@ -5247,14 +5258,15 @@ impl OpenFangKernel {
         /// Cap on wakes drained per tick, so a flood can't starve the shutdown
         /// check at the top of the loop.
         const MAX_WAKES_PER_TICK: usize = 32;
-        /// Max concurrently in-flight woken agent loops. Each dispatch runs a
-        /// FULL agent loop, so without this a non-empty wake queue would spawn
-        /// unbounded detached loops (concurrency/memory amplification). A permit
-        /// is reserved BEFORE each claim, so a wake is never flipped to
-        /// in_progress unless a slot is free to dispatch it immediately.
-        /// Conservative default; revisit if throughput needs it.
-        const MAX_INFLIGHT_WAKES: usize = 8;
-        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_WAKES));
+        // Max concurrently in-flight woken agent loops. Each dispatch runs a
+        // FULL agent loop, so without this a non-empty wake queue would spawn
+        // unbounded detached loops (concurrency/memory amplification). A permit
+        // is reserved BEFORE each claim, so a wake is never flipped to
+        // in_progress unless a slot is free to dispatch it immediately.
+        // Resolved from the [agent_wake] knob (ANAI-111), installed at boot
+        // just above; env > config > compiled default (8), floored at 1.
+        let max_inflight = openfang_types::agent_wake::max_inflight();
+        let permits = Arc::new(tokio::sync::Semaphore::new(max_inflight));
 
         let kernel = Arc::clone(self);
         tokio::spawn(async move {
@@ -5290,7 +5302,7 @@ impl OpenFangKernel {
                 }
             }
         });
-        info!("Wake-consumer started (interval: 500ms, max in-flight: {MAX_INFLIGHT_WAKES})");
+        info!("Wake-consumer started (interval: 500ms, max in-flight: {max_inflight})");
     }
 
     /// Dispatch one claimed wake: resolve the target (UUID then name, mirroring
