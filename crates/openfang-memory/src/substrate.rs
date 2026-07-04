@@ -1230,4 +1230,81 @@ mod tests {
         assert_eq!(c4["created_by"], "orch");
         assert_ne!(c4["id"], c2["id"]);
     }
+
+    /// ANAI-107 (Stage-A mechanism smoke): the keystone durability proof that
+    /// no in-memory test can give. A queued wake must survive a real
+    /// file-backed WAL substrate being dropped (daemon shutdown) and reopened
+    /// (daemon restart), then come back claimable through the consumer's decode
+    /// path with its cross-agent lineage byte-identical. Exercises
+    /// `claim_wake_for_dispatch` (the base64 + envelope decode wrapper the
+    /// kernel wake-consumer actually calls) end-to-end against on-disk state.
+    ///
+    /// Boundary: the woken turn itself (`TurnPolicy::woken()` + phantom guard)
+    /// needs the kernel and is covered by ANAI-118's runtime tests; the budget
+    /// trips by `wake_{emit,tree}_admit` unit tests. This closes the ONE gap
+    /// neither covers — on-disk survival + claim + lineage integrity.
+    #[tokio::test]
+    async fn test_wake_survives_daemon_reload_claim_and_lineage_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wake_reload.db");
+
+        // A three-hop chain: orchestrator -> worker-a -> worker-b. The root
+        // (orchestrator) is the per-tree budget owner; current is worker-b.
+        let env = WakeEnvelope {
+            target: "worker-b".to_string(),
+            sender: "worker-a".to_string(),
+            message: "survive the reload \u{2014} em dash and unicode \u{2713}".to_string(),
+            lineage: WakeLineage::root_at("orchestrator")
+                .extended("worker-a")
+                .extended("worker-b"),
+            trigger: TurnTrigger::AgentCall,
+            origin: Some("channel:1086446153098342510".to_string()),
+        };
+
+        // --- Producer half: post the wake into a file-backed WAL substrate. ---
+        {
+            let substrate =
+                MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+            substrate
+                .task_post_wake(
+                    &format!("{WAKE_TASK_PREFIX}worker-b"),
+                    &env.message,
+                    Some("worker-b"),
+                    Some("worker-a"),
+                    &env.to_payload().unwrap(),
+                )
+                .await
+                .unwrap();
+            // substrate drops here -> connection closes -> WAL persists to disk.
+        }
+
+        // --- Simulated daemon restart: reopen the SAME on-disk database. ---
+        let substrate =
+            MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+
+        // --- Consumer half: the real dispatch-decode path claims it. ---
+        let (task_id, decoded) = substrate
+            .claim_wake_for_dispatch(4)
+            .await
+            .unwrap()
+            .expect("wake must survive the reload and remain claimable");
+        assert!(!task_id.is_empty());
+
+        // The envelope round-tripped through SQLite + reload byte-for-byte...
+        assert_eq!(decoded, env, "envelope must survive reload intact");
+        // ...and the cross-agent lineage threaded through unchanged: root still
+        // owns the budget, current is the last hop, depth is preserved.
+        assert_eq!(decoded.lineage.root(), Some("orchestrator"));
+        assert_eq!(decoded.lineage.current(), Some("worker-b"));
+        assert_eq!(decoded.lineage.depth(), 3);
+        assert_eq!(
+            decoded.lineage.as_slice(),
+            &["orchestrator", "worker-a", "worker-b"]
+        );
+        assert_eq!(decoded.trigger, TurnTrigger::AgentCall);
+
+        // The claim flipped exactly one wake to in_progress; the queue is now
+        // drained, so a second dispatch claim finds nothing.
+        assert!(substrate.claim_wake_for_dispatch(4).await.unwrap().is_none());
+    }
 }
