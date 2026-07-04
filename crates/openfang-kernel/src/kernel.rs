@@ -4883,6 +4883,7 @@ impl OpenFangKernel {
             tree_budget_max: self.config.agent_wake.tree_budget_max,
             window_secs: self.config.agent_wake.window_secs,
             max_inflight: self.config.agent_wake.max_inflight,
+            per_caller_max: self.config.agent_wake.per_caller_max,
         });
 
         // Start heartbeat monitor for agent health checking
@@ -5267,6 +5268,13 @@ impl OpenFangKernel {
         // just above; env > config > compiled default (8), floored at 1.
         let max_inflight = openfang_types::agent_wake::max_inflight();
         let permits = Arc::new(tokio::sync::Semaphore::new(max_inflight));
+        // Per-caller in-flight cap (ANAI-104): bounds the wakes any single
+        // caller (`created_by`) may have in flight at once, enforced at claim.
+        // Where `max_inflight` (the semaphore above) bounds the fleet's
+        // concurrent dispatch, this bounds one caller's slice — restoring the
+        // backpressure async dispatch removed. Resolved once at consumer start
+        // from the [agent_wake] knob; env > config > compiled default (4).
+        let per_caller_max = openfang_types::agent_wake::per_caller_max();
 
         let kernel = Arc::clone(self);
         tokio::spawn(async move {
@@ -5285,7 +5293,7 @@ impl OpenFangKernel {
                         Ok(p) => p,
                         Err(_) => break, // at capacity; resume next tick
                     };
-                    match kernel.memory.claim_wake_for_dispatch().await {
+                    match kernel.memory.claim_wake_for_dispatch(per_caller_max).await {
                         Ok(Some((task_id, envelope))) => {
                             let k = Arc::clone(&kernel);
                             tokio::spawn(async move {

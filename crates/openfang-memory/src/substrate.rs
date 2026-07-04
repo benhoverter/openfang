@@ -621,12 +621,15 @@ impl MemorySubstrate {
     /// forever) and `None` is returned, letting the consumer poll on.
     pub async fn claim_wake_for_dispatch(
         &self,
+        per_caller_cap: usize,
     ) -> OpenFangResult<Option<(String, openfang_types::wake::WakeEnvelope)>> {
+        // ANAI-104: `per_caller_cap` is threaded to `task_claim_wake` so the
+        // per-caller in-flight limit is enforced atomically at the claim/flip.
         // Bound on poison rows skipped per call, so a flood of malformed wakes
         // can't spin this method indefinitely before yielding.
         const MAX_POISON_SKIPS: usize = 64;
         for _ in 0..MAX_POISON_SKIPS {
-            let Some(task) = self.task_claim_wake().await? else {
+            let Some(task) = self.task_claim_wake(per_caller_cap).await? else {
                 return Ok(None); // queue genuinely empty
             };
             let task_id = task
@@ -670,7 +673,27 @@ impl MemorySubstrate {
     /// Ordinary agents never call this; their `task_claim` excludes wake titles.
     /// Same JSON shape as `task_claim` — payload stays at column idx 6 under the
     /// base64-STANDARD convention.
-    pub async fn task_claim_wake(&self) -> OpenFangResult<Option<serde_json::Value>> {
+    ///
+    /// ## Per-caller in-flight cap (ANAI-104)
+    ///
+    /// `per_caller_cap` bounds how many wakes a single caller (`created_by`) may
+    /// have `in_progress` at once — restoring the backpressure that async
+    /// dispatch removed (the old blocking `agent_send` self-throttled the
+    /// caller's own turn). Enforced as a correlated subquery in the claim
+    /// SELECT: a pending wake is claimable only if its caller currently has
+    /// FEWER than `per_caller_cap` wakes in flight. Queue-over-limit semantics —
+    /// an over-cap caller's wakes stay `pending` (nothing rejected/lost) until
+    /// one of its runs completes, while `ORDER BY` still advances to the next
+    /// *eligible* caller, so a saturated caller never head-of-line-blocks the
+    /// others. The count and the flip-to-`in_progress` share one locked
+    /// connection, so the cap is authoritative and race-free (the single
+    /// wake-consumer is the only claimer).
+    pub async fn task_claim_wake(
+        &self,
+        per_caller_cap: usize,
+    ) -> OpenFangResult<Option<serde_json::Value>> {
+        // Bind as i64 for rusqlite; already floored to >=1 by the resolver.
+        let cap = per_caller_cap as i64;
         let conn = Arc::clone(&self.conn);
         let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
 
@@ -681,12 +704,18 @@ impl MemorySubstrate {
                     "SELECT id, title, description, assigned_to, created_by, created_at, payload
                      FROM task_queue
                      WHERE status = 'pending' AND title LIKE ?1
+                       AND (
+                           SELECT COUNT(*) FROM task_queue AS inflight
+                           WHERE inflight.status = 'in_progress'
+                             AND inflight.title LIKE ?1
+                             AND inflight.created_by = task_queue.created_by
+                       ) < ?2
                      ORDER BY priority DESC, created_at ASC
                      LIMIT 1",
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![wake_like], |row| {
+            let result = stmt.query_row(rusqlite::params![wake_like, cap], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1043,7 +1072,7 @@ mod tests {
         assert_eq!(WakeEnvelope::from_payload(&listed_bytes).unwrap(), env);
 
         // idx 6 on claim: same payload, recovered via the wake-scoped claim.
-        let claimed = substrate.task_claim_wake().await.unwrap().unwrap();
+        let claimed = substrate.task_claim_wake(1_000).await.unwrap().unwrap();
         let claimed_bytes = base64::engine::general_purpose::STANDARD
             .decode(claimed["payload"].as_str().unwrap())
             .unwrap();
@@ -1079,7 +1108,7 @@ mod tests {
         assert_eq!(regular["title"], "Regular job");
 
         // Wake claim gets the wake, never the regular task.
-        let wake = substrate.task_claim_wake().await.unwrap().unwrap();
+        let wake = substrate.task_claim_wake(1_000).await.unwrap().unwrap();
         // assigned_to is preserved (the producer's target), not overwritten.
         assert_eq!(wake["assigned_to"], "worker-b");
         assert_eq!(wake["title"], format!("{WAKE_TASK_PREFIX}worker-b"));
@@ -1105,10 +1134,10 @@ mod tests {
         }
 
         // Two distinct wakes drained in two claims; the third claim is empty.
-        let first = substrate.task_claim_wake().await.unwrap().unwrap();
-        let second = substrate.task_claim_wake().await.unwrap().unwrap();
+        let first = substrate.task_claim_wake(1_000).await.unwrap().unwrap();
+        let second = substrate.task_claim_wake(1_000).await.unwrap().unwrap();
         assert_ne!(first["id"], second["id"]);
-        assert!(substrate.task_claim_wake().await.unwrap().is_none());
+        assert!(substrate.task_claim_wake(1_000).await.unwrap().is_none());
     }
 
     /// SECURITY: ordinary task_post must REJECT the reserved wake title prefix,
@@ -1130,7 +1159,7 @@ mod tests {
             .await;
         assert!(forged.is_err(), "ordinary task_post must reject a wake-prefixed title");
         // And nothing reached the wake queue.
-        assert!(substrate.task_claim_wake().await.unwrap().is_none());
+        assert!(substrate.task_claim_wake(1_000).await.unwrap().is_none());
         // The privileged path still works.
         assert!(substrate
             .task_post_wake(
@@ -1142,6 +1171,63 @@ mod tests {
             )
             .await
             .is_ok());
-        assert!(substrate.task_claim_wake().await.unwrap().is_some());
+        assert!(substrate.task_claim_wake(1_000).await.unwrap().is_some());
+    }
+
+    /// ANAI-104: the per-caller in-flight cap queues an over-cap caller's extra
+    /// wakes (leaves them `pending`) while still admitting a DIFFERENT caller's
+    /// wake — no cross-caller head-of-line blocking — and releases the queued
+    /// wake once one of that caller's in-flight runs completes.
+    #[tokio::test]
+    async fn test_wake_per_caller_in_flight_cap() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+
+        // Three wakes from "orch", one from "other".
+        for (target, sender) in [
+            ("w1", "orch"),
+            ("w2", "orch"),
+            ("w3", "orch"),
+            ("x1", "other"),
+        ] {
+            let env = sample_wake_envelope(target, sender);
+            substrate
+                .task_post_wake(
+                    &format!("{WAKE_TASK_PREFIX}{target}"),
+                    &env.message,
+                    Some(target),
+                    Some(sender),
+                    &env.to_payload().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Cap = 2 per caller. The first two claims drain "orch"'s oldest two
+        // wakes, so created_by = "orch" now has 2 in flight.
+        let c1 = substrate.task_claim_wake(2).await.unwrap().unwrap();
+        let c2 = substrate.task_claim_wake(2).await.unwrap().unwrap();
+        assert_eq!(c1["created_by"], "orch");
+        assert_eq!(c2["created_by"], "orch");
+        assert_ne!(c1["id"], c2["id"]);
+
+        // "orch" is now AT cap: its third wake is not claimable. The claim skips
+        // to the next eligible caller and returns "other"'s wake instead —
+        // proving a saturated caller does not starve the others.
+        let c3 = substrate.task_claim_wake(2).await.unwrap().unwrap();
+        assert_eq!(c3["created_by"], "other");
+
+        // Nothing else is eligible now: "orch" still at cap (2 in flight), and
+        // "other" is at 1 with no pending wake left.
+        assert!(substrate.task_claim_wake(2).await.unwrap().is_none());
+
+        // Complete one of "orch"'s in-flight runs -> it drops to 1 in flight,
+        // so its queued third wake becomes claimable.
+        substrate
+            .task_complete(c1["id"].as_str().unwrap(), "done")
+            .await
+            .unwrap();
+        let c4 = substrate.task_claim_wake(2).await.unwrap().unwrap();
+        assert_eq!(c4["created_by"], "orch");
+        assert_ne!(c4["id"], c2["id"]);
     }
 }

@@ -22,6 +22,13 @@
 //!   on simultaneously-running woken agent loops in the kernel's wake-consumer.
 //!   Distinct from the rate limits above: it bounds *concurrent dispatch*, not
 //!   *emission rate*.
+//! * **Per-caller in-flight cap (`per_caller_max`, ANAI-104):** a concurrency
+//!   cap on the woken loops attributable to ONE caller (`created_by`), enforced
+//!   at wake-claim. Async removed the synchronous path's accidental
+//!   self-throttle (a blocking `agent_send` tied up the caller's own turn);
+//!   this restores per-caller backpressure so one buggy/compromised orchestrator
+//!   cannot dispatch unbounded concurrent runs. Where `max_inflight` bounds the
+//!   FLEET's concurrent dispatch, this bounds any SINGLE caller's slice of it.
 //!
 //! Both sliding counters share one `window_secs` — they measure the same
 //! per-window rate, at different granularities (one tree vs. the whole fleet).
@@ -60,6 +67,16 @@ pub const WAKE_WINDOW_SECS: u64 = 60;
 /// or `OPENFANG_AGENT_WAKE_MAX_INFLIGHT`; read through [`max_inflight`].
 pub const MAX_INFLIGHT_WAKES: usize = 8;
 
+/// Default per-caller in-flight cap (ANAI-104): max simultaneously in-flight
+/// woken agent loops attributable to ONE caller (`created_by`), enforced at
+/// wake-claim. A single caller therefore claims at most this many concurrent
+/// runs even when the fleet-wide [`MAX_INFLIGHT_WAKES`] budget has more slots
+/// free — so no one caller monopolizes dispatch (default is half of
+/// `MAX_INFLIGHT_WAKES`, leaving room for a second caller). Tune via
+/// `[agent_wake] per_caller_max` or `OPENFANG_AGENT_WAKE_PER_CALLER_MAX`; read
+/// through [`per_caller_max`].
+pub const WAKE_PER_CALLER_MAX: usize = 4;
+
 /// Floor for every resolved limit. `0` for any of these is a footgun — a zero
 /// ceiling/budget refuses all wakes, a zero window degenerates eviction, a zero
 /// permit count stalls the wake-consumer forever — so a fat-fingered value is
@@ -78,6 +95,8 @@ pub struct AgentWakeLimits {
     pub window_secs: u64,
     /// Max concurrently in-flight woken agent loops.
     pub max_inflight: usize,
+    /// Max concurrently in-flight woken agent loops attributable to one caller.
+    pub per_caller_max: usize,
 }
 
 static INSTALLED: std::sync::OnceLock<AgentWakeLimits> = std::sync::OnceLock::new();
@@ -147,6 +166,19 @@ pub fn max_inflight() -> usize {
         .max(LIMIT_FLOOR as usize)
 }
 
+/// Resolved per-caller in-flight cap on woken agent loops (ANAI-104).
+///
+/// Precedence: `OPENFANG_AGENT_WAKE_PER_CALLER_MAX` env var > installed
+/// `[agent_wake]` config > compiled default ([`WAKE_PER_CALLER_MAX`]). Clamped
+/// up to a floor of `1` so a caller can always make forward progress (a `0`
+/// would refuse every wake a caller enqueues).
+pub fn per_caller_max() -> usize {
+    env_usize("OPENFANG_AGENT_WAKE_PER_CALLER_MAX")
+        .or_else(|| INSTALLED.get().map(|l| l.per_caller_max))
+        .unwrap_or(WAKE_PER_CALLER_MAX)
+        .max(LIMIT_FLOOR as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +225,16 @@ mod tests {
         std::env::set_var("OPENFANG_AGENT_WAKE_MAX_INFLIGHT", "0"); // would-be stall
         assert_eq!(max_inflight(), 1);
         std::env::remove_var("OPENFANG_AGENT_WAKE_MAX_INFLIGHT");
+
+        // per_caller_max: default, override, floor.
+        std::env::remove_var("OPENFANG_AGENT_WAKE_PER_CALLER_MAX");
+        assert_eq!(per_caller_max(), 4);
+        std::env::set_var("OPENFANG_AGENT_WAKE_PER_CALLER_MAX", "12");
+        assert_eq!(per_caller_max(), 12);
+        std::env::set_var("OPENFANG_AGENT_WAKE_PER_CALLER_MAX", "0"); // would-be refuse-all
+        assert_eq!(per_caller_max(), 1);
+        std::env::remove_var("OPENFANG_AGENT_WAKE_PER_CALLER_MAX");
+        assert_eq!(WAKE_PER_CALLER_MAX, 4);
     }
 
     #[test]

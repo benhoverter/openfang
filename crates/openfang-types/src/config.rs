@@ -1595,6 +1595,11 @@ pub struct AgentWakeConfig {
     /// Max concurrently in-flight woken agent loops in the wake-consumer.
     /// Default: 8. Bounds concurrency/memory amplification of dispatch.
     pub max_inflight: usize,
+    /// Max concurrently in-flight woken agent loops attributable to one caller
+    /// (`created_by`), enforced at wake-claim (ANAI-104). Default: 4. Restores
+    /// per-caller backpressure that async dispatch removed, so one caller cannot
+    /// monopolize the fleet-wide `max_inflight` budget.
+    pub per_caller_max: usize,
 }
 
 impl Default for AgentWakeConfig {
@@ -1604,6 +1609,7 @@ impl Default for AgentWakeConfig {
             tree_budget_max: crate::agent_wake::WAKE_TREE_BUDGET_MAX,
             window_secs: crate::agent_wake::WAKE_WINDOW_SECS,
             max_inflight: crate::agent_wake::MAX_INFLIGHT_WAKES,
+            per_caller_max: crate::agent_wake::WAKE_PER_CALLER_MAX,
         }
     }
 }
@@ -1982,11 +1988,12 @@ impl std::fmt::Debug for KernelConfig {
             .field(
                 "agent_wake",
                 &format!(
-                    "emit={} tree={} window={}s inflight={}",
+                    "emit={} tree={} window={}s inflight={} per_caller={}",
                     self.agent_wake.emit_max,
                     self.agent_wake.tree_budget_max,
                     self.agent_wake.window_secs,
-                    self.agent_wake.max_inflight
+                    self.agent_wake.max_inflight,
+                    self.agent_wake.per_caller_max
                 ),
             )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
@@ -4960,6 +4967,7 @@ mod tests {
         assert_eq!(c.agent_wake.tree_budget_max, 40);
         assert_eq!(c.agent_wake.window_secs, 60);
         assert_eq!(c.agent_wake.max_inflight, 8);
+        assert_eq!(c.agent_wake.per_caller_max, 4);
     }
 
     #[test]
@@ -4970,12 +4978,14 @@ mod tests {
             tree_budget_max = 80
             window_secs = 30
             max_inflight = 16
+            per_caller_max = 6
         "#;
         let c: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(c.agent_wake.emit_max, 200);
         assert_eq!(c.agent_wake.tree_budget_max, 80);
         assert_eq!(c.agent_wake.window_secs, 30);
         assert_eq!(c.agent_wake.max_inflight, 16);
+        assert_eq!(c.agent_wake.per_caller_max, 6);
     }
 
     #[test]
