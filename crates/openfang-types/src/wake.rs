@@ -203,6 +203,25 @@ pub struct WakeEnvelope {
     /// so every pre-ANAI-122 wake decodes back to a non-reply unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_reply: bool,
+    /// Optional surfacing route for the terminal reply (ANAI-123/124).
+    ///
+    /// When an origin dispatches `agent_send_async` with `surface_to`, this
+    /// value rides the WHOLE round-trip: on the outbound leg (1->2) it is baked
+    /// into the callee's one-shot reply-right token; on the reply leg (3->4)
+    /// `agent_reply_async` copies it back onto the reply envelope; and on
+    /// origin's leg-4 woken turn the wake-consumer emits exactly one
+    /// `channel_send(surface_to, reply_text)` so the delegated answer reaches a
+    /// human channel instead of dying in origin's silent woken turn (the
+    /// 2026-07-04 live-test failure this closes).
+    ///
+    /// Encoded as `"<channel>:<recipient>"` (e.g.
+    /// `"discord:1086446153098342510"`) — the same (adapter, recipient) pair
+    /// the `channel_send` tool takes. `None` means "no surfacing"; the reply
+    /// still reaches origin as a woken turn, it just is not auto-posted.
+    /// Omitted on the wire when absent, so a pre-ANAI-123 wake decodes back to
+    /// no-surfacing unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_to: Option<String>,
 }
 
 /// serde `skip_serializing_if` predicate: skip a `bool` field when it is false,
@@ -306,6 +325,7 @@ mod tests {
             trigger: TurnTrigger::AgentCall,
             origin: Some("channel:1086446153098342510".into()),
             is_reply: false,
+            surface_to: None,
         };
         let payload = env.to_payload().unwrap();
         let back = WakeEnvelope::from_payload(&payload).unwrap();
@@ -326,6 +346,7 @@ mod tests {
             trigger: TurnTrigger::Cron,
             origin: None,
             is_reply: false,
+            surface_to: None,
         };
         let json = serde_json::to_string(&env).unwrap();
         // origin is skipped on the wire when absent...
@@ -340,6 +361,12 @@ mod tests {
         assert_eq!(back.origin, None);
         assert_eq!(back.trigger, TurnTrigger::Cron);
         assert!(!back.is_reply, "absent is_reply must decode to false");
+        // surface_to is likewise absent on the wire when None.
+        assert!(
+            !json.contains("surface_to"),
+            "None surface_to must be omitted: {json}"
+        );
+        assert_eq!(back.surface_to, None, "absent surface_to must decode to None");
     }
 
     #[test]
@@ -355,12 +382,19 @@ mod tests {
             trigger: TurnTrigger::AgentCall,
             origin: None,
             is_reply: true,
+            surface_to: Some("discord:1086446153098342510".into()),
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains("is_reply"), "true is_reply must serialize: {json}");
         let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
         assert_eq!(env, back);
         assert!(back.is_reply);
+        // ANAI-123: the surfacing route round-trips on the terminal reply leg,
+        // so origin's leg-4 turn knows where to post the delegated answer.
+        assert_eq!(
+            back.surface_to.as_deref(),
+            Some("discord:1086446153098342510")
+        );
         // The reply roots a fresh chain at the replier: depth 1, so origin's
         // leg-4 turn starts clean and cannot be over-deep.
         assert_eq!(back.lineage.depth(), 1);

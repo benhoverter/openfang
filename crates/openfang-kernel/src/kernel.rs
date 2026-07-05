@@ -5440,6 +5440,10 @@ impl OpenFangKernel {
             Some(openfang_runtime::tool_runner::ReplyRight::new(
                 envelope.sender.clone(),
                 task_id.clone(),
+                // ANAI-123: bake the inbound surfacing route into the token so
+                // the callee's one-shot `agent_reply_async` inherits it without
+                // ever seeing or choosing a target/route.
+                envelope.surface_to.clone(),
             ))
         };
         let result = openfang_runtime::tool_runner::WAKE_REPLY_RIGHT
@@ -5451,7 +5455,22 @@ impl OpenFangKernel {
             .await;
 
         match result {
-            Ok(_) => {
+            Ok(loop_result) => {
+                // ANAI-124: terminal-reply surfacing. Origin's leg-4 turn was
+                // woken by a reply (`is_reply`); if the round-trip carried a
+                // surfacing route (`surface_to`), the DAEMON — not origin's own
+                // turn — guarantees exactly one channel post of origin's shaped
+                // answer. This closes the 2026-07-04 failure: a woken turn runs
+                // under `TurnPolicy::woken()` (non-delivery), so its text never
+                // auto-routes and the delegated answer otherwise dies in the
+                // loop. We shape-in-origin, emit-in-daemon: `loop_result` IS
+                // origin's reply text, and the daemon guarantees the emit.
+                if envelope.is_reply {
+                    if let Some(route) = envelope.surface_to.as_deref() {
+                        self.surface_reply_to_channel(&task_id, &envelope, route, &loop_result)
+                            .await;
+                    }
+                }
                 self.audit_wake_completion(
                     &envelope.sender,
                     &envelope.target,
@@ -5473,6 +5492,109 @@ impl OpenFangKernel {
                     .task_complete(&task_id, &format!("wake dispatch failed: {e}"))
                     .await;
             }
+        }
+    }
+
+    /// ANAI-124: emit exactly one channel post of origin's shaped reply text on
+    /// the terminal leg of an async round-trip.
+    ///
+    /// Called only from [`Self::run_woken_agent_loop`] when the woken turn was a
+    /// reply (`is_reply`) carrying a surfacing route (`surface_to`). The daemon
+    /// owns this emit — not origin's own turn — because a woken turn runs under
+    /// [`TurnPolicy::woken`](openfang_types::turn::TurnPolicy) (non-delivery),
+    /// so its text never auto-routes. "Shape in origin, emit in daemon":
+    /// `loop_result.response` IS origin's shaped answer; the daemon guarantees
+    /// it reaches the channel.
+    ///
+    /// `route` is `"<channel>:<recipient>"` (the `channel_send` (adapter,
+    /// recipient) pair). Every non-emit path is a VISIBLE non-drop — logged, not
+    /// silent — so the "answer died in the loop" failure can never recur unseen:
+    /// * malformed route (no `:`)          -> `warn`, skip;
+    /// * origin declined the turn (silent) -> `info`, skip (honor the NO_REPLY);
+    /// * empty reply text                  -> `warn`, skip;
+    /// * adapter send failure              -> `warn` with the error.
+    ///
+    /// Exactly-once is MVP at-least-once: the emit fires inline before
+    /// `task_complete`, so a daemon reload wedged between them could double-post.
+    /// Documented here and reconciled with the ANAI-103 dedup sweep rather than
+    /// solved with per-emit dedup now.
+    async fn surface_reply_to_channel(
+        &self,
+        task_id: &str,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        route: &str,
+        loop_result: &AgentLoopResult,
+    ) {
+        let Some((channel, recipient)) = route.split_once(':') else {
+            warn!(
+                correlation = %task_id,
+                surface_to = %route,
+                "ANAI-124 surfacing: malformed route (expected \"<channel>:<recipient>\"); \
+                 skipping post — reply reached origin as a woken turn but was NOT auto-surfaced"
+            );
+            return;
+        };
+        let (channel, recipient) = (channel.trim(), recipient.trim());
+        if channel.is_empty() || recipient.is_empty() {
+            warn!(
+                correlation = %task_id,
+                surface_to = %route,
+                "ANAI-124 surfacing: empty channel or recipient in route; skipping post"
+            );
+            return;
+        }
+
+        // Honor an explicit decline: origin's turn chose NO_REPLY. Skipping is a
+        // deliberate, logged non-drop — not the silent loss ANAI-124 fixes.
+        if loop_result.silent {
+            info!(
+                correlation = %task_id,
+                origin = %envelope.target,
+                surface_to = %route,
+                "ANAI-124 surfacing: origin's reply turn was silent (NO_REPLY) — honoring the \
+                 decline, no channel post"
+            );
+            return;
+        }
+
+        let text = loop_result.response.trim();
+        if text.is_empty() {
+            warn!(
+                correlation = %task_id,
+                origin = %envelope.target,
+                surface_to = %route,
+                "ANAI-124 surfacing: origin's reply text was empty; skipping post"
+            );
+            return;
+        }
+
+        info!(
+            correlation = %task_id,
+            origin = %envelope.target,
+            channel = %channel,
+            recipient = %recipient,
+            reply_len = text.len(),
+            "ANAI-124 surfacing: posting delegated reply to channel (daemon-enforced emit)"
+        );
+
+        match self
+            .send_channel_message(channel, recipient, text, None, None)
+            .await
+        {
+            Ok(outcome) => info!(
+                correlation = %task_id,
+                channel = %channel,
+                recipient = %recipient,
+                "ANAI-124 surfacing: reply posted — {outcome}"
+            ),
+            Err(e) => warn!(
+                correlation = %task_id,
+                channel = %channel,
+                recipient = %recipient,
+                error = %e,
+                "ANAI-124 surfacing: channel post FAILED — reply reached origin but did not \
+                 surface to the channel"
+            ),
         }
     }
 

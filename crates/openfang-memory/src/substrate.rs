@@ -1046,6 +1046,7 @@ mod tests {
             trigger: TurnTrigger::AgentCall,
             origin: None,
             is_reply: false,
+            surface_to: None,
         }
     }
 
@@ -1261,6 +1262,7 @@ mod tests {
             trigger: TurnTrigger::AgentCall,
             origin: Some("channel:1086446153098342510".to_string()),
             is_reply: false,
+            surface_to: None,
         };
 
         // --- Producer half: post the wake into a file-backed WAL substrate. ---

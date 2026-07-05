@@ -972,12 +972,15 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                           instead of agent_send when you want to hand off work without waiting, \
                           or to avoid the head-of-line blocking of a synchronous A->B call. \
                           Accepts UUID or agent name."
-                .to_string(),
+                .to_string()
+                + " Optionally pass surface_to (\"<channel>:<recipient>\") to have the target's \
+                   eventual agent_reply_async answer auto-posted to that channel.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
-                    "message": { "type": "string", "description": "The message delivered to the target when it runs" }
+                    "message": { "type": "string", "description": "The message delivered to the target when it runs" },
+                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -2705,6 +2708,16 @@ async fn tool_agent_send_async(
         .ok_or("Missing 'message' parameter")?;
     let sender = caller_agent_id.ok_or("agent_send_async requires a caller identity (sender)")?;
 
+    // ANAI-123: optional surfacing route. When set, it rides the whole
+    // round-trip and origin's leg-4 turn auto-posts the delegated answer to
+    // this channel (see `WakeEnvelope::surface_to`). Inert data on this leg —
+    // it only takes effect if the callee replies. Encoded "<channel>:<recip>".
+    let surface_to = input["surface_to"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     // Canonicalize the target to a stable agent-id BEFORE the cycle check.
     // `sender` is always a UUID (the caller's agent id); a caller may address
     // `target` by NAME. would_cycle is a plain string compare, so without
@@ -2786,7 +2799,20 @@ async fn tool_agent_send_async(
         // Origination, not a reply — the consumer WILL grant this target a
         // one-shot reply-right (ANAI-122). Only `agent_reply_async` sets true.
         is_reply: false,
+        // ANAI-123: surfacing route rides outbound so the callee's reply-right
+        // token inherits it (minted in `run_woken_agent_loop`). None on the
+        // wire when unset.
+        surface_to: surface_to.clone(),
     };
+
+    if let Some(route) = surface_to.as_deref() {
+        info!(
+            target = %target,
+            sender = %sender,
+            surface_to = %route,
+            "agent_send_async: surfacing route set — callee's reply will auto-post here (ANAI-123)"
+        );
+    }
 
     let payload = envelope
         .to_payload()
@@ -2873,6 +2899,12 @@ async fn tool_agent_reply_async(
     // initiator — it cannot address anyone else. That is the whole safety story.
     let target = right.reply_to().to_string();
 
+    // ANAI-123: inherit the surfacing route the origin stamped on the inbound
+    // wake (baked into the token at mint time). The callee never sees or
+    // chooses it — it just rides through so origin's leg-4 turn knows where to
+    // auto-post. `None` when the origin dispatched without `surface_to`.
+    let surface_to = right.surface_to().map(str::to_string);
+
     // Aggregate cross-tree ceiling still applies (defense-in-depth): a reply is
     // a real wake emission. The per-tree budget is intentionally skipped (see
     // the doc comment) — it would gag a legitimate answer for the initiator's
@@ -2901,7 +2933,17 @@ async fn tool_agent_reply_async(
         trigger: TurnTrigger::AgentCall,
         origin: None,
         is_reply: true,
+        // ANAI-123: carry the surfacing route back to origin (leg 3->4).
+        surface_to: surface_to.clone(),
     };
+
+    debug!(
+        target = %target,
+        sender = %sender,
+        surface_to = surface_to.as_deref().unwrap_or("<none>"),
+        correlation = right.correlation(),
+        "agent_reply_async: queuing terminal reply (ANAI-122/123)"
+    );
 
     let payload = envelope
         .to_payload()
@@ -5020,7 +5062,14 @@ mod tests {
     fn reply_right_token_names_exactly_one_target() {
         // The token fixes the lawful reply target (the initiator) and carries
         // the inbound correlation id — the tool never chooses a target itself.
-        let right = ReplyRight::new("origin-agent", "wake-task-42");
+        let right = ReplyRight::new(
+            "origin-agent",
+            "wake-task-42",
+            Some("discord:1086446153098342510".to_string()),
+        );
+        // ANAI-123: the surfacing route rides in the token so the reply inherits
+        // it without the callee ever choosing a target/route.
+        assert_eq!(right.surface_to(), Some("discord:1086446153098342510"));
         assert_eq!(right.reply_to(), "origin-agent");
         assert_eq!(right.correlation(), "wake-task-42");
     }
@@ -5031,7 +5080,7 @@ mod tests {
         // `Cell::take` consumes it: the first reply gets the token, a second
         // reply in the SAME turn finds None -> refused. This is what makes the
         // reply one-shot and unable to fan out.
-        let scoped = std::cell::Cell::new(Some(ReplyRight::new("origin-agent", "corr-1")));
+        let scoped = std::cell::Cell::new(Some(ReplyRight::new("origin-agent", "corr-1", None)));
         WAKE_REPLY_RIGHT
             .scope(scoped, async {
                 let first = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
@@ -7165,16 +7214,30 @@ mod convert_dispatch_tests {
 pub struct ReplyRight {
     reply_to: String,
     correlation: String,
+    /// Surfacing route carried inbound on the originating wake (ANAI-123).
+    /// Baked in at mint time so `agent_reply_async` copies it onto the terminal
+    /// reply envelope without the callee ever seeing or choosing it — origin's
+    /// leg-4 turn then auto-posts there. `None` when the origin dispatched with
+    /// no `surface_to`.
+    surface_to: Option<String>,
 }
 
 impl ReplyRight {
     /// Mint a reply-right authorizing one reply to `reply_to` (the initiator),
     /// tagged with the inbound wake's `correlation` id (its task id) for audit
     /// and provenance.
-    pub fn new(reply_to: impl Into<String>, correlation: impl Into<String>) -> Self {
+    ///
+    /// `surface_to` is the inbound wake's surfacing route (ANAI-123), carried
+    /// so the terminal reply inherits it — see [`Self::surface_to`].
+    pub fn new(
+        reply_to: impl Into<String>,
+        correlation: impl Into<String>,
+        surface_to: Option<String>,
+    ) -> Self {
         Self {
             reply_to: reply_to.into(),
             correlation: correlation.into(),
+            surface_to,
         }
     }
 
@@ -7186,5 +7249,12 @@ impl ReplyRight {
     /// The inbound wake's correlation id (its task id).
     pub fn correlation(&self) -> &str {
         &self.correlation
+    }
+
+    /// The inbound surfacing route (ANAI-123), if the origin dispatched one.
+    /// Copied onto the terminal reply envelope so origin's leg-4 woken turn
+    /// emits exactly one `channel_send(surface_to, ...)`.
+    pub fn surface_to(&self) -> Option<&str> {
+        self.surface_to.as_deref()
     }
 }
