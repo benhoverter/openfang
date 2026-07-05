@@ -42,6 +42,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
 
+/// Built-in tools that are **always surfaced to the LLM**, even for agents that
+/// declare an explicit `capabilities.tools` list which does not name them.
+///
+/// This is the kernel-side counterpart to the bridge's `DEFAULT_ALLOWED`
+/// (`openfang-mcp-bridge/src/lib.rs`), but it is deliberately **narrower**:
+/// membership here is reserved for tools that are *inert without a runtime
+/// token* and therefore safe to advertise universally. Advertising grants no
+/// authority — the one-shot `WAKE_REPLY_RIGHT` task-local is the real gate on
+/// *use*. Per-agent `tool_blocklist` (Step 4) still runs afterward, so an
+/// operator can explicitly remove any of these.
+///
+/// Do NOT copy the bridge's `DEFAULT_ALLOWED` wholesale here — that list
+/// includes broadly-useful tools (`file_read`, `web_fetch`, …) whose forced
+/// always-on presence would defeat every agent's careful tool restriction.
+/// Add a tool here only when it is token-gated at runtime.
+///
+/// ANAI-122: `agent_reply_async` is inert without the reply-right token.
+const ALWAYS_ON_BUILTIN_TOOLS: &[&str] = &["agent_reply_async"];
+
 /// The main OpenFang kernel — coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
@@ -6972,10 +6991,17 @@ impl OpenFangKernel {
         });
 
         let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
-            // Agent declares specific tools — only include matching builtins
+            // Agent declares specific tools — only include matching builtins,
+            // plus the always-on carve-out (token-gated tools that are inert
+            // without a runtime token; see ALWAYS_ON_BUILTIN_TOOLS). Advertising
+            // grants nothing — the reply-right token still gates actual use, and
+            // Step 4's tool_blocklist can still remove them. ANAI-122.
             all_builtins
                 .into_iter()
-                .filter(|t| declared_tools.iter().any(|d| d == &t.name))
+                .filter(|t| {
+                    declared_tools.iter().any(|d| d == &t.name)
+                        || ALWAYS_ON_BUILTIN_TOOLS.contains(&t.name.as_str())
+                })
                 .collect()
         } else {
             // No specific tools declared — fall back to profile or all builtins

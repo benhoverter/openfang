@@ -198,3 +198,66 @@ max_llm_tokens_per_hour = 100000
         "MCP servers should be parsed correctly (must be at top level)"
     );
 }
+
+/// ANAI-122 regression: a token-gated always-on tool (`agent_reply_async`) must
+/// be surfaced to an agent that declares an explicit `capabilities.tools` list
+/// WITHOUT naming it. This is the exact gap the 122/124 suite missed — the tool
+/// cleared the bridge's `DEFAULT_ALLOWED` gate but was filtered out by the
+/// kernel's declared-tools intersection in `available_tools_with_registry`,
+/// leaving it dead-on-arrival for every agent with a specific tool list.
+///
+/// No network needed: booting + spawning + querying the tool gate never calls
+/// an LLM. Guards two invariants together:
+///   1. positive — the carve-out surfaces `agent_reply_async` despite it being
+///      undeclared, alongside the declared `file_read`;
+///   2. narrowness — a privileged, undeclared tool (`agent_send_async`) is NOT
+///      force-surfaced, so the carve-out has not become a blanket bypass.
+#[tokio::test]
+async fn test_reply_async_always_on_for_declared_tools_agent() {
+    let config = test_config();
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    // Agent declares ONLY file_read — neither reply tool is named.
+    let manifest: AgentManifest = toml::from_str(
+        r#"
+name = "declared-tools-agent"
+version = "0.1.0"
+description = "Agent with an explicit, narrow tool list"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[capabilities]
+tools = ["file_read"]
+memory_read = ["*"]
+memory_write = ["self.*"]
+"#,
+    )
+    .unwrap();
+
+    let agent_id = kernel.spawn_agent(manifest).expect("Agent should spawn");
+
+    let tools = kernel.available_tools_with_registry(agent_id, None);
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        names.contains(&"file_read"),
+        "declared tool file_read must be present, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"agent_reply_async"),
+        "token-gated always-on tool agent_reply_async must be surfaced even though \
+         it is not in the declared tools list (ANAI-122 carve-out), got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"agent_send_async"),
+        "privileged, undeclared agent_send_async must NOT be force-surfaced — the \
+         always-on carve-out must stay narrow, got: {names:?}"
+    );
+
+    kernel.kill_agent(agent_id).ok();
+    kernel.shutdown();
+}
