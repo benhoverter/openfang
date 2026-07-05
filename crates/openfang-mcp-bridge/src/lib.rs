@@ -757,6 +757,7 @@ mod tests {
                 "channel_send",
                 "agent_send",
                 "agent_send_async",
+                "agent_reply_async",
                 "agent_spawn",
                 "agent_kill",
                 "agent_activate",
