@@ -5424,8 +5424,30 @@ impl OpenFangKernel {
         // tokio::spawn — setting it at the spawn site would be severed. The
         // send future awaits the agent loop inline (no intervening spawn), so
         // the scope reaches execute_tool -> tool_agent_send_async.
-        let result = openfang_runtime::tool_runner::WAKE_LINEAGE
-            .scope(envelope.lineage.clone(), send_fut)
+        //
+        // ANAI-122: mint a one-shot reply-right for this turn, scoped in the
+        // SAME place and for the same task-local-severance reason. It is granted
+        // ONLY for an origination wake — a turn woken by a reply (`is_reply`)
+        // gets `None`, so the initiator's leg-4 turn cannot reply-bounce and the
+        // reply stays terminal. The token names exactly one lawful target (the
+        // initiator = `envelope.sender`) and is consumed by the first
+        // `agent_reply_async` call (`Cell::take`); a second reply this turn
+        // finds `None`. The two scopes nest: the reply-right wraps the lineage
+        // scope, both reaching `execute_tool` inline (no intervening spawn).
+        let reply_right = if envelope.is_reply {
+            None
+        } else {
+            Some(openfang_runtime::tool_runner::ReplyRight::new(
+                envelope.sender.clone(),
+                task_id.clone(),
+            ))
+        };
+        let result = openfang_runtime::tool_runner::WAKE_REPLY_RIGHT
+            .scope(
+                std::cell::Cell::new(reply_right),
+                openfang_runtime::tool_runner::WAKE_LINEAGE
+                    .scope(envelope.lineage.clone(), send_fut),
+            )
             .await;
 
         match result {

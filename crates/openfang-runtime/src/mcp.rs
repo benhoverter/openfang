@@ -364,6 +364,7 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "channel_send",
     "agent_send",
     "agent_send_async",
+    "agent_reply_async",
     "agent_spawn",
     "agent_kill",
     "memory_store",

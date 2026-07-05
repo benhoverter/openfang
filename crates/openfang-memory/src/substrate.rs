@@ -1045,6 +1045,7 @@ mod tests {
             lineage: WakeLineage::root_at(sender).extended(target),
             trigger: TurnTrigger::AgentCall,
             origin: None,
+            is_reply: false,
         }
     }
 
@@ -1259,6 +1260,7 @@ mod tests {
                 .extended("worker-b"),
             trigger: TurnTrigger::AgentCall,
             origin: Some("channel:1086446153098342510".to_string()),
+            is_reply: false,
         };
 
         // --- Producer half: post the wake into a file-backed WAL substrate. ---

@@ -164,6 +164,10 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     "agent_list",
     "channel_send",
     "agent_send",
+    // ANAI-122: default-safe. In DEFAULT_ALLOWED (not PRIVILEGED_DEFAULT_DENY)
+    // because being advertised grants nothing — the tool is inert without a
+    // one-shot reply-right token the wake-consumer mints for a woken turn.
+    "agent_reply_async",
     "memory_store",
     "memory_recall",
     "agent_find",
@@ -344,6 +348,30 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" }
                 },
                 "required": ["agent_id", "message"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` → `agent_reply_async`.
+        // NON-privileged and default-safe: it sits in `DEFAULT_ALLOWED`
+        // (unlike its origination sibling) precisely because advertising it
+        // grants nothing — it is INERT without a one-shot reply-right token
+        // that only the wake-consumer can mint into task-local scope for a
+        // woken turn (ANAI-122). Takes no target: the initiator is fixed by
+        // the token, so it can never originate a wake to an arbitrary agent.
+        Tool::new(
+            "agent_reply_async",
+            "Send a ONE-SHOT terminal reply to the agent that woke you via \
+             agent_send_async (fire-and-forget). Valid ONLY inside a turn that \
+             another agent woke asynchronously — it answers that initiator and \
+             no one else, so it takes no target. The reply is terminal: the \
+             initiator receives your message as its own woken turn and surfaces \
+             or continues, but cannot bounce back. Outside a woken turn, or \
+             after you have already replied once this turn, the call refuses.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "The reply delivered to your initiator when it runs" }
+                },
+                "required": ["message"]
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `agent_spawn`. High-

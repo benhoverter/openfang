@@ -149,6 +149,19 @@ tokio::task_local! {
     /// (req 4) and depth (req 9) enforce for real. Absent on origin turns
     /// (channel / cron / API), which have no wake ancestry.
     pub static WAKE_LINEAGE: openfang_types::wake::WakeLineage;
+    /// One-shot reply-right for the current woken turn (ANAI-122).
+    ///
+    /// Minted by `Kernel::run_woken_agent_loop` alongside [`WAKE_LINEAGE`], but
+    /// ONLY for a turn woken by an *origination* wake — never for one woken by a
+    /// reply ([`WakeEnvelope::is_reply`](openfang_types::wake::WakeEnvelope)),
+    /// which keeps the reply strictly terminal. Read and CONSUMED by
+    /// `tool_agent_reply_async` via `Cell::take`, so the reply is one-shot: a
+    /// second call in the same turn finds `None`. Absent on origin turns and on
+    /// reply-woken turns — in both the tool is inert and refuses. This is the
+    /// whole authority model: the tool is advertised fleet-wide but does
+    /// nothing without this token, and the token names exactly one lawful
+    /// target (the initiator) for exactly one reply.
+    pub static WAKE_REPLY_RIGHT: std::cell::Cell<Option<ReplyRight>>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -554,6 +567,7 @@ pub async fn execute_tool(
         // Inter-agent tools (require kernel handle)
         "agent_send" => tool_agent_send(input, kernel).await,
         "agent_send_async" => tool_agent_send_async(input, kernel, caller_agent_id).await,
+        "agent_reply_async" => tool_agent_reply_async(input, kernel, caller_agent_id).await,
         "agent_spawn" => tool_agent_spawn(input, kernel, caller_agent_id).await,
         "agent_list" => tool_agent_list(kernel),
         "agent_kill" => tool_agent_kill(input, kernel),
@@ -966,6 +980,25 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" }
                 },
                 "required": ["agent_id", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "agent_reply_async".to_string(),
+            description: "Send a ONE-SHOT terminal reply to the agent that woke you via \
+                          agent_send_async (fire-and-forget). Valid ONLY inside a turn that \
+                          another agent woke asynchronously — it answers that initiator and no \
+                          one else, so it takes no target (you cannot choose who to reply to). \
+                          The reply is terminal: the initiator receives your message as its own \
+                          woken turn and surfaces or continues, but cannot bounce back. Outside \
+                          a woken turn, or after you have already replied once this turn, the \
+                          call refuses. Use this to complete a delegated async round-trip."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "The reply delivered to your initiator when it runs" }
+                },
+                "required": ["message"]
             }),
         },
         ToolDefinition {
@@ -2750,6 +2783,9 @@ async fn tool_agent_send_async(
         // origin threading is a documented follow-up (audit finding #3): a wake
         // that raises an approval prompt has no inbound route yet.
         origin: None,
+        // Origination, not a reply — the consumer WILL grant this target a
+        // one-shot reply-right (ANAI-122). Only `agent_reply_async` sets true.
+        is_reply: false,
     };
 
     let payload = envelope
@@ -2768,6 +2804,122 @@ async fn tool_agent_send_async(
     Ok(format!(
         "Async wake queued for '{target}' (task {task_id}). \
          The target runs on its own; no reply is returned inline."
+    ))
+}
+
+/// Send a **one-shot terminal reply** to the agent that woke this turn (ANAI-122,
+/// leg 3 of the four-step round-trip: fleet -> origin).
+///
+/// Unlike [`tool_agent_send_async`] this is NOT an origination and takes no
+/// target: the reply target is fixed by the [`ReplyRight`] token that the
+/// wake-consumer minted into task-local scope for this turn. The tool is
+/// advertised fleet-wide but **inert without that token** — outside a woken
+/// turn (or inside a turn that was itself woken by a reply) there is no token
+/// and the call refuses. The token authorizes exactly one reply to the
+/// initiator and is consumed here, so it cannot be used to originate a wake to
+/// anyone else or to fan out.
+///
+/// Terminal-edge rules (why the normal wake guards do not apply):
+/// * **Cycle (req 4):** the reply targets an ancestor (the initiator), which
+///   [`WakeLineage::would_cycle`](openfang_types::wake::WakeLineage) would
+///   refuse. The one-shot token replaces the cycle guard on this edge — no ring
+///   can form because the reply grants no further reply-right.
+/// * **Depth (req 9):** the reply roots a FRESH single-element lineage at the
+///   replier, so depth is 1 — it can never be over-deep.
+/// * **Per-tree budget (req 10):** deliberately NOT charged. It keys on the
+///   initiator's root, which the initiator's own fan-out may have exhausted;
+///   gagging a legitimate terminal answer for the initiator's spending buys no
+///   safety, since the reply is one-shot and cannot itself fan out.
+/// * **Aggregate ceiling:** still enforced — a reply is a real emission, and
+///   the fleet-wide backstop only ever refuses, never permits.
+async fn tool_agent_reply_async(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    use openfang_types::turn::TurnTrigger;
+    use openfang_types::wake::{WakeEnvelope, WakeLineage, WAKE_TASK_PREFIX};
+
+    let kh = require_kernel(kernel)?;
+    let sender = caller_agent_id.ok_or("agent_reply_async requires a caller identity (sender)")?;
+    let message = input["message"]
+        .as_str()
+        .ok_or("Missing 'message' parameter")?;
+
+    // One-shot reply-right: minted by the wake-consumer for this woken turn and
+    // consumed here with `Cell::take`, which leaves `None` behind. Two refusal
+    // surfaces:
+    //   * task-local unset  -> not a woken turn at all (origin/channel/cron/API).
+    //   * task-local == None -> already replied this turn, OR this turn was
+    //     itself woken by a reply (terminal; no right was ever minted).
+    // Either way the tool is inert without a live token — the default-safe
+    // property that lets it live in DEFAULT_ALLOWED without a manifest grant.
+    let right = WAKE_REPLY_RIGHT
+        .try_with(|cell| cell.take())
+        .map_err(|_| {
+            "agent_reply_async is only valid inside a turn woken by another \
+             agent's async wake; no reply-right is in scope here."
+                .to_string()
+        })?
+        .ok_or_else(|| {
+            "agent_reply_async reply-right already used (one-shot per woken \
+             turn), or this turn was itself woken by a reply (terminal — no \
+             further reply is permitted)."
+                .to_string()
+        })?;
+
+    // The reply target is FIXED by the token (the initiator that woke us). The
+    // tool takes no `agent_id`, so a woken agent can only ever answer its own
+    // initiator — it cannot address anyone else. That is the whole safety story.
+    let target = right.reply_to().to_string();
+
+    // Aggregate cross-tree ceiling still applies (defense-in-depth): a reply is
+    // a real wake emission. The per-tree budget is intentionally skipped (see
+    // the doc comment) — it would gag a legitimate answer for the initiator's
+    // own fan-out spending, and the reply cannot itself fan out.
+    if !wake_emit_admit() {
+        return Err(format!(
+            "Refusing async reply: aggregate wake-emission ceiling exceeded \
+             ({} wakes / {}s window across all trees). It clears once emissions \
+             go quiet.",
+            openfang_types::agent_wake::emit_max(),
+            openfang_types::agent_wake::window_secs()
+        ));
+    }
+
+    // Terminal edge: root a FRESH single-element lineage at the replier. This is
+    // the *completion* of a correlation, not an extension of the inbound chain;
+    // extending would form the real cycle [origin,...,callee,origin] that
+    // `would_cycle` rightly refuses. `is_reply = true` tells the consumer to
+    // grant NO further reply-right, so the initiator's leg-4 turn is a leaf: it
+    // surfaces (channel_send) or does fresh work, but cannot reply-bounce.
+    let envelope = WakeEnvelope {
+        target: target.clone(),
+        sender: sender.to_string(),
+        message: message.to_string(),
+        lineage: WakeLineage::root_at(sender),
+        trigger: TurnTrigger::AgentCall,
+        origin: None,
+        is_reply: true,
+    };
+
+    let payload = envelope
+        .to_payload()
+        .map_err(|e| format!("Failed to serialize reply envelope: {e}"))?;
+
+    // Same reserved-prefix + privileged wake_post path as origination: the
+    // consumer claims it as a wake, ordinary task_claim skips it, and a forged
+    // reply cannot enter through the generic task tool.
+    let title = format!("{WAKE_TASK_PREFIX}{target}");
+    let task_id = kh
+        .wake_post(&title, message, Some(&target), Some(sender), &payload)
+        .await?;
+
+    Ok(format!(
+        "Async reply queued for initiator '{target}' (task {task_id}, \
+         correlation {}). Terminal — no further reply-right is granted, so the \
+         initiator surfaces or continues but cannot bounce back.",
+        right.correlation()
     ))
 }
 
@@ -4859,6 +5011,64 @@ mod tests {
             .await;
     }
 
+    // ANAI-122: the one-shot reply-right. These prove the whole authority model
+    // for `agent_reply_async` WITHOUT a kernel: the tool is inert unless a live
+    // token is scoped, the token is consumed on first use, and a reply-woken
+    // turn is granted no token (so the reply stays terminal).
+
+    #[test]
+    fn reply_right_token_names_exactly_one_target() {
+        // The token fixes the lawful reply target (the initiator) and carries
+        // the inbound correlation id — the tool never chooses a target itself.
+        let right = ReplyRight::new("origin-agent", "wake-task-42");
+        assert_eq!(right.reply_to(), "origin-agent");
+        assert_eq!(right.correlation(), "wake-task-42");
+    }
+
+    #[tokio::test]
+    async fn reply_right_is_one_shot_within_a_woken_turn() {
+        // The consumer scopes Some(right) for an origination-woken turn.
+        // `Cell::take` consumes it: the first reply gets the token, a second
+        // reply in the SAME turn finds None -> refused. This is what makes the
+        // reply one-shot and unable to fan out.
+        let scoped = std::cell::Cell::new(Some(ReplyRight::new("origin-agent", "corr-1")));
+        WAKE_REPLY_RIGHT
+            .scope(scoped, async {
+                let first = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
+                assert!(first.is_some(), "first reply must find the minted token");
+                assert_eq!(first.unwrap().reply_to(), "origin-agent");
+                let second = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
+                assert!(second.is_none(), "second reply in the same turn must be refused");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reply_right_absent_outside_a_woken_turn() {
+        // No task-local scoped (origin / channel / cron / API turn): the tool
+        // is INERT. `try_with` errors, which the tool maps to a refusal. This is
+        // the default-safe property that lets it live in DEFAULT_ALLOWED.
+        let probe = WAKE_REPLY_RIGHT.try_with(|c| c.take());
+        assert!(
+            probe.is_err(),
+            "outside a woken turn there is no reply-right; the tool must refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_right_not_granted_on_a_reply_woken_turn() {
+        // The consumer scopes None for a turn woken BY a reply (is_reply). The
+        // token is present-but-empty, so the tool refuses -> the reply is
+        // strictly terminal and the initiator cannot reply-bounce.
+        let scoped: std::cell::Cell<Option<ReplyRight>> = std::cell::Cell::new(None);
+        WAKE_REPLY_RIGHT
+            .scope(scoped, async {
+                let got = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
+                assert!(got.is_none(), "a reply-woken turn must hold no reply-right");
+            })
+            .await;
+    }
+
     #[test]
     fn wake_emit_admit_ceiling_trips_then_holds() {
         // The first `emit_max` emissions in a single window are admitted; the
@@ -6933,5 +7143,48 @@ mod convert_dispatch_tests {
             assert!(find_on_path("sh", &path).is_some());
             assert!(find_on_path("definitely-not-a-real-binary-xyz", &path).is_none());
         }
+    }
+}
+/// One-shot authority minted by the wake-consumer (`run_woken_agent_loop`) for
+/// the lifetime of a single woken turn, authorizing exactly ONE terminal reply
+/// back to the agent that initiated the wake (ANAI-122, leg 3 of the four-step
+/// round-trip: fleet -> origin).
+///
+/// This is the entire capability model for `agent_reply_async`. The tool is
+/// advertised fleet-wide (it sits in `DEFAULT_ALLOWED`, not
+/// `PRIVILEGED_DEFAULT_DENY`), but is INERT without this token in task-local
+/// scope. The token names exactly one lawful target — the initiator, captured
+/// as [`WakeEnvelope::sender`](openfang_types::wake::WakeEnvelope) — and is
+/// consumed on first use. So a woken agent can answer its initiator once and
+/// cannot originate a wake to anyone else: no standing grant, no new fan-out
+/// surface, and the aggregate emission ceiling still bounds the total. Not
+/// minted for a turn that was itself woken by a reply, which makes the reply
+/// strictly terminal and closes the reply-bounce (A replies to B, B's turn
+/// gets no right, so it cannot reply back to A).
+#[derive(Debug, Clone)]
+pub struct ReplyRight {
+    reply_to: String,
+    correlation: String,
+}
+
+impl ReplyRight {
+    /// Mint a reply-right authorizing one reply to `reply_to` (the initiator),
+    /// tagged with the inbound wake's `correlation` id (its task id) for audit
+    /// and provenance.
+    pub fn new(reply_to: impl Into<String>, correlation: impl Into<String>) -> Self {
+        Self {
+            reply_to: reply_to.into(),
+            correlation: correlation.into(),
+        }
+    }
+
+    /// The single lawful reply target — the initiator that woke this turn.
+    pub fn reply_to(&self) -> &str {
+        &self.reply_to
+    }
+
+    /// The inbound wake's correlation id (its task id).
+    pub fn correlation(&self) -> &str {
+        &self.correlation
     }
 }

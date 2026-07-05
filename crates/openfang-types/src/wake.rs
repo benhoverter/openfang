@@ -190,6 +190,26 @@ pub struct WakeEnvelope {
     /// has nowhere to route back — a documented latent gap, not an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// True when this wake is a **terminal reply** produced by `agent_reply_async`
+    /// (ANAI-122), i.e. leg 3 of the four-step round-trip (fleet -> origin).
+    ///
+    /// A reply is the *completion* of a correlation, not an origination: the
+    /// wake-consumer grants **no** `WAKE_REPLY_RIGHT` for a turn woken by a
+    /// reply, so origin's leg-4 turn cannot reply-bounce back into the tree —
+    /// it can only surface (leg 4, `channel_send`) or do fresh work. That one
+    /// bit is the structural guarantee that replaces the cycle guard on the
+    /// terminal edge (the reply targets an ancestor, which `would_cycle` would
+    /// otherwise refuse — see ANAI-122 spike). Omitted on the wire when false,
+    /// so every pre-ANAI-122 wake decodes back to a non-reply unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_reply: bool,
+}
+
+/// serde `skip_serializing_if` predicate: skip a `bool` field when it is false,
+/// so the flag is absent on the wire unless explicitly set (keeps the common
+/// non-reply wake payload byte-identical to the pre-ANAI-122 shape).
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl WakeEnvelope {
@@ -285,6 +305,7 @@ mod tests {
             lineage: WakeLineage::root_at("orchestrator").extended("worker-a"),
             trigger: TurnTrigger::AgentCall,
             origin: Some("channel:1086446153098342510".into()),
+            is_reply: false,
         };
         let payload = env.to_payload().unwrap();
         let back = WakeEnvelope::from_payload(&payload).unwrap();
@@ -304,13 +325,45 @@ mod tests {
             lineage: WakeLineage::empty(),
             trigger: TurnTrigger::Cron,
             origin: None,
+            is_reply: false,
         };
         let json = serde_json::to_string(&env).unwrap();
         // origin is skipped on the wire when absent...
         assert!(!json.contains("origin"), "None origin must be omitted: {json}");
+        // is_reply is likewise skipped when false — the default wake shape.
+        assert!(
+            !json.contains("is_reply"),
+            "false is_reply must be omitted: {json}"
+        );
         // ...and a payload with no origin field decodes back to None.
         let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
         assert_eq!(back.origin, None);
         assert_eq!(back.trigger, TurnTrigger::Cron);
+        assert!(!back.is_reply, "absent is_reply must decode to false");
+    }
+
+    #[test]
+    fn envelope_reply_flag_round_trips_and_is_present_when_set() {
+        // ANAI-122: a terminal reply wake (leg 3) carries is_reply = true and a
+        // fresh single-element lineage rooted at the replier, so the consumer
+        // grants no further reply-right and origin's leg-4 turn is a leaf.
+        let env = WakeEnvelope {
+            target: "orchestrator".into(),
+            sender: "worker-b".into(),
+            message: "here is the result you asked for".into(),
+            lineage: WakeLineage::root_at("worker-b"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: true,
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(json.contains("is_reply"), "true is_reply must serialize: {json}");
+        let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
+        assert_eq!(env, back);
+        assert!(back.is_reply);
+        // The reply roots a fresh chain at the replier: depth 1, so origin's
+        // leg-4 turn starts clean and cannot be over-deep.
+        assert_eq!(back.lineage.depth(), 1);
+        assert_eq!(back.lineage.root(), Some("worker-b"));
     }
 }
