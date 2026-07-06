@@ -6777,6 +6777,8 @@ mod tests {
                 }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
+                observed_tools: Vec::new(),
+                observer_live: false,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
