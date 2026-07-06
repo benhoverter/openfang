@@ -2498,6 +2498,7 @@ impl OpenFangKernel {
                     .and_then(|(s, _)| s),
                 user_name,
                 channel_type: None,
+                channel_binding: self.agent_channel_binding_summary(&manifest.name),
                 is_subagent: manifest
                     .metadata
                     .get("is_subagent")
@@ -3136,6 +3137,7 @@ impl OpenFangKernel {
                     .and_then(|(s, _)| s),
                 user_name,
                 channel_type: None,
+                channel_binding: self.agent_channel_binding_summary(&manifest.name),
                 is_subagent: manifest
                     .metadata
                     .get("is_subagent")
@@ -4497,6 +4499,37 @@ impl OpenFangKernel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Build a human-readable channel-binding summary for `agent_name`, or
+    /// `None` when the agent has no binding that carries a channel/room/peer.
+    ///
+    /// Reads the in-memory binding table — the same table the router resolves
+    /// against. Matches by `AgentBinding::agent` (which the router treats as an
+    /// agent *name* key), then selects the most-specific matching rule so an
+    /// agent bound to a specific room reports that room rather than a broad
+    /// channel-only fallback. Surfaced into the prompt via
+    /// `PromptContext::channel_binding` so an agent can see its home channel
+    /// without a tool call — the binding table is otherwise a one-directional
+    /// inbound routing map never projected back into the manifest.
+    fn agent_channel_binding_summary(&self, agent_name: &str) -> Option<String> {
+        let best = self
+            .list_bindings()
+            .into_iter()
+            .filter(|b| b.agent == agent_name)
+            .max_by_key(|b| b.match_rule.specificity())?;
+        let r = best.match_rule;
+        if r.channel.is_none() && r.channel_id.is_none() && r.peer_id.is_none() {
+            return None;
+        }
+        let channel = r.channel.as_deref().unwrap_or("unknown");
+        let mut summary = format!("the {channel} channel");
+        match (r.channel_id.as_deref(), r.peer_id.as_deref()) {
+            (Some(cid), _) => summary.push_str(&format!(" (channel_id {cid})")),
+            (None, Some(pid)) => summary.push_str(&format!(" (peer_id {pid})")),
+            (None, None) => {}
+        }
+        Some(summary)
     }
 
     /// Add a binding at runtime.

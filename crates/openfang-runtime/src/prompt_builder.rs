@@ -39,6 +39,11 @@ pub struct PromptContext {
     pub user_name: Option<String>,
     /// Channel type (telegram, discord, web, etc.).
     pub channel_type: Option<String>,
+    /// Pre-formatted channel-binding summary — the home channel this agent is
+    /// routed to (e.g. `the discord channel (channel_id 1515…)`), sourced from
+    /// the kernel binding table. Injected so an agent can retrieve its own
+    /// binding without a tool call. `None` when the agent has no binding.
+    pub channel_binding: Option<String>,
     /// Whether this agent was spawned as a subagent.
     pub is_subagent: bool,
     /// Whether this agent has autonomous config.
@@ -156,6 +161,18 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         if let Some(ref channel) = ctx.channel_type {
             sections.push(build_channel_section(channel));
+        }
+    }
+
+    // Section 9.05 — Channel Binding (skip for subagents)
+    // The agent's home channel from the kernel binding table. Distinct from
+    // Channel Awareness (which describes the *current* turn's channel type):
+    // this is the durable routing binding an agent could not otherwise see,
+    // since the binding table is a one-directional inbound routing map that is
+    // never projected back into the manifest or discovery tools.
+    if !ctx.is_subagent {
+        if let Some(ref binding) = ctx.channel_binding {
+            sections.push(build_channel_binding_section(binding));
         }
     }
 
@@ -452,6 +469,22 @@ fn build_channel_section(channel: &str) -> String {
     )
 }
 
+/// Render the durable channel-binding section from a kernel-supplied summary.
+///
+/// `binding` is already prose (built kernel-side from the winning
+/// `AgentBinding`), e.g. `the discord channel (channel_id 1515…)`. This keeps
+/// the data-shaping in the kernel (which owns the binding table) and the prose
+/// here (which owns the prompt).
+fn build_channel_binding_section(binding: &str) -> String {
+    format!(
+        "## Channel Binding\n\
+         You are bound to {binding}. This is your home channel: inbound messages \
+         on it are what wake you, and it is the surface your channel-directed \
+         replies target. You can rely on this binding directly — no tool call is \
+         needed to look it up."
+    )
+}
+
 fn build_sender_section(sender_name: Option<&str>, sender_id: Option<&str>) -> Option<String> {
     match (sender_name, sender_id) {
         (Some(name), Some(id)) => Some(format!("## Sender\nMessage from: {name} ({id})")),
@@ -737,6 +770,31 @@ mod tests {
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Your Tools"));
+    }
+
+    #[test]
+    fn test_channel_binding_section_rendered_when_set() {
+        let mut ctx = basic_ctx();
+        ctx.channel_binding = Some("the discord channel (channel_id 1515100439031451789)".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Channel Binding"));
+        assert!(prompt.contains("channel_id 1515100439031451789"));
+        assert!(prompt.contains("no tool call is needed") || prompt.contains("no tool call"));
+    }
+
+    #[test]
+    fn test_channel_binding_section_absent_when_none() {
+        let prompt = build_system_prompt(&basic_ctx());
+        assert!(!prompt.contains("## Channel Binding"));
+    }
+
+    #[test]
+    fn test_channel_binding_section_omitted_for_subagent() {
+        let mut ctx = basic_ctx();
+        ctx.is_subagent = true;
+        ctx.channel_binding = Some("the discord channel (channel_id 999)".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Channel Binding"));
     }
 
     #[test]
