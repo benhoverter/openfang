@@ -851,20 +851,15 @@ pub async fn run_agent_loop(
                 // ANAI-77 (observe-only): stamp the shadow would-drop verdict
                 // into the capture metadata. Nothing is skipped here — ANAI-85
                 // will consume metadata["would_drop"] to gate real drops.
-                // ANAI-77x: observer liveness = structural OR runtime-evidenced.
-                // Native/HTTP drivers surface tool_calls into the loop
-                // (OBSERVER_LIVE_PROVIDERS) and are live invariantly; they report
-                // response.observer_live=false because they wire no in-subprocess
-                // observer, so the allowlist is retained for them. The driver bit
-                // adds per-spawn runtime evidence for subprocess drivers (CC): true
-                // only when a working observe hook was wired this spawn, false on any
-                // binary predating/failing the hook. OR-ing flips false->true ONLY for
-                // claude-code-with-wired-hook (the intended new drop capability) and
-                // leaves every native verdict unchanged -- no telemetry/drop regression,
-                // and pure keep-mode until a deployed observe binary reports true.
-                let observer_live = openfang_memory::capture::observer_is_live(
-                    &manifest.model.provider,
-                ) || response.observer_live;
+                // ANAI-77x: observer liveness is now the driver's self-reported
+                // capability bit, full stop — the static per-provider allowlist
+                // (`observer_is_live`) is gone. Native/HTTP drivers report `true`
+                // invariantly (tools surface in-band as tool_calls), subprocess
+                // drivers report `true` only with a live out-of-band observer this
+                // spawn (CC + wired PreToolUse hook), `false` otherwise. A stale CC
+                // binary reports `false` → pure keep-mode until a deployed observe
+                // binary reports `true`; cannot over-delete pre-deploy.
+                let observer_live = response.observer_live;
                 let capture_meta =
                     capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
 
@@ -2488,20 +2483,15 @@ pub async fn run_agent_loop_streaming(
                 // ANAI-77 (observe-only): stamp the shadow would-drop verdict
                 // into the capture metadata. Nothing is skipped here — ANAI-85
                 // will consume metadata["would_drop"] to gate real drops.
-                // ANAI-77x: observer liveness = structural OR runtime-evidenced.
-                // Native/HTTP drivers surface tool_calls into the loop
-                // (OBSERVER_LIVE_PROVIDERS) and are live invariantly; they report
-                // response.observer_live=false because they wire no in-subprocess
-                // observer, so the allowlist is retained for them. The driver bit
-                // adds per-spawn runtime evidence for subprocess drivers (CC): true
-                // only when a working observe hook was wired this spawn, false on any
-                // binary predating/failing the hook. OR-ing flips false->true ONLY for
-                // claude-code-with-wired-hook (the intended new drop capability) and
-                // leaves every native verdict unchanged -- no telemetry/drop regression,
-                // and pure keep-mode until a deployed observe binary reports true.
-                let observer_live = openfang_memory::capture::observer_is_live(
-                    &manifest.model.provider,
-                ) || response.observer_live;
+                // ANAI-77x: observer liveness is now the driver's self-reported
+                // capability bit, full stop — the static per-provider allowlist
+                // (`observer_is_live`) is gone. Native/HTTP drivers report `true`
+                // invariantly (tools surface in-band as tool_calls), subprocess
+                // drivers report `true` only with a live out-of-band observer this
+                // spawn (CC + wired PreToolUse hook), `false` otherwise. A stale CC
+                // binary reports `false` → pure keep-mode until a deployed observe
+                // binary reports `true`; cannot over-delete pre-deploy.
+                let observer_live = response.observer_live;
                 let capture_meta =
                     capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
 

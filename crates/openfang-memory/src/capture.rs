@@ -52,7 +52,14 @@ impl CaptureDecision {
 /// is *vacuously* true -- it cannot distinguish "did nothing" from "did work we
 /// could not see". Gating the drop on a live observer makes the enforce flip
 /// safe by construction: an observer-blind driver's inert heartbeats are always
-/// kept, never dropped. See [`observer_is_live`].
+/// kept, never dropped.
+///
+/// `observer_live` is supplied by the driver itself, via the
+/// `CompletionResponse.observer_live` capability bit (ANAI-77x) — there is no
+/// static per-provider allowlist. Native/HTTP drivers report `true` invariantly
+/// (tool calls surface in-band); subprocess drivers report `true` only with a
+/// live out-of-band observer this spawn (Claude Code + wired PreToolUse hook),
+/// and `false` otherwise.
 pub fn should_capture_turn(
     trigger: TurnTrigger,
     effects: &TurnEffects,
@@ -63,80 +70,6 @@ pub fn should_capture_turn(
     } else {
         CaptureDecision::Keep
     }
-}
-
-/// Providers whose driver surfaces executed tool calls back into the OpenFang
-/// agent loop, so [`TurnEffects::observe_tool`] actually runs and the inert
-/// verdict (and the ANAI-77 `side_effecting_tools` / `tools_observed` counts)
-/// can be trusted.
-///
-/// This is an **allowlist**, and the bias is deliberate: a provider is treated
-/// as observer-live ONLY if it appears here. Anything not listed -- most
-/// importantly the subprocess CLI drivers `claude-code` and `qwen-code`, which
-/// hardcode `tool_calls: Vec::new()` because tools execute inside the
-/// subprocess and only final text round-trips back -- is treated as
-/// observer-blind and is therefore never eligible for an inert-heartbeat drop.
-/// Unknown provider => keep, matching the drop predicate's conservative bias.
-/// (Note: `codex`, `github-copilot`/`copilot`, and `kimi_coding` reuse the
-/// HTTP OpenAI/Anthropic drivers, which DO parse tool_use into `tool_calls`,
-/// so they are observer-live and listed here.)
-///
-/// INTERIM: the durable form of this signal is a per-driver capability on the
-/// driver trait, landing with the CC tool-execution -> `TurnEffects` work. Until
-/// that exists, the provider name is the only discriminator the capture policy
-/// can key off without reaching into the driver layer. To make a native
-/// provider's inert heartbeats droppable, add it here.
-const OBSERVER_LIVE_PROVIDERS: &[&str] = &[
-    "anthropic",
-    "openai",
-    "openrouter",
-    "gemini",
-    "google",
-    "vertex",
-    "vertex-ai",
-    "google-vertex",
-    "azure",
-    "azure-openai",
-    "bedrock",
-    "codex",
-    "openai-codex",
-    "github-copilot",
-    "copilot",
-    "kimi_coding",
-    "groq",
-    "mistral",
-    "deepseek",
-    "xai",
-    "grok",
-    "together",
-    "fireworks",
-    "perplexity",
-    "cohere",
-    "nvidia",
-    "chutes",
-    "venice",
-    "deepinfra",
-    "ollama",
-    "lmstudio",
-    "vllm",
-    "lemonade",
-    "minimax",
-    "zhipu",
-    "zai",
-    "qwen",
-    "moonshot",
-];
-
-/// True when `provider`'s driver feeds executed tool calls back into the agent
-/// loop, so the ANAI-77 side-effect observer is trustworthy for its turns.
-///
-/// Case-insensitive. Conservative by construction: an unrecognized provider
-/// returns `false` (observer-blind => its inert heartbeats are hard-kept). The
-/// subprocess CLI drivers (`claude-code`, `qwen-code`) are deliberately absent
-/// from [`OBSERVER_LIVE_PROVIDERS`] and therefore return `false`.
-pub fn observer_is_live(provider: &str) -> bool {
-    let p = provider.trim().to_ascii_lowercase();
-    OBSERVER_LIVE_PROVIDERS.contains(&p.as_str())
 }
 
 #[cfg(test)]
@@ -193,33 +126,6 @@ mod tests {
             should_capture_turn(TurnTrigger::Heartbeat, &active, false),
             CaptureDecision::Keep
         );
-    }
-
-    #[test]
-    fn observer_liveness_by_provider() {
-        // Native / HTTP drivers surface tool_calls into the loop -> live.
-        for p in [
-            "anthropic",
-            "openai",
-            "openrouter",
-            "codex",
-            "github-copilot",
-            "copilot",
-            "kimi_coding",
-            "gemini",
-            "bedrock",
-        ] {
-            assert!(observer_is_live(p), "{p} should be observer-live");
-        }
-        // Subprocess CLI drivers execute tools out of view -> blind.
-        for p in ["claude-code", "qwen-code"] {
-            assert!(!observer_is_live(p), "{p} must be observer-blind");
-        }
-        // Unknown provider is conservatively blind (keep, never drop).
-        assert!(!observer_is_live("some-future-provider"));
-        // Classification is case-insensitive and trims.
-        assert!(observer_is_live("  Anthropic  "));
-        assert!(!observer_is_live("Claude-Code"));
     }
 
     #[test]

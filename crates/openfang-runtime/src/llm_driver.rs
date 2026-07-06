@@ -143,27 +143,37 @@ pub struct CompletionResponse {
     /// driver populates the same field — the name is deliberately
     /// driver-neutral so the capability isn't baked in as CC-only.
     pub observed_tools: Vec<String>,
-    /// Whether this driver actually wired a working in-subprocess tool
-    /// observer for the spawn that produced this response (ANAI-77x).
+    /// Whether this driver's tool executions are observable by the agent
+    /// loop for the spawn that produced this response (ANAI-77x) — so an
+    /// empty side-effect summary can be trusted as "genuinely inert" rather
+    /// than "did work we couldn't see".
     ///
-    /// This is the *runtime-evidence* companion to `observed_tools`: it
-    /// disambiguates an empty `observed_tools` between "genuinely inert
-    /// turn" and "observer blind". The memory drop gate reads it as its
-    /// `observer_live` signal instead of a static per-driver allowlist:
-    /// - `observer_live == true`, `observed_tools == []` → the observer was
-    ///   live and saw nothing → genuinely inert → droppable.
-    /// - `observer_live == false` → no observer this spawn (stale binary,
-    ///   observe hook failed to materialize, or a non-observing driver) →
+    /// This is the *self-reported* companion to `observed_tools`, and the
+    /// sole `observer_live` signal the memory drop gate reads. It replaces
+    /// the old static per-provider allowlist (`OBSERVER_LIVE_PROVIDERS` /
+    /// `observer_is_live`), which ANAI-77x deleted in favor of this bit:
+    /// - `observer_live == true`, `observed_tools == []` → tools were
+    ///   observable and none ran → genuinely inert → droppable.
+    /// - `observer_live == false` → this spawn had no working observer →
     ///   observer blind → the row must be hard-kept, never dropped.
     ///
-    /// True only when a driver installed a functioning observer for *this*
-    /// spawn — today the Claude Code driver, iff the PreToolUse sideband
-    /// hook was wired (`sideband.is_some()`). `false` on every other driver
-    /// and on any CC spawn where the hook didn't materialize. Because a
-    /// binary that predates the observe feature reports `false`, the drop
-    /// gate stays in pure keep-mode until a deployed binary starts
-    /// reporting `true` — the enforce flip is live-evidence-gated by
-    /// construction and cannot over-delete pre-deploy.
+    /// Two ways a driver earns `true`:
+    /// - **Native / HTTP drivers** (anthropic, openai + every
+    ///   OpenAI-compatible provider, gemini, vertex, bedrock, copilot, …)
+    ///   execute tools *in-band*: tool calls round-trip as `tool_calls`
+    ///   blocks that the agent loop folds into `TurnEffects`. Their tool
+    ///   execution is always visible, so they report `true` invariantly.
+    /// - **Subprocess drivers** run tools inside their own process, out of
+    ///   band from the text round-trip. They report `true` only when they
+    ///   wired a working out-of-band observer *this spawn* — today the
+    ///   Claude Code driver, iff the PreToolUse sideband hook materialized
+    ///   (`sideband.is_some()`). A CC binary that predates/failed the hook,
+    ///   and the observer-less `qwen-code` driver, report `false`.
+    ///
+    /// Because a stale CC binary reports `false`, the drop gate stays in
+    /// pure keep-mode for it until a deployed binary starts reporting
+    /// `true` — the enforce flip is live-evidence-gated by construction and
+    /// cannot over-delete pre-deploy.
     pub observer_live: bool,
 }
 
