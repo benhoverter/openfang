@@ -116,6 +116,22 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// ANAI-125: resolve `agent_name`'s channel binding into a `surface_to`
+    /// route (`"<channel>:<recipient>"`) so an async wake that omits an
+    /// explicit route can default to the ORIGINATOR's own home channel — the
+    /// common case where a delegated reply belongs back where the originator
+    /// lives. `None` when the agent has no channel/peer binding (an unbound
+    /// worker), which preserves the pure fire-and-forget wake.
+    ///
+    /// Name-keyed to mirror the binding table (the router treats
+    /// `AgentBinding::agent` as a name key) and the sibling prose summary that
+    /// feeds `PromptContext::channel_binding`. The default returns `None`,
+    /// keeping mock/test handles inert exactly like a bindingless agent.
+    fn channel_binding_route(&self, agent_name: &str) -> Option<String> {
+        let _ = agent_name;
+        None
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 

@@ -865,6 +865,23 @@ impl BindingMatchRule {
     }
 }
 
+impl BindingMatchRule {
+    /// ANAI-125: render this rule as a `surface_to` route
+    /// (`"<channel>:<recipient>"`) — the exact `(adapter, recipient)` pair the
+    /// daemon's async-reply surfacing (`surface_reply_to_channel`) splits on.
+    ///
+    /// Used to default an `agent_send_async` surfacing route to the
+    /// originator's OWN home channel. Requires a `channel` AND a concrete
+    /// recipient — `channel_id` (a room post) preferred, else `peer_id` (a DM).
+    /// `None` when either is absent: there is nothing concrete to post to, so
+    /// the wake stays pure fire-and-forget.
+    pub fn surface_route(&self) -> Option<String> {
+        let channel = self.channel.as_deref()?;
+        let recipient = self.channel_id.as_deref().or(self.peer_id.as_deref())?;
+        Some(format!("{channel}:{recipient}"))
+    }
+}
+
 /// Broadcast config — send same message to multiple agents.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -4287,6 +4304,53 @@ mod tests {
             "expected deny_unknown_fields to reject typo'd field, got: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_surface_route_prefers_channel_id() {
+        // ANAI-125: channel + channel_id → a room-post route. channel_id wins
+        // over peer_id (the room is the more specific surface).
+        let rule = BindingMatchRule {
+            channel: Some("discord".to_string()),
+            channel_id: Some("1515100439031451789".to_string()),
+            peer_id: Some("1086446153098342510".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            rule.surface_route().as_deref(),
+            Some("discord:1515100439031451789")
+        );
+    }
+
+    #[test]
+    fn test_surface_route_falls_back_to_peer_id() {
+        // A DM binding (channel + peer_id, no channel_id) surfaces to the peer.
+        let rule = BindingMatchRule {
+            channel: Some("discord".to_string()),
+            peer_id: Some("1086446153098342510".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            rule.surface_route().as_deref(),
+            Some("discord:1086446153098342510")
+        );
+    }
+
+    #[test]
+    fn test_surface_route_none_without_channel_or_recipient() {
+        // No channel → nothing to post to, even with a recipient present.
+        let no_channel = BindingMatchRule {
+            channel_id: Some("123".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(no_channel.surface_route(), None);
+        // Channel but no concrete recipient (channel-only fallback) → None:
+        // a bindingless-in-practice rule stays pure fire-and-forget.
+        let no_recipient = BindingMatchRule {
+            channel: Some("discord".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(no_recipient.surface_route(), None);
     }
 
     #[test]

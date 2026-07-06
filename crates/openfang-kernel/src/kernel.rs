@@ -4532,6 +4532,27 @@ impl OpenFangKernel {
         Some(summary)
     }
 
+    /// ANAI-125: resolve `agent_name`'s channel binding into a machine
+    /// `surface_to` route (`"<channel>:<recipient>"`), the exact
+    /// `(adapter, recipient)` pair `surface_reply_to_channel` splits on. Used
+    /// to default an async wake's surfacing route to the ORIGINATOR's own home
+    /// channel when the call omits one — so a delegated reply auto-posts back
+    /// where the originator lives (the common case).
+    ///
+    /// Mirrors [`Self::agent_channel_binding_summary`] (same name-keyed,
+    /// most-specific selection) but emits the route rather than prose. Requires
+    /// a `channel` AND a concrete recipient (`channel_id`, else `peer_id`);
+    /// `None` otherwise, which preserves a pure fire-and-forget wake for a
+    /// bindingless agent.
+    fn agent_channel_binding_route(&self, agent_name: &str) -> Option<String> {
+        let best = self
+            .list_bindings()
+            .into_iter()
+            .filter(|b| b.agent == agent_name)
+            .max_by_key(|b| b.match_rule.specificity())?;
+        best.match_rule.surface_route()
+    }
+
     /// Add a binding at runtime.
     pub fn add_binding(&self, binding: openfang_types::config::AgentBinding) {
         let mut bindings = self.bindings.lock().unwrap_or_else(|e| e.into_inner());
@@ -8374,6 +8395,14 @@ impl KernelHandle for OpenFangKernel {
     ) -> Option<openfang_runtime::tool_runner::ReplyRight> {
         let id: AgentId = agent_id.parse().ok()?;
         self.reply_rights.remove(&id).map(|(_, right)| right)
+    }
+
+    /// ANAI-125: expose the originator's own channel binding as a `surface_to`
+    /// route so `agent_send_async` can default the surfacing route to the
+    /// caller's home channel. `agent_name`-keyed to match the binding table;
+    /// delegates to the private helper that also feeds the prompt summary.
+    fn channel_binding_route(&self, agent_name: &str) -> Option<String> {
+        self.agent_channel_binding_route(agent_name)
     }
 
     async fn spawn_agent(

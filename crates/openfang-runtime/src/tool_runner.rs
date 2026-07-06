@@ -2742,12 +2742,33 @@ async fn tool_agent_send_async(
     // run_woken_agent_loop resolves the name straight back to the same agent.
     // Resolving to the registered id here makes self-wake/cycle detection sound
     // and validates the target exists before anything is enqueued.
-    let target = kh
-        .list_agents()
-        .into_iter()
+    // One agent snapshot serves BOTH target resolution and (below) the sender's
+    // own-binding lookup for the ANAI-125 surface default.
+    let agents = kh.list_agents();
+    let target = agents
+        .iter()
         .find(|a| a.id == target_raw || a.name == target_raw)
-        .map(|a| a.id)
+        .map(|a| a.id.clone())
         .ok_or_else(|| format!("Async wake target not found: {target_raw}"))?;
+
+    // ANAI-125: default the surfacing route to the ORIGINATOR's OWN channel
+    // binding when the caller omitted `surface_to`. This makes the common case
+    // — "the delegated reply comes back to my home channel" — the default,
+    // instead of requiring every caller to pass `surface_to` by hand (leg 4
+    // silently no-op'd precisely because an unbound-in-turn originate had
+    // nothing to stamp). An EXPLICIT route always wins; a bindingless sender
+    // still resolves to `None`, preserving a pure fire-and-forget wake. The
+    // route rides the round-trip identically to an explicit one from here on.
+    let surface_to = surface_to.or_else(|| {
+        let sender_name = agents.iter().find(|a| a.id == sender).map(|a| a.name.as_str())?;
+        let route = kh.channel_binding_route(sender_name)?;
+        info!(
+            sender = %sender,
+            surface_to = %route,
+            "agent_send_async: no explicit surface_to — defaulting to originator's own channel binding (ANAI-125)"
+        );
+        Some(route)
+    });
 
     // Lineage (ANAI-110): thread the REAL inbound wake chain when this call is
     // itself running inside a woken turn (see `resolve_wake_base_lineage`). The
