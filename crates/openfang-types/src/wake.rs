@@ -194,8 +194,9 @@ pub struct WakeEnvelope {
     /// (ANAI-122), i.e. leg 3 of the four-step round-trip (fleet -> origin).
     ///
     /// A reply is the *completion* of a correlation, not an origination: the
-    /// wake-consumer grants **no** `WAKE_REPLY_RIGHT` for a turn woken by a
-    /// reply, so origin's leg-4 turn cannot reply-bounce back into the tree —
+    /// wake-consumer mints **no** reply-right (kernel `reply_rights` registry,
+    /// ANAI-122) for a turn woken by a reply, so origin's leg-4 turn cannot
+    /// reply-bounce back into the tree —
     /// it can only surface (leg 4, `channel_send`) or do fresh work. That one
     /// bit is the structural guarantee that replaces the cycle guard on the
     /// terminal edge (the reply targets an ancestor, which `would_cycle` would

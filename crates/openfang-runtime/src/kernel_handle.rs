@@ -94,6 +94,28 @@ pub trait KernelHandle: Send + Sync {
             .await
     }
 
+    /// ANAI-122: consume this agent's one-shot terminal reply-right for the
+    /// current woken turn, if the kernel minted one at wake-dispatch.
+    ///
+    /// Replaces the `WAKE_REPLY_RIGHT` task-local, which the process/IPC
+    /// boundary severed for every subprocess-driven agent (e.g. the Claude Code
+    /// driver): that agent calls its tools on the bridge-IPC handler task, NOT
+    /// the kernel wake-dispatch task the task-local lived on, so `try_with`
+    /// fail-closed for nearly the whole fleet. This lookup rides the kernel
+    /// handle instead — which `agent_reply_async` already holds via
+    /// `require_kernel` — so native (in-process) and subprocess (IPC) drivers
+    /// read the reply-right identically.
+    ///
+    /// The real kernel REMOVES the entry (consume-on-read), so a second call in
+    /// the same turn — or any later turn — finds `None`, which is what keeps the
+    /// reply strictly one-shot. The default returns `None`, keeping mock/test
+    /// handles (and any turn the kernel minted no right for) inert exactly like
+    /// an origin turn.
+    fn take_reply_right(&self, agent_id: &str) -> Option<crate::tool_runner::ReplyRight> {
+        let _ = agent_id;
+        None
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 

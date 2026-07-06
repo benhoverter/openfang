@@ -49,8 +49,9 @@ use tracing::{debug, info, warn};
 /// (`openfang-mcp-bridge/src/lib.rs`), but it is deliberately **narrower**:
 /// membership here is reserved for tools that are *inert without a runtime
 /// token* and therefore safe to advertise universally. Advertising grants no
-/// authority — the one-shot `WAKE_REPLY_RIGHT` task-local is the real gate on
-/// *use*. Per-agent `tool_blocklist` (Step 4) still runs afterward, so an
+/// authority — the one-shot reply-right in the kernel's `reply_rights` registry
+/// (ANAI-122) is the real gate on *use*. Per-agent `tool_blocklist` (Step 4)
+/// still runs afterward, so an
 /// operator can explicitly remove any of these.
 ///
 /// Do NOT copy the bridge's `DEFAULT_ALLOWED` wholesale here — that list
@@ -210,6 +211,25 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// ANAI-122: kernel-held one-shot reply-right registry. Replaces the
+    /// `WAKE_REPLY_RIGHT` task-local, which could not cross the process/IPC
+    /// boundary to a subprocess-driven agent (Claude Code driver): the tool
+    /// executes on the bridge-IPC handler task, not the wake-dispatch task that
+    /// owned the task-local, so `try_with` fail-closed for every out-of-process
+    /// agent. This registry lives on the kernel handle — which
+    /// `agent_reply_async` already holds via `require_kernel` — so the native
+    /// (in-process) and subprocess (IPC) drivers read it identically.
+    ///
+    /// Keyed by `AgentId`, which is race-free ONLY because `agent_msg_locks`
+    /// serializes an agent to one woken turn in flight. TODO(ANAI-125): re-key
+    /// by turn_id/correlation-id before the team-collaboration epic lets an
+    /// agent hold >1 concurrent right and breaks the single-turn invariant.
+    ///
+    /// Lifecycle: inserted at wake-dispatch for an origination turn; removed on
+    /// first read (consume-on-read keeps the reply one-shot) OR at turn end
+    /// (cleanup, so a stale token cannot leak into a later reply-woken/terminal
+    /// turn). A reply-woken turn inserts nothing, so the tool fail-closes.
+    reply_rights: dashmap::DashMap<AgentId, openfang_runtime::tool_runner::ReplyRight>,
     /// Per-agent stash of the active run's [`ApprovalOrigin`] (Piece 3, ANAI-82).
     /// The bridge-IPC tool-call path runs on a separate task with no handle to
     /// the run's origin stack, so it resolves a push target by looking up the
@@ -1301,6 +1321,7 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
+            reply_rights: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
             approval_prompt_coords: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
@@ -5444,34 +5465,53 @@ impl OpenFangKernel {
         // send future awaits the agent loop inline (no intervening spawn), so
         // the scope reaches execute_tool -> tool_agent_send_async.
         //
-        // ANAI-122: mint a one-shot reply-right for this turn, scoped in the
-        // SAME place and for the same task-local-severance reason. It is granted
-        // ONLY for an origination wake — a turn woken by a reply (`is_reply`)
-        // gets `None`, so the initiator's leg-4 turn cannot reply-bounce and the
-        // reply stays terminal. The token names exactly one lawful target (the
-        // initiator = `envelope.sender`) and is consumed by the first
-        // `agent_reply_async` call (`Cell::take`); a second reply this turn
-        // finds `None`. The two scopes nest: the reply-right wraps the lineage
-        // scope, both reaching `execute_tool` inline (no intervening spawn).
-        let reply_right = if envelope.is_reply {
-            None
+        // ANAI-122: mint the one-shot reply-right into the KERNEL-HELD registry
+        // (not the old `WAKE_REPLY_RIGHT` task-local, which the process/IPC
+        // boundary severed for every subprocess-driven agent — the tool runs on
+        // the bridge-IPC handler task, not this wake-dispatch task). Keyed by
+        // `target_id` (the woken agent = the caller of `agent_reply_async`), so
+        // the tool's `take_reply_right(caller)` finds it across BOTH drivers.
+        //
+        // Granted ONLY for an origination wake. A reply-woken turn (`is_reply`)
+        // inserts nothing AND proactively clears any prior entry, so the tool
+        // fail-closes and the reply stays strictly terminal (no reply-bounce).
+        // The token names exactly one lawful target (the initiator =
+        // `envelope.sender`) and is consumed by the first `agent_reply_async`
+        // call; a second reply this turn finds nothing.
+        //
+        // Keying by agent_id is race-free ONLY because `agent_msg_locks`
+        // serializes an agent to one woken turn in flight. TODO(ANAI-125):
+        // re-key by turn_id/correlation before fan-out lets an agent hold >1
+        // concurrent right.
+        if envelope.is_reply {
+            self.reply_rights.remove(&target_id);
         } else {
-            Some(openfang_runtime::tool_runner::ReplyRight::new(
-                envelope.sender.clone(),
-                task_id.clone(),
-                // ANAI-123: bake the inbound surfacing route into the token so
-                // the callee's one-shot `agent_reply_async` inherits it without
-                // ever seeing or choosing a target/route.
-                envelope.surface_to.clone(),
-            ))
-        };
-        let result = openfang_runtime::tool_runner::WAKE_REPLY_RIGHT
-            .scope(
-                std::cell::Cell::new(reply_right),
-                openfang_runtime::tool_runner::WAKE_LINEAGE
-                    .scope(envelope.lineage.clone(), send_fut),
-            )
+            self.reply_rights.insert(
+                target_id,
+                openfang_runtime::tool_runner::ReplyRight::new(
+                    envelope.sender.clone(),
+                    task_id.clone(),
+                    // ANAI-123: bake the inbound surfacing route into the token
+                    // so the callee's one-shot reply inherits it without ever
+                    // seeing or choosing a target/route.
+                    envelope.surface_to.clone(),
+                ),
+            );
+        }
+        // The lineage task-local still wraps the in-process send future: it is
+        // read only by in-process `resolve_wake_base_lineage`, never across the
+        // IPC boundary, so it correctly stays a task-local. The reply-right no
+        // longer does — it lives in the registry above and crosses both drivers.
+        let result = openfang_runtime::tool_runner::WAKE_LINEAGE
+            .scope(envelope.lineage.clone(), send_fut)
             .await;
+
+        // Cleanup (belt-and-suspenders): drop any reply-right that survived the
+        // turn UNUSED, so a stale token cannot leak into a later
+        // reply-woken/terminal turn for the same agent. Consume-on-read already
+        // removes a USED right; this covers the never-replied path. Safe under
+        // `agent_msg_locks` (one woken turn per agent at a time).
+        self.reply_rights.remove(&target_id);
 
         match result {
             Ok(loop_result) => {
@@ -8287,6 +8327,20 @@ mod approval_surface_tests {
 impl KernelHandle for OpenFangKernel {
     fn token_issuer(&self) -> Option<Arc<dyn TokenIssuer>> {
         OpenFangKernel::token_issuer(self)
+    }
+
+    /// ANAI-122: consume the calling agent's one-shot reply-right from the
+    /// kernel-held registry. `remove` makes it consume-on-read, so a second call
+    /// this turn — or any later turn — finds `None`. `agent_id` is the
+    /// authenticated caller (the woken agent), the same `AgentId` the mint site
+    /// keyed by in `run_woken_agent_loop`. A malformed id or a turn with no
+    /// minted right both yield `None`, leaving the tool inert.
+    fn take_reply_right(
+        &self,
+        agent_id: &str,
+    ) -> Option<openfang_runtime::tool_runner::ReplyRight> {
+        let id: AgentId = agent_id.parse().ok()?;
+        self.reply_rights.remove(&id).map(|(_, right)| right)
     }
 
     async fn spawn_agent(

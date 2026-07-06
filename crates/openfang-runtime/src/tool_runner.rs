@@ -149,19 +149,6 @@ tokio::task_local! {
     /// (req 4) and depth (req 9) enforce for real. Absent on origin turns
     /// (channel / cron / API), which have no wake ancestry.
     pub static WAKE_LINEAGE: openfang_types::wake::WakeLineage;
-    /// One-shot reply-right for the current woken turn (ANAI-122).
-    ///
-    /// Minted by `Kernel::run_woken_agent_loop` alongside [`WAKE_LINEAGE`], but
-    /// ONLY for a turn woken by an *origination* wake — never for one woken by a
-    /// reply ([`WakeEnvelope::is_reply`](openfang_types::wake::WakeEnvelope)),
-    /// which keeps the reply strictly terminal. Read and CONSUMED by
-    /// `tool_agent_reply_async` via `Cell::take`, so the reply is one-shot: a
-    /// second call in the same turn finds `None`. Absent on origin turns and on
-    /// reply-woken turns — in both the tool is inert and refuses. This is the
-    /// whole authority model: the tool is advertised fleet-wide but does
-    /// nothing without this token, and the token names exactly one lawful
-    /// target (the initiator) for exactly one reply.
-    pub static WAKE_REPLY_RIGHT: std::cell::Cell<Option<ReplyRight>>;
 }
 
 /// Get the current inter-agent call depth from the task-local context.
@@ -2872,27 +2859,27 @@ async fn tool_agent_reply_async(
         .as_str()
         .ok_or("Missing 'message' parameter")?;
 
-    // One-shot reply-right: minted by the wake-consumer for this woken turn and
-    // consumed here with `Cell::take`, which leaves `None` behind. Two refusal
-    // surfaces:
-    //   * task-local unset  -> not a woken turn at all (origin/channel/cron/API).
-    //   * task-local == None -> already replied this turn, OR this turn was
-    //     itself woken by a reply (terminal; no right was ever minted).
-    // Either way the tool is inert without a live token — the default-safe
-    // property that lets it live in DEFAULT_ALLOWED without a manifest grant.
-    let right = WAKE_REPLY_RIGHT
-        .try_with(|cell| cell.take())
-        .map_err(|_| {
-            "agent_reply_async is only valid inside a turn woken by another \
-             agent's async wake; no reply-right is in scope here."
-                .to_string()
-        })?
-        .ok_or_else(|| {
-            "agent_reply_async reply-right already used (one-shot per woken \
-             turn), or this turn was itself woken by a reply (terminal — no \
-             further reply is permitted)."
-                .to_string()
-        })?;
+    // One-shot reply-right, read from the KERNEL-HELD registry via the handle we
+    // already hold. This REPLACES the `WAKE_REPLY_RIGHT` task-local, which the
+    // process/IPC boundary severed: a subprocess-driven agent (e.g. Claude Code)
+    // calls this tool on the bridge-IPC handler task, NOT the kernel
+    // wake-dispatch task the task-local lived on, so `try_with` always
+    // fail-closed for out-of-process agents — i.e. nearly the whole fleet. The
+    // kernel handle crosses both drivers, so this works for native and
+    // subprocess agents alike. `take_reply_right` CONSUMES the entry
+    // (consume-on-read), so a second call this turn — or on any later turn —
+    // finds `None` and refuses, keeping the reply strictly one-shot. Absent for:
+    // an origin turn (channel/cron/API — never minted), a reply-woken turn
+    // (terminal — no right minted), or an already-used right. In every case the
+    // tool is inert without a live token — the default-safe property that lets
+    // it live in DEFAULT_ALLOWED without a manifest grant.
+    let right = kh.take_reply_right(sender).ok_or_else(|| {
+        "agent_reply_async is only valid once inside a turn woken by another \
+         agent's async wake: no one-shot reply-right is in scope here (an origin \
+         channel/cron/API turn, an already-used right, or a reply-woken terminal \
+         turn)."
+            .to_string()
+    })?;
 
     // The reply target is FIXED by the token (the initiator that woke us). The
     // tool takes no `agent_id`, so a woken agent can only ever answer its own
@@ -5054,9 +5041,13 @@ mod tests {
     }
 
     // ANAI-122: the one-shot reply-right. These prove the whole authority model
-    // for `agent_reply_async` WITHOUT a kernel: the tool is inert unless a live
-    // token is scoped, the token is consumed on first use, and a reply-woken
-    // turn is granted no token (so the reply stays terminal).
+    // for `agent_reply_async` through the KERNEL-HANDLE registry (not the old
+    // `WAKE_REPLY_RIGHT` task-local, which the process/IPC boundary severed for
+    // subprocess agents): the tool is inert unless the kernel minted a right for
+    // this agent, the right is consumed on first use (one-shot), and a turn with
+    // no minted right — origin, already-used, or reply-woken/terminal — refuses.
+    // Crucially these drive the tool with NO task-local set, i.e. the exact
+    // out-of-process path all three prior smokes slipped through.
 
     #[test]
     fn reply_right_token_names_exactly_one_target() {
@@ -5075,47 +5066,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reply_right_is_one_shot_within_a_woken_turn() {
-        // The consumer scopes Some(right) for an origination-woken turn.
-        // `Cell::take` consumes it: the first reply gets the token, a second
-        // reply in the SAME turn finds None -> refused. This is what makes the
-        // reply one-shot and unable to fan out.
-        let scoped = std::cell::Cell::new(Some(ReplyRight::new("origin-agent", "corr-1", None)));
-        WAKE_REPLY_RIGHT
-            .scope(scoped, async {
-                let first = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
-                assert!(first.is_some(), "first reply must find the minted token");
-                assert_eq!(first.unwrap().reply_to(), "origin-agent");
-                let second = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
-                assert!(second.is_none(), "second reply in the same turn must be refused");
-            })
-            .await;
-    }
+    async fn reply_right_consumed_one_shot_via_kernel_handle() {
+        // THE regression that closes the gap all three smokes slipped through:
+        // drive the real `tool_agent_reply_async` with NO task-local set —
+        // exactly the out-of-process bridge-IPC handler task — and prove the
+        // right is served from the kernel-handle registry, then consumed
+        // one-shot.
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(
+            FakeKernelHandle::new().with_reply_right(
+                "callee-agent",
+                ReplyRight::new("origin-agent", "corr-1", None),
+            ),
+        );
+        let input = serde_json::json!({ "message": "here is my answer" });
 
-    #[tokio::test]
-    async fn reply_right_absent_outside_a_woken_turn() {
-        // No task-local scoped (origin / channel / cron / API turn): the tool
-        // is INERT. `try_with` errors, which the tool maps to a refusal. This is
-        // the default-safe property that lets it live in DEFAULT_ALLOWED.
-        let probe = WAKE_REPLY_RIGHT.try_with(|c| c.take());
+        // First call: the seeded right MUST clear the token gate. Whatever the
+        // downstream outcome (the aggregate ceiling is process-global and may be
+        // exhausted by a parallel test), it must NOT be the reply-right refusal.
+        let first = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent")).await;
+        if let Err(e) = &first {
+            assert!(
+                !e.contains("reply-right"),
+                "a seeded right must pass the token gate; got refusal: {e}"
+            );
+        }
+
+        // Second call, same turn: the right was consumed on first read, so the
+        // registry is empty and the tool refuses. This is the one-shot property,
+        // now enforced by the kernel handle rather than a task-local `Cell`.
+        let second = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent")).await;
+        let err = second.expect_err("second reply in the same turn must be refused");
         assert!(
-            probe.is_err(),
-            "outside a woken turn there is no reply-right; the tool must refuse"
+            err.contains("reply-right"),
+            "second call must refuse at the reply-right gate; got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn reply_right_not_granted_on_a_reply_woken_turn() {
-        // The consumer scopes None for a turn woken BY a reply (is_reply). The
-        // token is present-but-empty, so the tool refuses -> the reply is
-        // strictly terminal and the initiator cannot reply-bounce.
-        let scoped: std::cell::Cell<Option<ReplyRight>> = std::cell::Cell::new(None);
-        WAKE_REPLY_RIGHT
-            .scope(scoped, async {
-                let got = WAKE_REPLY_RIGHT.try_with(|c| c.take()).unwrap();
-                assert!(got.is_none(), "a reply-woken turn must hold no reply-right");
-            })
-            .await;
+    async fn reply_right_absent_without_a_minted_right() {
+        // No right in the registry (origin / channel / cron / API turn, OR a
+        // reply-woken terminal turn — the kernel mints nothing for either). The
+        // kernel-handle lookup returns `None`, so the tool is INERT and refuses.
+        // This is the default-safe property that lets it live in DEFAULT_ALLOWED
+        // without a manifest grant.
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> =
+            Arc::new(FakeKernelHandle::new());
+        let input = serde_json::json!({ "message": "no right here" });
+        let result = tool_agent_reply_async(&input, Some(&handle), Some("some-agent")).await;
+        let err = result.expect_err("without a minted right the tool must refuse");
+        assert!(
+            err.contains("reply-right"),
+            "refusal must name the missing reply-right; got: {err}"
+        );
     }
 
     #[test]
@@ -6327,6 +6329,15 @@ mod tests {
         // Flips true if the approval gate ever called request_approval. Used to
         // prove the allowlist wall short-circuits BEFORE the gate for shell_exec.
         approval_requested: std::sync::atomic::AtomicBool,
+        // ANAI-122: kernel-held reply-right registry stand-in. `take_reply_right`
+        // consumes from here, mirroring the real kernel's `reply_rights` DashMap,
+        // so a test can drive the reply tool through the KERNEL-HANDLE lookup
+        // with NO task-local set — the exact out-of-process (bridge-IPC) path the
+        // three prior smokes slipped through.
+        reply_rights: std::sync::Mutex<std::collections::HashMap<String, ReplyRight>>,
+        // Records every `wake_post` (assigned_to target, message) so a test can
+        // assert the terminal reply was queued to the right initiator.
+        wake_posts: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl FakeKernelHandle {
@@ -6336,11 +6347,23 @@ mod tests {
                 cancelled: std::sync::Mutex::new(Vec::new()),
                 jobs: std::sync::Mutex::new(Vec::new()),
                 approval_requested: std::sync::atomic::AtomicBool::new(false),
+                reply_rights: std::sync::Mutex::new(std::collections::HashMap::new()),
+                wake_posts: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn with_job(self, job: serde_json::Value) -> Self {
             self.jobs.lock().unwrap().push(job);
+            self
+        }
+
+        // Seed a one-shot reply-right for `agent_id`, as the kernel does at
+        // wake-dispatch for an origination turn.
+        fn with_reply_right(self, agent_id: &str, right: ReplyRight) -> Self {
+            self.reply_rights
+                .lock()
+                .unwrap()
+                .insert(agent_id.to_string(), right);
             self
         }
     }
@@ -6381,6 +6404,27 @@ mod tests {
             _payload: &[u8],
         ) -> Result<String, String> {
             Err("not used".into())
+        }
+        // ANAI-122: record the terminal-reply enqueue and return a stub task id,
+        // so the reply tool's happy path completes end-to-end in-test.
+        async fn wake_post(
+            &self,
+            _title: &str,
+            description: &str,
+            assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+            _payload: &[u8],
+        ) -> Result<String, String> {
+            self.wake_posts.lock().unwrap().push((
+                assigned_to.unwrap_or("").to_string(),
+                description.to_string(),
+            ));
+            Ok("wake-task-stub".to_string())
+        }
+        // ANAI-122: consume the seeded reply-right, mirroring the real kernel's
+        // consume-on-read `DashMap::remove`.
+        fn take_reply_right(&self, agent_id: &str) -> Option<ReplyRight> {
+            self.reply_rights.lock().unwrap().remove(agent_id)
         }
         async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
             Ok(None)
