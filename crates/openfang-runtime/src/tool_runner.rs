@@ -2585,16 +2585,26 @@ async fn tool_agent_send(
 ///   permits — harmless defense-in-depth the per-tree budget does not subsume.
 
 /// Record-and-test the process-global aggregate wake-emission window. Returns
+/// Process-global sliding window backing [`wake_emit_admit`]. Hoisted to module
+/// scope (rather than a fn-local `static`) so the test-only
+/// [`reset_wake_emit_window`] can drain it: the aggregate ceiling is a shared
+/// mutable global, and the ceiling test must start from a known-empty window
+/// even when a parallel test drives the real emit path (ANAI-122 — the reply-
+/// right refactor added tests that exercise the real emit path the ceiling test
+/// had assumed no other test touched).
+static WAKE_EMIT_WINDOW: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
 /// `true` if admitted (and stamps it into the window), `false` if the trailing
 /// window is already at [`emit_max`](openfang_types::agent_wake::emit_max)
 /// capacity — in which case the caller must refuse the wake.
 fn wake_emit_admit() -> bool {
     use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    static WINDOW: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
-    let slot = WINDOW.get_or_init(|| Mutex::new(VecDeque::new()));
+    let slot = WAKE_EMIT_WINDOW.get_or_init(|| Mutex::new(VecDeque::new()));
     let window = Duration::from_secs(openfang_types::agent_wake::window_secs());
     let cap = openfang_types::agent_wake::emit_max();
     let now = Instant::now();
@@ -2618,6 +2628,26 @@ fn wake_emit_admit() -> bool {
     q.push_back(now);
     true
 }
+
+/// Test-only: drain the process-global emit window so a ceiling test can start
+/// from empty regardless of what parallel emit-path tests have stamped. Pair it
+/// with [`WAKE_EMIT_TEST_GUARD`] so no concurrent emit re-pollutes mid-test.
+#[cfg(test)]
+fn reset_wake_emit_window() {
+    if let Some(slot) = WAKE_EMIT_WINDOW.get() {
+        let mut q = slot.lock().unwrap_or_else(|p| p.into_inner());
+        q.clear();
+    }
+}
+
+/// Test-only serialization guard. The aggregate emit ceiling is a shared mutable
+/// global, so the ceiling test and any test that drives the real emit path
+/// (`tool_agent_reply_async`) must not interleave. Hold it across the emit-
+/// touching critical section. Introduced by ANAI-122: the reply-right refactor's
+/// tests newly exercise the real emit path, which the sole-consumer ceiling test
+/// had assumed nothing else touched.
+#[cfg(test)]
+static WAKE_EMIT_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Record-and-test the per-tree wake-emission window for one lineage `root`
 /// (req 10). Returns `true` if this tree is under its
@@ -5080,6 +5110,15 @@ mod tests {
         );
         let input = serde_json::json!({ "message": "here is my answer" });
 
+        // ANAI-122: the first call reaches the real emit path (`wake_emit_admit`),
+        // which stamps the process-global ceiling window. Serialize behind the
+        // shared guard and drain first so this test neither pollutes nor is
+        // polluted by the ceiling test — the two are the only emit-touching tests.
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+
         // First call: the seeded right MUST clear the token gate. Whatever the
         // downstream outcome (the aggregate ceiling is process-global and may be
         // exhausted by a parallel test), it must NOT be the reply-right refusal.
@@ -5125,7 +5164,14 @@ mod tests {
         // The first `emit_max` emissions in a single window are admitted; the
         // next is refused. All calls land inside the trailing window, so none
         // age out — this exercises the ceiling, not eviction. (Uses the
-        // process-global window; only `wake_emit_admit` touches this static.)
+        // process-global window.) ANAI-122: this static is shared with any test
+        // that drives the real emit path, so serialize behind the guard and
+        // drain the window first — otherwise a parallel `tool_agent_reply_async`
+        // emit steals a slot and the `0..cap` loop trips one short.
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
         let cap = openfang_types::agent_wake::emit_max();
         for i in 0..cap {
             assert!(wake_emit_admit(), "emission {i} should be admitted");
