@@ -155,7 +155,7 @@ api_key_env = "PERPLEXITY_API_KEY"
 model = "sonar"
 
 [web.fetch]
-max_chars = 50000
+max_bytes = 250000
 max_response_bytes = 10485760        # 10 MB
 timeout_secs = 30
 readability = true
@@ -503,7 +503,7 @@ url = "https://searxng.example.com"    # SearXNG instance URL (required)
 
 ```toml
 [web.fetch]
-max_chars = 50000
+max_bytes = 250000
 max_response_bytes = 10485760
 timeout_secs = 30
 readability = true
@@ -511,7 +511,7 @@ readability = true
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_chars` | usize | `50000` | Maximum characters returned in fetched content. Content exceeding this is truncated. |
+| `max_bytes` | usize | `250000` | Maximum bytes returned in fetched content (byte-boundary-safe truncation). Accepts the legacy `max_chars` key for backward compatibility. |
 | `max_response_bytes` | usize | `10485760` (10 MB) | Maximum HTTP response body size in bytes. |
 | `timeout_secs` | u64 | `30` | HTTP request timeout in seconds. |
 | `readability` | bool | `true` | Enable HTML-to-Markdown readability extraction. When true, fetched HTML is converted to clean Markdown. |

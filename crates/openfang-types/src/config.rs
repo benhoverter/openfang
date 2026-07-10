@@ -329,8 +329,11 @@ pub struct SearxngSearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebFetchConfig {
-    /// Maximum characters to return in content.
-    pub max_chars: usize,
+    /// Maximum bytes to return in content. Content exceeding this is
+    /// truncated (byte-boundary-safe). Accepts the legacy `max_chars`
+    /// key for backward compatibility.
+    #[serde(alias = "max_chars")]
+    pub max_bytes: usize,
     /// Maximum response body size in bytes.
     pub max_response_bytes: usize,
     /// HTTP request timeout in seconds.
@@ -351,7 +354,7 @@ pub struct WebFetchConfig {
 impl Default for WebFetchConfig {
     fn default() -> Self {
         Self {
-            max_chars: 50_000,
+            max_bytes: 250_000,
             max_response_bytes: 10 * 1024 * 1024, // 10 MB
             timeout_secs: 30,
             readability: true,
@@ -5367,5 +5370,28 @@ shell_env_passthrough = ["*"]
         // A sibling outside the grant still hits the deny default.
         let ungranted = home.join("ungranted").join("file.txt");
         assert_eq!(fp.tier_for(&ungranted, ws), FileAccessTier::Deny);
+    }
+
+    #[test]
+    fn web_fetch_default_max_bytes_is_raised() {
+        // Guards the default bump: agents routinely fetch logs/docs, so the
+        // floor is 250k bytes, not the old 50k.
+        assert_eq!(WebFetchConfig::default().max_bytes, 250_000);
+    }
+
+    #[test]
+    fn web_fetch_accepts_legacy_max_chars_key() {
+        // Backward-compat: configs written against the old field name must
+        // keep deserializing into `max_bytes` via the serde alias — else a
+        // bare rename silently drops users back to the default (the very
+        // bug this rename fixes).
+        let cfg: WebFetchConfig = toml::from_str("max_chars = 123456").unwrap();
+        assert_eq!(cfg.max_bytes, 123_456);
+    }
+
+    #[test]
+    fn web_fetch_accepts_new_max_bytes_key() {
+        let cfg: WebFetchConfig = toml::from_str("max_bytes = 654321").unwrap();
+        assert_eq!(cfg.max_bytes, 654_321);
     }
 }

@@ -140,11 +140,11 @@ impl WebFetchEngine {
             resp_body
         };
 
-        // Step 5: Truncate (char-boundary-safe to avoid panics on multi-byte UTF-8)
-        let truncated = if processed.len() > self.config.max_chars {
+        // Step 5: Truncate (byte-boundary-safe to avoid panics on multi-byte UTF-8)
+        let truncated = if processed.len() > self.config.max_bytes {
             format!(
-                "{}... [truncated, {} total chars]",
-                safe_truncate_str(&processed, self.config.max_chars),
+                "{}... [truncated, {} total bytes]",
+                safe_truncate_str(&processed, self.config.max_bytes),
                 processed.len()
             )
         } else {
