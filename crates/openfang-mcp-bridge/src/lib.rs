@@ -340,12 +340,15 @@ pub fn built_in_tools() -> Vec<Tool> {
              block on the target's loop and receives NO inline reply. Use this \
              instead of agent_send when you want to hand off work without waiting, \
              or to avoid the head-of-line blocking of a synchronous A->B call. \
-             Accepts UUID or agent name.",
+             Accepts UUID or agent name. Optionally pass surface_to \
+             (\"<channel>:<recipient>\") to have the target's eventual \
+             agent_reply_async answer auto-posted to that channel.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
-                    "message": { "type": "string", "description": "The message delivered to the target when it runs" }
+                    "message": { "type": "string", "description": "The message delivered to the target when it runs" },
+                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." }
                 },
                 "required": ["agent_id", "message"]
             })),
@@ -771,6 +774,29 @@ mod tests {
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"
+        );
+
+        // Property-level drift guard (ANAI-126). The name-list assertion above
+        // only checks that a tool *exists* — a field silently dropped from an
+        // existing tool's schema slides right past it. `surface_to` did exactly
+        // that: it landed in the runtime (ANAI-123) but was never mirrored here,
+        // leaving every subprocess/bridge agent blind to the param. Assert the
+        // surfacing route is advertised on agent_send_async, in lockstep with
+        // the runtime tool_runner schema.
+        let send_async = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "agent_send_async")
+            .expect("agent_send_async must be advertised");
+        let props = send_async
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("agent_send_async schema must declare a `properties` object");
+        assert!(
+            props.contains_key("surface_to"),
+            "schema drift — agent_send_async must advertise `surface_to` to \
+             mirror the runtime tool_runner schema (ANAI-126); subprocess agents \
+             cannot set a param the bridge never told them exists"
         );
     }
 
