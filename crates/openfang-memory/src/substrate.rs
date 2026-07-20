@@ -193,6 +193,38 @@ impl MemorySubstrate {
         self.sessions.get_session(session_id)
     }
 
+    /// Last-agent-activity stamp for a session (RFC3339), or `None` if the
+    /// session is missing. Turn-context envelope (ANAI-128):
+    /// `now - updated_at = since_agent_msg`.
+    pub fn session_updated_at(&self, session_id: SessionId) -> OpenFangResult<Option<String>> {
+        self.sessions.session_updated_at(session_id)
+    }
+
+    /// Record a genuine human inbound (trigger == User) from `speaker_id`,
+    /// stamping presence at `now` (RFC3339). Returns the actor's PRIOR stamp —
+    /// the anchor for `since_this_speaker`. See
+    /// [`crate::session::SessionStore::record_participant`].
+    pub fn record_participant(
+        &self,
+        session_id: SessionId,
+        speaker_id: &str,
+        display_name: &str,
+        now: &str,
+    ) -> OpenFangResult<Option<String>> {
+        self.sessions
+            .record_participant(session_id, speaker_id, display_name, now)
+    }
+
+    /// Session participants, most-recent-first, capped at `limit`. Substrate
+    /// for the turn-context roster line (ANAI-128).
+    pub fn session_roster(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> OpenFangResult<Vec<crate::session::Participant>> {
+        self.sessions.session_roster(session_id, limit)
+    }
+
     /// Save a session.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
         self.sessions.save_session(session)

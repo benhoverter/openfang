@@ -5004,6 +5004,11 @@ impl OpenFangKernel {
             stream_idle_timeout_secs: self.config.watchdog.stream_idle_timeout_secs,
         });
 
+        // Install operator-configured per-turn context settings ([turn_context]
+        // config, ANAI-128) so the runtime envelope resolver picks them up.
+        // Idempotent: first call at boot wins. `TurnContextConfig` is `Copy`.
+        openfang_types::turn_context::install(self.config.turn_context);
+
         // Install operator-configured agent-wake limits ([agent_wake] config,
         // ANAI-111) so the producer's rate backstops and the wake-consumer's
         // concurrency cap resolve them. Idempotent; must precede

@@ -1557,6 +1557,40 @@ pub struct KernelConfig {
     /// ```
     #[serde(default)]
     pub skills: HashMap<String, HashMap<String, String>>,
+    /// Per-turn context envelope settings ([turn_context], ANAI-128). Global,
+    /// installed at boot via `crate::turn_context::install`.
+    #[serde(default)]
+    pub turn_context: TurnContextConfig,
+}
+
+/// Per-turn context envelope settings exposed in the `[turn_context]` config
+/// section (ANAI-128). Global, not per-agent: the kernel installs these once at
+/// boot via [`crate::turn_context::install`] and the runtime resolves them
+/// through that module without threading a config handle through the agent-loop
+/// signature (which would ripple across ~15 call/test sites).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnContextConfig {
+    /// Master switch. When true, an ambient `<turn_context>` block (time,
+    /// speaker, presence deltas) is injected as a user-role message ahead of
+    /// each turn's real inbound. Default: true.
+    pub enabled: bool,
+    /// Whether to render the multi-actor `recently_present` roster line — the
+    /// most novel signal, so it ships OFF and toggles independently of the
+    /// master switch. Default: false.
+    pub roster: bool,
+    /// Max actors listed in the roster line (most-recent-first). Default: 5.
+    pub roster_limit: usize,
+}
+
+impl Default for TurnContextConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            roster: false,
+            roster_limit: 5,
+        }
+    }
 }
 
 /// Turn-watchdog ceilings exposed in the `[watchdog]` config section.
@@ -1877,6 +1911,7 @@ impl Default for KernelConfig {
             watchdog: WatchdogConfig::default(),
             agent_wake: AgentWakeConfig::default(),
             skills: HashMap::new(),
+            turn_context: TurnContextConfig::default(),
         }
     }
 }

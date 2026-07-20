@@ -534,6 +534,149 @@ pub async fn run_agent_loop(
         }
     }
 
+    // ANAI-128: inject the ambient per-turn context envelope as a user-role
+    // message immediately ahead of the real inbound. User-role (not system) is
+    // deliberate — an in-array system message is dropped by every driver when
+    // `request.system` is already set (always, here), so a system-role envelope
+    // would never reach the model; the `<turn_context>` wrapper recovers the
+    // "ambient metadata, not the human" framing. Kept out of `system` so the
+    // cached system prefix stays stable. Gated on `[turn_context] enabled`;
+    // presence is stamped only on genuine User turns. (Mirrors the non-streaming
+    // loop's injection site.)
+    if openfang_types::turn_context::enabled() {
+        let tc_now = chrono::Utc::now();
+        let tc_updated_at = memory.session_updated_at(session.id).ok().flatten();
+        let tc_sender_id = origin.and_then(|o| o.recipient.as_deref());
+        let tc_sender_name = origin.and_then(|o| o.sender_display_name.as_deref());
+
+        // Stamp presence + read this actor's PRIOR gap ONLY on genuine human
+        // turns, so cron/autonomous turns never reset an actor's clock. Non-User
+        // turns still render `now` / `since_agent_msg`, just no speaker gap.
+        let tc_prior_seen = if trigger == TurnTrigger::User {
+            match tc_sender_id {
+                Some(sid) => memory
+                    .record_participant(
+                        session.id,
+                        sid,
+                        tc_sender_name.unwrap_or(sid),
+                        &tc_now.to_rfc3339(),
+                    )
+                    .unwrap_or_default(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let tc_roster = if openfang_types::turn_context::roster_enabled() {
+            memory
+                .session_roster(session.id, openfang_types::turn_context::roster_limit())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let tc_input = crate::turn_context::TurnContextInput {
+            now: tc_now,
+            sender_id: tc_sender_id,
+            sender_name: tc_sender_name,
+            prior_seen: tc_prior_seen.as_deref(),
+            updated_at: tc_updated_at.as_deref(),
+            roster: &tc_roster,
+        };
+        if let Some(tc_envelope) = crate::turn_context::render(&tc_input) {
+            // QA trace (ANAI-128): the exact injected values. Scoped to target
+            // "turn_context" so it isolates/silences via RUST_LOG=turn_context=info|off.
+            info!(
+                target: "turn_context",
+                agent = %manifest.name,
+                agent_id = %agent_id_str,
+                sender_id = ?tc_sender_id,
+                sender_name = ?tc_sender_name,
+                trigger = %trigger.as_str(),
+                prior_seen = ?tc_prior_seen,
+                updated_at = ?tc_updated_at,
+                roster_len = tc_roster.len(),
+                "turn-context inject (streaming): <turn_context> -> messages (user role, pre-inbound)"
+            );
+            // Insert just before the final (real inbound) user turn so the
+            // human's message stays last while the envelope rides fresh.
+            let tc_at = messages.len().saturating_sub(1);
+            messages.insert(tc_at, Message::user(tc_envelope));
+        }
+    }
+
+    // ANAI-128: inject the ambient per-turn context envelope as a user-role
+    // message immediately ahead of the real inbound. User-role (not system) is
+    // deliberate — an in-array system message is dropped by every driver when
+    // `request.system` is already set (always, here), so a system-role envelope
+    // would never reach the model; the `<turn_context>` wrapper recovers the
+    // "ambient metadata, not the human" framing. Kept out of `system` so the
+    // cached system prefix stays stable. Gated on `[turn_context] enabled`;
+    // presence is stamped only on genuine User turns.
+    if openfang_types::turn_context::enabled() {
+        let tc_now = chrono::Utc::now();
+        let tc_updated_at = memory.session_updated_at(session.id).ok().flatten();
+        let tc_sender_id = origin.and_then(|o| o.recipient.as_deref());
+        let tc_sender_name = origin.and_then(|o| o.sender_display_name.as_deref());
+
+        // Stamp presence + read this actor's PRIOR gap ONLY on genuine human
+        // turns, so cron/autonomous turns never reset an actor's clock. Non-User
+        // turns still render `now` / `since_agent_msg`, just no speaker gap.
+        let tc_prior_seen = if trigger == TurnTrigger::User {
+            match tc_sender_id {
+                Some(sid) => memory
+                    .record_participant(
+                        session.id,
+                        sid,
+                        tc_sender_name.unwrap_or(sid),
+                        &tc_now.to_rfc3339(),
+                    )
+                    .unwrap_or_default(),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let tc_roster = if openfang_types::turn_context::roster_enabled() {
+            memory
+                .session_roster(session.id, openfang_types::turn_context::roster_limit())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let tc_input = crate::turn_context::TurnContextInput {
+            now: tc_now,
+            sender_id: tc_sender_id,
+            sender_name: tc_sender_name,
+            prior_seen: tc_prior_seen.as_deref(),
+            updated_at: tc_updated_at.as_deref(),
+            roster: &tc_roster,
+        };
+        if let Some(tc_envelope) = crate::turn_context::render(&tc_input) {
+            // QA trace (ANAI-128): the exact injected values. Scoped to target
+            // "turn_context" so it isolates/silences via RUST_LOG=turn_context=info|off.
+            info!(
+                target: "turn_context",
+                agent = %manifest.name,
+                agent_id = %agent_id_str,
+                sender_id = ?tc_sender_id,
+                sender_name = ?tc_sender_name,
+                trigger = %trigger.as_str(),
+                prior_seen = ?tc_prior_seen,
+                updated_at = ?tc_updated_at,
+                roster_len = tc_roster.len(),
+                "turn-context inject: <turn_context> -> messages (user role, pre-inbound)"
+            );
+            // Insert just before the final (real inbound) user turn so the
+            // human's message stays last while the envelope rides fresh.
+            let tc_at = messages.len().saturating_sub(1);
+            messages.insert(tc_at, Message::user(tc_envelope));
+        }
+    }
+
     let mut total_usage = TokenUsage::default();
     let final_response;
     // Accumulate text from intermediate iterations (tool_use turns may include text
