@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -41,6 +41,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 8 {
         migrate_v8(conn)?;
+    }
+
+    if current_version < 9 {
+        migrate_v9(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -328,6 +332,34 @@ fn migrate_v8(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 9: Add session_participants table for per-actor presence and
+/// the snowflake -> identity binding (ANAI-127/128 turn-context envelope).
+///
+/// Keyed on (session_id, speaker_id) where speaker_id is the durable actor
+/// snowflake. `last_msg_at` is the presence clock; `display_name` folds in
+/// the identity label so identity and presence live in one artifact.
+fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS session_participants (
+            session_id TEXT NOT NULL,
+            speaker_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_msg_at TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, speaker_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_participants_session_seen
+            ON session_participants(session_id, last_msg_at DESC);
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (9, datetime('now'), 'Add session_participants for per-actor presence and identity');
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +384,7 @@ mod tests {
         assert!(tables.contains(&"memories".to_string()));
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
+        assert!(tables.contains(&"session_participants".to_string()));
     }
 
     #[test]

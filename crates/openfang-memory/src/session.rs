@@ -643,6 +643,108 @@ impl SessionStore {
     }
 }
 
+/// A participant in a session — one human (or agent) actor keyed by a durable
+/// speaker id (snowflake). Carries the presence clock and the identity label.
+#[derive(Debug, Clone)]
+pub struct Participant {
+    /// Durable actor key (e.g. Discord snowflake).
+    pub speaker_id: String,
+    /// Human-readable display name (may drift; snapshot of last inbound).
+    pub display_name: String,
+    /// RFC3339 timestamp of this actor's most recent inbound message.
+    pub last_msg_at: String,
+    /// RFC3339 timestamp of this actor's first observed message in the session.
+    pub first_seen_at: String,
+    /// Count of inbound messages recorded for this actor in the session.
+    pub message_count: i64,
+}
+
+impl SessionStore {
+    /// Record a genuine human inbound from `speaker_id` in `session`, stamping
+    /// presence at `now` (RFC3339). Returns the actor's PRIOR `last_msg_at`
+    /// (before this stamp), or `None` on first contact.
+    ///
+    /// The returned prior is the anchor for `since_this_speaker = now - prior`
+    /// in the turn-context envelope (ANAI-128). MUST be called only on real
+    /// user turns (trigger == User) so autonomous/cron turns never reset an
+    /// actor's clock. `now` is passed in so the caller controls the clock.
+    pub fn record_participant(
+        &self,
+        session_id: SessionId,
+        speaker_id: &str,
+        display_name: &str,
+        now: &str,
+    ) -> OpenFangResult<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+        // Read the prior stamp before we overwrite it (serialized under the lock).
+        let prior: Option<String> = conn
+            .query_row(
+                "SELECT last_msg_at FROM session_participants \
+                 WHERE session_id = ?1 AND speaker_id = ?2",
+                rusqlite::params![session_id.0.to_string(), speaker_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+
+        conn.execute(
+            "INSERT INTO session_participants \
+                 (session_id, speaker_id, display_name, first_seen_at, last_msg_at, message_count) \
+             VALUES (?1, ?2, ?3, ?4, ?4, 1) \
+             ON CONFLICT(session_id, speaker_id) DO UPDATE SET \
+                 display_name = excluded.display_name, \
+                 last_msg_at = excluded.last_msg_at, \
+                 message_count = session_participants.message_count + 1",
+            rusqlite::params![session_id.0.to_string(), speaker_id, display_name, now],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        Ok(prior)
+    }
+
+    /// Return the session's participants ordered by most-recent activity first,
+    /// capped at `limit`. Substrate for the envelope's presence roster.
+    pub fn session_roster(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Participant>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT speaker_id, display_name, last_msg_at, first_seen_at, message_count \
+                 FROM session_participants WHERE session_id = ?1 \
+                 ORDER BY last_msg_at DESC LIMIT ?2",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![session_id.0.to_string(), limit as i64],
+                |row| {
+                    Ok(Participant {
+                        speaker_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        last_msg_at: row.get(2)?,
+                        first_seen_at: row.get(3)?,
+                        message_count: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +937,76 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    #[test]
+    fn test_record_participant_returns_prior() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let session = store.create_session(agent_id).unwrap();
+
+        // First contact: no prior.
+        let prior = store
+            .record_participant(session.id, "snow_alice", "Alice", "2026-07-20T10:00:00Z")
+            .unwrap();
+        assert!(prior.is_none());
+
+        // Second message from Alice: prior is her previous stamp.
+        let prior = store
+            .record_participant(session.id, "snow_alice", "Alice", "2026-07-20T10:05:00Z")
+            .unwrap();
+        assert_eq!(prior.as_deref(), Some("2026-07-20T10:00:00Z"));
+    }
+
+    #[test]
+    fn test_record_participant_per_actor_clock() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let session = store.create_session(agent_id).unwrap();
+
+        // Alice yesterday, Bob today. Bob's gap must key off Bob, not Alice.
+        store
+            .record_participant(session.id, "snow_alice", "Alice", "2026-07-19T10:00:00Z")
+            .unwrap();
+        let bob_first = store
+            .record_participant(session.id, "snow_bob", "Bob", "2026-07-20T10:05:00Z")
+            .unwrap();
+        assert!(bob_first.is_none(), "Bob's first message has no prior");
+
+        // Bob again — prior is Bob's own last stamp, not Alice's.
+        let bob_prior = store
+            .record_participant(session.id, "snow_bob", "Bob", "2026-07-20T10:06:00Z")
+            .unwrap();
+        assert_eq!(bob_prior.as_deref(), Some("2026-07-20T10:05:00Z"));
+    }
+
+    #[test]
+    fn test_session_roster_recency_order() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let session = store.create_session(agent_id).unwrap();
+
+        store
+            .record_participant(session.id, "snow_carol", "Carol", "2026-07-16T10:00:00Z")
+            .unwrap();
+        store
+            .record_participant(session.id, "snow_alice", "Alice", "2026-07-20T09:58:00Z")
+            .unwrap();
+        store
+            .record_participant(session.id, "snow_bob", "Bob", "2026-07-19T10:05:00Z")
+            .unwrap();
+
+        let roster = store.session_roster(session.id, 10).unwrap();
+        assert_eq!(roster.len(), 3);
+        // Most recent first: Alice, Bob, Carol.
+        assert_eq!(roster[0].speaker_id, "snow_alice");
+        assert_eq!(roster[1].speaker_id, "snow_bob");
+        assert_eq!(roster[2].speaker_id, "snow_carol");
+
+        // Limit is honored.
+        let capped = store.session_roster(session.id, 2).unwrap();
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[0].speaker_id, "snow_alice");
     }
 
     #[test]
