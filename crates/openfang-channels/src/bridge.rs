@@ -1003,6 +1003,10 @@ fn approval_origin_for(message: &ChannelMessage, thread_id: Option<&str>) -> App
         channel_id: ctx.channel_id,
         thread_id: thread_id.map(String::from),
         recipient: Some(ctx.peer_id),
+        // Display identity for §9.1 / the turn-context envelope. The snowflake
+        // rides in `recipient` (peer_id); this is the human-readable name the
+        // adapter attested at the gateway (Discord username, etc.).
+        sender_display_name: Some(message.sender.display_name.clone()),
     }
 }
 
@@ -2670,6 +2674,7 @@ mod tests {
             channel_id: Some("chan-1".to_string()),
             thread_id: None,
             recipient: Some("peer-1".to_string()),
+            sender_display_name: None,
         };
         let out = handle
             .send_message_with_origin(AgentId::new(), "hello", origin)

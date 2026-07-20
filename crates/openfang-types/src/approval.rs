@@ -121,6 +121,14 @@ pub struct ApprovalOrigin {
     /// audit/recipient targeting — NEVER as an authz carrier (the clicker is
     /// re-authorized from the platform-attested interaction identity).
     pub recipient: Option<String>,
+    /// Human-readable display name of the triggering sender (e.g. the Discord
+    /// username). Rendered into the turn-context envelope / §9.1 "## Sender"
+    /// alongside the snowflake carried in `recipient`. Display identity only —
+    /// never an authz carrier. `None` for non-channel triggers (cron / API /
+    /// agent_send). `#[serde(default)]` keeps pre-field serialized origins
+    /// deserializing to `None`.
+    #[serde(default)]
+    pub sender_display_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +225,7 @@ impl ApprovalRequest {
                 ("origin.channel_id", &origin.channel_id),
                 ("origin.thread_id", &origin.thread_id),
                 ("origin.recipient", &origin.recipient),
+                ("origin.sender_display_name", &origin.sender_display_name),
             ] {
                 if let Some(v) = value {
                     if v.len() > MAX_ORIGIN_FIELD_LEN {
@@ -543,6 +552,7 @@ mod tests {
             channel_id: None,
             thread_id: None,
             recipient: None,
+            sender_display_name: None,
         });
         let err = req.validate().unwrap_err();
         assert!(err.contains("origin.channel_type"), "{err}");
@@ -845,6 +855,7 @@ mod tests {
             channel_id: Some("123456789".into()),
             thread_id: Some("987654321".into()),
             recipient: Some("user-42".into()),
+            sender_display_name: Some("Ben Hoverter".into()),
         };
         let json = serde_json::to_string(&origin).unwrap();
         let back: ApprovalOrigin = serde_json::from_str(&json).unwrap();
@@ -859,6 +870,7 @@ mod tests {
             channel_id: Some("chan-1".into()),
             thread_id: None,
             recipient: Some("peer-1".into()),
+            sender_display_name: Some("peer-name".into()),
         });
         let json = serde_json::to_string(&req).unwrap();
         let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
@@ -892,6 +904,7 @@ mod tests {
             channel_id: Some("a".repeat(257)),
             thread_id: None,
             recipient: None,
+            sender_display_name: None,
         });
         let err = req.validate().unwrap_err();
         assert!(err.contains("origin.channel_id"), "{err}");
@@ -906,8 +919,24 @@ mod tests {
             channel_id: Some("a".repeat(256)),
             thread_id: Some("b".repeat(256)),
             recipient: Some("c".repeat(256)),
+            sender_display_name: Some("d".repeat(256)),
         });
         assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn request_origin_sender_display_name_too_long_rejected() {
+        let mut req = valid_request();
+        req.origin = Some(ApprovalOrigin {
+            channel_type: "discord".into(),
+            channel_id: None,
+            thread_id: None,
+            recipient: None,
+            sender_display_name: Some("a".repeat(257)),
+        });
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("origin.sender_display_name"), "{err}");
+        assert!(err.contains("too long"), "{err}");
     }
 
     // -----------------------------------------------------------------------

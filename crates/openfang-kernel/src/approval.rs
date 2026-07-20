@@ -585,6 +585,7 @@ mod tests {
             channel_id: Some("chan-123".to_string()),
             thread_id: Some("thread-9".to_string()),
             recipient: Some("peer-7".to_string()),
+            sender_display_name: None,
         });
         let id = req.id;
 

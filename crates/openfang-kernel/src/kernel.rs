@@ -2040,13 +2040,21 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
+        // Backfill the structured sender fields from the origin so §9.1
+        // "## Sender" (and the ANAI-128 turn-context envelope) light up on the
+        // channel path — previously hard-`None`, which is why Discord's speaker
+        // was fuzzy. `recipient` carries the platform-attested sender snowflake;
+        // `sender_display_name` is the human-readable label. Display identity
+        // only, never an authz carrier.
+        let sender_id = origin.recipient.clone();
+        let sender_name = origin.sender_display_name.clone();
         self.send_message_with_handle_and_blocks(
             agent_id,
             message,
             handle,
             None,
-            None,
-            None,
+            sender_id,
+            sender_name,
             Some(origin),
             TurnPolicy::channel_delivery(),
             TurnTrigger::User,
@@ -2095,13 +2103,18 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
+        // See `send_message_channel_reply_with_origin`: backfill structured
+        // sender identity from the origin (snowflake + display name) on the
+        // multimodal channel path too.
+        let sender_id = origin.recipient.clone();
+        let sender_name = origin.sender_display_name.clone();
         self.send_message_with_handle_and_blocks(
             agent_id,
             message,
             handle,
             Some(blocks),
-            None,
-            None,
+            sender_id,
+            sender_name,
             Some(origin),
             TurnPolicy::channel_delivery(),
             TurnTrigger::User,
@@ -2437,6 +2450,16 @@ impl OpenFangKernel {
         // and workspace skill tools are visible to the LLM.
         let tools = self.available_tools_with_registry(agent_id, Some(&skill_snapshot));
         let tools = entry.mode.filter_tools(tools);
+
+        // QA (ANAI-127): trace injected sender identity on the streaming path
+        // too (API route). `trigger` isn't threaded here; sender fields are.
+        tracing::info!(
+            target: "turn_context",
+            agent_id = %agent_id,
+            sender_id = ?sender_id,
+            sender_name = ?sender_name,
+            "turn-context inject (streaming): sender -> PromptContext §9.1 (## Sender)"
+        );
 
         // Build the structured system prompt via prompt_builder
         {
@@ -3075,6 +3098,19 @@ impl OpenFangKernel {
             tool_count = tools.len(),
             tool_names = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
             "Tools selected for LLM request"
+        );
+
+        // QA (ANAI-127): trace the sender identity threaded from the channel
+        // origin into the prompt — the values QA follows in the daemon log.
+        // `target: "turn_context"` so it can be dialed up/down independently.
+        tracing::info!(
+            target: "turn_context",
+            agent = %entry.name,
+            agent_id = %agent_id,
+            sender_id = ?sender_id,
+            sender_name = ?sender_name,
+            trigger = ?trigger,
+            "turn-context inject: sender -> PromptContext §9.1 (## Sender)"
         );
 
         // Build the structured system prompt via prompt_builder
@@ -8337,6 +8373,7 @@ mod approval_surface_tests {
             channel_id: Some("C123".to_string()),
             thread_id: None,
             recipient: Some("U999".to_string()),
+            sender_display_name: None,
         };
         assert_eq!(approval_push_target(&req_with(Some(o))), None);
     }
@@ -8348,6 +8385,7 @@ mod approval_surface_tests {
             channel_id: None,
             thread_id: None,
             recipient: Some("U999".to_string()),
+            sender_display_name: None,
         };
         assert_eq!(approval_push_target(&req_with(Some(missing))), None);
 
@@ -8356,6 +8394,7 @@ mod approval_surface_tests {
             channel_id: Some(String::new()),
             thread_id: None,
             recipient: Some("U999".to_string()),
+            sender_display_name: None,
         };
         assert_eq!(approval_push_target(&req_with(Some(empty))), None);
     }
@@ -8367,6 +8406,7 @@ mod approval_surface_tests {
             channel_id: Some("C123".to_string()),
             thread_id: Some("T456".to_string()),
             recipient: Some("U999".to_string()),
+            sender_display_name: None,
         };
         let target = approval_push_target(&req_with(Some(o))).expect("resolvable");
         assert_eq!(target.channel_type, "discord");
