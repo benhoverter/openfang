@@ -2440,10 +2440,16 @@ async fn parse_discord_message(
     };
     let username = author["username"].as_str().unwrap_or("Unknown");
     let discriminator = author["discriminator"].as_str().unwrap_or("0000");
-    let display_name = if discriminator == "0" {
-        username.to_string()
-    } else {
-        format!("{username}#{discriminator}")
+    // Prefer Discord's user-chosen `global_name` (the account "display name")
+    // when present and non-empty; fall back to the handle. Resolution hierarchy
+    // is authoritative-binding > global_name > username — when a participants
+    // binding lands it must OVERRIDE this, so a user-set global_name never beats
+    // Ben's own snowflake->name mapping. Bridge-wide chokepoint: this label
+    // feeds the `[From:]` prefix, §9.1 `## Sender`, and the turn_context speaker.
+    let display_name = match author["global_name"].as_str().filter(|g| !g.is_empty()) {
+        Some(global_name) => global_name.to_string(),
+        None if discriminator == "0" => username.to_string(),
+        None => format!("{username}#{discriminator}"),
     };
 
     let timestamp = d["timestamp"]
