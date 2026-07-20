@@ -597,7 +597,6 @@ pub async fn run_agent_loop(
                 prior_seen = ?tc_prior_seen,
                 updated_at = ?tc_updated_at,
                 roster_len = tc_roster.len(),
-                envelope = %tc_envelope,
                 "turn-context inject (streaming): <turn_context> -> messages (user role, pre-inbound)"
             );
             // Insert just before the final (real inbound) user turn so the
@@ -669,7 +668,6 @@ pub async fn run_agent_loop(
                 prior_seen = ?tc_prior_seen,
                 updated_at = ?tc_updated_at,
                 roster_len = tc_roster.len(),
-                envelope = %tc_envelope,
                 "turn-context inject: <turn_context> -> messages (user role, pre-inbound)"
             );
             // Insert just before the final (real inbound) user turn so the
