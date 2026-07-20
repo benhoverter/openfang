@@ -2023,6 +2023,22 @@ impl OpenFangKernel {
         .await
     }
 
+    /// Rung 1 of the identity hierarchy (ANAI-127): an operator-curated
+    /// `identity_bindings` entry for `sender_id` OVERRIDES the platform's
+    /// display name (Discord `global_name`). Falls back to `platform_name`
+    /// (global_name, then handle) when no authoritative binding exists. Display
+    /// identity only — never an authz decision.
+    fn resolve_authoritative_name(
+        &self,
+        sender_id: &Option<String>,
+        platform_name: Option<String>,
+    ) -> Option<String> {
+        sender_id
+            .as_deref()
+            .and_then(|id| self.memory.resolve_identity(id).ok().flatten())
+            .or(platform_name)
+    }
+
     /// Origin-carrying counterpart to [`Self::send_message_channel_reply`].
     ///
     /// Threads the triggering run's [`ApprovalOrigin`] down to the agent loop
@@ -2046,8 +2062,15 @@ impl OpenFangKernel {
         // was fuzzy. `recipient` carries the platform-attested sender snowflake;
         // `sender_display_name` is the human-readable label. Display identity
         // only, never an authz carrier.
+        let mut origin = origin;
         let sender_id = origin.recipient.clone();
-        let sender_name = origin.sender_display_name.clone();
+        let sender_name = self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
+        // Write the resolved authoritative name back onto the origin so the
+        // ANAI-128 envelope (which reads `origin.sender_display_name` in the
+        // agent loop) and §9.1 (which reads the `sender_name` param) show the
+        // SAME name. Otherwise a binding would fix §9.1 but leave the envelope
+        // speaker on the raw global_name.
+        origin.sender_display_name = sender_name.clone();
         self.send_message_with_handle_and_blocks(
             agent_id,
             message,
@@ -2106,8 +2129,11 @@ impl OpenFangKernel {
         // See `send_message_channel_reply_with_origin`: backfill structured
         // sender identity from the origin (snowflake + display name) on the
         // multimodal channel path too.
+        let mut origin = origin;
         let sender_id = origin.recipient.clone();
-        let sender_name = origin.sender_display_name.clone();
+        let sender_name = self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
+        // Keep the envelope speaker and §9.1 coherent — see the non-blocks path.
+        origin.sender_display_name = sender_name.clone();
         self.send_message_with_handle_and_blocks(
             agent_id,
             message,

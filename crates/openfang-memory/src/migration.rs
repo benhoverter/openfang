@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -45,6 +45,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 9 {
         migrate_v9(conn)?;
+    }
+
+    if current_version < 10 {
+        migrate_v10(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -360,6 +364,36 @@ fn migrate_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 10: Add identity_bindings — the authoritative, curated snowflake ->
+/// display-name map (ANAI-127 rung 1). This is the ONE place an operator can
+/// assert "this snowflake is Teo" regardless of what the platform reports.
+///
+/// Resolution hierarchy for a turn's speaker name:
+///   1. identity_bindings.openfang_name  (authoritative — this table)
+///   2. Discord global_name              (user-chosen, nullable)
+///   3. username / handle                (last resort)
+///
+/// Deliberately fleet-wide (keyed on speaker_id alone, NOT per-session): an
+/// operator's mapping should hold across every channel and agent. Left EMPTY by
+/// the migration on purpose — bindings are runtime data, not schema, so no
+/// operator's snowflake is ever baked into a fresh database.
+fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS identity_bindings (
+            speaker_id TEXT PRIMARY KEY,
+            openfang_name TEXT NOT NULL,
+            note TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        INSERT OR IGNORE INTO migrations (version, applied_at, description)
+        VALUES (10, datetime('now'), 'Add identity_bindings for authoritative snowflake -> name mapping');
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +419,7 @@ mod tests {
         assert!(tables.contains(&"entities".to_string()));
         assert!(tables.contains(&"relations".to_string()));
         assert!(tables.contains(&"session_participants".to_string()));
+        assert!(tables.contains(&"identity_bindings".to_string()));
     }
 
     #[test]

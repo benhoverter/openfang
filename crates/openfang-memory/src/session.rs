@@ -745,6 +745,59 @@ impl SessionStore {
     }
 }
 
+impl SessionStore {
+    /// Resolve a durable speaker id (snowflake) to its AUTHORITATIVE display
+    /// name from the curated `identity_bindings` table — rung 1 of the identity
+    /// hierarchy (ANAI-127). Returns `None` when the operator has asserted no
+    /// binding for this speaker, in which case the caller falls back to the
+    /// platform's `global_name`, then the raw handle.
+    ///
+    /// This is display identity only, never an authz carrier. The binding is
+    /// fleet-wide (not per-session): one operator mapping holds everywhere.
+    pub fn resolve_identity(&self, speaker_id: &str) -> OpenFangResult<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT openfang_name FROM identity_bindings WHERE speaker_id = ?1",
+            rusqlite::params![speaker_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(name) => Ok(Some(name)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(OpenFangError::Memory(e.to_string())),
+        }
+    }
+
+    /// Create or update the authoritative binding for `speaker_id`. `note` is an
+    /// optional operator memo (e.g. "Ben's son"). Upserts on the snowflake so a
+    /// re-bind cleanly overwrites the prior name.
+    pub fn upsert_identity_binding(
+        &self,
+        speaker_id: &str,
+        openfang_name: &str,
+        note: Option<&str>,
+    ) -> OpenFangResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO identity_bindings (speaker_id, openfang_name, note, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(speaker_id) DO UPDATE SET \
+                 openfang_name = excluded.openfang_name, \
+                 note = excluded.note, \
+                 updated_at = excluded.updated_at",
+            rusqlite::params![speaker_id, openfang_name, note, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1073,27 @@ mod tests {
         // Missing session yields None, not an error.
         let missing = store.session_updated_at(SessionId::new()).unwrap();
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_identity_binding_resolves_and_overrides() {
+        let store = setup();
+        // Unbound snowflake resolves to None (caller falls back to global_name).
+        assert!(store.resolve_identity("snow_teo").unwrap().is_none());
+
+        // Operator asserts the binding.
+        store
+            .upsert_identity_binding("snow_teo", "Teo", Some("Ben's son"))
+            .unwrap();
+        assert_eq!(store.resolve_identity("snow_teo").unwrap().as_deref(), Some("Teo"));
+
+        // Re-bind overwrites cleanly (a kid's global_name can never beat this).
+        store
+            .upsert_identity_binding("snow_teo", "Teodoro", None)
+            .unwrap();
+        assert_eq!(
+            store.resolve_identity("snow_teo").unwrap().as_deref(),
+            Some("Teodoro")
+        );
     }
 }

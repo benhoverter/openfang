@@ -225,6 +225,26 @@ impl MemorySubstrate {
         self.sessions.session_roster(session_id, limit)
     }
 
+    /// Resolve a speaker snowflake to its AUTHORITATIVE name (rung 1 of the
+    /// identity hierarchy, ANAI-127). `None` => no operator binding; caller
+    /// falls back to `global_name` then the raw handle. See
+    /// [`crate::session::SessionStore::resolve_identity`].
+    pub fn resolve_identity(&self, speaker_id: &str) -> OpenFangResult<Option<String>> {
+        self.sessions.resolve_identity(speaker_id)
+    }
+
+    /// Create or update the authoritative snowflake -> name binding. See
+    /// [`crate::session::SessionStore::upsert_identity_binding`].
+    pub fn upsert_identity_binding(
+        &self,
+        speaker_id: &str,
+        openfang_name: &str,
+        note: Option<&str>,
+    ) -> OpenFangResult<()> {
+        self.sessions
+            .upsert_identity_binding(speaker_id, openfang_name, note)
+    }
+
     /// Save a session.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
         self.sessions.save_session(session)
