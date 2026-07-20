@@ -74,6 +74,29 @@ impl SessionStore {
         }
     }
 
+    /// Fetch just the `updated_at` timestamp (RFC3339) for a session.
+    ///
+    /// Returns `None` if the session does not exist. This is a targeted
+    /// accessor for the turn-context envelope (ANAI-128): it needs the
+    /// last-agent-activity stamp without paying to deserialize the message
+    /// blob or forcing a field onto the widely-constructed `Session` struct.
+    pub fn session_updated_at(&self, session_id: SessionId) -> OpenFangResult<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT updated_at FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id.0.to_string()],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(updated_at) => Ok(Some(updated_at)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(OpenFangError::Memory(e.to_string())),
+        }
+    }
+
     /// Save a session to the database.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
         let conn = self
@@ -812,5 +835,18 @@ mod tests {
         assert_eq!(line2["role"], "assistant");
         assert_eq!(line2["content"], "Hi there!");
         assert!(line2.get("tool_use").is_none());
+    }
+
+    #[test]
+    fn test_session_updated_at() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let session = store.create_session(agent_id).unwrap();
+        // A freshly created session has an updated_at stamp.
+        let ts = store.session_updated_at(session.id).unwrap();
+        assert!(ts.is_some(), "created session should have updated_at");
+        // Missing session yields None, not an error.
+        let missing = store.session_updated_at(SessionId::new()).unwrap();
+        assert!(missing.is_none());
     }
 }
