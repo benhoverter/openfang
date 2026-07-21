@@ -354,6 +354,108 @@ fn capture_metadata(
 /// This is the core of OpenFang: it loads session context, recalls memories,
 /// runs the LLM in a tool-use loop, and saves the updated session.
 #[allow(clippy::too_many_arguments)]
+/// ANAI-128/ANAI-127: build and inject the ambient per-turn `<turn_context>`
+/// envelope as a user-role message immediately ahead of the real inbound, and
+/// stamp session presence on genuine User turns. Shared by BOTH loops so the
+/// two paths can never drift again — the original ANAI-128 landing pasted this
+/// into `run_agent_loop` twice and left `run_agent_loop_streaming` with none,
+/// which is why `session_participants` stayed empty on the live (streaming)
+/// channel path.
+///
+/// Sender display hierarchy (display only, never an authz decision):
+///   1. `identity_bindings` (operator-curated, via `resolve_identity`)
+///   2. `sender_name` threaded from the kernel (Discord `global_name`)
+///   3. `origin.sender_display_name` (legacy origin carrier)
+/// The speaker id prefers the threaded `sender_id` (the live channel path
+/// passes `origin: None`) and falls back to `origin.recipient`.
+#[allow(clippy::too_many_arguments)]
+fn inject_turn_context(
+    messages: &mut Vec<Message>,
+    memory: &MemorySubstrate,
+    session: &Session,
+    agent_name: &str,
+    agent_id_str: &str,
+    trigger: TurnTrigger,
+    sender_id: Option<&str>,
+    sender_name: Option<&str>,
+    origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    streaming: bool,
+) {
+    if !openfang_types::turn_context::enabled() {
+        return;
+    }
+    let tc_now = chrono::Utc::now();
+    let tc_updated_at = memory.session_updated_at(session.id).ok().flatten();
+
+    // Speaker id: threaded sender_id first (live channel path passes
+    // origin: None), origin.recipient as fallback.
+    let tc_sender_id = sender_id.or_else(|| origin.and_then(|o| o.recipient.as_deref()));
+
+    // Rung 1 (ANAI-127): operator-curated binding overrides the platform name.
+    // `canonical` owns the String so the borrow below outlives the resolve call.
+    let canonical = tc_sender_id.and_then(|id| memory.resolve_identity(id).ok().flatten());
+    let tc_sender_name: Option<&str> = canonical
+        .as_deref()
+        .or(sender_name)
+        .or_else(|| origin.and_then(|o| o.sender_display_name.as_deref()));
+
+    // Stamp presence + read this actor's PRIOR gap ONLY on genuine human turns,
+    // so cron/autonomous turns never reset an actor's clock.
+    let tc_prior_seen = if trigger == TurnTrigger::User {
+        match tc_sender_id {
+            Some(sid) => memory
+                .record_participant(
+                    session.id,
+                    sid,
+                    tc_sender_name.unwrap_or(sid),
+                    &tc_now.to_rfc3339(),
+                )
+                .unwrap_or_default(),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let tc_roster = if openfang_types::turn_context::roster_enabled() {
+        memory
+            .session_roster(session.id, openfang_types::turn_context::roster_limit())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let tc_input = crate::turn_context::TurnContextInput {
+        now: tc_now,
+        sender_id: tc_sender_id,
+        sender_name: tc_sender_name,
+        prior_seen: tc_prior_seen.as_deref(),
+        updated_at: tc_updated_at.as_deref(),
+        roster: &tc_roster,
+    };
+    if let Some(tc_envelope) = crate::turn_context::render(&tc_input) {
+        // QA trace (ANAI-128): scoped to target "turn_context" so it
+        // isolates/silences via RUST_LOG=turn_context=info|off.
+        info!(
+            target: "turn_context",
+            agent = %agent_name,
+            agent_id = %agent_id_str,
+            sender_id = ?tc_sender_id,
+            sender_name = ?tc_sender_name,
+            trigger = %trigger.as_str(),
+            prior_seen = ?tc_prior_seen,
+            updated_at = ?tc_updated_at,
+            roster_len = tc_roster.len(),
+            streaming,
+            "turn-context inject: <turn_context> -> messages (user role, pre-inbound)"
+        );
+        // Insert just before the final (real inbound) user turn so the human's
+        // message stays last while the envelope rides fresh.
+        let tc_at = messages.len().saturating_sub(1);
+        messages.insert(tc_at, Message::user(tc_envelope));
+    }
+}
+
 pub async fn run_agent_loop(
     manifest: &AgentManifest,
     user_message: &str,
@@ -376,6 +478,8 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    sender_id: Option<&str>,
+    sender_name: Option<&str>,
     origin: Option<&openfang_types::approval::ApprovalOrigin>,
     // When true, the calling context treats the agent's final text response
     // as the user-visible delivery (e.g. Discord/Telegram channel-reply path,
@@ -534,148 +638,18 @@ pub async fn run_agent_loop(
         }
     }
 
-    // ANAI-128: inject the ambient per-turn context envelope as a user-role
-    // message immediately ahead of the real inbound. User-role (not system) is
-    // deliberate — an in-array system message is dropped by every driver when
-    // `request.system` is already set (always, here), so a system-role envelope
-    // would never reach the model; the `<turn_context>` wrapper recovers the
-    // "ambient metadata, not the human" framing. Kept out of `system` so the
-    // cached system prefix stays stable. Gated on `[turn_context] enabled`;
-    // presence is stamped only on genuine User turns. (Mirrors the non-streaming
-    // loop's injection site.)
-    if openfang_types::turn_context::enabled() {
-        let tc_now = chrono::Utc::now();
-        let tc_updated_at = memory.session_updated_at(session.id).ok().flatten();
-        let tc_sender_id = origin.and_then(|o| o.recipient.as_deref());
-        let tc_sender_name = origin.and_then(|o| o.sender_display_name.as_deref());
-
-        // Stamp presence + read this actor's PRIOR gap ONLY on genuine human
-        // turns, so cron/autonomous turns never reset an actor's clock. Non-User
-        // turns still render `now` / `since_agent_msg`, just no speaker gap.
-        let tc_prior_seen = if trigger == TurnTrigger::User {
-            match tc_sender_id {
-                Some(sid) => memory
-                    .record_participant(
-                        session.id,
-                        sid,
-                        tc_sender_name.unwrap_or(sid),
-                        &tc_now.to_rfc3339(),
-                    )
-                    .unwrap_or_default(),
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        let tc_roster = if openfang_types::turn_context::roster_enabled() {
-            memory
-                .session_roster(session.id, openfang_types::turn_context::roster_limit())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let tc_input = crate::turn_context::TurnContextInput {
-            now: tc_now,
-            sender_id: tc_sender_id,
-            sender_name: tc_sender_name,
-            prior_seen: tc_prior_seen.as_deref(),
-            updated_at: tc_updated_at.as_deref(),
-            roster: &tc_roster,
-        };
-        if let Some(tc_envelope) = crate::turn_context::render(&tc_input) {
-            // QA trace (ANAI-128): the exact injected values. Scoped to target
-            // "turn_context" so it isolates/silences via RUST_LOG=turn_context=info|off.
-            info!(
-                target: "turn_context",
-                agent = %manifest.name,
-                agent_id = %agent_id_str,
-                sender_id = ?tc_sender_id,
-                sender_name = ?tc_sender_name,
-                trigger = %trigger.as_str(),
-                prior_seen = ?tc_prior_seen,
-                updated_at = ?tc_updated_at,
-                roster_len = tc_roster.len(),
-                "turn-context inject (streaming): <turn_context> -> messages (user role, pre-inbound)"
-            );
-            // Insert just before the final (real inbound) user turn so the
-            // human's message stays last while the envelope rides fresh.
-            let tc_at = messages.len().saturating_sub(1);
-            messages.insert(tc_at, Message::user(tc_envelope));
-        }
-    }
-
-    // ANAI-128: inject the ambient per-turn context envelope as a user-role
-    // message immediately ahead of the real inbound. User-role (not system) is
-    // deliberate — an in-array system message is dropped by every driver when
-    // `request.system` is already set (always, here), so a system-role envelope
-    // would never reach the model; the `<turn_context>` wrapper recovers the
-    // "ambient metadata, not the human" framing. Kept out of `system` so the
-    // cached system prefix stays stable. Gated on `[turn_context] enabled`;
-    // presence is stamped only on genuine User turns.
-    if openfang_types::turn_context::enabled() {
-        let tc_now = chrono::Utc::now();
-        let tc_updated_at = memory.session_updated_at(session.id).ok().flatten();
-        let tc_sender_id = origin.and_then(|o| o.recipient.as_deref());
-        let tc_sender_name = origin.and_then(|o| o.sender_display_name.as_deref());
-
-        // Stamp presence + read this actor's PRIOR gap ONLY on genuine human
-        // turns, so cron/autonomous turns never reset an actor's clock. Non-User
-        // turns still render `now` / `since_agent_msg`, just no speaker gap.
-        let tc_prior_seen = if trigger == TurnTrigger::User {
-            match tc_sender_id {
-                Some(sid) => memory
-                    .record_participant(
-                        session.id,
-                        sid,
-                        tc_sender_name.unwrap_or(sid),
-                        &tc_now.to_rfc3339(),
-                    )
-                    .unwrap_or_default(),
-                None => None,
-            }
-        } else {
-            None
-        };
-
-        let tc_roster = if openfang_types::turn_context::roster_enabled() {
-            memory
-                .session_roster(session.id, openfang_types::turn_context::roster_limit())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        let tc_input = crate::turn_context::TurnContextInput {
-            now: tc_now,
-            sender_id: tc_sender_id,
-            sender_name: tc_sender_name,
-            prior_seen: tc_prior_seen.as_deref(),
-            updated_at: tc_updated_at.as_deref(),
-            roster: &tc_roster,
-        };
-        if let Some(tc_envelope) = crate::turn_context::render(&tc_input) {
-            // QA trace (ANAI-128): the exact injected values. Scoped to target
-            // "turn_context" so it isolates/silences via RUST_LOG=turn_context=info|off.
-            info!(
-                target: "turn_context",
-                agent = %manifest.name,
-                agent_id = %agent_id_str,
-                sender_id = ?tc_sender_id,
-                sender_name = ?tc_sender_name,
-                trigger = %trigger.as_str(),
-                prior_seen = ?tc_prior_seen,
-                updated_at = ?tc_updated_at,
-                roster_len = tc_roster.len(),
-                "turn-context inject: <turn_context> -> messages (user role, pre-inbound)"
-            );
-            // Insert just before the final (real inbound) user turn so the
-            // human's message stays last while the envelope rides fresh.
-            let tc_at = messages.len().saturating_sub(1);
-            messages.insert(tc_at, Message::user(tc_envelope));
-        }
-    }
+    inject_turn_context(
+        &mut messages,
+        memory,
+        session,
+        &manifest.name,
+        &agent_id_str,
+        trigger,
+        sender_id,
+        sender_name,
+        origin,
+        false,
+    );
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -2150,6 +2124,8 @@ pub async fn run_agent_loop_streaming(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
     user_content_blocks: Option<Vec<ContentBlock>>,
+    sender_id: Option<&str>,
+    sender_name: Option<&str>,
     origin: Option<&openfang_types::approval::ApprovalOrigin>,
     // ANAI-118: phantom-action guard axis, ported into the streaming loop so a
     // woken turn can stream (idle watchdog arms) *and* keep its guard. Mirrors
@@ -2297,6 +2273,19 @@ pub async fn run_agent_loop_streaming(
             messages.insert(0, Message::user(cc_msg));
         }
     }
+
+    inject_turn_context(
+        &mut messages,
+        memory,
+        session,
+        &manifest.name,
+        &agent_id_str,
+        trigger,
+        sender_id,
+        sender_name,
+        origin,
+        true,
+    );
 
     let mut total_usage = TokenUsage::default();
     let final_response;
@@ -4993,6 +4982,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5049,6 +5040,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5107,6 +5100,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5163,6 +5158,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5212,6 +5209,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
@@ -5345,6 +5344,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5395,6 +5396,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -5453,6 +5456,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
@@ -6440,6 +6445,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -6513,6 +6520,8 @@ mod tests {
             None,
             None,
             None,
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false,
             TurnTrigger::User,
@@ -6588,6 +6597,8 @@ mod tests {
             None,
             None,
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -6654,6 +6665,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
@@ -6801,6 +6814,8 @@ mod tests {
             None,  // context_window_tokens
             None,  // process_manager
             None,  // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
@@ -6856,6 +6871,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             true, // text_reply_is_delivery — suppress phantom guard
             TurnTrigger::User,
@@ -6972,6 +6989,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             false, // suppress_phantom_guard -- woken turn: guard must fire
             TurnTrigger::User,
@@ -7028,6 +7047,8 @@ mod tests {
             None, // context_window_tokens
             None, // process_manager
             None, // user_content_blocks
+            None, // sender_id
+            None, // sender_name
             None, // origin
             true, // suppress_phantom_guard -- channel delivery: guard suppressed
             TurnTrigger::User,

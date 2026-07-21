@@ -2585,8 +2585,8 @@ impl OpenFangKernel {
                         .format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)")
                         .to_string(),
                 ),
-                sender_id,
-                sender_name,
+                sender_id: sender_id.clone(),
+                sender_name: sender_name.clone(),
                 // Re-read context.md per turn by default so external writers
                 // (cron jobs, integrations) reach the LLM on the next message.
                 // Opt out via `cache_context = true` on the manifest. (#843)
@@ -2693,6 +2693,8 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 content_blocks,
+                sender_id.as_deref(),
+                sender_name.as_deref(),
                 None, // origin (Piece 2 plumbing — populated at gated emit step)
                 // ANAI-118: interactive SSE/WS path streams the agent's text
                 // live to the user — that IS the delivery, so the phantom guard
@@ -3237,8 +3239,8 @@ impl OpenFangKernel {
                         .format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)")
                         .to_string(),
                 ),
-                sender_id,
-                sender_name,
+                sender_id: sender_id.clone(),
+                sender_name: sender_name.clone(),
                 // Re-read context.md per turn by default (#843).
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
@@ -3377,6 +3379,8 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&self.process_manager),
                 content_blocks,
+                sender_id.as_deref(),
+                sender_name.as_deref(),
                 origin.as_ref(),
                 turn_policy.suppress_phantom_guard,
                 trigger,
@@ -3417,6 +3421,8 @@ impl OpenFangKernel {
                 ctx_window,
                 Some(&self.process_manager),
                 content_blocks,
+                sender_id.as_deref(),
+                sender_name.as_deref(),
                 origin.as_ref(), // origin (Piece 2 — channel context threaded from the bridge)
                 turn_policy.suppress_phantom_guard,
                 trigger,
