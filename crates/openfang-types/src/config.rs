@@ -1406,6 +1406,18 @@ pub struct KernelConfig {
     pub network_enabled: bool,
     /// Default LLM provider configuration.
     pub default_model: DefaultModelConfig,
+    /// Global model override — the fleet-flip knob.
+    ///
+    /// When `Some`, the kernel forces **every** agent onto this
+    /// provider/model at spawn, regardless of the agent's own
+    /// `[model]` block. Unlike `default_model` (which only fills in
+    /// agents that left provider/model as empty/"default"), this
+    /// overrides agents that explicitly chose a non-default provider
+    /// too. Set `[model_override]` in `config.toml` during a provider
+    /// outage to swing the whole fleet onto a backup provider, then
+    /// remove it to revert — hot-reloadable, no daemon bounce.
+    #[serde(default)]
+    pub model_override: Option<DefaultModelConfig>,
     /// Memory substrate configuration.
     pub memory: MemoryConfig,
     /// Network configuration.
@@ -1867,6 +1879,7 @@ impl Default for KernelConfig {
             api_listen: "127.0.0.1:50051".to_string(),
             network_enabled: false,
             default_model: DefaultModelConfig::default(),
+            model_override: None,
             memory: MemoryConfig::default(),
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),

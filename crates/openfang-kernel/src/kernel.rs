@@ -207,6 +207,16 @@ pub struct OpenFangKernel {
     /// boot-time `self.config.fallback_providers`". (#1129)
     pub fallback_providers_override:
         std::sync::RwLock<Option<Vec<openfang_types::config::FallbackProviderConfig>>>,
+    /// Hot-reloadable global model override (the fleet-flip knob).
+    ///
+    /// Seeded at boot from `config.model_override` and rewritten wholesale by
+    /// `apply_hot_actions(UpdateModelOverride)` when `[model_override]` changes
+    /// in `config.toml`. Read at agent spawn: when `Some`, it forces **every**
+    /// agent onto this provider/model regardless of the agent's own `[model]`
+    /// block (unlike `default_model_override`, which only fills default-provider
+    /// agents). `None` means "no fleet override — use each agent's own model".
+    pub model_override:
+        std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
     /// Per-agent message locks — serializes LLM calls for the same agent to prevent
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
@@ -1270,6 +1280,11 @@ impl OpenFangKernel {
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
 
+        // Capture the boot-time fleet override before `config` is moved into the
+        // kernel struct, so the RwLock starts authoritative (config.toml value
+        // active from boot; hot-reload rewrites it later).
+        let boot_model_override = config.model_override.clone();
+
         let kernel = Self {
             config,
             registry: AgentRegistry::new(),
@@ -1320,6 +1335,7 @@ impl OpenFangKernel {
             channel_adapters: dashmap::DashMap::new(),
             default_model_override: std::sync::RwLock::new(None),
             fallback_providers_override: std::sync::RwLock::new(None),
+            model_override: std::sync::RwLock::new(boot_model_override),
             agent_msg_locks: dashmap::DashMap::new(),
             reply_rights: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
@@ -1764,6 +1780,37 @@ impl OpenFangKernel {
             &self.config.file_policy,
             manifest.file_policy.take(),
         ));
+
+        // Global model override (the fleet-flip knob) — applied BEFORE the
+        // default_model overlay so it wins over everything. When
+        // `[model_override]` is set, force EVERY agent onto this provider/model
+        // at spawn, regardless of the agent's own `[model]` block. This is the
+        // "provider X is down, swing the whole fleet onto Y right now" switch.
+        // Hot-reloadable via config.toml; reverts when the section is removed.
+        {
+            let mo_guard = self
+                .model_override
+                .read()
+                .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+            if let Some(mo) = mo_guard.as_ref() {
+                if !mo.provider.is_empty() {
+                    manifest.model.provider = mo.provider.clone();
+                }
+                if !mo.model.is_empty() {
+                    manifest.model.model = mo.model.clone();
+                }
+                // Replace the auth hint and base URL wholesale so we never carry
+                // the overridden provider's stale credentials/endpoint forward.
+                // Clearing api_key_env lets the normalization below resolve the
+                // correct default env var for the override provider.
+                manifest.model.api_key_env = if mo.api_key_env.is_empty() {
+                    None
+                } else {
+                    Some(mo.api_key_env.clone())
+                };
+                manifest.model.base_url = mo.base_url.clone();
+            }
+        }
 
         // Overlay kernel default_model onto agent if agent didn't explicitly choose.
         // Treat empty or "default" as "use the kernel's configured default_model".
@@ -4714,6 +4761,22 @@ impl OpenFangKernel {
                         .write()
                         .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
                     *guard = Some(new_config.default_model.clone());
+                }
+                HotAction::UpdateModelOverride => {
+                    match &new_config.model_override {
+                        Some(mo) => info!(
+                            "Hot-reload: engaging global model override -> {}/{} (fleet-flip active)",
+                            mo.provider, mo.model,
+                        ),
+                        None => info!(
+                            "Hot-reload: clearing global model override (agents revert to their own models)"
+                        ),
+                    }
+                    let mut guard = self
+                        .model_override
+                        .write()
+                        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner());
+                    *guard = new_config.model_override.clone();
                 }
                 HotAction::ReloadFallbackProviders => {
                     info!(
@@ -10364,6 +10427,68 @@ mod tests {
         kernel.shutdown();
     }
 
+    /// The global model override (`[model_override]`) is the fleet-flip knob:
+    /// setting it hot-reloads into `model_override`, changing it rewrites the
+    /// slot, and clearing it empties the slot — all without a daemon bounce.
+    #[test]
+    fn test_model_override_hot_reload_lifecycle() {
+        use crate::config_reload::{build_reload_plan, HotAction};
+        use openfang_types::config::DefaultModelConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-model-override");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        // Boot with no fleet override.
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config.clone()).expect("kernel boots");
+        {
+            let guard = kernel.model_override.read().unwrap();
+            assert!(guard.is_none(), "model_override should start empty");
+        }
+
+        // Operator engages the knob: swing the fleet onto GLM.
+        let mut engaged = config.clone();
+        engaged.model_override = Some(DefaultModelConfig {
+            provider: "openrouter".to_string(),
+            model: "z-ai/glm-4.6".to_string(),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            base_url: None,
+            subprocess_timeout_secs: None,
+        });
+        let plan = build_reload_plan(&kernel.config, &engaged);
+        assert!(!plan.restart_required, "engaging the knob must be hot");
+        assert!(plan.hot_actions.contains(&HotAction::UpdateModelOverride));
+        kernel.apply_hot_actions(&plan, &engaged);
+        {
+            let guard = kernel.model_override.read().unwrap();
+            let mo = guard.as_ref().expect("override slot must be populated");
+            assert_eq!(mo.provider, "openrouter");
+            assert_eq!(mo.model, "z-ai/glm-4.6");
+        }
+
+        // Operator removes `[model_override]` — the fleet reverts.
+        let cleared = engaged.clone();
+        let mut cleared = cleared;
+        cleared.model_override = None;
+        let plan = build_reload_plan(&engaged, &cleared);
+        assert!(plan.hot_actions.contains(&HotAction::UpdateModelOverride));
+        kernel.apply_hot_actions(&plan, &cleared);
+        {
+            let guard = kernel.model_override.read().unwrap();
+            assert!(
+                guard.is_none(),
+                "clearing [model_override] must empty the slot so agents revert"
+            );
+        }
+
+        kernel.shutdown();
+    }
+
     /// Adding a `[[fallback_providers]]` entry on reload (no prior entry)
     /// must produce `ReloadFallbackProviders` and populate the override slot.
     /// Mirrors the operator workflow of "I want to add a Codex fallback to my
@@ -10905,3 +11030,39 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 }
+    /// A `[model_override]` present in `config.toml` at boot must be active
+    /// immediately — the RwLock is seeded from `config.model_override` before
+    /// the first agent spawns, so no reload is needed for a fresh daemon.
+    #[test]
+    fn test_model_override_seeded_at_boot() {
+        use openfang_types::config::DefaultModelConfig;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-model-override-boot");
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let mut config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        config.model_override = Some(DefaultModelConfig {
+            provider: "openrouter".to_string(),
+            model: "z-ai/glm-4.6".to_string(),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            base_url: None,
+            subprocess_timeout_secs: None,
+        });
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        {
+            let guard = kernel.model_override.read().unwrap();
+            let mo = guard
+                .as_ref()
+                .expect("boot-time [model_override] must seed the slot");
+            assert_eq!(mo.provider, "openrouter");
+            assert_eq!(mo.model, "z-ai/glm-4.6");
+        }
+
+        kernel.shutdown();
+    }

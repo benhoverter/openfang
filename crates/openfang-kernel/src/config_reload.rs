@@ -45,6 +45,9 @@ pub enum HotAction {
     ReloadProviderUrls,
     /// Default model changed — update in-place without restart.
     UpdateDefaultModel,
+    /// Global model override (`[model_override]`) changed — swap the fleet-flip
+    /// knob in-place; new agent spawns pick it up without a restart.
+    UpdateModelOverride,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +169,13 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
     // Default model — hot-reloadable (just swap config fields, new agents pick it up)
     if field_changed(&old.default_model, &new.default_model) {
         plan.hot_actions.push(HotAction::UpdateDefaultModel);
+    }
+
+    // Global model override (fleet-flip knob) — hot-reloadable. Setting,
+    // changing, or clearing `[model_override]` takes effect on the next agent
+    // spawn without a daemon bounce.
+    if field_changed(&old.model_override, &new.model_override) {
+        plan.hot_actions.push(HotAction::UpdateModelOverride);
     }
 
     // Home/data directory changes

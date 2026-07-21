@@ -1414,8 +1414,10 @@ pub async fn run_agent_loop(
 /// Uses the `llm_errors` classifier for smart error handling and the
 /// `ProviderCooldown` circuit breaker to prevent request storms.
 ///
-/// When the primary model returns a `ModelNotFound` error and `fallback_models`
-/// is non-empty, each fallback is tried in order before propagating the error.
+/// When the primary model returns a `ModelNotFound` error, or a transient
+/// provider outage (`Overloaded` / `RateLimit` / `Timeout`), and
+/// `fallback_models` is non-empty, each fallback is tried in order before
+/// propagating the error.
 async fn call_with_retry(
     driver: &dyn LlmDriver,
     request: CompletionRequest,
@@ -1539,14 +1541,21 @@ async fn call_with_retry(
                     cooldown.record_failure(provider, classified.is_billing);
                 }
 
-                // --- ModelNotFound fallback chain (issue #845) ---
-                // If the primary model was not found and fallback models are
-                // configured, try each fallback before giving up.
-                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
-                    && !fallback_models.is_empty()
+                // --- Fallback chain (issue #845) ---
+                // Fire when the primary model is missing OR the provider is in a
+                // transient outage (rate-limited / overloaded / timed out) and
+                // fallback models are configured. Try each fallback before giving up.
+                if matches!(
+                    classified.category,
+                    llm_errors::LlmErrorCategory::ModelNotFound
+                        | llm_errors::LlmErrorCategory::Overloaded
+                        | llm_errors::LlmErrorCategory::RateLimit
+                        | llm_errors::LlmErrorCategory::Timeout
+                ) && !fallback_models.is_empty()
                 {
                     warn!(
-                        "Primary model not found, trying {} fallback model(s)",
+                        "Primary model failed ({:?}), trying {} fallback model(s)",
+                        classified.category,
                         fallback_models.len()
                     );
                     for (fb_idx, fb) in fallback_models.iter().enumerate() {
@@ -1653,8 +1662,10 @@ async fn call_with_retry(
 ///
 /// Uses the `llm_errors` classifier and `ProviderCooldown` circuit breaker.
 ///
-/// When the primary model returns a `ModelNotFound` error and `fallback_models`
-/// is non-empty, each fallback is tried in order before propagating the error.
+/// When the primary model returns a `ModelNotFound` error, or a transient
+/// provider outage (`Overloaded` / `RateLimit` / `Timeout`), and
+/// `fallback_models` is non-empty, each fallback is tried in order before
+/// propagating the error.
 /// Exponential backoff with per-process jitter for stream idle-stall retries
 /// (ANAI-115).
 ///
@@ -1990,12 +2001,20 @@ async fn stream_with_retry(
                     cooldown.record_failure(provider, classified.is_billing);
                 }
 
-                // --- ModelNotFound fallback chain (issue #845) ---
-                if classified.category == llm_errors::LlmErrorCategory::ModelNotFound
-                    && !fallback_models.is_empty()
+                // --- Fallback chain (issue #845) ---
+                // Fire on missing model OR transient provider outage
+                // (rate-limited / overloaded / timed out) when fallbacks exist.
+                if matches!(
+                    classified.category,
+                    llm_errors::LlmErrorCategory::ModelNotFound
+                        | llm_errors::LlmErrorCategory::Overloaded
+                        | llm_errors::LlmErrorCategory::RateLimit
+                        | llm_errors::LlmErrorCategory::Timeout
+                ) && !fallback_models.is_empty()
                 {
                     warn!(
-                        "Primary model not found (stream), trying {} fallback model(s)",
+                        "Primary model failed ({:?}, stream), trying {} fallback model(s)",
+                        classified.category,
                         fallback_models.len()
                     );
                     for (fb_idx, fb) in fallback_models.iter().enumerate() {
