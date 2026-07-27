@@ -81,6 +81,17 @@ pub trait ToolDispatcher: Send + Sync {
         Vec::new()
     }
 
+    /// Projected `file_convert` `options` sub-schema (ANAI-131), if the
+    /// dispatcher can supply one. The bridge injects it into the advertised
+    /// `file_convert` tool schema so its option surface matches what the
+    /// dispatcher accepts. Default: `None` — the tool is still advertised,
+    /// just without a projected `options` property. The runtime-free bridge
+    /// never computes this itself; the IPC-backed dispatcher receives it from
+    /// the daemon at handshake time (see `HelloAck::Ok`).
+    fn convert_options_schema(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Invoke a tool by name with a JSON argument blob. The dispatcher is
     /// responsible for capability enforcement; the bridge MUST NOT assume the
     /// caller is trusted.
@@ -559,6 +570,21 @@ pub fn built_in_tools() -> Vec<Tool> {
     ]
 }
 
+/// Inject a projected `options` sub-schema into the `file_convert` tool's
+/// input schema (ANAI-131). The base [`built_in_tools`] entry ships without an
+/// `options` property; the dispatcher supplies the live projection (computed
+/// daemon-side from the recipe manifest) so the advertised surface matches
+/// what the dispatcher will accept. Clone-on-write: only the
+/// `properties.options` slot changes; every other field is preserved.
+fn inject_convert_options(mut tool: Tool, options_schema: serde_json::Value) -> Tool {
+    let mut schema = (*tool.input_schema).clone();
+    if let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") {
+        props.insert("options".to_string(), options_schema);
+    }
+    tool.input_schema = Arc::new(schema);
+    tool
+}
+
 /// The MCP server handler — wraps a [`ToolDispatcher`] and serves the
 /// four-tool ANAI-30 surface over MCP.
 ///
@@ -580,9 +606,18 @@ impl Bridge {
     /// dispatcher's allowed set, plus any daemon-forwarded upstream MCP tools.
     fn permitted_tools(&self) -> Vec<Tool> {
         let allowed = self.dispatcher.allowed_tools();
+        let convert_options = self.dispatcher.convert_options_schema();
         let mut tools: Vec<Tool> = built_in_tools()
             .into_iter()
             .filter(|t| allowed.iter().any(|a| a.as_str() == t.name.as_ref()))
+            .map(|t| {
+                if t.name.as_ref() == "file_convert" {
+                    if let Some(opts) = convert_options.clone() {
+                        return inject_convert_options(t, opts);
+                    }
+                }
+                t
+            })
             .collect();
         // Append upstream MCP tools. NOT gated by `allowed_tools()` —
         // server-side `agent.toml mcp_servers` gating already happened
@@ -710,6 +745,7 @@ mod tests {
         agent: String,
         allowed: Vec<String>,
         upstream: Vec<UpstreamToolDef>,
+        convert_options: Option<serde_json::Value>,
         canned: DispatchOk,
     }
 
@@ -719,6 +755,7 @@ mod tests {
                 agent: agent.into(),
                 allowed,
                 upstream: Vec::new(),
+                convert_options: None,
                 canned,
             }
         }
@@ -734,6 +771,9 @@ mod tests {
         }
         fn upstream_tools(&self) -> Vec<UpstreamToolDef> {
             self.upstream.clone()
+        }
+        fn convert_options_schema(&self) -> Option<serde_json::Value> {
+            self.convert_options.clone()
         }
         async fn call(
             &self,
@@ -797,6 +837,76 @@ mod tests {
             "schema drift — agent_send_async must advertise `surface_to` to \
              mirror the runtime tool_runner schema (ANAI-126); subprocess agents \
              cannot set a param the bridge never told them exists"
+        );
+    }
+
+    #[test]
+    fn file_convert_advertises_injected_options_schema() {
+        // ANAI-131: a dispatcher-supplied projection is injected into the
+        // advertised file_convert tool as its `options` property.
+        let opts = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "orientation": { "type": "string", "enum": ["portrait", "landscape"] }
+            },
+            "additionalProperties": false
+        });
+        let stub = StubDispatcher {
+            agent: "a".into(),
+            allowed: vec!["file_convert".into()],
+            upstream: Vec::new(),
+            convert_options: Some(opts),
+            canned: DispatchOk {
+                content: String::new(),
+                is_error: false,
+            },
+        };
+        let bridge = Bridge::new(Arc::new(stub));
+        let fc = bridge
+            .permitted_tools()
+            .into_iter()
+            .find(|t| t.name.as_ref() == "file_convert")
+            .expect("file_convert must be advertised");
+        let has_orientation = fc
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .and_then(|p| p.get("options"))
+            .and_then(|o| o.get("properties"))
+            .and_then(|p| p.as_object())
+            .map_or(false, |p| p.contains_key("orientation"));
+        assert!(
+            has_orientation,
+            "injected options schema must carry the projected orientation property"
+        );
+    }
+
+    #[test]
+    fn file_convert_without_dispatcher_options_omits_options_property() {
+        // Default dispatcher (convert_options_schema() == None) advertises
+        // file_convert with no injected options property — still callable.
+        let stub = StubDispatcher::new(
+            "a",
+            vec!["file_convert".into()],
+            DispatchOk {
+                content: String::new(),
+                is_error: false,
+            },
+        );
+        let bridge = Bridge::new(Arc::new(stub));
+        let fc = bridge
+            .permitted_tools()
+            .into_iter()
+            .find(|t| t.name.as_ref() == "file_convert")
+            .expect("file_convert must be advertised");
+        let has_options = fc
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map_or(false, |p| p.contains_key("options"));
+        assert!(
+            !has_options,
+            "no dispatcher options -> no injected options property"
         );
     }
 

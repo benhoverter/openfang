@@ -294,6 +294,27 @@ pub fn project_options_schema(set: &RecipeSet) -> serde_json::Value {
     })
 }
 
+/// Canonical projection of the `file_convert` `options` sub-schema from the
+/// live recipe manifest — the single source of truth both schema mirrors
+/// render from: the runtime `built_in_tools()` directly, and the runtime-free
+/// MCP bridge indirectly (the daemon computes this at handshake and ships it
+/// across the IPC seam, so the bridge advertises the same option surface the
+/// dispatcher accepts without importing this crate). On a recipe-load failure
+/// this returns a permissive object rather than panicking: the dispatcher
+/// still fail-closes on every option at call time, so keeping `file_convert`
+/// advertised (options temporarily undiscoverable) preserves the core
+/// md->pdf path even under a broken custom manifest.
+pub fn file_convert_options_schema() -> serde_json::Value {
+    match load_recipes(&openfang_home_dir()) {
+        Ok(set) => project_options_schema(&set),
+        Err(_) => serde_json::json!({
+            "type": "object",
+            "description": "Per-format render options. (Temporarily undiscoverable: the recipe manifest failed to load. Calls are still validated server-side.)",
+            "additionalProperties": true
+        }),
+    }
+}
+
 /// Errors raised while loading the recipe manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeError {

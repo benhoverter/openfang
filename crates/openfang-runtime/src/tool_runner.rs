@@ -2294,14 +2294,10 @@ fn convert_err(format: &str, code: &str, message: &str) -> String {
 /// temporarily undiscoverable) preserves the core md->pdf path even under a
 /// broken custom manifest.
 fn file_convert_options_schema() -> serde_json::Value {
-    match crate::convert::load_recipes(&crate::convert::openfang_home_dir()) {
-        Ok(set) => crate::convert::project_options_schema(&set),
-        Err(_) => serde_json::json!({
-            "type": "object",
-            "description": "Per-format render options. (Temporarily undiscoverable: the recipe manifest failed to load. Calls are still validated server-side.)",
-            "additionalProperties": true
-        }),
-    }
+    // Delegates to the canonical projection in `convert` so the runtime schema
+    // mirror and the MCP bridge (via the daemon handshake) render one and the
+    // same schema — no drift between the two advertise surfaces.
+    crate::convert::file_convert_options_schema()
 }
 
 /// Resolve a bare binary name against a composed PATH, returning the first
