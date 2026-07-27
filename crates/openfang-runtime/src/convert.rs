@@ -10,6 +10,14 @@
 //! Scope: this module is the manifest schema + loader only (ANAI-68). Token
 //! substitution, path/argv security, preflight, and dispatch wiring live in
 //! later subissues (ANAI-69/70/71) and intentionally do NOT appear here.
+//!
+//! ANAI-131 adds recipe-declared *options*: caller-suppliable, typed render
+//! knobs (`[recipe.options.*]`). Unlike presets — whose values are wholly
+//! manifest-authored — an option's VALUE is supplied by the tool caller and
+//! validated (type/enum) at dispatch before it is substituted into argv. The
+//! loader here validates the option *declarations* and projects them into the
+//! tool schema (see [`project_options_schema`]) so the advertised surface is
+//! derived from, and cannot drift from, what the converter accepts.
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
@@ -54,6 +62,50 @@ pub struct Recipe {
     /// empty. Names a key in `presets`.
     #[serde(default)]
     pub default_preset: Option<String>,
+    /// Caller-suppliable render options: option-name -> typed declaration
+    /// (ANAI-131). Empty for recipes that accept no options. Distinct from
+    /// `presets`: option VALUES are supplied by the tool caller and are
+    /// type/enum-validated at dispatch before reaching argv, whereas preset
+    /// values are wholly manifest-authored. Option and preset names share a
+    /// single substitution namespace, so a name may not appear in both (guarded
+    /// at load time).
+    #[serde(default)]
+    pub options: BTreeMap<String, OptionDecl>,
+}
+
+/// The type of a recipe option's value (ANAI-131). `enum` constrains the value
+/// to a fixed `values` list; `string` accepts any free-form string (still
+/// substituted as a single literal argv element, never re-parsed by a shell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionKind {
+    Enum,
+    String,
+}
+
+/// A single caller-suppliable option declaration on a recipe (ANAI-131).
+///
+/// The `default` is applied when the caller omits the option, which guarantees
+/// every option `{token}` in the recipe's argv resolves at dispatch time (the
+/// substitution engine builds a fixed-length argv array — there is no
+/// conditional inclusion of elements, so an "unset" option must still carry a
+/// meaningful value; an empty string is the conventional "no override").
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionDecl {
+    /// `enum` or `string`.
+    #[serde(rename = "type")]
+    pub kind: OptionKind,
+    /// Allowed values. REQUIRED and non-empty iff `kind == Enum`; MUST be empty
+    /// for `kind == String`. Validated at load time.
+    #[serde(default)]
+    pub values: Vec<String>,
+    /// Value applied when the caller omits this option. For an enum option this
+    /// MUST be one of `values`. Required so every option token resolves.
+    pub default: String,
+    /// One-line human/agent description, surfaced verbatim in the projected
+    /// tool schema so callers discover what the option does.
+    pub desc: String,
 }
 
 /// TOML envelope: the manifest is an array-of-tables under `[[recipe]]`.
@@ -91,11 +143,16 @@ impl RecipeSet {
 }
 
 /// The set of `{token}` values substituted into a recipe's argv at dispatch
-/// time. Every value is a resolved, trusted path: `script_dir` is the runtime's
-/// scripts directory and `input`/`output` are sandbox-validated workspace
-/// paths. Substitution is the only way caller-influenced data enters the argv,
-/// and the result is always spawned via an argv array (never a shell string),
-/// so a path can never smuggle shell syntax such as `; rm -rf`.
+/// time. `script_dir` is the runtime's scripts directory and `input`/`output`
+/// are sandbox-validated workspace paths.
+///
+/// `vars` carries the recipe's preset variables AND (ANAI-131) its resolved
+/// option values. Preset values are manifest-authored; option values are
+/// caller-supplied but type/enum-validated by the dispatcher before they reach
+/// this map. Either way, substitution is the only path caller-influenced data
+/// takes into argv, and the result is ALWAYS spawned via an argv array (never a
+/// shell string) — so a value can never smuggle shell syntax such as `; rm -rf`
+/// (it lands as one literal argv element).
 pub struct ArgvTokens<'a> {
     /// Absolute path of `<openfang_home>/scripts`, substituted for `{script}`.
     pub script_dir: &'a Path,
@@ -103,10 +160,11 @@ pub struct ArgvTokens<'a> {
     pub input: &'a Path,
     /// Sandbox-resolved absolute output path, substituted for `{output}`.
     pub output: &'a Path,
-    /// Selected preset's variables: token-name -> value. Empty when the
-    /// recipe defines no presets. Values are manifest-authored and
-    /// substituted with the same trust as argv literals; no caller string
-    /// ever reaches this map.
+    /// Substitution variables: preset vars merged with resolved option values
+    /// (token-name -> value). Empty when the recipe defines neither. Preset
+    /// values are manifest-authored; option values are caller-supplied and
+    /// validated (type/enum) before reaching this map. Both substitute with the
+    /// same argv-literal trust — no value is ever re-parsed by a shell.
     pub vars: &'a BTreeMap<String, String>,
 }
 
@@ -141,7 +199,7 @@ impl Recipe {
                     return Err(format!(
                         "recipe argv element {elem:?} contains unknown token {tok:?}; \
                          supported tokens are {{script}}, {{input}}, {{output}}, \
-                         plus this recipe's preset variables"
+                         plus this recipe's preset variables and options"
                     ));
                 }
                 rest = &rest[end + 1..];
@@ -157,6 +215,83 @@ impl Recipe {
         }
         Ok(out)
     }
+}
+
+/// Render the `options` JSON-Schema property for the advertised `file_convert`
+/// tool (ANAI-131), derived from the union of every recipe's declared options.
+///
+/// Called by BOTH tool-schema mirrors (the runtime `built_in_tools()` and,
+/// through the dispatcher seam, the MCP bridge) so the advertised surface is a
+/// projection of the live recipe set and cannot drift from what the dispatcher
+/// accepts. Each declared option becomes a typed sub-property carrying its
+/// `enum` (for enum options), `default` (when non-empty), and `desc`. The
+/// property `description` also lists a prose catalog grouped by conversion pair,
+/// for callers that read prose better than nested schema. `additionalProperties`
+/// is `false`, so a client can reject unknown option keys before the call even
+/// reaches the server-side fail-closed check.
+pub fn project_options_schema(set: &RecipeSet) -> serde_json::Value {
+    use serde_json::{Map, Value};
+
+    let mut props: Map<String, Value> = Map::new();
+    let mut catalog: Vec<String> = Vec::new();
+
+    for recipe in set.recipes() {
+        if recipe.options.is_empty() {
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for (name, decl) in &recipe.options {
+            let mut prop = Map::new();
+            // Every option value substitutes as a string argv literal.
+            prop.insert("type".to_string(), Value::String("string".to_string()));
+            if matches!(decl.kind, OptionKind::Enum) {
+                prop.insert(
+                    "enum".to_string(),
+                    Value::Array(decl.values.iter().cloned().map(Value::String).collect()),
+                );
+            }
+            if !decl.default.is_empty() {
+                prop.insert("default".to_string(), Value::String(decl.default.clone()));
+            }
+            prop.insert("description".to_string(), Value::String(decl.desc.clone()));
+            // Union across recipes: first declaration of a name wins the
+            // schema sub-property. Today the recipe set is single-row, so this
+            // is unambiguous; identical names across future recipes are
+            // expected to agree in type/enum.
+            props.entry(name.clone()).or_insert(Value::Object(prop));
+
+            // Prose catalog fragment for this option.
+            let mut frag = name.clone();
+            if matches!(decl.kind, OptionKind::Enum) {
+                frag.push_str(&format!(" ({})", decl.values.join("|")));
+            } else {
+                frag.push_str(" (str)");
+            }
+            if !decl.default.is_empty() {
+                frag.push_str(&format!(", def {}", decl.default));
+            }
+            parts.push(frag);
+        }
+        catalog.push(format!(
+            "{}->{} accepts: {}",
+            recipe.from,
+            recipe.to,
+            parts.join(", ")
+        ));
+    }
+
+    let description = if catalog.is_empty() {
+        "Per-format render options. The active recipe set declares no options.".to_string()
+    } else {
+        format!("Per-format render options. {}.", catalog.join(". "))
+    };
+
+    serde_json::json!({
+        "type": "object",
+        "description": description,
+        "properties": Value::Object(props),
+        "additionalProperties": false
+    })
 }
 
 /// Errors raised while loading the recipe manifest.
@@ -265,6 +400,8 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
             )));
         }
         validate_presets(r).map_err(|reason| invalid(reason))?;
+        validate_options(r).map_err(|reason| invalid(reason))?;
+        validate_argv_tokens(r).map_err(|reason| invalid(reason))?;
         let key = (r.from.to_ascii_lowercase(), r.to.to_ascii_lowercase());
         if !seen.insert(key) {
             return Err(invalid(format!(
@@ -276,15 +413,14 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
     Ok(())
 }
 
-/// Validate a recipe's preset table (the preset spec's load-time rules):
-/// `default_preset` present-iff-`presets`, the default names a real preset, no
-/// preset reuses a reserved token name, and every argv `{var}` beyond
-/// `{script}`/`{input}`/`{output}` is defined by *every* preset (so no preset
-/// can leave a token unsubstituted at dispatch time). Returns the failure
-/// reason as a `String`, which the caller wraps into a `RecipeError::Invalid`.
-fn validate_presets(r: &Recipe) -> Result<(), String> {
-    const RESERVED: [&str; 3] = ["script", "input", "output"];
+/// Reserved argv token names that never come from a preset or an option.
+const RESERVED_TOKENS: [&str; 3] = ["script", "input", "output"];
 
+/// Validate a recipe's preset table (the preset spec's load-time rules):
+/// `default_preset` present-iff-`presets`, the default names a real preset, and
+/// no preset reuses a reserved token name. (Argv `{token}` coverage is validated
+/// separately in [`validate_argv_tokens`], which is option-aware.)
+fn validate_presets(r: &Recipe) -> Result<(), String> {
     if r.presets.is_empty() {
         if r.default_preset.is_some() {
             return Err(format!(
@@ -313,7 +449,7 @@ fn validate_presets(r: &Recipe) -> Result<(), String> {
 
     for (pname, vars) in &r.presets {
         for key in vars.keys() {
-            if RESERVED.contains(&key.as_str()) {
+            if RESERVED_TOKENS.contains(&key.as_str()) {
                 return Err(format!(
                     "recipe {}->{} preset {:?} uses reserved token name {:?}",
                     r.from, r.to, pname, key
@@ -322,6 +458,68 @@ fn validate_presets(r: &Recipe) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Validate a recipe's option declarations (ANAI-131):
+/// * enum options declare a non-empty `values` list AND a `default` among them;
+/// * string options declare NO `values`;
+/// * an option name never collides with a reserved token (`script`/`input`/
+///   `output`) nor with a preset var — both feed the same substitution map, so
+///   a collision would be ambiguous.
+///
+/// Option VALUES are supplied by the caller and validated at dispatch; this
+/// covers only the manifest-authored declarations.
+fn validate_options(r: &Recipe) -> Result<(), String> {
+    for (name, decl) in &r.options {
+        if RESERVED_TOKENS.contains(&name.as_str()) {
+            return Err(format!(
+                "recipe {}->{} option {:?} uses reserved token name",
+                r.from, r.to, name
+            ));
+        }
+        for (pname, vars) in &r.presets {
+            if vars.contains_key(name) {
+                return Err(format!(
+                    "recipe {}->{} option {:?} collides with a var in preset {:?}",
+                    r.from, r.to, name, pname
+                ));
+            }
+        }
+        match decl.kind {
+            OptionKind::Enum => {
+                if decl.values.is_empty() {
+                    return Err(format!(
+                        "recipe {}->{} enum option {:?} declares no `values`",
+                        r.from, r.to, name
+                    ));
+                }
+                if !decl.values.contains(&decl.default) {
+                    return Err(format!(
+                        "recipe {}->{} enum option {:?} default {:?} is not among its values",
+                        r.from, r.to, name, decl.default
+                    ));
+                }
+            }
+            OptionKind::String => {
+                if !decl.values.is_empty() {
+                    return Err(format!(
+                        "recipe {}->{} string option {:?} must not declare `values`",
+                        r.from, r.to, name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate that every `{token}` in a recipe's argv resolves at dispatch time.
+/// A token is acceptable when it is a reserved token (`script`/`input`/`output`),
+/// a declared option, or — when the recipe defines presets — a var supplied by
+/// EVERY preset (so no preset can leave a token unsubstituted). This is the
+/// option-aware successor to the argv scan formerly inside `validate_presets`.
+fn validate_argv_tokens(r: &Recipe) -> Result<(), String> {
     for elem in &r.argv {
         let mut rest = elem.as_str();
         while let Some(start) = rest.find('{') {
@@ -330,20 +528,28 @@ fn validate_presets(r: &Recipe) -> Result<(), String> {
                 None => break,
             };
             let name = &rest[start + 1..end];
-            if !RESERVED.contains(&name) {
-                for (pname, vars) in &r.presets {
-                    if !vars.contains_key(name) {
-                        return Err(format!(
-                            "recipe {}->{} argv token {{{}}} is not defined by preset {:?}",
-                            r.from, r.to, name, pname
-                        ));
-                    }
+            rest = &rest[end + 1..];
+
+            if RESERVED_TOKENS.contains(&name) || r.options.contains_key(name) {
+                continue;
+            }
+            if r.presets.is_empty() {
+                return Err(format!(
+                    "recipe {}->{} argv token {{{}}} is not a reserved token, \
+                     a declared option, or a preset var",
+                    r.from, r.to, name
+                ));
+            }
+            for (pname, vars) in &r.presets {
+                if !vars.contains_key(name) {
+                    return Err(format!(
+                        "recipe {}->{} argv token {{{}}} is not defined by preset {:?}",
+                        r.from, r.to, name, pname
+                    ));
                 }
             }
-            rest = &rest[end + 1..];
         }
     }
-
     Ok(())
 }
 
@@ -361,35 +567,75 @@ mod tests {
         path
     }
 
+    fn recipe_with(
+        argv: Vec<&str>,
+        presets: BTreeMap<String, BTreeMap<String, String>>,
+        default_preset: Option<&str>,
+        options: BTreeMap<String, OptionDecl>,
+    ) -> Recipe {
+        Recipe {
+            from: "md".into(),
+            to: "pdf".into(),
+            argv: argv.into_iter().map(String::from).collect(),
+            needs: vec![],
+            out_ext: "pdf".into(),
+            presets,
+            default_preset: default_preset.map(String::from),
+            options,
+        }
+    }
+
+    fn enum_opt(values: &[&str], default: &str) -> OptionDecl {
+        OptionDecl {
+            kind: OptionKind::Enum,
+            values: values.iter().map(|s| s.to_string()).collect(),
+            default: default.to_string(),
+            desc: "test option".into(),
+        }
+    }
+
+    fn string_opt(default: &str) -> OptionDecl {
+        OptionDecl {
+            kind: OptionKind::String,
+            values: vec![],
+            default: default.to_string(),
+            desc: "test option".into(),
+        }
+    }
+
     #[test]
     fn resolve_argv_substitutes_known_tokens() {
         let recipe = &default_recipes()[0];
+        // The default recipe now declares options (ANAI-131); the dispatcher
+        // fills every option with its declared default before resolving. Mirror
+        // that here so the fixed-length argv fully resolves.
+        let mut vars = BTreeMap::new();
+        for (name, decl) in &recipe.options {
+            vars.insert(name.clone(), decl.default.clone());
+        }
         let argv = recipe
             .resolve_argv(&ArgvTokens {
                 script_dir: Path::new("/home/.openfang/scripts"),
                 input: Path::new("/ws/doc.md"),
                 output: Path::new("/ws/doc.pdf"),
-                vars: &BTreeMap::new(),
+                vars: &vars,
             })
             .unwrap();
         assert_eq!(argv[0], "/home/.openfang/scripts/build-pdf.sh");
         assert!(argv.contains(&"/ws/doc.md".to_string()));
         assert!(argv.contains(&"/ws/doc.pdf".to_string()));
-        // No template tokens survive substitution.
+        // No template tokens survive substitution once option defaults fill in.
         assert!(!argv.iter().any(|a| a.contains('{')));
     }
 
     #[test]
     fn resolve_argv_rejects_unknown_token() {
-        let recipe = Recipe {
-            from: "md".into(),
-            to: "pdf".into(),
-            argv: vec!["{script}/x".into(), "{evil}".into()],
-            needs: vec![],
-            out_ext: "pdf".into(),
-            presets: BTreeMap::new(),
-            default_preset: None,
-        };
+        let recipe = recipe_with(
+            vec!["{script}/x", "{evil}"],
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
         let err = recipe
             .resolve_argv(&ArgvTokens {
                 script_dir: Path::new("/s"),
@@ -403,15 +649,7 @@ mod tests {
 
     #[test]
     fn resolve_argv_rejects_unterminated_token() {
-        let recipe = Recipe {
-            from: "md".into(),
-            to: "pdf".into(),
-            argv: vec!["{input".into()],
-            needs: vec![],
-            out_ext: "pdf".into(),
-            presets: BTreeMap::new(),
-            default_preset: None,
-        };
+        let recipe = recipe_with(vec!["{input"], BTreeMap::new(), None, BTreeMap::new());
         let err = recipe
             .resolve_argv(&ArgvTokens {
                 script_dir: Path::new("/s"),
@@ -437,6 +675,15 @@ mod tests {
         assert_eq!(md.argv[0], "{script}/build-pdf.sh");
         assert!(md.argv.contains(&"{input}".to_string()));
         assert!(md.argv.contains(&"{output}".to_string()));
+        // ANAI-131: the default md->pdf recipe now declares options with the
+        // decisions Ben locked (orientation default portrait, embed_images true).
+        assert!(md.options.contains_key("orientation"));
+        assert_eq!(md.options["orientation"].default, "portrait");
+        assert!(md.options.contains_key("embed_images"));
+        assert_eq!(md.options["embed_images"].default, "true");
+        // The embedded default must survive full semantic validation.
+        let tmp = std::path::Path::new("/embedded/default/recipes.toml");
+        validate(&recipes, tmp).expect("embedded default recipes must validate");
     }
 
     #[test]
@@ -578,6 +825,7 @@ mod tests {
             out_ext: "png".into(),
             presets: BTreeMap::new(),
             default_preset: None,
+            options: BTreeMap::new(),
         };
         let argv = recipe
             .resolve_argv(&ArgvTokens {
@@ -604,6 +852,7 @@ mod tests {
             out_ext: "png".into(),
             presets: BTreeMap::new(),
             default_preset: None,
+            options: BTreeMap::new(),
         };
         let argv = recipe
             .resolve_argv(&ArgvTokens {
@@ -614,6 +863,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(argv[1], "x; touch pwned");
+    }
+
+    #[test]
+    fn resolve_argv_option_value_is_literal_not_reparsed() {
+        // ANAI-131: an option VALUE is the first caller-supplied string to
+        // reach argv. It must land as a single literal element, never reparsed.
+        let mut vars = BTreeMap::new();
+        vars.insert("font_body".to_string(), "x; touch pwned".to_string());
+        let recipe = recipe_with(
+            vec!["{script}/build-pdf.sh", "--font-body", "{font_body}"],
+            BTreeMap::new(),
+            None,
+            {
+                let mut o = BTreeMap::new();
+                o.insert("font_body".to_string(), string_opt(""));
+                o
+            },
+        );
+        let argv = recipe
+            .resolve_argv(&ArgvTokens {
+                script_dir: Path::new("/s"),
+                input: Path::new("/i"),
+                output: Path::new("/o"),
+                vars: &vars,
+            })
+            .unwrap();
+        assert_eq!(argv[2], "x; touch pwned");
     }
 
     fn preset_manifest(default_line: &str, mobile_vp: &str) -> String {
@@ -724,6 +1000,203 @@ mod tests {
         let r = set.lookup("md", "pdf").unwrap();
         assert!(r.presets.is_empty());
         assert!(r.default_preset.is_none());
+        assert!(r.options.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // ANAI-131: option declaration + projection tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enum_option_requires_values_and_default_in_them() {
+        // Missing values.
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/b.sh", "{input}", "{output}", "{orientation}"]
+                out_ext = "pdf"
+
+                [recipe.options.orientation]
+                type = "enum"
+                default = "portrait"
+                desc = "Page orientation"
+            "#,
+        );
+        assert!(matches!(
+            load_recipes(home.path()).unwrap_err(),
+            RecipeError::Invalid { .. }
+        ));
+
+        // Default not among values.
+        let home2 = TempDir::new().unwrap();
+        write_manifest(
+            home2.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/b.sh", "{input}", "{output}", "{orientation}"]
+                out_ext = "pdf"
+
+                [recipe.options.orientation]
+                type = "enum"
+                values = ["portrait", "landscape"]
+                default = "sideways"
+                desc = "Page orientation"
+            "#,
+        );
+        assert!(matches!(
+            load_recipes(home2.path()).unwrap_err(),
+            RecipeError::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn string_option_must_not_declare_values() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/b.sh", "{input}", "{output}", "{font_body}"]
+                out_ext = "pdf"
+
+                [recipe.options.font_body]
+                type = "string"
+                values = ["nope"]
+                default = ""
+                desc = "Body font"
+            "#,
+        );
+        assert!(matches!(
+            load_recipes(home.path()).unwrap_err(),
+            RecipeError::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn option_name_colliding_with_reserved_token_invalid() {
+        let r = recipe_with(
+            vec!["{script}/b.sh", "{input}", "{output}"],
+            BTreeMap::new(),
+            None,
+            {
+                let mut o = BTreeMap::new();
+                o.insert("input".to_string(), string_opt(""));
+                o
+            },
+        );
+        assert!(validate_options(&r).is_err());
+    }
+
+    #[test]
+    fn option_name_colliding_with_preset_var_invalid() {
+        let mut presets = BTreeMap::new();
+        let mut mobile = BTreeMap::new();
+        mobile.insert("viewport".to_string(), "390,844".to_string());
+        presets.insert("mobile".to_string(), mobile);
+        let mut options = BTreeMap::new();
+        options.insert("viewport".to_string(), string_opt(""));
+        let r = recipe_with(
+            vec!["{script}/b.sh", "{input}", "{output}", "{viewport}"],
+            presets,
+            Some("mobile"),
+            options,
+        );
+        assert!(validate_options(&r).is_err());
+    }
+
+    #[test]
+    fn argv_token_referencing_undeclared_option_invalid() {
+        let r = recipe_with(
+            vec!["{script}/b.sh", "{input}", "{output}", "{ghost}"],
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        );
+        assert!(validate_argv_tokens(&r).is_err());
+    }
+
+    #[test]
+    fn argv_token_referencing_declared_option_ok() {
+        let mut options = BTreeMap::new();
+        options.insert(
+            "orientation".to_string(),
+            enum_opt(&["portrait", "landscape"], "portrait"),
+        );
+        let r = recipe_with(
+            vec!["{script}/b.sh", "{input}", "{output}", "{orientation}"],
+            BTreeMap::new(),
+            None,
+            options,
+        );
+        assert!(validate_argv_tokens(&r).is_ok());
+        assert!(validate_options(&r).is_ok());
+    }
+
+    #[test]
+    fn project_options_schema_surfaces_enum_default_and_desc() {
+        let mut options = BTreeMap::new();
+        options.insert(
+            "orientation".to_string(),
+            OptionDecl {
+                kind: OptionKind::Enum,
+                values: vec!["portrait".into(), "landscape".into()],
+                default: "portrait".into(),
+                desc: "Page orientation".into(),
+            },
+        );
+        options.insert("font_body".to_string(), string_opt(""));
+        let r = recipe_with(
+            vec![
+                "{script}/b.sh",
+                "{input}",
+                "{output}",
+                "{orientation}",
+                "{font_body}",
+            ],
+            BTreeMap::new(),
+            None,
+            options,
+        );
+        let schema = project_options_schema(&RecipeSet::new(vec![r]));
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        // Catalog description is non-empty and names the pair.
+        let desc = schema["description"].as_str().unwrap();
+        assert!(desc.contains("md->pdf accepts"));
+        assert!(desc.contains("orientation"));
+
+        let props = &schema["properties"];
+        assert_eq!(props["orientation"]["type"], "string");
+        assert_eq!(props["orientation"]["default"], "portrait");
+        assert_eq!(props["orientation"]["description"], "Page orientation");
+        let en = props["orientation"]["enum"].as_array().unwrap();
+        assert_eq!(en.len(), 2);
+        assert!(en.iter().any(|v| v == "portrait"));
+        // A string option carries no enum; empty default is omitted.
+        assert_eq!(props["font_body"]["type"], "string");
+        assert!(props["font_body"].get("enum").is_none());
+        assert!(props["font_body"].get("default").is_none());
+    }
+
+    #[test]
+    fn project_options_schema_empty_when_no_options() {
+        let set = RecipeSet::new(vec![recipe_with(
+            vec!["{script}/b.sh", "{input}", "{output}"],
+            BTreeMap::new(),
+            None,
+            BTreeMap::new(),
+        )]);
+        let schema = project_options_schema(&set);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 0);
     }
 }
-

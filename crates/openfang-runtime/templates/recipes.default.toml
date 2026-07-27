@@ -15,12 +15,94 @@
 #   {script}  -> <openfang_home>/scripts
 #   {input}   -> sandbox-resolved absolute path of the input file
 #   {output}  -> sandbox-resolved absolute path of the output file
+#   {<option>} -> a caller-supplied, validated option value (see [recipe.options])
 # argv[0] is the program; the remaining entries are literal arguments. There is
 # no shell parsing, globbing, or word-splitting -- each array element is one argv.
+#
+# OPTIONS (ANAI-131): [recipe.options.<name>] declares a caller-suppliable,
+# typed render knob. Each option maps to a value-taking script flag; because the
+# argv array is fixed-length (no conditional inclusion), every option carries a
+# `default` and an empty-string default means "no override". Enum options list
+# their allowed `values`; string options are free-form. Option values are
+# type/enum-validated before substitution and always land as single argv
+# literals (never re-parsed by a shell). These declarations are projected into
+# the file_convert tool schema so callers discover them automatically.
 
 [[recipe]]
 from    = "md"
 to      = "pdf"
-argv    = ["{script}/build-pdf.sh", "{input}", "-o", "{output}"]
+argv    = [
+  "{script}/build-pdf.sh", "{input}", "-o", "{output}",
+  "--orientation", "{orientation}",
+  "--font-body", "{font_body}",
+  "--font-header", "{font_header}",
+  "--font-mono", "{font_mono}",
+  "--font-size", "{font_size}",
+  "--margin", "{margin}",
+  "--paper", "{paper}",
+  "--highlight-style", "{highlight_style}",
+  "--embed-resources", "{embed_images}",
+  "--table-align", "{table_align}",
+  "--table-justify", "{table_justify}",
+]
 needs   = ["pandoc", "typst"]
 out_ext = "pdf"
+
+[recipe.options.orientation]
+type    = "enum"
+values  = ["portrait", "landscape"]
+default = "portrait"   # ANAI-131 O1: tool default is portrait (script's own default is landscape; the recipe passes portrait explicitly)
+desc    = "Page orientation"
+
+[recipe.options.font_body]
+type    = "string"
+default = ""           # empty = template default
+desc    = "Body text font family (e.g. \"Libertinus Serif\")"
+
+[recipe.options.font_header]
+type    = "string"
+default = ""
+desc    = "Heading font family; empty inherits the body font"
+
+[recipe.options.font_mono]
+type    = "string"
+default = ""
+desc    = "Monospace / code-block font family"
+
+[recipe.options.font_size]
+type    = "string"
+default = ""
+desc    = "Base text size, e.g. \"11pt\"; empty = template default"
+
+[recipe.options.margin]
+type    = "string"
+default = "1in"
+desc    = "Page margin, e.g. \"1in\", \"0.9in\", \"2cm\""
+
+[recipe.options.paper]
+type    = "string"
+default = "us-letter"
+desc    = "Paper size, e.g. \"us-letter\", \"a4\""
+
+[recipe.options.highlight_style]
+type    = "string"
+default = ""
+desc    = "Code syntax-highlight theme (pandoc --highlight-style), e.g. \"tango\", \"kate\", \"monochrome\""
+
+[recipe.options.embed_images]
+type    = "enum"
+values  = ["true", "false"]
+default = "true"       # ANAI-131 O2: self-contained by default (images bundled into the PDF)
+desc    = "Bundle referenced images into the PDF for a self-contained, portable file"
+
+[recipe.options.table_align]
+type    = "enum"
+values  = ["", "left", "center", "right"]
+default = ""           # empty = leave pandoc/typst default alignment
+desc    = "Table cell horizontal alignment"
+
+[recipe.options.table_justify]
+type    = "enum"
+values  = ["true", "false"]
+default = "false"      # ANAI-131 O3: cell-content justification (best-effort), not column width
+desc    = "Justify text within table cells (best-effort)"

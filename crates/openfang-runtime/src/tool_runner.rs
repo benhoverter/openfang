@@ -893,7 +893,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
                     "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
                     "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
-                    "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
+                    "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." },
+                    "options": file_convert_options_schema()
                 },
                 "required": ["format", "input"]
             }),
@@ -2080,13 +2081,92 @@ async fn tool_file_convert_in(
         }
     };
 
+    // §6 (ANAI-131) option resolution: build the substitution var map from the
+    // recipe's declared option defaults, overlay validated caller-supplied
+    // option values, then merge the selected preset vars. Caller option VALUES
+    // are the first caller strings to reach argv (see `ArgvTokens.vars` and the
+    // convert.rs module docs); they are enum/type-checked here and always land
+    // as single argv literals (never a shell string). Defaults fill every
+    // option, so the fixed-length argv always fully resolves.
+    let mut merged_vars: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for (name, decl) in &recipe.options {
+        merged_vars.insert(name.clone(), decl.default.clone());
+    }
+    match input.get("options") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(obj)) => {
+            for (key, val) in obj {
+                let decl = match recipe.options.get(key) {
+                    Some(d) => d,
+                    None => {
+                        let valid = if recipe.options.is_empty() {
+                            "(this conversion accepts no options)".to_string()
+                        } else {
+                            recipe
+                                .options
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        return Ok(convert_err(
+                            to,
+                            "UNKNOWN_OPTION",
+                            &format!(
+                                "unknown option '{key}' for '{from}'->'{to}'. Valid: {valid}"
+                            ),
+                        ));
+                    }
+                };
+                // Accept strings and naturally-stringifiable scalars so a caller
+                // may pass e.g. embed_images: true or "true" interchangeably.
+                let sval = match val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => {
+                        return Ok(convert_err(
+                            to,
+                            "INVALID_OPTION",
+                            &format!(
+                                "option '{key}' for '{from}'->'{to}' must be a string, boolean, or number"
+                            ),
+                        ));
+                    }
+                };
+                if matches!(decl.kind, crate::convert::OptionKind::Enum)
+                    && !decl.values.contains(&sval)
+                {
+                    return Ok(convert_err(
+                        to,
+                        "INVALID_OPTION",
+                        &format!(
+                            "option '{key}'='{sval}' not allowed for '{from}'->'{to}'. Valid: {}",
+                            decl.values.join(", ")
+                        ),
+                    ));
+                }
+                merged_vars.insert(key.clone(), sval);
+            }
+        }
+        Some(_) => {
+            return Err("'options' parameter must be an object".to_string());
+        }
+    }
+    // Preset and option namespaces are disjoint (guaranteed at load time), so
+    // merging preset vars cannot clobber a resolved option.
+    for (k, v) in preset_vars {
+        merged_vars.insert(k.clone(), v.clone());
+    }
+
     // §5.3 argv-template substitution: tokens -> resolved literal paths only.
     let scripts_dir = home.join("scripts");
     let argv = match recipe.resolve_argv(&crate::convert::ArgvTokens {
         script_dir: &scripts_dir,
         input: &resolved_input,
         output: &resolved_output,
-        vars: preset_vars,
+        vars: &merged_vars,
     }) {
         Ok(a) => a,
         // A bad token is a manifest-authoring defect, not a conversion outcome.
@@ -2194,7 +2274,8 @@ fn convert_ok(format: &str, output_path: &str) -> String {
 
 /// Build the structured `file_convert` error envelope (§4.3):
 /// `{ "ok": false, "format": "<fmt>", "error": { "code": "<CODE>", "message": "<msg>" } }`.
-/// `code` is one of UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED.
+/// `code` is one of UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED,
+/// UNKNOWN_PRESET, UNKNOWN_OPTION, INVALID_OPTION (ANAI-131).
 fn convert_err(format: &str, code: &str, message: &str) -> String {
     serde_json::json!({
         "ok": false,
@@ -2202,6 +2283,25 @@ fn convert_err(format: &str, code: &str, message: &str) -> String {
         "error": { "code": code, "message": message }
     })
     .to_string()
+}
+
+/// Build the projected `options` sub-schema for the advertised `file_convert`
+/// tool (ANAI-131) from the live recipe set, via the shared
+/// `convert::project_options_schema` helper (the single source of truth both
+/// schema mirrors use). On a recipe-load failure this advertises a permissive
+/// object rather than panicking the tool list — the dispatcher still fail-closes
+/// on every option at call time, so keeping the tool advertised (options
+/// temporarily undiscoverable) preserves the core md->pdf path even under a
+/// broken custom manifest.
+fn file_convert_options_schema() -> serde_json::Value {
+    match crate::convert::load_recipes(&crate::convert::openfang_home_dir()) {
+        Ok(set) => crate::convert::project_options_schema(&set),
+        Err(_) => serde_json::json!({
+            "type": "object",
+            "description": "Per-format render options. (Temporarily undiscoverable: the recipe manifest failed to load. Calls are still validated server-side.)",
+            "additionalProperties": true
+        }),
+    }
 }
 
 /// Resolve a bare binary name against a composed PATH, returning the first
@@ -7293,6 +7393,128 @@ mod convert_dispatch_tests {
         .await
         .unwrap();
         assert_eq!(parse(&out)["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
+    }
+
+    // ------------------------------------------------------------------
+    // ANAI-131: caller-supplied option resolution
+    // ------------------------------------------------------------------
+
+    /// Hermetic home whose md->txt recipe declares an enum option
+    /// (`orientation`, default portrait), a string option (`font_body`,
+    /// default ""), AND a preset (`viewport`) — so a single test can prove
+    /// options and presets resolve into the same argv without collision.
+    #[cfg(unix)]
+    fn hermetic_home_options() -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(
+            &stub,
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$@\" > \"$2.argv\"\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{script}/stub.sh\", \"{input}\", \"{output}\", \"--orient\", \"{orientation}\", \"--font\", \"{font_body}\", \"--vp\", \"{viewport}\"]\nout_ext = \"txt\"\ndefault_preset = \"desktop\"\n\n[recipe.options.orientation]\ntype = \"enum\"\nvalues = [\"portrait\", \"landscape\"]\ndefault = \"portrait\"\ndesc = \"Page orientation\"\n\n[recipe.options.font_body]\ntype = \"string\"\ndefault = \"\"\ndesc = \"Body font\"\n\n[recipe.presets.mobile]\nviewport = \"MOBILEVP\"\n\n[recipe.presets.desktop]\nviewport = \"DESKTOPVP\"\n",
+        )
+        .unwrap();
+        home
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_unknown_option_rejected() {
+        let home = hermetic_home_options();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "options": { "bogus": "1" } }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "UNKNOWN_OPTION", "envelope: {out}");
+        // The message teaches: it lists the valid option names.
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("orientation"), "message: {msg}");
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_invalid_enum_option_rejected() {
+        let home = hermetic_home_options();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md", "options": { "orientation": "sideways" } }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false));
+        assert_eq!(v["error"]["code"], "INVALID_OPTION", "envelope: {out}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("portrait") && msg.contains("landscape"), "message: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_omitted_options_apply_defaults() {
+        let home = hermetic_home_options();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        // Enum default applied; preset default applied; no token survives.
+        assert!(log.lines().any(|l| l == "portrait"), "argv log: {log}");
+        assert!(log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
+        assert!(!log.contains('{'), "unresolved token in argv log: {log}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_options_and_preset_resolve_together() {
+        let home = hermetic_home_options();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({
+                "format": "txt",
+                "input": "note.md",
+                "preset": "mobile",
+                "options": { "orientation": "landscape", "font_body": "Iosevka" }
+            }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        let log = read_argv_log(ws.path(), "note.txt");
+        // Caller option value overrides the default; string option flows through;
+        // the chosen preset var lands in the same argv.
+        assert!(log.lines().any(|l| l == "landscape"), "argv log: {log}");
+        assert!(log.lines().any(|l| l == "Iosevka"), "argv log: {log}");
+        assert!(log.lines().any(|l| l == "MOBILEVP"), "argv log: {log}");
+        assert!(!log.lines().any(|l| l == "portrait"), "default leaked: {log}");
     }
 
     #[test]
