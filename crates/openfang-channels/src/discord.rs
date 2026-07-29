@@ -3,6 +3,7 @@
 //! Uses Discord Gateway WebSocket (v10) for receiving messages and the REST API
 //! for sending responses. No external Discord crate — just `tokio-tungstenite` + `reqwest`.
 
+use crate::inbound_files::{self, DEFAULT_MAX_UPLOAD_BYTES};
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
     InteractiveButton,
@@ -398,6 +399,14 @@ pub struct DiscordAdapter {
     /// tests can swap in [`PermissiveFetcher`] to point at local stubs without
     /// bypassing the wire path.
     fetcher: Arc<dyn Fetcher>,
+    /// Per-attachment ceiling for inbound file materialization (ANAI-137),
+    /// from `channels.discord.max_upload_bytes`. Attachments larger than this
+    /// are left as URL-only descriptors rather than downloaded.
+    ///
+    /// Clamped at construction to [`URL_FETCH_MAX_BYTES`], which is the
+    /// fetcher's own hard memory ceiling — a larger config value cannot
+    /// actually be honoured, so we refuse to pretend otherwise.
+    max_upload_bytes: u64,
 }
 
 impl DiscordAdapter {
@@ -418,6 +427,7 @@ impl DiscordAdapter {
             ignore_bots,
             intents,
             auto_thread,
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
             bot_user_id: Arc::new(RwLock::new(None)),
@@ -433,6 +443,33 @@ impl DiscordAdapter {
             api_base_override: None,
             fetcher: Arc::new(ProductionFetcher),
         }
+    }
+
+    /// Set the inbound-attachment materialization ceiling (ANAI-137), from
+    /// `channels.discord.max_upload_bytes`.
+    ///
+    /// Builder rather than a `new()` parameter so the (already six-argument)
+    /// constructor and its existing call sites stay untouched.
+    ///
+    /// `0` disables materialization entirely — every file stays a URL-only
+    /// descriptor, i.e. exact pre-ANAI-137 behaviour — which is the escape
+    /// hatch if an operator wants no inbound bytes on disk. Values above
+    /// [`URL_FETCH_MAX_BYTES`] are clamped with a warning, because the
+    /// fetcher's own hard ceiling would reject the body anyway and silently
+    /// accepting the larger number would mislead the operator.
+    pub fn with_max_upload_bytes(mut self, max_upload_bytes: u64) -> Self {
+        let ceiling = URL_FETCH_MAX_BYTES as u64;
+        self.max_upload_bytes = if max_upload_bytes > ceiling {
+            warn!(
+                requested = max_upload_bytes,
+                ceiling,
+                "discord max_upload_bytes exceeds the fetcher's hard byte ceiling; clamping"
+            );
+            ceiling
+        } else {
+            max_upload_bytes
+        };
+        self
     }
 
     /// Returns the Discord REST API base URL, honouring the test override when
@@ -1159,6 +1196,16 @@ impl ChannelAdapter for DiscordAdapter {
         let allowed_guilds = self.allowed_guilds.clone();
         let allowed_users = self.allowed_users.clone();
         let ignore_bots = self.ignore_bots;
+        // ANAI-137: inbound attachment materialization. The fetcher is the
+        // same SSRF-checked one used by the outbound path, so inbound
+        // downloads inherit its preflight, redirect cap, and byte ceiling.
+        let fetcher = self.fetcher.clone();
+        let max_upload_bytes = self.max_upload_bytes;
+        // Resolved once here rather than per message: it only reads $HOME.
+        let inbound_file_dir = inbound_files::file_tmp_dir();
+        if max_upload_bytes > 0 {
+            inbound_files::spawn_sweep_once();
+        }
         let bot_user_id = self.bot_user_id.clone();
         let session_id_store = self.session_id.clone();
         let resume_url_store = self.resume_gateway_url.clone();
@@ -1420,7 +1467,7 @@ impl ChannelAdapter for DiscordAdapter {
                                         }
                                     }
 
-                                    if let Some(msg) = parse_discord_message(
+                                    if let Some(mut msg) = parse_discord_message(
                                         d,
                                         &bot_user_id,
                                         &allowed_guilds,
@@ -1430,6 +1477,22 @@ impl ChannelAdapter for DiscordAdapter {
                                     )
                                     .await
                                     {
+                                        // ANAI-137: download File attachments
+                                        // to disk and stamp `local_path` before
+                                        // the message reaches the bridge, so
+                                        // agents get a readable path instead of
+                                        // an unusable signed CDN URL. Runs
+                                        // after all the allow-list filters in
+                                        // parse_discord_message so we never
+                                        // fetch bytes for a message we drop.
+                                        materialize_inbound_files(
+                                            &mut msg.content,
+                                            &fetcher,
+                                            max_upload_bytes,
+                                            &inbound_file_dir,
+                                        )
+                                        .await;
+
                                         // MESSAGE_UPDATE must be suppressed if we already
                                         // forwarded a MESSAGE_CREATE for this message ID.
                                         // The check uses `seen_message_ids` (tracked below)
@@ -1814,6 +1877,9 @@ impl ChannelAdapter for DiscordAdapter {
                 filename,
                 mime,
                 size: _,
+                // Inbound-only (ANAI-137); outbound File blocks come from
+                // `channel_send`, which passes a URL, never a local path.
+                local_path: _,
             } => {
                 // Fetch then route through the existing multipart helper.
                 // `Fetcher::fetch` enforces SSRF + 15s timeout + 25 MiB cap.
@@ -1877,6 +1943,8 @@ impl ChannelAdapter for DiscordAdapter {
                             filename,
                             mime,
                             size: _,
+                            // Inbound-only (ANAI-137).
+                            local_path: _,
                         } => sources.push(AttachmentSource::UrlFile {
                             url,
                             filename,
@@ -2295,6 +2363,113 @@ fn mime_from_extension(filename: &str) -> Option<&'static str> {
     }
 }
 
+/// Walk a parsed message's content and materialize every `File` block's bytes
+/// to local disk, stamping `local_path` on success (ANAI-137).
+///
+/// Best-effort by construction: any skip or failure leaves `local_path` as
+/// `None`, and the bridge then renders exactly the pre-ANAI-137 URL-only
+/// descriptor. A CDN hiccup or a full disk must never cost the user their
+/// message.
+///
+/// `max_bytes == 0` disables the whole pass.
+async fn materialize_inbound_files(
+    content: &mut ChannelContent,
+    fetcher: &Arc<dyn Fetcher>,
+    max_bytes: u64,
+    dir: &std::path::Path,
+) {
+    if max_bytes == 0 {
+        return;
+    }
+    match content {
+        // Adapters must not produce nested Multipart (see ChannelContent
+        // docs), so a single level of iteration covers every block.
+        ChannelContent::Multipart(parts) => {
+            for part in parts.iter_mut() {
+                materialize_one_file(part, fetcher, max_bytes, dir).await;
+            }
+        }
+        single => materialize_one_file(single, fetcher, max_bytes, dir).await,
+    }
+}
+
+/// Materialize one block if it is a `File`; no-op for every other variant.
+///
+/// Note the deliberate omission: `ChannelContent::Voice` has the identical
+/// URL-only gap, but nothing in the Discord path produces it (voice notes
+/// arrive as attachments and classify as `File`), so wiring it here would be
+/// untestable dead code. Telegram is where Voice is constructed; it needs its
+/// own pass.
+async fn materialize_one_file(
+    block: &mut ChannelContent,
+    fetcher: &Arc<dyn Fetcher>,
+    max_bytes: u64,
+    dir: &std::path::Path,
+) {
+    let ChannelContent::File {
+        url,
+        filename,
+        size,
+        local_path,
+        ..
+    } = block
+    else {
+        return;
+    };
+    // Idempotence: never re-download for a block some other pass already
+    // resolved (e.g. a MESSAGE_UPDATE replay of the same content).
+    if local_path.is_some() {
+        return;
+    }
+
+    // Fail fast on the declared size so an oversize attachment costs us no
+    // bytes at all. Discord always reports `size`; when it is absent we
+    // optimistically fetch and re-check the real length below.
+    if let Some(declared) = *size {
+        if declared > max_bytes {
+            info!(
+                filename = %filename,
+                declared,
+                max_bytes,
+                "inbound attachment exceeds max_upload_bytes; leaving URL-only descriptor"
+            );
+            return;
+        }
+    }
+
+    let bytes = match fetcher.fetch(url).await {
+        Ok((bytes, _content_type)) => bytes,
+        Err(e) => {
+            // `Fetcher` errors already carry a redacted URL, so the CDN's
+            // HMAC query params stay out of the logs.
+            warn!(filename = %filename, error = %e, "inbound attachment download failed");
+            return;
+        }
+    };
+
+    // Post-fetch check: covers a missing or lying Content-Length.
+    if bytes.len() as u64 > max_bytes {
+        warn!(
+            filename = %filename,
+            actual = bytes.len(),
+            max_bytes,
+            "inbound attachment body exceeds max_upload_bytes after download; discarding"
+        );
+        return;
+    }
+
+    match inbound_files::materialize_bytes(&bytes, filename, dir) {
+        Some(path) => {
+            debug!(filename = %filename, path = ?path, bytes = bytes.len(), "materialized inbound attachment");
+            *local_path = Some(path.to_string_lossy().into_owned());
+        }
+        None => {
+            // materialize_bytes already logged the I/O failure.
+            warn!(filename = %filename, "inbound attachment could not be written to disk");
+        }
+    }
+}
+
 /// Classify a single Discord attachment JSON object into a `ChannelContent`
 /// block. Vision-eligible image MIME types (jpeg/png/gif/webp) under
 /// `VISION_IMAGE_MAX_BYTES` become `Image`; everything else becomes `File`
@@ -2331,6 +2506,9 @@ fn classify_discord_attachment(att: &serde_json::Value) -> ChannelContent {
             filename,
             mime: Some(resolved_mime),
             size,
+            // Populated later by `materialize_inbound_files`, which needs
+            // async I/O; classification stays sync and pure.
+            local_path: None,
         }
     }
 }
@@ -4211,6 +4389,7 @@ mod tests {
                 filename: "report.pdf".to_string(),
                 mime: Some("application/pdf".to_string()),
                 size: None,
+                local_path: None,
             },
         ]);
 
@@ -4290,6 +4469,7 @@ mod tests {
                 filename: "s.txt".to_string(),
                 mime: None,
                 size: None,
+                local_path: None,
             },
         ]);
 
@@ -4620,8 +4800,247 @@ mod tests {
         let chunks = chunk_attachments(Vec::new());
         assert!(chunks.is_empty());
     }
-}
 
+    // ================= ANAI-137: inbound file materialization =================
+
+    /// Build a `File` block the way `classify_discord_attachment` does.
+    fn inbound_file(url: &str, filename: &str, size: Option<u64>) -> ChannelContent {
+        ChannelContent::File {
+            url: url.to_string(),
+            filename: filename.to_string(),
+            mime: Some("application/pdf".to_string()),
+            size,
+            local_path: None,
+        }
+    }
+
+    fn local_path_of(content: &ChannelContent) -> Option<String> {
+        match content {
+            ChannelContent::File { local_path, .. } => local_path.clone(),
+            ChannelContent::Multipart(parts) => parts.iter().find_map(local_path_of),
+            _ => None,
+        }
+    }
+
+    /// Permissive fetcher so 127.0.0.1 fixture servers don't trip the SSRF
+    /// preflight — same wire path, guard skipped, exactly as the outbound
+    /// tests do it.
+    fn test_inbound_fetcher() -> Arc<dyn Fetcher> {
+        Arc::new(PermissiveFetcher)
+    }
+
+    /// Count published (non-`.tmp`) files in the materialization dir.
+    fn published_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// The core ANAI-137 guarantee: a File attachment's bytes land on disk and
+    /// `local_path` points at them.
+    #[tokio::test]
+    async fn inbound_file_is_materialized_and_stamped() {
+        let body = bytes::Bytes::from_static(b"%PDF-1.7 pretend pdf");
+        let url = spawn_fixture_server("application/pdf", "doc.pdf", body.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut content = inbound_file(&url, "alchemists-warlocks.pdf", Some(body.len() as u64));
+        materialize_inbound_files(
+            &mut content,
+            &test_inbound_fetcher(),
+            DEFAULT_MAX_UPLOAD_BYTES,
+            tmp.path(),
+        )
+        .await;
+
+        let path = local_path_of(&content).expect("local_path should be stamped");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            body.as_ref(),
+            "materialized bytes must match the served body"
+        );
+        assert!(
+            path.ends_with(".pdf"),
+            "source extension must survive (file_convert dispatches on it): {path}"
+        );
+        assert!(
+            path.contains("alchemists-warlocks") || path.contains("alchemists_warlocks"),
+            "human-readable name hint should survive: {path}"
+        );
+    }
+
+    /// Attachments inside a Multipart (caption + file, the common Discord
+    /// shape) must be materialized too — the pre-ANAI-137 bug was that the
+    /// descriptor was rendered at three separate sites and a fix to one
+    /// silently missed the others.
+    #[tokio::test]
+    async fn inbound_file_inside_multipart_is_materialized() {
+        let body = bytes::Bytes::from_static(b"caption sibling body");
+        let url = spawn_fixture_server("text/plain", "n.txt", body.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut content = ChannelContent::Multipart(vec![
+            ChannelContent::Text("here you go".to_string()),
+            inbound_file(&url, "notes.txt", Some(body.len() as u64)),
+        ]);
+        materialize_inbound_files(
+            &mut content,
+            &test_inbound_fetcher(),
+            DEFAULT_MAX_UPLOAD_BYTES,
+            tmp.path(),
+        )
+        .await;
+
+        assert!(
+            local_path_of(&content).is_some(),
+            "File block nested in Multipart must be materialized"
+        );
+    }
+
+    /// Declared size over the cap must skip the download entirely — no bytes
+    /// fetched, nothing written, URL-only descriptor preserved.
+    #[tokio::test]
+    async fn oversize_declared_attachment_is_not_downloaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Deliberately unreachable URL: if we tried to fetch it the test would
+        // still pass on local_path, so the real assertion is that nothing was
+        // written and no fetch was needed.
+        let mut content = inbound_file("http://127.0.0.1:1/huge.bin", "huge.bin", Some(64 * 1024));
+
+        materialize_inbound_files(&mut content, &test_inbound_fetcher(), 1024, tmp.path()).await;
+
+        assert!(
+            local_path_of(&content).is_none(),
+            "oversize attachment must stay URL-only"
+        );
+        assert_eq!(published_count(tmp.path()), 0, "nothing should be written");
+    }
+
+    /// A source that under-reports (or omits) its size must still be capped
+    /// after the fact, and the body discarded rather than written.
+    #[tokio::test]
+    async fn undeclared_oversize_body_is_discarded_after_fetch() {
+        let body = bytes::Bytes::from(vec![b'z'; 8 * 1024]);
+        let url = spawn_fixture_server("application/octet-stream", "lie.bin", body).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // size: None → no pre-flight skip; the post-fetch check must catch it.
+        let mut content = inbound_file(&url, "lie.bin", None);
+        materialize_inbound_files(&mut content, &test_inbound_fetcher(), 1024, tmp.path()).await;
+
+        assert!(
+            local_path_of(&content).is_none(),
+            "body over the cap must not be stamped"
+        );
+        assert_eq!(
+            published_count(tmp.path()),
+            0,
+            "over-cap body must not be written to disk"
+        );
+    }
+
+    /// Fail-soft: a dead CDN must degrade to the pre-ANAI-137 descriptor, not
+    /// drop the user's message.
+    #[tokio::test]
+    async fn download_failure_leaves_url_only_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Port 1 on loopback: connection refused, fast.
+        let mut content = inbound_file("http://127.0.0.1:1/gone.pdf", "gone.pdf", Some(10));
+
+        materialize_inbound_files(
+            &mut content,
+            &test_inbound_fetcher(),
+            DEFAULT_MAX_UPLOAD_BYTES,
+            tmp.path(),
+        )
+        .await;
+
+        assert!(local_path_of(&content).is_none());
+        assert!(
+            matches!(&content, ChannelContent::File { url, .. } if url.contains("gone.pdf")),
+            "the URL must survive so the agent still has the reference"
+        );
+    }
+
+    /// `max_upload_bytes = 0` is the operator escape hatch: no inbound bytes
+    /// touch disk at all.
+    #[tokio::test]
+    async fn zero_cap_disables_materialization() {
+        let body = bytes::Bytes::from_static(b"nope");
+        let url = spawn_fixture_server("text/plain", "x.txt", body.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let mut content = inbound_file(&url, "x.txt", Some(body.len() as u64));
+        materialize_inbound_files(&mut content, &test_inbound_fetcher(), 0, tmp.path()).await;
+
+        assert!(local_path_of(&content).is_none());
+        assert_eq!(published_count(tmp.path()), 0);
+    }
+
+    /// An already-stamped block must not be re-fetched (MESSAGE_UPDATE replays
+    /// the same payload).
+    #[tokio::test]
+    async fn already_stamped_block_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut content = ChannelContent::File {
+            url: "http://127.0.0.1:1/x.pdf".to_string(),
+            filename: "x.pdf".to_string(),
+            mime: None,
+            size: Some(4),
+            local_path: Some("/already/there.pdf".to_string()),
+        };
+
+        materialize_inbound_files(
+            &mut content,
+            &test_inbound_fetcher(),
+            DEFAULT_MAX_UPLOAD_BYTES,
+            tmp.path(),
+        )
+        .await;
+
+        assert_eq!(
+            local_path_of(&content).as_deref(),
+            Some("/already/there.pdf"),
+            "existing local_path must be preserved untouched"
+        );
+    }
+
+    /// The config knob cannot promise more than the fetcher's hard ceiling.
+    #[test]
+    fn max_upload_bytes_is_clamped_to_fetch_ceiling() {
+        let adapter = test_adapter().with_max_upload_bytes(u64::MAX);
+        assert_eq!(adapter.max_upload_bytes, URL_FETCH_MAX_BYTES as u64);
+
+        let adapter = test_adapter().with_max_upload_bytes(1024);
+        assert_eq!(adapter.max_upload_bytes, 1024);
+
+        assert_eq!(
+            test_adapter().max_upload_bytes,
+            DEFAULT_MAX_UPLOAD_BYTES,
+            "default must be the 25 MiB Discord upload limit"
+        );
+    }
+
+    /// Classification must leave `local_path` unset — materialization is a
+    /// separate async pass.
+    #[test]
+    fn classify_leaves_local_path_none() {
+        let att = serde_json::json!({
+            "url": "https://cdn.discordapp.com/x/y.pdf",
+            "filename": "y.pdf",
+            "content_type": "application/pdf",
+            "size": 1234,
+        });
+        match classify_discord_attachment(&att) {
+            ChannelContent::File { local_path, .. } => assert!(local_path.is_none()),
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+}
 
 /// Build Discord `components` action rows from platform-neutral buttons.
 /// Discord allows max 5 buttons per action row (and 5 rows); buttons are

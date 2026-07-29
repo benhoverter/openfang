@@ -1219,9 +1219,14 @@ async fn dispatch_message(
                     let mut img = download_image_to_blocks(url, caption.as_deref()).await;
                     blocks.append(&mut img);
                 }
-                ChannelContent::File { url, filename, .. } => {
+                ChannelContent::File {
+                    url,
+                    filename,
+                    local_path,
+                    ..
+                } => {
                     blocks.push(ContentBlock::Text {
-                        text: format!("[User sent a file ({filename}): {url}]"),
+                        text: render_file_descriptor(url, filename, local_path.as_deref()),
                         provider_metadata: None,
                     });
                 }
@@ -1348,10 +1353,9 @@ async fn dispatch_message(
         ChannelContent::File {
             ref url,
             ref filename,
+            ref local_path,
             ..
-        } => {
-            format!("[User sent a file ({filename}): {url}]")
-        }
+        } => render_file_descriptor(url, filename, local_path.as_deref()),
         ChannelContent::Voice {
             ref url,
             duration_seconds,
@@ -1372,9 +1376,12 @@ async fn dispatch_message(
                     Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
                     None => format!("[User sent a photo: {url}]"),
                 },
-                ChannelContent::File { url, filename, .. } => {
-                    format!("[User sent a file ({filename}): {url}]")
-                }
+                ChannelContent::File {
+                    url,
+                    filename,
+                    local_path,
+                    ..
+                } => render_file_descriptor(url, filename, local_path.as_deref()),
                 ChannelContent::Voice {
                     url,
                     duration_seconds,
@@ -1916,6 +1923,27 @@ fn media_type_from_url(url: &str) -> String {
     } else {
         // JPEG is the most common image format — safe default
         "image/jpeg".to_string()
+    }
+}
+
+/// Render the inbound descriptor for a `ChannelContent::File` block.
+///
+/// Single source of truth for all three sites that surface a file to the model
+/// (Multipart->blocks, single-content text fallback, Multipart->text join).
+/// Before ANAI-137 the format string was duplicated at each site, so a fix
+/// applied to one shape silently failed in the others.
+///
+/// The URL is always emitted, whether or not materialization succeeded — an
+/// agent must never lose the reference. When `local_path` is present a second
+/// line names the on-disk copy and tells the model what it can do with it;
+/// when it is absent the output is byte-identical to the pre-ANAI-137
+/// descriptor, so a download failure degrades instead of regressing.
+fn render_file_descriptor(url: &str, filename: &str, local_path: Option<&str>) -> String {
+    match local_path {
+        Some(path) => format!(
+            "[User sent a file ({filename}): {url}]\nLocal copy (read it with file_read / file_convert): {path}"
+        ),
+        None => format!("[User sent a file ({filename}): {url}]"),
     }
 }
 
@@ -3369,6 +3397,37 @@ mod tests {
         assert_eq!(
             media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"),
             "image/jpeg"
+        );
+    }
+
+    /// ANAI-137: the descriptor must always carry the URL, and additionally
+    /// name the local copy when one exists. The no-path output is pinned
+    /// byte-for-byte against the pre-ANAI-137 format so a download failure
+    /// degrades rather than regresses.
+    #[test]
+    fn file_descriptor_with_and_without_local_path() {
+        let bare = render_file_descriptor("https://cdn/x.pdf?ex=1&hm=2", "x.pdf", None);
+        assert_eq!(
+            bare,
+            "[User sent a file (x.pdf): https://cdn/x.pdf?ex=1&hm=2]"
+        );
+
+        let stamped = render_file_descriptor(
+            "https://cdn/x.pdf?ex=1&hm=2",
+            "x.pdf",
+            Some("/tmp/files/ab12__x.pdf"),
+        );
+        assert!(
+            stamped.starts_with(&bare),
+            "the URL descriptor must be preserved verbatim, got: {stamped}"
+        );
+        assert!(
+            stamped.contains("/tmp/files/ab12__x.pdf"),
+            "local path must be surfaced: {stamped}"
+        );
+        assert!(
+            stamped.contains("file_read"),
+            "the model should be told what it can do with the path: {stamped}"
         );
     }
 

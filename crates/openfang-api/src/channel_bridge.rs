@@ -1376,14 +1376,18 @@ pub async fn start_channel_bridge_with_config(
     // Discord
     if let Some(ref dc_config) = config.discord {
         if let Some(token) = read_token(&dc_config.bot_token_env, "Discord") {
-            let adapter = Arc::new(DiscordAdapter::new(
-                token,
-                dc_config.allowed_guilds.clone(),
-                dc_config.allowed_users.clone(),
-                dc_config.ignore_bots,
-                dc_config.intents,
-                dc_config.auto_thread.clone(),
-            ));
+            let adapter = Arc::new(
+                DiscordAdapter::new(
+                    token,
+                    dc_config.allowed_guilds.clone(),
+                    dc_config.allowed_users.clone(),
+                    dc_config.ignore_bots,
+                    dc_config.intents,
+                    dc_config.auto_thread.clone(),
+                )
+                // ANAI-137: inbound attachment materialization ceiling.
+                .with_max_upload_bytes(dc_config.max_upload_bytes),
+            );
             adapters.push((adapter, dc_config.default_agent.clone()));
         }
     }

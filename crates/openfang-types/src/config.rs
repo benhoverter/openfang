@@ -2400,9 +2400,25 @@ pub struct DiscordConfig {
     /// Default: "false"
     #[serde(default = "default_auto_thread")]
     pub auto_thread: String,
+    /// Per-attachment ceiling, in bytes, for materializing inbound file
+    /// attachments to local disk (ANAI-137). Default 25 MiB — Discord's own
+    /// non-Nitro upload limit, so under normal operation it cannot be hit.
+    ///
+    /// Files larger than this are surfaced to the agent as a URL-only
+    /// descriptor (pre-ANAI-137 behaviour) instead of being downloaded.
+    /// `0` disables inbound materialization entirely. Values above the
+    /// adapter's hard 25 MiB fetch ceiling are clamped with a warning.
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+}
+
+/// Default inbound attachment materialization cap: 25 MiB (Discord's
+/// non-Nitro upload limit).
+fn default_max_upload_bytes() -> u64 {
+    25 * 1024 * 1024
 }
 
 impl Default for DiscordConfig {
@@ -2417,6 +2433,7 @@ impl Default for DiscordConfig {
             default_channel_id: None,
             free_response_channels: vec![],
             auto_thread: "false".to_string(),
+            max_upload_bytes: default_max_upload_bytes(),
             overrides: ChannelOverrides::default(),
         }
     }

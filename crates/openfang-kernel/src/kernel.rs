@@ -9242,6 +9242,10 @@ impl KernelHandle for OpenFangKernel {
                 filename: filename.unwrap_or("file").to_string(),
                 mime: None,
                 size: None,
+                // Outbound: the adapter fetches `url`. `local_path` is the
+                // inbound materialization field (ANAI-137) and is never set
+                // on a block we originate.
+                local_path: None,
             },
             _ => {
                 return Err(format!(

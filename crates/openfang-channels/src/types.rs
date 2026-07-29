@@ -60,6 +60,18 @@ pub enum ChannelContent {
         /// the bridge attempts to materialize or transmit the file.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<u64>,
+        /// Absolute path to the attachment's bytes on local disk, when the
+        /// adapter was able to materialize them (ANAI-137).
+        ///
+        /// Populated by adapters that download inbound attachments into
+        /// `~/.openfang/tmp/files/` (see [`crate::inbound_files`]); `None`
+        /// when the download was skipped (over `max_upload_bytes`), failed,
+        /// or the adapter has not adopted materialization yet. Consumers must
+        /// treat `None` as "URL only" and degrade gracefully — the bridge
+        /// keeps rendering `url` either way, so an agent never loses the
+        /// reference, it just may not be able to read the bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
     },
     /// Local file data (bytes read from disk). Used by the proactive `channel_send`
     /// tool when `file_path` is provided instead of `file_url`.

@@ -549,6 +549,7 @@ bot_token_env = "DISCORD_BOT_TOKEN"
 allowed_guilds = []
 # default_agent = "assistant"
 intents = 33280
+# max_upload_bytes = 26214400   # 25 MiB (default)
 ```
 
 | Field | Type | Default | Description |
@@ -557,6 +558,35 @@ intents = 33280
 | `allowed_guilds` | list of u64 | `[]` | Guild (server) IDs allowed. Empty = allow all. |
 | `default_agent` | string or null | `null` | Agent name to route messages to. |
 | `intents` | u64 | `33280` | Gateway intents bitmask. Default = `GUILD_MESSAGES \| MESSAGE_CONTENT`. |
+| `max_upload_bytes` | u64 | `26214400` (25 MiB) | Per-attachment ceiling for downloading **inbound** file attachments to local disk. Larger files are surfaced as a URL-only descriptor. `0` disables the download entirely. Clamped to the adapter's hard 25 MiB fetch ceiling. |
+
+##### Inbound file attachments
+
+When a user attaches a non-image file (PDF, zip, markdown, CSV…), the Discord
+adapter downloads it to a content-addressed path under
+`~/.openfang/tmp/files/` and surfaces that path to the agent alongside the CDN
+URL:
+
+```
+[User sent a file (report.pdf): https://cdn.discordapp.com/...]
+Local copy (read it with file_read / file_convert): /Users/you/.openfang/tmp/files/9f3c...__report.pdf
+```
+
+Agents can then use `file_read` / `file_convert` directly. Without this, the
+signed CDN URL is effectively unusable from an agent: it contains `&`, which
+the shell metacharacter floor blocks, so there is no way to fetch the bytes.
+
+Notes:
+
+- Files are swept after 24 hours; a cache hit refreshes the timestamp, so a
+  long-running conversation does not lose its bytes mid-thread.
+- Identical bytes are stored once (the filename carries a content hash).
+- Failures are soft: an oversize file, a dead CDN, or a full disk degrades to
+  the URL-only descriptor. The agent never loses the reference.
+- Images continue to travel the vision path (`~/.openfang/tmp/images/`);
+  oversize images fall through to this file path.
+- Telegram documents and voice notes are **not** yet materialized — they still
+  arrive as URL-only descriptors.
 
 #### `[channels.slack]`
 

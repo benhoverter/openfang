@@ -977,6 +977,9 @@ async fn parse_telegram_update(
                 filename,
                 mime: None,
                 size: None,
+                // ANAI-137 materialization is Discord-only for now; Telegram
+                // documents still arrive as URL-only descriptors.
+                local_path: None,
             },
             None => ChannelContent::Text(format!("[Document received: {filename}]")),
         }
