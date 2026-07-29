@@ -62,7 +62,9 @@ usage() { sed -n '2,49p' "$0"; exit "${1:-0}"; }
 
 # Normalise a boolean-ish flag value to "true"/"false"/"" (empty = no override).
 norm_bool() {
-  case "${1,,}" in
+  local __v
+  __v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$__v" in
     true|1|yes|on)   echo "true";;
     false|0|no|off)  echo "false";;
     "")              echo "";;
