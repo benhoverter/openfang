@@ -56,6 +56,24 @@ pub trait TokenIssuer: Send + Sync + 'static {
     /// happen together.
     #[doc(hidden)]
     fn revoke(&self, token: &Token);
+
+    /// Revoke *every* live token bound to `agent_id` and tombstone the id so
+    /// later [`issue`](Self::issue) calls hand back a token that will never
+    /// resolve. Returns the number of live spawns evicted.
+    ///
+    /// Called from the kill path. Without it, a killed agent whose loop task
+    /// is still holding an `Arc<dyn TokenIssuer>` can mint a *fresh, valid*
+    /// token on respawn and complete the bridge handshake with no registry
+    /// entry behind it — authentication succeeding for an identity that no
+    /// longer exists (the "corpse bounce" defect).
+    fn revoke_agent(&self, agent_id: AgentId) -> usize;
+
+    /// Clear a tombstone so `agent_id` can issue live tokens again.
+    ///
+    /// Called from the spawn path. Required because [`AgentId::from_string`]
+    /// mints *deterministic* ids for hand agents — kill-then-reactivate
+    /// reuses the same id, and a permanent tombstone would brick it.
+    fn reinstate_agent(&self, agent_id: AgentId);
 }
 
 /// RAII handle for a reserved spawn slot. Drop evicts the entry from the
@@ -118,6 +136,7 @@ mod tests {
     #[derive(Default)]
     struct StubInner {
         live: Vec<(Token, AgentId)>,
+        tombstoned: Vec<AgentId>,
         weak: Option<std::sync::Weak<StubIssuer>>,
     }
 
@@ -133,7 +152,9 @@ mod tests {
         fn issue(&self, agent_id: AgentId) -> SpawnGuard {
             let token = Token::generate();
             let mut inner = self.inner.lock().unwrap();
-            inner.live.push((token.clone(), agent_id));
+            if !inner.tombstoned.contains(&agent_id) {
+                inner.live.push((token.clone(), agent_id));
+            }
             let me: Arc<dyn TokenIssuer> = inner
                 .weak
                 .as_ref()
@@ -146,6 +167,19 @@ mod tests {
         fn revoke(&self, token: &Token) {
             let mut inner = self.inner.lock().unwrap();
             inner.live.retain(|(t, _)| t != token);
+        }
+
+        fn revoke_agent(&self, agent_id: AgentId) -> usize {
+            let mut inner = self.inner.lock().unwrap();
+            let before = inner.live.len();
+            inner.live.retain(|(_, a)| *a != agent_id);
+            inner.tombstoned.push(agent_id);
+            before - inner.live.len()
+        }
+
+        fn reinstate_agent(&self, agent_id: AgentId) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.tombstoned.retain(|a| *a != agent_id);
         }
     }
 
@@ -165,5 +199,23 @@ mod tests {
         let g = issuer.issue(AgentId::new());
         assert_eq!(g.fingerprint(), g.token().fingerprint());
         assert_eq!(g.token().to_hex().len(), 64);
+    }
+
+    #[test]
+    fn revoke_agent_evicts_all_and_tombstones() {
+        let issuer = StubIssuer::new();
+        let a = AgentId::new();
+        let _g1 = issuer.issue(a);
+        let _g2 = issuer.issue(a);
+        assert_eq!(issuer.inner.lock().unwrap().live.len(), 2);
+        assert_eq!(issuer.revoke_agent(a), 2);
+        assert_eq!(issuer.inner.lock().unwrap().live.len(), 0);
+        // Post-kill issuance is dead on arrival.
+        let _g3 = issuer.issue(a);
+        assert_eq!(issuer.inner.lock().unwrap().live.len(), 0);
+        // ...until the id is reinstated by a fresh spawn.
+        issuer.reinstate_agent(a);
+        let _g4 = issuer.issue(a);
+        assert_eq!(issuer.inner.lock().unwrap().live.len(), 1);
     }
 }

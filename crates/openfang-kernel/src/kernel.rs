@@ -1932,6 +1932,14 @@ impl OpenFangKernel {
             .register(entry.clone())
             .map_err(KernelError::OpenFang)?;
 
+        // Clear any kill-time tombstone on this id. Hand agents get
+        // deterministic ids (`AgentId::from_string`), so kill-then-reactivate
+        // reuses the same id — without this the re-spawned agent would issue
+        // bridge tokens that never resolve.
+        if let Some(issuer) = self.token_issuer() {
+            issuer.reinstate_agent(agent_id);
+        }
+
         // Update parent's children list
         if let Some(parent_id) = parent {
             self.registry.add_child(parent_id, agent_id);
@@ -4232,6 +4240,37 @@ impl OpenFangKernel {
 
     /// Kill an agent.
     pub fn kill_agent(&self, agent_id: AgentId) -> KernelResult<()> {
+        // Abort the in-flight turn FIRST. The running LLM task lives in
+        // `running_tasks`, not in `background.tasks`, so `background
+        // .stop_agent` below does not touch it. Leaving it alive is the
+        // corpse-bounce defect: the surviving task hits the ANAI-115
+        // idle-stall retry minutes later, spawns a fresh CC subprocess, and
+        // replays the dead agent's conversation against a registry that no
+        // longer has an entry for it — zero tools, phantom-action
+        // re-prompting, tokens burned forever.
+        //
+        // Order matters: aborting before `registry.remove` means a racing
+        // turn can never observe a half-dismantled entry. Aborting also
+        // drops the task's `SpawnGuard`, which evicts its bridge token.
+        match self.stop_agent_run(agent_id) {
+            Ok(true) => info!(id = %agent_id, "Aborted in-flight run before kill"),
+            Ok(false) => {}
+            Err(e) => warn!(id = %agent_id, "Failed to abort run before kill: {e}"),
+        }
+
+        // Revoke every bridge token bound to this agent and tombstone the id.
+        // The abort above drops the guard for the *current* spawn, but the
+        // dying task still holds an `Arc<dyn TokenIssuer>` and could mint a
+        // fresh, valid token on its way out. Tombstoning makes any such
+        // token unresolvable, so the handshake rejects a corpse rather than
+        // authenticating it and handing it an empty toolset.
+        if let Some(issuer) = self.token_issuer() {
+            let evicted = issuer.revoke_agent(agent_id);
+            if evicted > 0 {
+                info!(id = %agent_id, evicted, "Revoked live bridge tokens on kill");
+            }
+        }
+
         let entry = self
             .registry
             .remove(agent_id)
@@ -10974,6 +11013,13 @@ system_prompt = "You are a test agent."
             fn revoke(&self, _token: &Token) {
                 // No-op — the fake holds no spawn table.
             }
+            fn revoke_agent(&self, _agent_id: AgentId) -> usize {
+                // No-op — the fake holds no spawn table.
+                0
+            }
+            fn reinstate_agent(&self, _agent_id: AgentId) {
+                // No-op — the fake holds no tombstone set.
+            }
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -11029,7 +11075,92 @@ system_prompt = "You are a test agent."
 
         kernel.shutdown();
     }
-}
+
+    /// Corpse bounce: `kill_agent` must abort the agent's in-flight run and
+    /// revoke its bridge tokens.
+    ///
+    /// Before this fix, `kill_agent` dropped the registry entry and stopped
+    /// the *background* tick loop, but the running LLM task in
+    /// `running_tasks` survived. Minutes later it hit the ANAI-115 idle-stall
+    /// retry, spawned a fresh CC subprocess under the dead agent's id, and
+    /// authenticated with a freshly-minted bridge token — then found no
+    /// registry entry, got zero tools, and phantom-action re-prompted
+    /// forever.
+    #[tokio::test]
+    async fn kill_agent_aborts_in_flight_run_and_revokes_bridge_tokens() {
+        use openfang_runtime::bridge_auth::{SpawnGuard, TokenIssuer};
+        use openfang_types::bridge_auth::Token;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingIssuer {
+            revoked: Mutex<Vec<AgentId>>,
+        }
+        impl TokenIssuer for RecordingIssuer {
+            fn issue(&self, _agent_id: AgentId) -> SpawnGuard {
+                unreachable!("no driver is constructed in this test")
+            }
+            fn revoke(&self, _token: &Token) {}
+            fn revoke_agent(&self, agent_id: AgentId) -> usize {
+                self.revoked.lock().unwrap().push(agent_id);
+                0
+            }
+            fn reinstate_agent(&self, _agent_id: AgentId) {}
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-kill-orphan");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let issuer = Arc::new(RecordingIssuer::default());
+        let kernel = OpenFangKernel::boot_with_config_and_issuer(config, Some(issuer.clone()))
+            .expect("kernel boots");
+
+        let agent = register_test_agent(&kernel, "doomed");
+
+        // Stand in for an agent-loop turn: a task that never completes on
+        // its own. `completed` proves it was aborted rather than finishing.
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        kernel.running_tasks.insert(agent, handle.abort_handle());
+
+        kernel.kill_agent(agent).expect("kill succeeds");
+
+        // The run task is gone from the map and cancelled.
+        assert!(
+            !kernel.running_tasks.contains_key(&agent),
+            "kill_agent must drop the in-flight run from running_tasks"
+        );
+        assert!(
+            handle.await.unwrap_err().is_cancelled(),
+            "kill_agent must abort the in-flight run task"
+        );
+        assert!(
+            !completed.load(Ordering::SeqCst),
+            "the aborted task must not have run to completion"
+        );
+
+        // ...and its bridge identity was revoked, so a respawn cannot
+        // re-authenticate under the dead id.
+        assert_eq!(
+            issuer.revoked.lock().unwrap().as_slice(),
+            &[agent],
+            "kill_agent must revoke the killed agent's bridge tokens"
+        );
+
+        kernel.shutdown();
+    }
+
     /// A `[model_override]` present in `config.toml` at boot must be active
     /// immediately — the RwLock is seeded from `config.model_override` before
     /// the first agent spawns, so no reload is needed for a fresh daemon.
@@ -11066,3 +11197,4 @@ system_prompt = "You are a test agent."
 
         kernel.shutdown();
     }
+}
