@@ -299,6 +299,10 @@ async fn handle_connection(
 
     let ack = Frame::HelloAck(HelloAck::Ok {
         daemon_version: daemon_version(),
+        // ANAI-131: hand the projected file_convert `options` schema to the
+        // runtime-free bridge so its tools/list advertises the same option
+        // surface the dispatcher accepts, without importing the runtime.
+        convert_options_schema: Some(openfang_runtime::convert::file_convert_options_schema()),
     });
     codec::write_frame(&mut write_half, &ack).await?;
     let authed_display = identity
@@ -1160,6 +1164,7 @@ mod tests {
             &mut write_half,
             &Frame::HelloAck(HelloAck::Ok {
                 daemon_version: daemon_version(),
+                convert_options_schema: None,
             }),
         )
         .await?;

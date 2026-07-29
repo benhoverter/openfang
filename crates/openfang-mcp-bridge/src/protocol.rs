@@ -66,6 +66,15 @@ pub struct Hello {
 pub enum HelloAck {
     Ok {
         daemon_version: String,
+        /// Projected `file_convert` `options` sub-schema (ANAI-131), computed
+        /// daemon-side from the live recipe manifest and handed to the bridge
+        /// so its `tools/list` advertises the same option surface the
+        /// dispatcher accepts — without the runtime-free bridge importing the
+        /// runtime. `None` from daemons that predate this field (or when the
+        /// agent lacks `file_convert`); the bridge then advertises
+        /// `file_convert` with no projected `options` property (still callable).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        convert_options_schema: Option<serde_json::Value>,
     },
     /// Connection rejected. Bridge should log and exit.
     Rejected {
@@ -288,6 +297,45 @@ mod tests {
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains("rejected"));
         assert!(s.contains("bad token"));
+    }
+
+    #[test]
+    fn hello_ack_ok_roundtrips_convert_options_schema() {
+        // ANAI-131: the projected options schema rides HelloAck::Ok and
+        // survives a serialize -> deserialize round-trip intact.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "orientation": { "type": "string" } }
+        });
+        let f = Frame::HelloAck(HelloAck::Ok {
+            daemon_version: "test".into(),
+            convert_options_schema: Some(schema.clone()),
+        });
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("orientation"));
+        let back: Frame = serde_json::from_str(&s).unwrap();
+        match back {
+            Frame::HelloAck(HelloAck::Ok {
+                convert_options_schema,
+                ..
+            }) => assert_eq!(convert_options_schema, Some(schema)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_ack_ok_defaults_convert_options_schema_when_absent() {
+        // Forward/backward compat: a HelloAck::Ok serialized without the field
+        // (older daemon) decodes with convert_options_schema == None.
+        let json = r#"{"type":"hello_ack","kind":"ok","daemon_version":"old"}"#;
+        let back: Frame = serde_json::from_str(json).unwrap();
+        match back {
+            Frame::HelloAck(HelloAck::Ok {
+                convert_options_schema,
+                ..
+            }) => assert!(convert_options_schema.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

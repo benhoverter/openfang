@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("connect to daemon socket {socket_path}"))?;
 
-    handshake(&mut stream, &token).await?;
+    let convert_options_schema = handshake(&mut stream, &token).await?;
 
     // --- List upstream MCP tools (best-effort) ---
     //
@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
         agent_id.clone(),
         allowed_tools.clone(),
         upstream_tools,
+        convert_options_schema,
     );
 
     // --- Run MCP server over stdio ---
@@ -163,7 +164,10 @@ async fn main() -> Result<()> {
 
 /// Send Hello, await HelloAck. Errors on rejection or wire issues.
 #[cfg(unix)]
-async fn handshake(stream: &mut UnixStream, token: &str) -> Result<()> {
+async fn handshake(
+    stream: &mut UnixStream,
+    token: &str,
+) -> Result<Option<serde_json::Value>> {
     let (read_half, mut write_half) = stream.split();
     let mut read_half = BufReader::new(read_half);
 
@@ -180,9 +184,12 @@ async fn handshake(stream: &mut UnixStream, token: &str) -> Result<()> {
         .await
         .context("read HelloAck")?
     {
-        Frame::HelloAck(HelloAck::Ok { daemon_version }) => {
+        Frame::HelloAck(HelloAck::Ok {
+            daemon_version,
+            convert_options_schema,
+        }) => {
             tracing::info!(daemon_version, "bridge IPC handshake ok");
-            Ok(())
+            Ok(convert_options_schema)
         }
         Frame::HelloAck(HelloAck::Rejected { reason }) => {
             bail!("daemon rejected handshake: {reason}")
@@ -263,6 +270,11 @@ pub struct IpcDispatcher {
     /// require restarting the bridge — by design for now, since the
     /// daemon also restarts agents on `agent.toml mcp_servers` changes.
     upstream: Vec<UpstreamToolDef>,
+    /// Projected `file_convert` `options` sub-schema, computed daemon-side and
+    /// delivered in the handshake (ANAI-131). `None` when the daemon didn't
+    /// send one; the bridge then advertises `file_convert` without a projected
+    /// `options` property. Session snapshot, like `upstream`.
+    convert_options_schema: Option<serde_json::Value>,
     tx: mpsc::Sender<IpcRequest>,
     next_id: AtomicU64,
 }
@@ -280,6 +292,10 @@ impl ToolDispatcher for IpcDispatcher {
 
     fn upstream_tools(&self) -> Vec<UpstreamToolDef> {
         self.upstream.clone()
+    }
+
+    fn convert_options_schema(&self) -> Option<serde_json::Value> {
+        self.convert_options_schema.clone()
     }
 
     async fn call(
@@ -347,6 +363,7 @@ pub fn spawn_ipc_actor(
     agent_id: String,
     allowed: Vec<String>,
     upstream: Vec<UpstreamToolDef>,
+    convert_options_schema: Option<serde_json::Value>,
 ) -> IpcDispatcher {
     let (tx, mut rx) = mpsc::channel::<IpcRequest>(32);
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -435,6 +452,7 @@ pub fn spawn_ipc_actor(
         agent_id,
         allowed,
         upstream,
+        convert_options_schema,
         tx,
         next_id: AtomicU64::new(1),
     }
@@ -485,6 +503,7 @@ mod tests {
                 &mut wh,
                 &Frame::HelloAck(HelloAck::Ok {
                     daemon_version: "test".into(),
+                    convert_options_schema: None,
                 }),
             )
             .await
@@ -538,6 +557,7 @@ mod tests {
             "agent-x".into(),
             vec!["file_read".into(), "file_list".into()],
             Vec::new(),
+            None,
         );
 
         // Concurrent calls — exercise the correlation map.
@@ -595,6 +615,7 @@ mod tests {
                 &mut wh,
                 &Frame::HelloAck(HelloAck::Ok {
                     daemon_version: "test".into(),
+                    convert_options_schema: None,
                 }),
             )
             .await
@@ -673,6 +694,7 @@ mod tests {
             // upstream cache should grant it.
             vec!["file_read".into()],
             upstream,
+            None,
         );
 
         // Allowed via upstream cache.
