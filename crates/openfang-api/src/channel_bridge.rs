@@ -106,9 +106,7 @@ fn classify_approver(
                     .unwrap_or_else(|| approver_display.to_string());
                 Ok((format!("{uid}:{name}"), name))
             }
-            None => {
-                Err("Unrecognized user — not authorized to resolve approvals.".to_string())
-            }
+            None => Err("Unrecognized user — not authorized to resolve approvals.".to_string()),
         }
     } else {
         // RBAC disabled: fail-open-but-recorded (security-openfang verdict A).
@@ -820,7 +818,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         // prompt was surfaced with editable coordinates. This
                         // unifies the button and text `/approve` paths: both
                         // stamp the prompt.
-                        let stamp_verb = if approve { "✅ Approved" } else { "❌ Rejected" };
+                        let stamp_verb = if approve {
+                            "✅ Approved"
+                        } else {
+                            "❌ Rejected"
+                        };
                         // ANAI-82: stamp the command being resolved (not the
                         // `/approve <id>` slash echo) so chat keeps a record of
                         // what was approved/rejected. For shell_exec this is the
@@ -2434,21 +2436,39 @@ mod tests {
 
     #[test]
     fn scope_similar_refused_without_binary_or_non_shell() {
-        assert_eq!(cache_scope_from_token(Some("similar"), &req("shell_exec", None)), None);
-        assert_eq!(cache_scope_from_token(Some("similar"), &req("file_write", Some("grep"))), None);
+        assert_eq!(
+            cache_scope_from_token(Some("similar"), &req("shell_exec", None)),
+            None
+        );
+        assert_eq!(
+            cache_scope_from_token(Some("similar"), &req("file_write", Some("grep"))),
+            None
+        );
     }
 
     #[test]
     fn scope_tool_ok_for_non_shell_but_refused_for_shell() {
-        assert_eq!(cache_scope_from_token(Some("tool"), &req("file_write", None)), Some(CacheScope::Tool));
+        assert_eq!(
+            cache_scope_from_token(Some("tool"), &req("file_write", None)),
+            Some(CacheScope::Tool)
+        );
         // Approve Tool for shell_exec is policy-forbidden (use exec mode=full)
-        assert_eq!(cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep"))), None);
+        assert_eq!(
+            cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep"))),
+            None
+        );
     }
 
     #[test]
     fn scope_once_and_unknown_never_cache() {
         assert_eq!(cache_scope_from_token(None, &req("file_write", None)), None);
-        assert_eq!(cache_scope_from_token(Some("once"), &req("file_write", None)), None);
-        assert_eq!(cache_scope_from_token(Some("bogus"), &req("file_write", None)), None);
+        assert_eq!(
+            cache_scope_from_token(Some("once"), &req("file_write", None)),
+            None
+        );
+        assert_eq!(
+            cache_scope_from_token(Some("bogus"), &req("file_write", None)),
+            None
+        );
     }
 }

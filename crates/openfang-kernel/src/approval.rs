@@ -604,7 +604,8 @@ mod tests {
             other => panic!("expected Submitted, got {other:?}"),
         }
 
-        mgr.resolve(id, ApprovalDecision::Denied, None).expect("resolve");
+        mgr.resolve(id, ApprovalDecision::Denied, None)
+            .expect("resolve");
         assert_eq!(join.await.unwrap(), ApprovalDecision::Denied);
     }
 

@@ -1615,7 +1615,12 @@ mod tests {
     #[test]
     fn privileged_lifecycle_tools_excluded_from_default() {
         use openfang_mcp_bridge::{DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
-        for tool in ["agent_spawn", "agent_kill", "agent_activate", "agent_send_async"] {
+        for tool in [
+            "agent_spawn",
+            "agent_kill",
+            "agent_activate",
+            "agent_send_async",
+        ] {
             assert!(
                 PRIVILEGED_DEFAULT_DENY.contains(&tool),
                 "{tool} must be in PRIVILEGED_DEFAULT_DENY",

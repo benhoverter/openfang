@@ -1935,9 +1935,7 @@ impl LlmDriver for ClaudeCodeDriver {
                     // bracket the in-subprocess tool-execution window so a long,
                     // silent build is not mistaken for a dead stream.
                     if let Some(thinking) = outcome.thinking {
-                        let _ = tx
-                            .send(StreamEvent::ThinkingDelta { text: thinking })
-                            .await;
+                        let _ = tx.send(StreamEvent::ThinkingDelta { text: thinking }).await;
                     }
                     for _ in 0..outcome.tool_starts {
                         let _ = tx
@@ -2583,7 +2581,9 @@ mod tests {
             "first group must be the Read guard"
         );
         assert_eq!(
-            groups[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            groups[0]
+                .pointer("/hooks/0/command")
+                .and_then(|v| v.as_str()),
             Some(read),
         );
 
@@ -2594,7 +2594,9 @@ mod tests {
             "observe matcher must be the empty-string match-all, not `*`"
         );
         assert_eq!(
-            groups[1].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            groups[1]
+                .pointer("/hooks/0/command")
+                .and_then(|v| v.as_str()),
             Some(observe),
         );
     }
@@ -3052,8 +3054,7 @@ mod tests {
     fn fidelity_simple_text_with_usage() {
         // Single assistant chunk + a terminal result event carrying usage —
         // the common case. Both paths must agree on text and tokens.
-        let json =
-            r#"{"result":"Hello, world.","usage":{"input_tokens":12,"output_tokens":4}}"#;
+        let json = r#"{"result":"Hello, world.","usage":{"input_tokens":12,"output_tokens":4}}"#;
         let stream = [
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, world."}]}}"#,
             r#"{"type":"result","result":"Hello, world.","usage":{"input_tokens":12,"output_tokens":4}}"#,
@@ -3276,7 +3277,8 @@ mod tests {
         assert_eq!(o1.tool_ends, 0);
         assert_eq!(o1.text, None);
 
-        let close = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+        let close =
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
         let o2 = fold_stream_line(close, &mut full_text, &mut usage);
         assert_eq!(o2.tool_ends, 1);
         assert_eq!(o2.tool_starts, 0);

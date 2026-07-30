@@ -12,6 +12,7 @@ use crate::structured::StructuredStore;
 use crate::usage::UsageStore;
 
 use async_trait::async_trait;
+use base64::Engine;
 use openfang_types::agent::{AgentEntry, AgentId, SessionId};
 use openfang_types::config::MemoryConfig;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -23,7 +24,6 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use base64::Engine;
 use tracing::{info, warn};
 
 /// The unified memory substrate. Implements the `Memory` trait by delegating
@@ -750,7 +750,9 @@ impl MemorySubstrate {
         let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
 
         tokio::task::spawn_blocking(move || {
-            let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let db = conn
+                .lock()
+                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
             let mut stmt = db
                 .prepare(
                     "SELECT id, title, description, assigned_to, created_by, created_at, payload
@@ -1113,7 +1115,13 @@ mod tests {
 
         let title = format!("{WAKE_TASK_PREFIX}worker-b");
         substrate
-            .task_post_wake(&title, &env.message, Some("worker-b"), Some("orchestrator"), &payload)
+            .task_post_wake(
+                &title,
+                &env.message,
+                Some("worker-b"),
+                Some("orchestrator"),
+                &payload,
+            )
             .await
             .unwrap();
 
@@ -1143,7 +1151,13 @@ mod tests {
 
         // A regular collaboration task AND a wake, both assigned to worker-b.
         substrate
-            .task_post("Regular job", "do normal work", Some("worker-b"), Some("orchestrator"), b"")
+            .task_post(
+                "Regular job",
+                "do normal work",
+                Some("worker-b"),
+                Some("orchestrator"),
+                b"",
+            )
             .await
             .unwrap();
         substrate
@@ -1211,7 +1225,10 @@ mod tests {
                 &env.to_payload().unwrap(),
             )
             .await;
-        assert!(forged.is_err(), "ordinary task_post must reject a wake-prefixed title");
+        assert!(
+            forged.is_err(),
+            "ordinary task_post must reject a wake-prefixed title"
+        );
         // And nothing reached the wake queue.
         assert!(substrate.task_claim_wake(1_000).await.unwrap().is_none());
         // The privileged path still works.
@@ -1319,8 +1336,7 @@ mod tests {
 
         // --- Producer half: post the wake into a file-backed WAL substrate. ---
         {
-            let substrate =
-                MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+            let substrate = MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
             substrate
                 .task_post_wake(
                     &format!("{WAKE_TASK_PREFIX}worker-b"),
@@ -1335,8 +1351,7 @@ mod tests {
         }
 
         // --- Simulated daemon restart: reopen the SAME on-disk database. ---
-        let substrate =
-            MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+        let substrate = MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
 
         // --- Consumer half: the real dispatch-decode path claims it. ---
         let (task_id, decoded) = substrate
@@ -1361,6 +1376,10 @@ mod tests {
 
         // The claim flipped exactly one wake to in_progress; the queue is now
         // drained, so a second dispatch claim finds nothing.
-        assert!(substrate.claim_wake_for_dispatch(4).await.unwrap().is_none());
+        assert!(substrate
+            .claim_wake_for_dispatch(4)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

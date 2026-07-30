@@ -215,8 +215,7 @@ pub struct OpenFangKernel {
     /// agent onto this provider/model regardless of the agent's own `[model]`
     /// block (unlike `default_model_override`, which only fills default-provider
     /// agents). `None` means "no fleet override — use each agent's own model".
-    pub model_override:
-        std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
+    pub model_override: std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
     /// Per-agent message locks — serializes LLM calls for the same agent to prevent
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
@@ -246,8 +245,7 @@ pub struct OpenFangKernel {
     /// running agent here. `agent_msg_locks` guarantees one run per agent at a
     /// time, making this key race-free. Cleared on run exit by a drop guard.
     /// Audit/targeting metadata only — never an authz carrier.
-    pub active_run_origins:
-        dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+    pub active_run_origins: dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
     /// Discord coordinates of a surfaced approval prompt, keyed by approval id
     /// (ANAI-82 edit-on-resolve). Populated by `surface_approval_prompt` only
     /// when the adapter returned a message id (Discord), and read once by
@@ -2072,7 +2070,14 @@ impl OpenFangKernel {
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
         self.send_message_with_handle_and_blocks(
-            agent_id, message, handle, None, None, None, None, TurnPolicy::channel_delivery(),
+            agent_id,
+            message,
+            handle,
+            None,
+            None,
+            None,
+            None,
+            TurnPolicy::channel_delivery(),
             TurnTrigger::User,
         )
         .await
@@ -2119,7 +2124,8 @@ impl OpenFangKernel {
         // only, never an authz carrier.
         let mut origin = origin;
         let sender_id = origin.recipient.clone();
-        let sender_name = self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
+        let sender_name =
+            self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
         // Write the resolved authoritative name back onto the origin so the
         // ANAI-128 envelope (which reads `origin.sender_display_name` in the
         // agent loop) and §9.1 (which reads the `sender_name` param) show the
@@ -2186,7 +2192,8 @@ impl OpenFangKernel {
         // multimodal channel path too.
         let mut origin = origin;
         let sender_id = origin.recipient.clone();
-        let sender_name = self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
+        let sender_name =
+            self.resolve_authoritative_name(&sender_id, origin.sender_display_name.clone());
         // Keep the envelope speaker and §9.1 coherent — see the non-blocks path.
         origin.sender_display_name = sender_name.clone();
         self.send_message_with_handle_and_blocks(
@@ -3048,8 +3055,7 @@ impl OpenFangKernel {
         // Origin stays audit/targeting metadata; the bridge authorizes off the
         // daemon-issued agent identity, not this map.
         struct ActiveRunOriginGuard<'a> {
-            origins:
-                &'a dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
+            origins: &'a dashmap::DashMap<AgentId, openfang_types::approval::ApprovalOrigin>,
             agent_id: AgentId,
         }
         impl Drop for ActiveRunOriginGuard<'_> {
@@ -3399,10 +3405,8 @@ impl OpenFangKernel {
             info!(agent_id = %agent_id, path = "stream", "ANAI-118 channel turn dispatch");
             // No live client consumes the stream here; drain it so the bounded
             // sender never back-pressures the watchdog's per-event liveness check.
-            let (stream_tx, mut stream_rx) =
-                tokio::sync::mpsc::channel::<StreamEvent>(256);
-            let drain =
-                tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamEvent>(256);
+            let drain = tokio::spawn(async move { while stream_rx.recv().await.is_some() {} });
             let streamed = run_agent_loop_streaming(
                 &manifest,
                 &message_with_links,
@@ -5548,8 +5552,7 @@ impl OpenFangKernel {
         let kernel = Arc::clone(self);
         tokio::spawn(async move {
             // Poll faster than heartbeat — a queued wake should feel responsive.
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(500));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
                 if kernel.supervisor.is_shutting_down() {
@@ -6087,7 +6090,15 @@ impl OpenFangKernel {
                     let handle = Some(Arc::clone(&k) as Arc<dyn KernelHandle>);
                     match k
                         .send_message_with_handle_and_blocks(
-                            aid, &msg, handle, None, None, None, None, TurnPolicy::autonomous(), trigger,
+                            aid,
+                            &msg,
+                            handle,
+                            None,
+                            None,
+                            None,
+                            None,
+                            TurnPolicy::autonomous(),
+                            trigger,
                         )
                         .await
                     {

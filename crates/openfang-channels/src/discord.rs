@@ -6,8 +6,7 @@
 use crate::inbound_files::{self, DEFAULT_MAX_UPLOAD_BYTES};
 use crate::types::{
     split_message, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser,
-    InteractiveButton,
-    ResolutionError,
+    InteractiveButton, ResolutionError,
 };
 use async_trait::async_trait;
 use futures::{SinkExt, Stream, StreamExt};
@@ -1544,13 +1543,10 @@ impl ChannelAdapter for DiscordAdapter {
                                         continue;
                                     }
 
-                                    let interaction_id =
-                                        d["id"].as_str().unwrap_or("").to_string();
+                                    let interaction_id = d["id"].as_str().unwrap_or("").to_string();
                                     let interaction_token =
                                         d["token"].as_str().unwrap_or("").to_string();
-                                    if interaction_id.is_empty()
-                                        || interaction_token.is_empty()
-                                    {
+                                    if interaction_id.is_empty() || interaction_token.is_empty() {
                                         continue;
                                     }
 
@@ -1580,8 +1576,7 @@ impl ChannelAdapter for DiscordAdapter {
                                     // clicking user's identity is what gets gated,
                                     // server-side, by the same `classify_approver`
                                     // path the text `/approve` command uses.
-                                    let custom_id =
-                                        d["data"]["custom_id"].as_str().unwrap_or("");
+                                    let custom_id = d["data"]["custom_id"].as_str().unwrap_or("");
                                     let (approve, approval_id, scope_token) =
                                         match parse_approval_custom_id(custom_id) {
                                             Some(v) => v,
@@ -1598,8 +1593,7 @@ impl ChannelAdapter for DiscordAdapter {
                                     } else {
                                         &d["user"]
                                     };
-                                    let clicker_id =
-                                        user_obj["id"].as_str().unwrap_or("");
+                                    let clicker_id = user_obj["id"].as_str().unwrap_or("");
                                     if clicker_id.is_empty() {
                                         continue;
                                     }
@@ -1626,19 +1620,16 @@ impl ChannelAdapter for DiscordAdapter {
 
                                     let username =
                                         user_obj["username"].as_str().unwrap_or("Unknown");
-                                    let discriminator = user_obj["discriminator"]
-                                        .as_str()
-                                        .unwrap_or("0");
-                                    let display_name = if discriminator == "0"
-                                        || discriminator.is_empty()
-                                    {
-                                        username.to_string()
-                                    } else {
-                                        format!("{username}#{discriminator}")
-                                    };
+                                    let discriminator =
+                                        user_obj["discriminator"].as_str().unwrap_or("0");
+                                    let display_name =
+                                        if discriminator == "0" || discriminator.is_empty() {
+                                            username.to_string()
+                                        } else {
+                                            format!("{username}#{discriminator}")
+                                        };
 
-                                    let channel_id =
-                                        d["channel_id"].as_str().unwrap_or("");
+                                    let channel_id = d["channel_id"].as_str().unwrap_or("");
                                     if channel_id.is_empty() {
                                         continue;
                                     }
@@ -1862,7 +1853,8 @@ impl ChannelAdapter for DiscordAdapter {
                 self.api_send_message(channel_id, &text).await?;
             }
             ChannelContent::Interactive { text, buttons } => {
-                self.api_send_interactive(channel_id, &text, &buttons).await?;
+                self.api_send_interactive(channel_id, &text, &buttons)
+                    .await?;
             }
             ChannelContent::FileData {
                 data,
@@ -5181,8 +5173,7 @@ mod anai82_interactive_tests {
     fn parse_approval_custom_id_id_with_colons_is_first_segment_only() {
         // splitn(3) caps segments: a nonce containing a stray colon stays in
         // the third field and never corrupts the recovered id.
-        let (approve, id, scope) =
-            parse_approval_custom_id("ap:abc123:n0:extra").expect("parses");
+        let (approve, id, scope) = parse_approval_custom_id("ap:abc123:n0:extra").expect("parses");
         assert!(approve);
         assert_eq!(id, "abc123");
         assert_eq!(scope, None);

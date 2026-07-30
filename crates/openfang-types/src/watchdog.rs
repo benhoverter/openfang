@@ -140,7 +140,6 @@ pub fn stream_idle_timeout_secs() -> u64 {
         .max(STREAM_IDLE_TIMEOUT_FLOOR_SECS)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

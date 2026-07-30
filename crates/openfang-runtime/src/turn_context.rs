@@ -61,7 +61,9 @@ fn humanize(secs: i64) -> String {
 /// Seconds between `now` and an RFC3339 stamp, clamped to `>= 0`. `None` if the
 /// stamp is unparseable (defensive — the tables always write RFC3339).
 fn delta_secs(now: DateTime<Utc>, stamp: &str) -> Option<i64> {
-    let then = DateTime::parse_from_rfc3339(stamp).ok()?.with_timezone(&Utc);
+    let then = DateTime::parse_from_rfc3339(stamp)
+        .ok()?
+        .with_timezone(&Utc);
     Some((now - then).num_seconds().max(0))
 }
 

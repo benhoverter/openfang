@@ -775,7 +775,8 @@ mod tests {
     #[test]
     fn test_channel_binding_section_rendered_when_set() {
         let mut ctx = basic_ctx();
-        ctx.channel_binding = Some("the discord channel (channel_id 1515100439031451789)".to_string());
+        ctx.channel_binding =
+            Some("the discord channel (channel_id 1515100439031451789)".to_string());
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Channel Binding"));
         assert!(prompt.contains("channel_id 1515100439031451789"));

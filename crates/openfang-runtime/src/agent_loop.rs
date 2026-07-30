@@ -15,9 +15,9 @@ use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
+use openfang_memory::capture::should_capture_turn;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
-use openfang_memory::capture::should_capture_turn;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::{AgentManifest, FallbackModel};
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -76,9 +76,7 @@ fn tool_timeout_for(tool_name: &str) -> Option<Duration> {
         }
         // MCP tools (esp. remote SSE) get their own ceiling, distinct from the
         // generic tool default. Resolver layers env > [watchdog] config > default.
-        name if crate::mcp::is_mcp_tool(name) => {
-            openfang_types::watchdog::mcp_tool_timeout_secs()
-        }
+        name if crate::mcp::is_mcp_tool(name) => openfang_types::watchdog::mcp_tool_timeout_secs(),
         _ => env_timeout_secs("OPENFANG_TOOL_TIMEOUT_SECS").unwrap_or(TOOL_TIMEOUT_SECS),
     };
     if secs == 0 {
@@ -1685,8 +1683,8 @@ fn stream_idle_retry_delay_ms(attempt: u32) -> u64 {
         .wrapping_mul(2_654_435_761)
         .wrapping_add(u64::from(attempt).wrapping_mul(40_503));
     let offset = seed % (band + 1); // 0..=band
-    // base - band/2 == 0.75*base (no underflow) + offset in 0..=band
-    // => result in [0.75*base, 1.25*base].
+                                    // base - band/2 == 0.75*base (no underflow) + offset in 0..=band
+                                    // => result in [0.75*base, 1.25*base].
     base - band / 2 + offset
 }
 
@@ -1863,43 +1861,44 @@ async fn stream_with_retry(
         // `stream_with_idle_watchdog`, so every driver (not just CC) gets
         // slow-but-alive-vs-dead discrimination and the bounded `StreamIdleStall`
         // retry below. Terminal on absolute elapse: provider stall.
-        let stream_result = match tokio::time::timeout(
-            std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
-            stream_with_idle_watchdog(
-                driver,
-                request.clone(),
-                tx.clone(),
-                std::time::Duration::from_secs(
-                    openfang_types::watchdog::stream_idle_timeout_secs(),
+        let stream_result =
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(openfang_types::watchdog::llm_call_timeout_secs()),
+                stream_with_idle_watchdog(
+                    driver,
+                    request.clone(),
+                    tx.clone(),
+                    std::time::Duration::from_secs(
+                        openfang_types::watchdog::stream_idle_timeout_secs(),
+                    ),
+                    // ANAI-119: active window while a tool runs in the subprocess.
+                    // `mcp_tool_timeout_secs == 0` disables the bound (None) -> the
+                    // tool runs without an idle deadline, capped only by the
+                    // absolute `llm_call_timeout_secs` ceiling wrapping this call.
+                    match openfang_types::watchdog::mcp_tool_timeout_secs() {
+                        0 => None,
+                        secs => Some(std::time::Duration::from_secs(secs)),
+                    },
                 ),
-                // ANAI-119: active window while a tool runs in the subprocess.
-                // `mcp_tool_timeout_secs == 0` disables the bound (None) -> the
-                // tool runs without an idle deadline, capped only by the
-                // absolute `llm_call_timeout_secs` ceiling wrapping this call.
-                match openfang_types::watchdog::mcp_tool_timeout_secs() {
-                    0 => None,
-                    secs => Some(std::time::Duration::from_secs(secs)),
-                },
-            ),
-        )
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
-                    cooldown.record_failure(provider, false);
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
+                        cooldown.record_failure(provider, false);
+                    }
+                    warn!(
+                        timeout_secs = openfang_types::watchdog::llm_call_timeout_secs(),
+                        "LLM stream exceeded watchdog ceiling; aborting turn (provider stall)"
+                    );
+                    return Err(OpenFangError::LlmDriver(format!(
+                        "{}: no response within {}s",
+                        openfang_types::watchdog::PROVIDER_STALL_MARKER,
+                        openfang_types::watchdog::llm_call_timeout_secs()
+                    )));
                 }
-                warn!(
-                    timeout_secs = openfang_types::watchdog::llm_call_timeout_secs(),
-                    "LLM stream exceeded watchdog ceiling; aborting turn (provider stall)"
-                );
-                return Err(OpenFangError::LlmDriver(format!(
-                    "{}: no response within {}s",
-                    openfang_types::watchdog::PROVIDER_STALL_MARKER,
-                    openfang_types::watchdog::llm_call_timeout_secs()
-                )));
-            }
-        };
+            };
         match stream_result {
             Ok(response) => {
                 if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
@@ -3958,10 +3957,7 @@ mod tests {
     }
     #[async_trait]
     impl LlmDriver for IdleStallThenOkDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("ANAI-115 test exercises the stream path only")
         }
         async fn stream(
@@ -3997,10 +3993,7 @@ mod tests {
     }
     #[async_trait]
     impl LlmDriver for AlwaysApiErrorDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("ANAI-115 test exercises the stream path only")
         }
         async fn stream(
@@ -4099,10 +4092,7 @@ mod tests {
     struct SilentHangDriver;
     #[async_trait]
     impl LlmDriver for SilentHangDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("ANAI-116 test exercises the stream path only")
         }
         async fn stream(
@@ -4122,10 +4112,7 @@ mod tests {
     struct AliveStreamDriver;
     #[async_trait]
     impl LlmDriver for AliveStreamDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("ANAI-116 test exercises the stream path only")
         }
         async fn stream(
@@ -4212,10 +4199,7 @@ mod tests {
     struct ToolInFlightDriver;
     #[async_trait]
     impl LlmDriver for ToolInFlightDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("tool-in-flight test exercises the stream path only")
         }
         async fn stream(
@@ -4283,10 +4267,7 @@ mod tests {
     struct SilentGapDriver;
     #[async_trait]
     impl LlmDriver for SilentGapDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("silent-gap test exercises the stream path only")
         }
         async fn stream(
@@ -4993,17 +4974,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5051,17 +5032,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5111,17 +5092,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5169,17 +5150,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5220,17 +5201,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
         )
@@ -5360,12 +5341,12 @@ mod tests {
             None,
             None,
             None,
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5412,12 +5393,12 @@ mod tests {
             None,
             None,
             None,
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -5467,17 +5448,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
         )
@@ -6456,17 +6437,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -6615,10 +6596,10 @@ mod tests {
             None,
             None,
             None,
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -6676,17 +6657,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // suppress_phantom_guard
             TurnTrigger::User,
         )
@@ -6833,9 +6814,9 @@ mod tests {
             None,  // context_window_tokens
             None,  // process_manager
             None,  // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // text_reply_is_delivery
             TurnTrigger::User,
         )
@@ -6927,10 +6908,7 @@ mod tests {
 
     #[async_trait]
     impl LlmDriver for StreamingPhantomShapedDriver {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> Result<CompletionResponse, LlmError> {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
             unreachable!("ANAI-118 streaming guard test exercises the stream path only")
         }
         async fn stream(
@@ -7000,17 +6978,17 @@ mod tests {
             None,
             None,
             None,
-            None, // on_phase
-            None, // media_engine
-            None, // tts_engine
-            None, // docker_config
-            None, // hooks
-            None, // context_window_tokens
-            None, // process_manager
-            None, // user_content_blocks
-            None, // sender_id
-            None, // sender_name
-            None, // origin
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
             false, // suppress_phantom_guard -- woken turn: guard must fire
             TurnTrigger::User,
         )

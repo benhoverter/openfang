@@ -753,7 +753,6 @@ mod tests {
     }
 }
 
-
 /// A single button in a [`ChannelContent::Interactive`] action row.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractiveButton {

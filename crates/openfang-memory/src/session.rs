@@ -1085,7 +1085,10 @@ mod tests {
         store
             .upsert_identity_binding("snow_teo", "Teo", Some("Ben's son"))
             .unwrap();
-        assert_eq!(store.resolve_identity("snow_teo").unwrap().as_deref(), Some("Teo"));
+        assert_eq!(
+            store.resolve_identity("snow_teo").unwrap().as_deref(),
+            Some("Teo")
+        );
 
         // Re-bind overwrites cleanly (a kid's global_name can never beat this).
         store

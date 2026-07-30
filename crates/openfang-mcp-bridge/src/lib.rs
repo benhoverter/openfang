@@ -202,8 +202,12 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
 /// Drift-pin: the `bridge_ipc::allowlist_*` tests assert that every entry
 /// here is **present** in `ALLOWED_TOOLS` and `built_in_tools()` and
 /// **absent** from `DEFAULT_ALLOWED`.
-pub const PRIVILEGED_DEFAULT_DENY: &[&str] =
-    &["agent_spawn", "agent_kill", "agent_activate", "agent_send_async"];
+pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
+    "agent_spawn",
+    "agent_kill",
+    "agent_activate",
+    "agent_send_async",
+];
 
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;

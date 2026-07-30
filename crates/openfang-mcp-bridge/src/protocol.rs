@@ -77,9 +77,7 @@ pub enum HelloAck {
         convert_options_schema: Option<serde_json::Value>,
     },
     /// Connection rejected. Bridge should log and exit.
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
 }
 
 /// Bridge → daemon: a single tool call request.

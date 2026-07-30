@@ -404,9 +404,7 @@ impl WorkflowEngine {
                             // provider. Stop now and surface the failure instead
                             // of burning the remaining retries on a guaranteed
                             // re-stall. (Other errors retry as before.)
-                            if last_err
-                                .contains(openfang_types::watchdog::PROVIDER_STALL_MARKER)
-                            {
+                            if last_err.contains(openfang_types::watchdog::PROVIDER_STALL_MARKER) {
                                 warn!(
                                     "Step '{}' hit a provider stall; not retrying (terminal)",
                                     step.name

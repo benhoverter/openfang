@@ -2055,7 +2055,6 @@ async fn tool_file_convert_in(
         }
     };
 
-
     // §5.1 path validation: both paths must resolve INSIDE the workspace.
     // resolve_sandbox_path rejects `..`, absolute escape, and symlink escape;
     // the input must exist and the output's parent directory must exist.
@@ -2113,9 +2112,7 @@ async fn tool_file_convert_in(
                         return Ok(convert_err(
                             to,
                             "UNKNOWN_OPTION",
-                            &format!(
-                                "unknown option '{key}' for '{from}'->'{to}'. Valid: {valid}"
-                            ),
+                            &format!("unknown option '{key}' for '{from}'->'{to}'. Valid: {valid}"),
                         ));
                     }
                 };
@@ -2617,7 +2614,9 @@ async fn tool_shell_exec(
             ))
         }
         Ok(Err(e)) => Err(format!("Failed to execute command: {e}")),
-        Err(_) => Err(format!("Command timed out after {timeout_secs}s (process killed)")),
+        Err(_) => Err(format!(
+            "Command timed out after {timeout_secs}s (process killed)"
+        )),
     }
 }
 
@@ -5142,7 +5141,10 @@ mod tests {
         // is a cycle — identical to v1 behavior for channel / cron / API turns.
         let base = resolve_wake_base_lineage("agent-a");
         assert_eq!(base.as_slice(), &["agent-a"]);
-        assert!(base.would_cycle("agent-a"), "self-wake must still be a cycle");
+        assert!(
+            base.would_cycle("agent-a"),
+            "self-wake must still be a cycle"
+        );
         assert!(!base.would_cycle("agent-b"));
     }
 
@@ -5150,8 +5152,7 @@ mod tests {
     async fn wake_lineage_present_extends_real_inbound_chain() {
         // Woken turn A -> B: run_woken_agent_loop scoped the inbound chain
         // [a, b] whose `current` (b) is this agent, which is also `sender`.
-        let inbound =
-            openfang_types::wake::WakeLineage::from_agents(vec!["a".into(), "b".into()]);
+        let inbound = openfang_types::wake::WakeLineage::from_agents(vec!["a".into(), "b".into()]);
         WAKE_LINEAGE
             .scope(inbound, async {
                 let base = resolve_wake_base_lineage("b");
@@ -5172,7 +5173,10 @@ mod tests {
         // bound, so the producer's `exceeds_depth` check refuses the wake —
         // depth now accrues across agents instead of resetting to 1 each hop.
         let inbound = openfang_types::wake::WakeLineage::from_agents(
-            vec!["a", "b", "c", "d"].into_iter().map(String::from).collect(),
+            vec!["a", "b", "c", "d"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         );
         WAKE_LINEAGE
             .scope(inbound, async {
@@ -5219,12 +5223,11 @@ mod tests {
         // exactly the out-of-process bridge-IPC handler task — and prove the
         // right is served from the kernel-handle registry, then consumed
         // one-shot.
-        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(
-            FakeKernelHandle::new().with_reply_right(
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> =
+            Arc::new(FakeKernelHandle::new().with_reply_right(
                 "callee-agent",
                 ReplyRight::new("origin-agent", "corr-1", None),
-            ),
-        );
+            ));
         let input = serde_json::json!({ "message": "here is my answer" });
 
         // ANAI-122: the first call reaches the real emit path (`wake_emit_admit`),
@@ -5265,8 +5268,7 @@ mod tests {
         // kernel-handle lookup returns `None`, so the tool is INERT and refuses.
         // This is the default-safe property that lets it live in DEFAULT_ALLOWED
         // without a manifest grant.
-        let handle: Arc<dyn crate::kernel_handle::KernelHandle> =
-            Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
         let input = serde_json::json!({ "message": "no right here" });
         let result = tool_agent_reply_async(&input, Some(&handle), Some("some-agent")).await;
         let err = result.expect_err("without a minted right the tool must refuse");
@@ -5307,7 +5309,10 @@ mod tests {
         let budget = openfang_types::agent_wake::tree_budget_max();
         let root = "root-fanout-tree-under-test";
         for i in 0..budget {
-            assert!(wake_tree_admit(root), "tree emission {i} should be admitted");
+            assert!(
+                wake_tree_admit(root),
+                "tree emission {i} should be admitted"
+            );
         }
         // Over budget for this root -> refused...
         assert!(
@@ -7332,7 +7337,11 @@ mod convert_dispatch_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
         let log = read_argv_log(ws.path(), "note.txt");
         assert!(log.lines().any(|l| l == "MOBILEVP"), "argv log: {log}");
         assert!(!log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
@@ -7351,7 +7360,11 @@ mod convert_dispatch_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
         let log = read_argv_log(ws.path(), "note.txt");
         assert!(log.lines().any(|l| l == "DESKTOPVP"), "argv log: {log}");
     }
@@ -7388,7 +7401,11 @@ mod convert_dispatch_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&out)["error"]["code"], "UNKNOWN_PRESET", "envelope: {out}");
+        assert_eq!(
+            parse(&out)["error"]["code"],
+            "UNKNOWN_PRESET",
+            "envelope: {out}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -7461,7 +7478,10 @@ mod convert_dispatch_tests {
         assert_eq!(v["ok"], serde_json::json!(false));
         assert_eq!(v["error"]["code"], "INVALID_OPTION", "envelope: {out}");
         let msg = v["error"]["message"].as_str().unwrap();
-        assert!(msg.contains("portrait") && msg.contains("landscape"), "message: {msg}");
+        assert!(
+            msg.contains("portrait") && msg.contains("landscape"),
+            "message: {msg}"
+        );
     }
 
     #[cfg(unix)]
@@ -7477,7 +7497,11 @@ mod convert_dispatch_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
         let log = read_argv_log(ws.path(), "note.txt");
         // Enum default applied; preset default applied; no token survives.
         assert!(log.lines().any(|l| l == "portrait"), "argv log: {log}");
@@ -7503,14 +7527,21 @@ mod convert_dispatch_tests {
         )
         .await
         .unwrap();
-        assert_eq!(parse(&out)["ok"], serde_json::json!(true), "envelope: {out}");
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
         let log = read_argv_log(ws.path(), "note.txt");
         // Caller option value overrides the default; string option flows through;
         // the chosen preset var lands in the same argv.
         assert!(log.lines().any(|l| l == "landscape"), "argv log: {log}");
         assert!(log.lines().any(|l| l == "Iosevka"), "argv log: {log}");
         assert!(log.lines().any(|l| l == "MOBILEVP"), "argv log: {log}");
-        assert!(!log.lines().any(|l| l == "portrait"), "default leaked: {log}");
+        assert!(
+            !log.lines().any(|l| l == "portrait"),
+            "default leaked: {log}"
+        );
     }
 
     #[test]

@@ -2789,7 +2789,10 @@ mod tests {
         assert_eq!(received.len(), 1);
         match &received[0] {
             ChannelContent::Text(t) => {
-                assert!(t.contains("/approve abc123"), "text body must survive degrade");
+                assert!(
+                    t.contains("/approve abc123"),
+                    "text body must survive degrade"
+                );
             }
             other => panic!("expected degraded Text, got {other:?}"),
         }

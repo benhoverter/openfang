@@ -303,7 +303,10 @@ mod tests {
         assert!(chain.exceeds_depth(DEFAULT_MAX_WAKE_DEPTH));
         // one shorter is still under the bound
         let shorter = WakeLineage::from_agents(
-            vec!["a", "b", "c", "d"].into_iter().map(String::from).collect(),
+            vec!["a", "b", "c", "d"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         );
         assert!(!shorter.exceeds_depth(DEFAULT_MAX_WAKE_DEPTH));
     }
@@ -351,7 +354,10 @@ mod tests {
         };
         let json = serde_json::to_string(&env).unwrap();
         // origin is skipped on the wire when absent...
-        assert!(!json.contains("origin"), "None origin must be omitted: {json}");
+        assert!(
+            !json.contains("origin"),
+            "None origin must be omitted: {json}"
+        );
         // is_reply is likewise skipped when false — the default wake shape.
         assert!(
             !json.contains("is_reply"),
@@ -367,7 +373,10 @@ mod tests {
             !json.contains("surface_to"),
             "None surface_to must be omitted: {json}"
         );
-        assert_eq!(back.surface_to, None, "absent surface_to must decode to None");
+        assert_eq!(
+            back.surface_to, None,
+            "absent surface_to must decode to None"
+        );
     }
 
     #[test]
@@ -386,7 +395,10 @@ mod tests {
             surface_to: Some("discord:1086446153098342510".into()),
         };
         let json = serde_json::to_string(&env).unwrap();
-        assert!(json.contains("is_reply"), "true is_reply must serialize: {json}");
+        assert!(
+            json.contains("is_reply"),
+            "true is_reply must serialize: {json}"
+        );
         let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
         assert_eq!(env, back);
         assert!(back.is_reply);

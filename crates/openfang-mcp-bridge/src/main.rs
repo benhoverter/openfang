@@ -164,10 +164,7 @@ async fn main() -> Result<()> {
 
 /// Send Hello, await HelloAck. Errors on rejection or wire issues.
 #[cfg(unix)]
-async fn handshake(
-    stream: &mut UnixStream,
-    token: &str,
-) -> Result<Option<serde_json::Value>> {
+async fn handshake(stream: &mut UnixStream, token: &str) -> Result<Option<serde_json::Value>> {
     let (read_half, mut write_half) = stream.split();
     let mut read_half = BufReader::new(read_half);
 
