@@ -572,7 +572,10 @@ URL:
 Local copy (read it with file_read / file_convert): /Users/you/.openfang/tmp/files/9f3c...__report.pdf
 ```
 
-Agents can then use `file_read` / `file_convert` directly. Without this, the
+Agents can then use `file_read` / `file_convert` directly, and agents on the
+Claude Code driver can use the native `Read` tool (which handles PDFs and
+images natively) — the driver grants and guards `~/.openfang/tmp/files/`
+alongside the image tmpdir. Without this, the
 signed CDN URL is effectively unusable from an agent: it contains `&`, which
 the shell metacharacter floor blocks, so there is no way to fetch the bytes.
 

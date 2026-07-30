@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
+use openfang_types::paths::file_tmp_dir;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -161,10 +162,10 @@ const CC_NATIVE_DENY: &[&str] = &[
     // Filesystem read/write.
     //
     // `Read` is intentionally NOT in this list. It's gated by a per-spawn
-    // PreToolUse hook (`CC_READ_GUARD_SCRIPT`) that scopes it to the image
-    // tmpfile dir only — required for vision (drivers materialize image
-    // bytes to disk and the directive points the model at the native Read
-    // tool). See `projects/openfang-fork/vision-cc-read-deny.md` for why
+    // PreToolUse hook (`CC_READ_GUARD_SCRIPT`) that scopes it to the
+    // driver-managed materialization dirs only (`cc_read_allowed_prefixes`:
+    // image tmpfiles for vision, inbound-file tmpfiles for attachments).
+    // See `projects/openfang-fork/vision-cc-read-deny.md` for why
     // a path-scoped allow rule can't substitute (CC deny precedence is
     // absolute; an allow can never rescue a denied tool).
     "Write",
@@ -211,9 +212,16 @@ const CC_READ_GUARD_HOOK_MATCHER: &str = "Read";
 /// payload on stdin, canonicalizes it through `os.path.realpath` (which
 /// resolves symlinks and `..` segments without requiring the target to
 /// exist), and exits `0` iff the canonical target falls under the
-/// canonical `ALLOWED_PREFIX` passed as `argv[1]`. Otherwise it exits `2`
-/// with a reason on stderr — per CC's hook contract, exit `2` blocks the
-/// tool call and surfaces stderr to the model.
+/// canonical form of **any** allowed prefix passed in `argv[1:]`.
+/// Otherwise it exits `2` with a reason on stderr — per CC's hook contract,
+/// exit `2` blocks the tool call and surfaces stderr to the model.
+///
+/// The prefix list (not a single prefix) is ANAI-137a: the runtime
+/// materializes inbound **images** under `image_tmp_dir()` and inbound
+/// **files** under `openfang_types::paths::file_tmp_dir()`. A one-prefix
+/// guard makes the second dir unreadable, which is exactly the bug ANAI-137
+/// surfaced — the bytes land on disk and nothing can open them. Prefixes are
+/// supplied by the materialization site, never by the model.
 ///
 /// Why a hook and not a path-scoped allow rule: CC deny precedence is
 /// absolute (deny -> ask -> allow; first match wins; an allow can never
@@ -241,10 +249,10 @@ const CC_READ_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 
 Invoked per `Read` call by Claude Code. Reads the hook JSON payload from
 stdin, pulls `tool_input.file_path`, canonicalizes both it and the
-`ALLOWED_PREFIX` arg via `os.path.realpath`, and exits 0 iff the target
-resolves under the prefix. Exit 2 (with stderr) on anything else — CC's
-hook contract treats exit 2 as a hard block and surfaces stderr to the
-model so the denial has a reason attached.
+allowed prefixes in `argv[1:]` via `os.path.realpath`, and exits 0 iff the
+target resolves under at least one of them. Exit 2 (with stderr) on anything
+else — CC's hook contract treats exit 2 as a hard block and surfaces stderr
+to the model so the denial has a reason attached.
 """
 import json
 import os
@@ -257,9 +265,13 @@ def _die(msg):
 
 
 def main():
-    if len(sys.argv) < 2 or not sys.argv[1]:
+    # argv[1:] is the allowed-prefix list. Empty strings are dropped so a
+    # stray quoted-empty arg can never widen the guard to "" (which every
+    # path would startswith-match). No usable prefix at all denies
+    # everything, the safe direction for a fail-closed guard.
+    allowed = [a for a in sys.argv[1:] if a]
+    if not allowed:
         _die("missing ALLOWED_PREFIX arg")
-    allowed = sys.argv[1]
 
     try:
         payload = json.load(sys.stdin)
@@ -271,16 +283,17 @@ def main():
     if not file_path:
         _die("tool_input.file_path missing or empty")
 
-    canon_allowed = os.path.realpath(os.path.expanduser(allowed))
+    canon_allowed = [os.path.realpath(os.path.expanduser(a)) for a in allowed]
     canon_target = os.path.realpath(os.path.expanduser(file_path))
 
     # Trailing-sep test so /tmp/images doesn't accidentally accept
     # /tmp/images-evil/foo. Equality also accepted so a Read of the dir
     # itself (rare, but valid) doesn't false-negative.
-    if canon_target == canon_allowed or canon_target.startswith(canon_allowed + os.sep):
-        sys.exit(0)
+    for prefix in canon_allowed:
+        if canon_target == prefix or canon_target.startswith(prefix + os.sep):
+            sys.exit(0)
 
-    _die("Read denied: " + canon_target + " not under " + canon_allowed)
+    _die("Read denied: " + canon_target + " not under any of " + ", ".join(canon_allowed))
 
 
 if __name__ == "__main__":
@@ -902,6 +915,24 @@ fn build_cc_settings_value(
     serde_json::Value::Object(root)
 }
 
+/// Directories the native `Read` tool is permitted to reach, in the order
+/// they are passed to the guard script and to `--add-dir`.
+///
+/// Two entries, both driver-managed materialization sinks outside the agent
+/// workspace:
+/// - [`image_tmp_dir`] — inbound images, for the vision path.
+/// - [`file_tmp_dir`] — inbound non-image attachments (ANAI-137). Before
+///   ANAI-137a this dir was absent from the guard, so materialized PDFs and
+///   other files landed on disk and every `Read` of them was hard-denied.
+///
+/// Single source for both the guard args and the `--add-dir` grants so the
+/// two can't drift: a dir in one and not the other is a silent half-failure
+/// (CC refuses the path, or the guard blocks it, depending which half is
+/// missing).
+fn cc_read_allowed_prefixes() -> Vec<PathBuf> {
+    vec![image_tmp_dir(), file_tmp_dir()]
+}
+
 /// Materialize a per-spawn CC settings file containing the OpenFang deny
 /// set, returning an RAII handle that removes the file on drop.
 ///
@@ -940,13 +971,13 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
 
     // Write the guard script first; if this fails we don't want a
     // settings file pointing at a non-existent hook command. 0700 on
-    // unix: executable by us only. Hook script path + image-dir arg are
-    // both quoted with the python interpreter explicit so the command
+    // unix: executable by us only. Hook script path + each allowed-prefix
+    // arg are quoted with the python interpreter explicit so the command
     // works whether or not the script ends up `+x` on the host fs
     // (belt + suspenders: chmod below sets the bit; the explicit
     // `python3` here makes the deps obvious in audits and decouples the
     // command from fs-mode races).
-    let allowed_prefix = image_tmp_dir();
+    let allowed_prefixes = cc_read_allowed_prefixes();
     if let Err(e) = std::fs::write(&guard_path, CC_READ_GUARD_SCRIPT) {
         warn!(error = %e, path = %guard_path.display(), "failed to write CC read-guard script");
         return None;
@@ -969,11 +1000,13 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     // single-quote both args to neutralize any unlikely metacharacters
     // in the socket-dir path (it lives under `~/.openfang/run` by
     // convention; no spaces today, but we don't want to depend on that).
-    let read_hook_cmd = format!(
-        "python3 '{}' '{}'",
-        guard_path.display(),
-        allowed_prefix.display(),
-    );
+    let read_hook_cmd = {
+        let mut c = format!("python3 '{}'", guard_path.display());
+        for prefix in &allowed_prefixes {
+            c.push_str(&format!(" '{}'", prefix.display()));
+        }
+        c
+    };
 
     // Write the tool-observation appender script (ANAI-77x). Same 0700 +
     // explicit-python3 treatment as the guard. On failure we skip the
@@ -1040,7 +1073,11 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
         agent_id = %caller_agent_id.unwrap_or("<none>"),
         settings = %path.display(),
         guard = %guard_path.display(),
-        allowed_prefix = %allowed_prefix.display(),
+        allowed_prefixes = %allowed_prefixes
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         deny_count = CC_NATIVE_DENY.len(),
         observe_wired,
         "materialized CC --settings deny set + Read guard hook + observe hook"
@@ -1537,13 +1574,17 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
-        // Grant the CLI's Read tool access to our image tmp dir, which lives
-        // outside the agent's workspace cwd. Without --add-dir the CLI would
-        // refuse Read on `$HOME/.openfang/tmp/images/*` (unless
+        // Grant the CLI's Read tool access to our materialization dirs
+        // (images + inbound files), which live outside the agent's workspace
+        // cwd. Without --add-dir the CLI would refuse Read on
+        // `$HOME/.openfang/tmp/{images,files}/*` (unless
         // --dangerously-skip-permissions is set) and the materialization would
-        // be a dead-end. Cheap and idempotent — the dir is per-user and
-        // content-addressed.
-        cmd.arg("--add-dir").arg(image_tmp_dir());
+        // be a dead-end. Cheap and idempotent — the dirs are per-user and
+        // content-addressed. Same list the read-guard is given, by
+        // construction (`cc_read_allowed_prefixes`).
+        for dir in cc_read_allowed_prefixes() {
+            cmd.arg("--add-dir").arg(dir);
+        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -1785,8 +1826,10 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
-        // Same image-tmp-dir grant as the non-streaming path; see complete().
-        cmd.arg("--add-dir").arg(image_tmp_dir());
+        // Same tmp-dir grants as the non-streaming path; see complete().
+        for dir in cc_read_allowed_prefixes() {
+            cmd.arg("--add-dir").arg(dir);
+        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -2688,7 +2731,7 @@ mod tests {
 
         // Core dangerous tools — the load-bearing reason for this commit.
         // Note: `Read` is intentionally absent. It's gated by a PreToolUse
-        // hook (`CC_READ_GUARD_SCRIPT`) scoped to the image tmpfile dir,
+        // hook (`CC_READ_GUARD_SCRIPT`) scoped to the driver tmpfile dirs,
         // not by deny — see vision-cc-read-deny.md for why deny-then-allow
         // can't scope `Read`.
         for must_deny in [
@@ -2838,8 +2881,8 @@ mod tests {
             "guard script must lead with a python3 shebang"
         );
         assert!(
-            CC_READ_GUARD_SCRIPT.contains("sys.argv[1]"),
-            "guard script must read ALLOWED_PREFIX from argv[1]"
+            CC_READ_GUARD_SCRIPT.contains("sys.argv[1:]"),
+            "guard script must read the ALLOWED_PREFIX list from argv[1:]"
         );
         assert!(
             CC_READ_GUARD_SCRIPT.contains("json.load(sys.stdin)"),
@@ -2853,6 +2896,56 @@ mod tests {
             CC_READ_GUARD_SCRIPT.contains("sys.exit(2)") || CC_READ_GUARD_SCRIPT.contains("_die"),
             "guard script must exit 2 on denial (CC contract for blocking PreToolUse)"
         );
+    }
+
+    #[test]
+    fn test_cc_read_allowed_prefixes_covers_images_and_files() {
+        // ANAI-137a regression pin. The guard and `--add-dir` both consume
+        // this list; if the inbound-file dir falls out, materialized PDFs
+        // land on disk and every Read of them is hard-denied — the exact
+        // failure ANAI-137's smoke test surfaced.
+        let prefixes = cc_read_allowed_prefixes();
+        assert_eq!(prefixes.len(), 2, "expected image + file tmp dirs");
+        assert!(
+            prefixes.contains(&image_tmp_dir()),
+            "image tmp dir must stay allowed (vision path)"
+        );
+        assert!(
+            prefixes.contains(&file_tmp_dir()),
+            "inbound-file tmp dir must be allowed (ANAI-137 materialization)"
+        );
+        for p in &prefixes {
+            assert!(p.is_absolute(), "prefix must be absolute: {p:?}");
+            assert!(
+                !p.as_os_str().is_empty(),
+                "empty prefix would widen the guard to everything"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_guard_hook_cmd_quotes_every_prefix() {
+        // The hook command is built by string concatenation, so the
+        // quoting-per-arg property is worth pinning: one `'...'` group per
+        // prefix, plus the script path itself.
+        let guard_path = std::path::Path::new("/tmp/of-test/cc-read-guard-x.py");
+        let prefixes = cc_read_allowed_prefixes();
+        let mut cmd = format!("python3 '{}'", guard_path.display());
+        for prefix in &prefixes {
+            cmd.push_str(&format!(" '{}'", prefix.display()));
+        }
+        assert_eq!(
+            cmd.matches('\'').count(),
+            2 * (prefixes.len() + 1),
+            "every arg must be single-quoted: {cmd}"
+        );
+        for prefix in &prefixes {
+            assert!(
+                cmd.contains(&format!("'{}'", prefix.display())),
+                "prefix missing from hook cmd: {}",
+                prefix.display()
+            );
+        }
     }
 
     #[test]

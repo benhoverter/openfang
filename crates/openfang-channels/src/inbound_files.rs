@@ -71,30 +71,19 @@ const MAX_EXT_LEN: usize = 16;
 /// One-shot guard so the TTL sweep only fires once per process.
 static FILE_TMP_SWEEP_ONCE: Once = Once::new();
 
-/// Resolve the directory used for materializing inbound file attachments:
-/// `$HOME/.openfang/tmp/files` (or `%USERPROFILE%\.openfang\tmp\files`).
+/// Re-export of the canonical inbound-file tmpdir resolver.
 ///
-/// Falls back to the OS temp dir when neither `$HOME` nor `%USERPROFILE%` is
-/// set. `HOME` → `USERPROFILE` order matches the convention used by
-/// `image_cache::image_tmp_dir` and `drivers/mod.rs`.
+/// The definition moved to `openfang_types::paths` in ANAI-137a because the
+/// runtime's Claude Code read-guard has to grant read access to this exact
+/// directory, and `openfang-runtime` does not depend on `openfang-channels`.
+/// One resolver, two consumers — a duplicated copy is how the materializer
+/// and the read-guard end up pointing at different dirs.
 ///
 /// Note: this path already existed on deployed boxes as a **vestigial** dir —
 /// something stubbed it long ago and never wired it up (grep for `tmp/files`
 /// across the tree pre-ANAI-137 returned zero hits). This module is what
 /// finally makes it live.
-pub fn file_tmp_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        let mut p = PathBuf::from(home);
-        p.push(".openfang");
-        p.push("tmp");
-        p.push("files");
-        p
-    } else {
-        let mut p = std::env::temp_dir();
-        p.push("openfang-files");
-        p
-    }
-}
+pub use openfang_types::paths::file_tmp_dir;
 
 /// Write `bytes` to a content-addressed file under `dir` and return its path.
 ///
