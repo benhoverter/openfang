@@ -77,6 +77,23 @@ pub const MAX_INFLIGHT_WAKES: usize = 8;
 /// through [`per_caller_max`].
 pub const WAKE_PER_CALLER_MAX: usize = 4;
 
+/// Default stale-claim timeout, in seconds (ANAI-147 defect 2): how long a wake
+/// may sit `in_progress` before the kernel's stale-wake reaper concludes its
+/// dispatcher is dead and fails it closed, freeing the caller's
+/// [`WAKE_PER_CALLER_MAX`] slot.
+///
+/// The per-caller cap is a *concurrency* limit whose slots are released only by
+/// `task_complete`. A dispatcher that dies without completing (process restart,
+/// panicked detached task, wedged agent loop) leaks its slot permanently, and
+/// `per_caller_max` such leaks wedge that caller's queue forever. The boot
+/// reaper handles the restart case; this timeout handles every other one.
+///
+/// One hour: far above any legitimate woken turn (the `[watchdog]` ceilings bound
+/// a real turn to minutes), so a live loop is never reaped out from under itself.
+/// Tune via `[agent_wake] stale_wake_secs` or `OPENFANG_AGENT_WAKE_STALE_SECS`;
+/// read through [`stale_wake_secs`].
+pub const WAKE_STALE_SECS: u64 = 3600;
+
 /// Floor for every resolved limit. `0` for any of these is a footgun — a zero
 /// ceiling/budget refuses all wakes, a zero window degenerates eviction, a zero
 /// permit count stalls the wake-consumer forever — so a fat-fingered value is
@@ -97,6 +114,9 @@ pub struct AgentWakeLimits {
     pub max_inflight: usize,
     /// Max concurrently in-flight woken agent loops attributable to one caller.
     pub per_caller_max: usize,
+    /// Seconds a wake may sit `in_progress` before the stale-claim reaper
+    /// fails it closed.
+    pub stale_wake_secs: u64,
 }
 
 static INSTALLED: std::sync::OnceLock<AgentWakeLimits> = std::sync::OnceLock::new();
@@ -179,6 +199,19 @@ pub fn per_caller_max() -> usize {
         .max(LIMIT_FLOOR as usize)
 }
 
+/// Resolved stale-claim timeout for in-flight wakes, in seconds (ANAI-147).
+///
+/// Precedence: `OPENFANG_AGENT_WAKE_STALE_SECS` env var > installed
+/// `[agent_wake]` config > compiled default ([`WAKE_STALE_SECS`]). Clamped up to
+/// a floor of `1` — note that a very low value will reap *live* loops, so this
+/// floor is a footgun guard, not a recommendation.
+pub fn stale_wake_secs() -> u64 {
+    env_u64("OPENFANG_AGENT_WAKE_STALE_SECS")
+        .or_else(|| INSTALLED.get().map(|l| l.stale_wake_secs))
+        .unwrap_or(WAKE_STALE_SECS)
+        .max(LIMIT_FLOOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +268,15 @@ mod tests {
         assert_eq!(per_caller_max(), 1);
         std::env::remove_var("OPENFANG_AGENT_WAKE_PER_CALLER_MAX");
         assert_eq!(WAKE_PER_CALLER_MAX, 4);
+
+        // stale_wake_secs: default, override, floor.
+        std::env::remove_var("OPENFANG_AGENT_WAKE_STALE_SECS");
+        assert_eq!(stale_wake_secs(), 3600);
+        std::env::set_var("OPENFANG_AGENT_WAKE_STALE_SECS", "900");
+        assert_eq!(stale_wake_secs(), 900);
+        std::env::set_var("OPENFANG_AGENT_WAKE_STALE_SECS", "0");
+        assert_eq!(stale_wake_secs(), 1);
+        std::env::remove_var("OPENFANG_AGENT_WAKE_STALE_SECS");
     }
 
     #[test]
@@ -243,5 +285,7 @@ mod tests {
         assert_eq!(WAKE_TREE_BUDGET_MAX, 40);
         assert_eq!(WAKE_WINDOW_SECS, 60);
         assert_eq!(MAX_INFLIGHT_WAKES, 8);
+        assert_eq!(WAKE_PER_CALLER_MAX, 4);
+        assert_eq!(WAKE_STALE_SECS, 3600);
     }
 }

@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 10;
+const SCHEMA_VERSION: u32 = 11;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -49,6 +49,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 10 {
         migrate_v10(conn)?;
+    }
+
+    if current_version < 11 {
+        migrate_v11(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -390,6 +394,29 @@ fn migrate_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
         INSERT OR IGNORE INTO migrations (version, applied_at, description)
         VALUES (10, datetime('now'), 'Add identity_bindings for authoritative snowflake -> name mapping');
         ",
+    )?;
+    Ok(())
+}
+
+/// Version 11: Add `claimed_at` to `task_queue` (ANAI-147).
+///
+/// The wake queue's per-caller in-flight cap (ANAI-104) counts rows sitting in
+/// `in_progress`, and only `task_complete` clears them. Nothing recorded WHEN a
+/// row was claimed, so a claim whose dispatcher died could not be distinguished
+/// from one still running — leaving no safe basis for a stale-claim sweep.
+/// `claimed_at` is stamped at the claim/flip and is the reaper's clock.
+///
+/// Nullable with no default on purpose: rows claimed by a pre-migration binary
+/// legitimately have no claim time, and the reaper falls back to `created_at`
+/// for those rather than pretending they were claimed just now (which would
+/// make a leaked pre-migration row immortal all over again).
+fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "task_queue", "claimed_at") {
+        conn.execute("ALTER TABLE task_queue ADD COLUMN claimed_at TEXT", [])?;
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (11, datetime('now'), 'Add claimed_at to task_queue for stale-wake reaping')",
+        [],
     )?;
     Ok(())
 }

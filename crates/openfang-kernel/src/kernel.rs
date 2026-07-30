@@ -5157,6 +5157,7 @@ impl OpenFangKernel {
             window_secs: self.config.agent_wake.window_secs,
             max_inflight: self.config.agent_wake.max_inflight,
             per_caller_max: self.config.agent_wake.per_caller_max,
+            stale_wake_secs: self.config.agent_wake.stale_wake_secs,
         });
 
         // Start heartbeat monitor for agent health checking
@@ -5164,7 +5165,22 @@ impl OpenFangKernel {
 
         // Start the agent_send_async wake-consumer: drains queued wakes and
         // re-enters the send funnel for each target on its own task.
-        self.start_wake_consumer();
+        //
+        // ORDERING IS LOAD-BEARING (ANAI-147): the boot sweep must complete
+        // BEFORE the consumer starts. The sweep fails closed EVERY in-flight
+        // wake on the premise that no live dispatcher can exist at boot — true
+        // only until the consumer claims its first wake. Start the consumer
+        // first and the sweep reaps a wake that is actively running. This
+        // enclosing fn is sync, so the sequence rides one task to keep the
+        // happens-before relationship explicit rather than timing-dependent.
+        {
+            let kernel = Arc::clone(self);
+            tokio::spawn(async move {
+                kernel.reap_orphaned_wakes_at_boot().await;
+                kernel.start_wake_consumer();
+                kernel.start_stale_wake_reaper();
+            });
+        }
 
         // Start OFP peer node if network is enabled
         if self.config.network_enabled && !self.config.network.shared_secret.is_empty() {
@@ -5519,6 +5535,129 @@ impl OpenFangKernel {
     ///
     /// Periodically checks all running agents' last_active timestamps and
     /// publishes `HealthCheckFailed` events for unresponsive agents.
+    /// Fail closed every wake left `in_progress` from the previous process
+    /// (ANAI-147). Must complete BEFORE [`Self::start_wake_consumer`].
+    ///
+    /// A woken agent loop runs on a detached tokio task, so daemon shutdown
+    /// kills it without ever calling `task_complete` and its wake row stays
+    /// `in_progress` forever. Those rows still count against the per-caller
+    /// in-flight cap (ANAI-104), whose claim predicate is
+    /// `COUNT(in_progress for this caller) < per_caller_max` — so
+    /// `per_caller_max` restarts mid-dispatch permanently starve that caller:
+    /// every subsequent wake it enqueues stays `pending` and is never claimed.
+    /// That is the whole of the "agent_send_async silently drops messages" bug;
+    /// nothing was ever dropped, the queue simply stopped being drainable.
+    ///
+    /// At boot the premise is airtight: the wake-consumer is the only claimer
+    /// and its dispatch tasks are process-bound, so an in-flight row cannot
+    /// have a live dispatcher. Reaped wakes are **failed closed, not
+    /// requeued** — see `reap_in_flight_wakes` for why late dispatch is the
+    /// worse failure.
+    async fn reap_orphaned_wakes_at_boot(self: &Arc<Self>) {
+        match self
+            .memory
+            .reap_in_flight_wakes(
+                None,
+                "wake orphaned by daemon restart (dispatcher died mid-flight); failed closed, not re-dispatched",
+            )
+            .await
+        {
+            Ok(reaped) if reaped.is_empty() => {
+                debug!("Wake boot-reaper: no orphaned in-flight wakes");
+            }
+            Ok(reaped) => {
+                let mut callers: Vec<&str> = reaped.iter().map(|(_, c)| c.as_str()).collect();
+                callers.sort_unstable();
+                callers.dedup();
+                warn!(
+                    count = reaped.len(),
+                    callers = %callers.join(","),
+                    "Wake boot-reaper: failed closed orphaned in-flight wakes from the previous \
+                     process; their callers' per-caller slots are freed and their queued wakes \
+                     will now dispatch"
+                );
+                for (task_id, created_by) in &reaped {
+                    self.audit_wake_completion(
+                        created_by,
+                        "unknown",
+                        task_id,
+                        "reaped: orphaned by daemon restart",
+                    );
+                }
+            }
+            Err(e) => {
+                // Non-fatal: the daemon still boots, but say so loudly — a
+                // failed sweep means any pre-existing wedge persists.
+                warn!(error = %e, "Wake boot-reaper failed; a starved caller may remain wedged");
+            }
+        }
+    }
+
+    /// Periodic stale-claim sweep for wakes whose dispatcher died WITHOUT a
+    /// restart (ANAI-147 defect 2): a panicked detached task, or an agent loop
+    /// wedged past every watchdog. The boot reaper cannot see these — the
+    /// process never restarts — yet each one holds a per-caller slot forever,
+    /// so `per_caller_max` of them reproduce the same permanent starvation.
+    ///
+    /// Deliberately conservative: the cutoff (`[agent_wake] stale_wake_secs`,
+    /// default 1h) sits far above any legitimate woken turn, because reaping a
+    /// LIVE loop frees its caller's slot while it is still running and stamps a
+    /// failure on work that may yet succeed. Missing a stale row for an extra
+    /// sweep is cheap; killing a live one is not.
+    fn start_stale_wake_reaper(self: &Arc<Self>) {
+        let stale_secs = openfang_types::agent_wake::stale_wake_secs();
+        let stale_after = std::time::Duration::from_secs(stale_secs);
+        // Sweep well inside the cutoff so a leak is cleared in bounded time
+        // without polling hot; floored so a tiny (test/tuned-down) cutoff can
+        // never spin the sweeper.
+        let period = std::time::Duration::from_secs((stale_secs / 6).max(30));
+        let kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.tick().await; // the first tick is immediate; skip it —
+                                   // the boot reaper just ran.
+            loop {
+                interval.tick().await;
+                if kernel.supervisor.is_shutting_down() {
+                    info!("Stale-wake reaper stopping (shutdown)");
+                    break;
+                }
+                match kernel
+                    .memory
+                    .reap_in_flight_wakes(
+                        Some(stale_after),
+                        "wake exceeded the stale-claim timeout (dispatcher presumed dead); \
+                         failed closed, not re-dispatched",
+                    )
+                    .await
+                {
+                    Ok(reaped) if reaped.is_empty() => {}
+                    Ok(reaped) => {
+                        for (task_id, created_by) in &reaped {
+                            warn!(
+                                task_id = %task_id,
+                                caller = %created_by,
+                                stale_after_secs = stale_secs,
+                                "Stale-wake reaper: failed closed a wake stuck in flight"
+                            );
+                            kernel.audit_wake_completion(
+                                created_by,
+                                "unknown",
+                                task_id,
+                                "reaped: stale claim timeout",
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "Stale-wake reaper sweep failed"),
+                }
+            }
+        });
+        info!(
+            "Stale-wake reaper started (cutoff: {stale_secs}s, sweep: {}s)",
+            period.as_secs()
+        );
+    }
+
     /// Start the background wake-consumer for `agent_send_async`.
     ///
     /// A single central poller drains the wake queue (tasks whose title bears
@@ -8746,6 +8885,14 @@ impl KernelHandle for OpenFangKernel {
             .task_post(title, description, assigned_to, created_by, payload)
             .await
             .map_err(|e| format!("Task post failed: {e}"))
+    }
+
+    async fn wake_queue_depth(&self, created_by: &str) -> Result<(usize, usize), String> {
+        // ANAI-147: real depth for the enqueue's honesty line.
+        self.memory
+            .wake_queue_depth(created_by)
+            .await
+            .map_err(|e| format!("Wake queue depth failed: {e}"))
     }
 
     async fn wake_post(

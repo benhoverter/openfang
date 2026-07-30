@@ -94,6 +94,20 @@ pub trait KernelHandle: Send + Sync {
             .await
     }
 
+    /// ANAI-147: wake-queue depth for one caller — `(pending, in_flight)`.
+    ///
+    /// Backs the honesty fix on `agent_send_async`'s result. A returned task id
+    /// reads as "this will run", but a caller at its per-caller in-flight cap
+    /// has its wake sit `pending` behind the cap — indefinitely, if a slot is
+    /// leaked. The producer reports the depth so a stuck queue is visible in
+    /// the tool result instead of being diagnosed by A/B probe a day later.
+    ///
+    /// Defaults to `(0, 0)` so mock/test handles keep working: the depth line
+    /// is diagnostic, never load-bearing for dispatch.
+    async fn wake_queue_depth(&self, _created_by: &str) -> Result<(usize, usize), String> {
+        Ok((0, 0))
+    }
+
     /// ANAI-122: consume this agent's one-shot terminal reply-right for the
     /// current woken turn, if the kernel minted one at wake-dispatch.
     ///

@@ -1114,11 +1114,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "task_list".to_string(),
-            description: "List tasks in the shared queue, optionally filtered by status (pending, in_progress, completed).".to_string(),
+            description: "List tasks in the shared queue, optionally filtered by status (pending, in_progress, completed) or narrowed to a single task_id. Use task_id with the id returned by agent_send_async to check whether that wake actually ran.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed (optional)" }
+                    "status": { "type": "string", "description": "Filter by status: pending, in_progress, completed (optional)" },
+                    "task_id": { "type": "string", "description": "Look up ONE task by id (optional). Pass the id returned by agent_send_async to see whether that wake is still pending, in flight, or completed (and with what result)." }
                 }
             }),
         },
@@ -2960,9 +2961,22 @@ async fn tool_agent_send_async(
         .wake_post(&title, message, Some(&target), Some(sender), &payload)
         .await?;
 
+    // ANAI-147: report the queue this wake just joined. "Queued" alone reads as
+    // "will run", but a caller at its per-caller in-flight cap has its wake sit
+    // `pending` behind that cap — the failure mode that cost a day of A/B
+    // probing to distinguish from a dropped message. Depth is diagnostic only:
+    // a lookup failure must never fail an enqueue that already succeeded.
+    let depth_note = match kh.wake_queue_depth(sender).await {
+        Ok((pending, in_flight)) => format!(
+            " Queue for this sender: {pending} pending, {in_flight} in flight. \
+             Check outcome with task_list (task_id={task_id})."
+        ),
+        Err(_) => String::new(),
+    };
+
     Ok(format!(
         "Async wake queued for '{target}' (task {task_id}). \
-         The target runs on its own; no reply is returned inline."
+         The target runs on its own; no reply is returned inline.{depth_note}"
     ))
 }
 
@@ -3274,7 +3288,18 @@ async fn tool_task_list(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let status = input["status"].as_str();
-    let tasks = kh.task_list(status).await?;
+    let mut tasks = kh.task_list(status).await?;
+    // ANAI-147: narrow to one id. The substrate query is status-keyed, so the
+    // filter lands here rather than widening the KernelHandle contract for a
+    // diagnostic read. Without this there is no way to ask "did the wake I
+    // enqueued actually run?" — the gap that made a stalled queue look exactly
+    // like a dropped message.
+    if let Some(task_id) = input["task_id"].as_str() {
+        tasks.retain(|t| t["id"].as_str() == Some(task_id));
+        if tasks.is_empty() {
+            return Ok(format!("No task found with id {task_id}."));
+        }
+    }
     if tasks.is_empty() {
         return Ok("No tasks found.".to_string());
     }

@@ -1666,6 +1666,11 @@ pub struct AgentWakeConfig {
     /// per-caller backpressure that async dispatch removed, so one caller cannot
     /// monopolize the fleet-wide `max_inflight` budget.
     pub per_caller_max: usize,
+    /// Seconds a wake may sit `in_progress` before the kernel's stale-wake
+    /// reaper fails it closed and frees the caller's slot (ANAI-147). Default:
+    /// 3600. Set well above the longest legitimate woken turn — reaping a LIVE
+    /// loop frees its per-caller slot while it still runs.
+    pub stale_wake_secs: u64,
 }
 
 impl Default for AgentWakeConfig {
@@ -1676,6 +1681,7 @@ impl Default for AgentWakeConfig {
             window_secs: crate::agent_wake::WAKE_WINDOW_SECS,
             max_inflight: crate::agent_wake::MAX_INFLIGHT_WAKES,
             per_caller_max: crate::agent_wake::WAKE_PER_CALLER_MAX,
+            stale_wake_secs: crate::agent_wake::WAKE_STALE_SECS,
         }
     }
 }
@@ -2056,12 +2062,13 @@ impl std::fmt::Debug for KernelConfig {
             .field(
                 "agent_wake",
                 &format!(
-                    "emit={} tree={} window={}s inflight={} per_caller={}",
+                    "emit={} tree={} window={}s inflight={} per_caller={} stale={}s",
                     self.agent_wake.emit_max,
                     self.agent_wake.tree_budget_max,
                     self.agent_wake.window_secs,
                     self.agent_wake.max_inflight,
-                    self.agent_wake.per_caller_max
+                    self.agent_wake.per_caller_max,
+                    self.agent_wake.stale_wake_secs
                 ),
             )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
@@ -5100,6 +5107,7 @@ mod tests {
         assert_eq!(c.agent_wake.window_secs, 60);
         assert_eq!(c.agent_wake.max_inflight, 8);
         assert_eq!(c.agent_wake.per_caller_max, 4);
+        assert_eq!(c.agent_wake.stale_wake_secs, 3600);
     }
 
     #[test]
@@ -5111,6 +5119,7 @@ mod tests {
             window_secs = 30
             max_inflight = 16
             per_caller_max = 6
+            stale_wake_secs = 900
         "#;
         let c: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(c.agent_wake.emit_max, 200);
@@ -5118,6 +5127,7 @@ mod tests {
         assert_eq!(c.agent_wake.window_secs, 30);
         assert_eq!(c.agent_wake.max_inflight, 16);
         assert_eq!(c.agent_wake.per_caller_max, 6);
+        assert_eq!(c.agent_wake.stale_wake_secs, 900);
     }
 
     #[test]

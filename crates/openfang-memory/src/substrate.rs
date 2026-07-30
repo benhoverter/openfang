@@ -784,10 +784,14 @@ impl MemorySubstrate {
             match result {
                 Ok((id, title, description, assigned, created_by, created_at, payload)) => {
                     // Flip to in_progress; do NOT touch assigned_to — the producer
-                    // already recorded the wake target there.
+                    // already recorded the wake target there. Stamp `claimed_at`
+                    // (ANAI-147): it is the ONLY record of when this row began
+                    // occupying one of its caller's per-caller in-flight slots,
+                    // and so the stale-claim reaper's sole clock.
+                    let claimed_at = chrono::Utc::now().to_rfc3339();
                     db.execute(
-                        "UPDATE task_queue SET status = 'in_progress' WHERE id = ?1",
-                        rusqlite::params![id],
+                        "UPDATE task_queue SET status = 'in_progress', claimed_at = ?2 WHERE id = ?1",
+                        rusqlite::params![id, claimed_at],
                     )
                     .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
@@ -805,6 +809,157 @@ impl MemorySubstrate {
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(OpenFangError::Memory(e.to_string())),
             }
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Fail-closed sweep of wakes stuck `in_progress` (ANAI-147).
+    ///
+    /// ## Why this must exist
+    ///
+    /// The per-caller in-flight cap (ANAI-104) is a *concurrency* limit whose
+    /// slots are released by exactly one thing: `task_complete`, called at the
+    /// end of `run_woken_agent_loop`. That loop runs on a **detached tokio
+    /// task**, so a daemon restart kills it mid-flight and the row stays
+    /// `in_progress` with `completed_at = NULL` forever. Nothing else ever
+    /// touches it. Accumulate `per_caller_max` such orphans for one caller and
+    /// the claim predicate's `COUNT(...) < cap` is false permanently: every
+    /// later wake from that caller stays `pending` and is never claimed —
+    /// silent, total starvation that looks exactly like "async sends are
+    /// dropped".
+    ///
+    /// ## Semantics: fail closed, never re-run
+    ///
+    /// Reaped wakes are marked **completed with an error result**, not requeued.
+    /// A wake is an instruction to an agent about a moment; re-dispatching a
+    /// day-old one into a changed world is a worse failure than a logged loss,
+    /// and a requeue-on-boot policy turns a wake that reliably crashes its
+    /// dispatcher into an infinite restart loop. The row is preserved with a
+    /// diagnostic `result`, so the loss is auditable rather than invisible.
+    ///
+    /// ## Scope
+    ///
+    /// `stale_after` selects the two callers:
+    /// * `None` — **boot sweep**. Every in-flight wake is an orphan by
+    ///   construction: the wake-consumer is the sole claimer and its dispatch
+    ///   tasks are process-bound, so at daemon start no in-flight row can have a
+    ///   live dispatcher. Must run BEFORE the consumer starts, or it will reap
+    ///   wakes the fresh consumer just claimed.
+    /// * `Some(d)` — **periodic sweep**. Reaps only rows claimed longer than `d`
+    ///   ago, catching the non-restart leaks (panicked dispatch task, wedged
+    ///   agent loop) that the boot sweep can't see.
+    ///
+    /// Only wake-titled rows are touched; an ordinary agent's `in_progress`
+    /// collaboration task is none of this function's business.
+    ///
+    /// Returns the `(task_id, created_by)` pairs reaped, so the caller can log
+    /// which callers were unwedged.
+    pub async fn reap_in_flight_wakes(
+        &self,
+        stale_after: Option<std::time::Duration>,
+        reason: &str,
+    ) -> OpenFangResult<Vec<(String, String)>> {
+        let conn = Arc::clone(&self.conn);
+        let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
+        let reason = reason.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now();
+            let cutoff =
+                stale_after.and_then(|d| chrono::Duration::from_std(d).ok().map(|d| now - d));
+            let db = conn
+                .lock()
+                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+
+            // Select candidates first so the caller can be told exactly what was
+            // lost. `claimed_at` is NULL for rows claimed by a pre-v11 binary;
+            // fall back to `created_at` rather than skipping them, or the very
+            // orphans that motivated this sweep would survive it.
+            let mut stmt = db
+                .prepare(
+                    "SELECT id, created_by, COALESCE(NULLIF(claimed_at, ''), created_at)
+                     FROM task_queue
+                     WHERE status = 'in_progress' AND title LIKE ?1",
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![wake_like], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1).unwrap_or_default(),
+                        row.get::<_, Option<String>>(2).unwrap_or(None),
+                    ))
+                })
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+            let mut doomed: Vec<(String, String)> = Vec::new();
+            for row in rows {
+                let (id, created_by, at) = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                match cutoff {
+                    // Boot sweep: no cutoff, everything in flight is an orphan.
+                    None => doomed.push((id, created_by)),
+                    Some(cut) => {
+                        // Parse rather than compare timestamp strings: a row
+                        // written in a different RFC3339 offset would order
+                        // wrong lexicographically and get reaped while live.
+                        // An unparseable/missing stamp is NOT reaped — a live
+                        // loop killed by a bad timestamp is worse than an
+                        // orphan that waits for the next boot sweep.
+                        let stale = at
+                            .as_deref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                            .map(|t| t.with_timezone(&chrono::Utc) < cut)
+                            .unwrap_or(false);
+                        if stale {
+                            doomed.push((id, created_by));
+                        }
+                    }
+                }
+            }
+
+            let now_s = now.to_rfc3339();
+            for (id, _) in &doomed {
+                db.execute(
+                    "UPDATE task_queue SET status = 'completed', result = ?2, completed_at = ?3
+                     WHERE id = ?1 AND status = 'in_progress'",
+                    rusqlite::params![id, &reason, &now_s],
+                )
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            }
+            Ok(doomed)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Wake-queue depth for one caller: `(pending, in_flight)` (ANAI-147).
+    ///
+    /// Backs the honesty fix on `agent_send_async`'s tool result. The enqueue
+    /// returns a task id and says "queued", which reads as "will run" — but if
+    /// the caller is at its per-caller cap the wake sits `pending` behind the
+    /// cap indefinitely, and nothing in the result distinguishes the two. This
+    /// lets the producer report the queue it just joined.
+    pub async fn wake_queue_depth(&self, created_by: &str) -> OpenFangResult<(usize, usize)> {
+        let conn = Arc::clone(&self.conn);
+        let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
+        let created_by = created_by.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let db = conn
+                .lock()
+                .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+            let count = |status: &str| -> OpenFangResult<usize> {
+                db.query_row(
+                    "SELECT COUNT(*) FROM task_queue
+                     WHERE status = ?1 AND title LIKE ?2 AND created_by = ?3",
+                    rusqlite::params![status, &wake_like, &created_by],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|n| n.max(0) as usize)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))
+            };
+            Ok((count("pending")?, count("in_progress")?))
         })
         .await
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
@@ -1300,6 +1455,150 @@ mod tests {
         let c4 = substrate.task_claim_wake(2).await.unwrap().unwrap();
         assert_eq!(c4["created_by"], "orch");
         assert_ne!(c4["id"], c2["id"]);
+    }
+
+    /// Helper: enqueue one wake from `sender` to `target`, return its task id.
+    async fn post_wake(substrate: &MemorySubstrate, target: &str, sender: &str) -> String {
+        let env = sample_wake_envelope(target, sender);
+        substrate
+            .task_post_wake(
+                &format!("{WAKE_TASK_PREFIX}{target}"),
+                &env.message,
+                Some(target),
+                Some(sender),
+                &env.to_payload().unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// ANAI-147, the keystone: reproduce the production wedge on a REAL
+    /// file-backed substrate, then prove the boot reaper clears it.
+    ///
+    /// Sequence is the exact one that bit the fleet: a caller saturates its
+    /// per-caller cap, the daemon dies (dropping the detached dispatch tasks
+    /// that would have called `task_complete`), and on restart every later wake
+    /// from that caller is unclaimable forever. In-memory tests cannot show
+    /// this — the wedge only exists because the rows OUTLIVE the process.
+    #[tokio::test]
+    async fn test_boot_reaper_unwedges_starved_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wake_reap.db");
+        let orphans: Vec<String>;
+
+        // --- Pre-restart daemon: two wakes claimed (cap 2), never completed. ---
+        {
+            let substrate = MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+            for t in ["w1", "w2", "w3"] {
+                post_wake(&substrate, t, "orch").await;
+            }
+            let a = substrate.task_claim_wake(2).await.unwrap().unwrap();
+            let b = substrate.task_claim_wake(2).await.unwrap().unwrap();
+            orphans = vec![
+                a["id"].as_str().unwrap().to_string(),
+                b["id"].as_str().unwrap().to_string(),
+            ];
+            // At cap: the third wake is already unclaimable.
+            assert!(substrate.task_claim_wake(2).await.unwrap().is_none());
+            // Substrate drops WITHOUT task_complete — the detached dispatch
+            // tasks died with the process, exactly as on a daemon restart.
+        }
+
+        let substrate = MemorySubstrate::open(&db_path, 0.1, &MemoryConfig::default()).unwrap();
+
+        // The wedge is real and survives the restart: w3 is still starved.
+        assert!(
+            substrate.task_claim_wake(2).await.unwrap().is_none(),
+            "orphaned in-flight rows must starve the caller before the reap"
+        );
+
+        // Boot sweep: no cutoff, everything in flight is an orphan.
+        let reaped = substrate
+            .reap_in_flight_wakes(None, "wake orphaned by daemon restart")
+            .await
+            .unwrap();
+        assert_eq!(reaped.len(), 2);
+        for (id, created_by) in &reaped {
+            assert!(orphans.contains(id));
+            assert_eq!(created_by, "orch");
+        }
+
+        // Fail-CLOSED, not requeued: the orphans are completed with a
+        // diagnostic, and must never be dispatched late.
+        let completed = substrate.task_list(Some("completed")).await.unwrap();
+        assert_eq!(completed.len(), 2);
+        for t in &completed {
+            assert_eq!(
+                t["result"].as_str().unwrap(),
+                "wake orphaned by daemon restart"
+            );
+            assert!(t["completed_at"].as_str().is_some());
+        }
+
+        // And the caller is unwedged: w3 finally becomes claimable.
+        let freed = substrate.task_claim_wake(2).await.unwrap().unwrap();
+        assert_eq!(freed["created_by"], "orch");
+        assert!(!orphans.contains(&freed["id"].as_str().unwrap().to_string()));
+        // Exactly the three we posted; the reap invented no new rows.
+        assert_eq!(substrate.task_list(None).await.unwrap().len(), 3);
+    }
+
+    /// The stale sweep must be a scalpel, not the boot hammer: a wake claimed
+    /// moments ago is a LIVE agent loop, and reaping it would free its caller's
+    /// slot while the loop still runs — double-dispatch pressure and a bogus
+    /// "failed" result on work that is about to succeed.
+    #[tokio::test]
+    async fn test_stale_reaper_spares_fresh_claims_and_regular_tasks() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        post_wake(&substrate, "w1", "orch").await;
+        substrate
+            .task_post("Regular job", "normal work", Some("w1"), Some("orch"), b"")
+            .await
+            .unwrap();
+
+        let wake = substrate.task_claim_wake(4).await.unwrap().unwrap();
+        let regular = substrate.task_claim("w1").await.unwrap().unwrap();
+
+        // Fresh claim, one-hour staleness bound: nothing is reaped.
+        let spared = substrate
+            .reap_in_flight_wakes(Some(std::time::Duration::from_secs(3600)), "stale")
+            .await
+            .unwrap();
+        assert!(spared.is_empty(), "a just-claimed wake must not be reaped");
+
+        // Zero-second bound reaps the wake — and ONLY the wake. An ordinary
+        // agent's in-flight collaboration task is not the reaper's business.
+        let reaped = substrate
+            .reap_in_flight_wakes(Some(std::time::Duration::ZERO), "stale claim timeout")
+            .await
+            .unwrap();
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].0, wake["id"].as_str().unwrap());
+
+        let still_running = substrate.task_list(Some("in_progress")).await.unwrap();
+        assert_eq!(still_running.len(), 1);
+        assert_eq!(still_running[0]["id"], regular["id"]);
+    }
+
+    /// The honesty fix's data source: per-caller wake depth, so the enqueue can
+    /// say whether the wake it just queued is dispatchable or stacked behind a
+    /// saturated cap.
+    #[tokio::test]
+    async fn test_wake_queue_depth_is_per_caller() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        for t in ["w1", "w2", "w3"] {
+            post_wake(&substrate, t, "orch").await;
+        }
+        post_wake(&substrate, "x1", "other").await;
+
+        assert_eq!(substrate.wake_queue_depth("orch").await.unwrap(), (3, 0));
+        assert_eq!(substrate.wake_queue_depth("other").await.unwrap(), (1, 0));
+        assert_eq!(substrate.wake_queue_depth("nobody").await.unwrap(), (0, 0));
+
+        substrate.task_claim_wake(2).await.unwrap().unwrap();
+        assert_eq!(substrate.wake_queue_depth("orch").await.unwrap(), (2, 1));
+        // Another caller's traffic never shows up in this caller's depth.
+        assert_eq!(substrate.wake_queue_depth("other").await.unwrap(), (1, 0));
     }
 
     /// ANAI-107 (Stage-A mechanism smoke): the keystone durability proof that
