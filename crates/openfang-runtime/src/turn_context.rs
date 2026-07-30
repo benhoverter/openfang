@@ -25,6 +25,13 @@ pub struct TurnContextInput<'a> {
     pub sender_id: Option<&'a str>,
     /// Display name for this turn's speaker, if known.
     pub sender_name: Option<&'a str>,
+    /// ANAI-147: `true` when the speaker is a PEER AGENT, not a human.
+    ///
+    /// Renders the speaker line as `name (agent, id:…)` so the envelope agrees
+    /// with §9.1's agent attribution. Without it the envelope names an agent in
+    /// the same shape it names a human, which is precisely the ambiguity that
+    /// let a woken turn be attributed to the operator in-session.
+    pub sender_is_agent: bool,
     /// This speaker's PRIOR last-seen stamp (RFC3339), for `since_this_speaker`.
     pub prior_seen: Option<&'a str>,
     /// Session `updated_at` (RFC3339) = last agent activity, for `since_agent_msg`.
@@ -81,7 +88,11 @@ pub fn render(input: &TurnContextInput) -> Option<String> {
     // speaker + per-actor gap — only when we know who spoke.
     if let Some(id) = input.sender_id {
         let name = input.sender_name.unwrap_or(id);
-        lines.push(format!("speaker:            {name} (id:{id})"));
+        if input.sender_is_agent {
+            lines.push(format!("speaker:            {name} (peer agent, id:{id})"));
+        } else {
+            lines.push(format!("speaker:            {name} (id:{id})"));
+        }
         if let Some(prior) = input.prior_seen {
             if let Some(d) = delta_secs(input.now, prior) {
                 lines.push(format!("since_this_speaker: {}", humanize(d)));
@@ -164,6 +175,7 @@ mod tests {
             now,
             sender_id: Some("snow_ben"),
             sender_name: Some("Ben Hoverter"),
+            sender_is_agent: false,
             prior_seen: Some("2026-07-20T10:00:00Z"),
             updated_at: Some("2026-07-20T11:59:00Z"),
             roster: &roster,
@@ -189,6 +201,7 @@ mod tests {
             now,
             sender_id: None,
             sender_name: None,
+            sender_is_agent: false,
             prior_seen: None,
             updated_at: Some("2026-07-20T06:00:00Z"),
             roster: &[],
@@ -197,5 +210,30 @@ mod tests {
         assert!(!out.contains("speaker:"));
         assert!(!out.contains("since_this_speaker:"));
         assert!(out.contains("since_agent_msg:    6h 00m"));
+    }
+
+    /// ANAI-147: an agent speaker is labelled as such in the envelope, so a
+    /// woken target cannot read the wake as a human turn. The human shape
+    /// (`name (id:…)`) and the agent shape (`name (peer agent, id:…)`) must
+    /// stay visibly distinct — that difference IS the attribution fix.
+    #[test]
+    fn test_render_agent_speaker_is_labelled() {
+        let now = DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let input = TurnContextInput {
+            now,
+            sender_id: Some("26bbc85a-0000-4000-8000-000000000000"),
+            sender_name: Some("coder-openfang-tools"),
+            sender_is_agent: true,
+            prior_seen: None,
+            updated_at: None,
+            roster: &[],
+        };
+        let out = render(&input).unwrap();
+        assert!(out.contains(
+            "speaker:            coder-openfang-tools \
+             (peer agent, id:26bbc85a-0000-4000-8000-000000000000)"
+        ));
     }
 }

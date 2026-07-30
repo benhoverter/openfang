@@ -347,11 +347,6 @@ fn capture_metadata(
     meta
 }
 
-/// Run the agent execution loop for a single user message.
-///
-/// This is the core of OpenFang: it loads session context, recalls memories,
-/// runs the LLM in a tool-use loop, and saves the updated session.
-#[allow(clippy::too_many_arguments)]
 /// ANAI-128/ANAI-127: build and inject the ambient per-turn `<turn_context>`
 /// envelope as a user-role message immediately ahead of the real inbound, and
 /// stamp session presence on genuine User turns. Shared by BOTH loops so the
@@ -364,8 +359,15 @@ fn capture_metadata(
 ///   1. `identity_bindings` (operator-curated, via `resolve_identity`)
 ///   2. `sender_name` threaded from the kernel (Discord `global_name`)
 ///   3. `origin.sender_display_name` (legacy origin carrier)
+///
 /// The speaker id prefers the threaded `sender_id` (the live channel path
 /// passes `origin: None`) and falls back to `origin.recipient`.
+///
+/// ANAI-147: ahead of that hierarchy, `sender_id` is tested against the AGENT
+/// REGISTRY. A hit means the turn was driven by a peer agent (async wake or
+/// `agent_send`), which is labelled as such in the envelope and kept out of the
+/// human presence roster — see `build_sender_section` for why the distinction
+/// is a trust boundary, not a cosmetic one.
 #[allow(clippy::too_many_arguments)]
 fn inject_turn_context(
     messages: &mut Vec<Message>,
@@ -377,6 +379,7 @@ fn inject_turn_context(
     sender_id: Option<&str>,
     sender_name: Option<&str>,
     origin: Option<&openfang_types::approval::ApprovalOrigin>,
+    kernel: Option<&Arc<dyn KernelHandle>>,
     streaming: bool,
 ) {
     if !openfang_types::turn_context::enabled() {
@@ -392,14 +395,34 @@ fn inject_turn_context(
     // Rung 1 (ANAI-127): operator-curated binding overrides the platform name.
     // `canonical` owns the String so the borrow below outlives the resolve call.
     let canonical = tc_sender_id.and_then(|id| memory.resolve_identity(id).ok().flatten());
-    let tc_sender_name: Option<&str> = canonical
-        .as_deref()
-        .or(sender_name)
-        .or_else(|| origin.and_then(|o| o.sender_display_name.as_deref()));
+    // ANAI-147: is this turn driven by a PEER AGENT rather than a human?
+    // Registry lookup by ID, never by name — a human display name must not be
+    // able to impersonate an agent here. An agent id is a UUID and a platform
+    // snowflake never is, so the two key spaces cannot collide.
+    let agent_sender_name: Option<String> = tc_sender_id.and_then(|id| {
+        kernel.and_then(|k| {
+            k.list_agents()
+                .into_iter()
+                .find(|a| a.id == id)
+                .map(|a| a.name)
+        })
+    });
+    let tc_sender_is_agent = agent_sender_name.is_some();
+    // The registry name OUTRANKS every human rung: it is the kernel's own
+    // attested record of who this id is, not a curated display alias.
+    let tc_sender_name: Option<&str> = agent_sender_name.as_deref().or_else(|| {
+        canonical
+            .as_deref()
+            .or(sender_name)
+            .or_else(|| origin.and_then(|o| o.sender_display_name.as_deref()))
+    });
 
     // Stamp presence + read this actor's PRIOR gap ONLY on genuine human turns,
     // so cron/autonomous turns never reset an actor's clock.
-    let tc_prior_seen = if trigger == TurnTrigger::User {
+    // ANAI-147: never stamp on an agent-driven turn either — a peer agent is
+    // not a participant in the human conversation, and stamping it would list
+    // an agent in `recently_present` as though it had walked into the room.
+    let tc_prior_seen = if trigger == TurnTrigger::User && !tc_sender_is_agent {
         match tc_sender_id {
             Some(sid) => memory
                 .record_participant(
@@ -427,6 +450,7 @@ fn inject_turn_context(
         now: tc_now,
         sender_id: tc_sender_id,
         sender_name: tc_sender_name,
+        sender_is_agent: tc_sender_is_agent,
         prior_seen: tc_prior_seen.as_deref(),
         updated_at: tc_updated_at.as_deref(),
         roster: &tc_roster,
@@ -440,6 +464,7 @@ fn inject_turn_context(
             agent_id = %agent_id_str,
             sender_id = ?tc_sender_id,
             sender_name = ?tc_sender_name,
+            sender_is_agent = tc_sender_is_agent,
             trigger = %trigger.as_str(),
             prior_seen = ?tc_prior_seen,
             updated_at = ?tc_updated_at,
@@ -454,6 +479,11 @@ fn inject_turn_context(
     }
 }
 
+/// Run the agent execution loop for a single user message.
+///
+/// This is the core of OpenFang: it loads session context, recalls memories,
+/// runs the LLM in a tool-use loop, and saves the updated session.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop(
     manifest: &AgentManifest,
     user_message: &str,
@@ -646,6 +676,7 @@ pub async fn run_agent_loop(
         sender_id,
         sender_name,
         origin,
+        kernel.as_ref(),
         false,
     );
 
@@ -2302,6 +2333,7 @@ pub async fn run_agent_loop_streaming(
         sender_id,
         sender_name,
         origin,
+        kernel.as_ref(),
         true,
     );
 

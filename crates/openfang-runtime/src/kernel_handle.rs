@@ -40,6 +40,28 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to another agent and get the response.
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String>;
 
+    /// ANAI-147: sender-attributed counterpart to [`Self::send_to_agent`].
+    ///
+    /// `sender_agent_id` is the CALLING agent's UUID, threaded into the send
+    /// funnel's sender slot so the target's turn carries kernel-attested
+    /// agent-to-agent attribution instead of arriving unattributed (and being
+    /// pinned on whichever human last spoke in the target's session). Callers
+    /// hand-writing a `[From: X]` prefix into the message body were papering
+    /// over exactly this gap — and body text is the one thing an agent is told
+    /// not to trust for identity.
+    ///
+    /// Defaults to the unattributed call so non-kernel implementors (test
+    /// doubles, WASM host shims) need no change.
+    async fn send_to_agent_from(
+        &self,
+        agent_id: &str,
+        message: &str,
+        sender_agent_id: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = sender_agent_id;
+        self.send_to_agent(agent_id, message).await
+    }
+
     /// List all running agents.
     fn list_agents(&self) -> Vec<AgentInfo>;
 

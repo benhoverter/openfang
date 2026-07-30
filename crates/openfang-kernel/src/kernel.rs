@@ -2099,6 +2099,25 @@ impl OpenFangKernel {
             .or(platform_name)
     }
 
+    /// ANAI-147: resolve a sender key to a PEER AGENT name, or `None` if the
+    /// key is not a live agent.
+    ///
+    /// Lookup is by **id only**, never by name: an agent id is a UUID and a
+    /// platform sender key (Discord snowflake, phone number) never parses as
+    /// one, so the two key spaces cannot collide and no human-supplied string
+    /// can promote itself to agent attribution here.
+    ///
+    /// This is the missing half of the identity story. `resolve_authoritative_name`
+    /// answers "which human is this?" against `identity_bindings`; an agent id
+    /// simply misses there, which left every agent-originated turn — every async
+    /// wake, every `agent_send` — arriving with NO attribution at all. A target
+    /// with a human in-session then pinned the message on that human. Display /
+    /// trust framing only; authorization is unaffected.
+    fn resolve_agent_sender_name(&self, sender_id: &Option<String>) -> Option<String> {
+        let id: AgentId = sender_id.as_deref()?.parse().ok()?;
+        self.registry.get(id).map(|e| e.name.clone())
+    }
+
     /// Origin-carrying counterpart to [`Self::send_message_channel_reply`].
     ///
     /// Threads the triggering run's [`ApprovalOrigin`] down to the agent loop
@@ -2541,11 +2560,18 @@ impl OpenFangKernel {
 
         // QA (ANAI-127): trace injected sender identity on the streaming path
         // too (API route). `trigger` isn't threaded here; sender fields are.
+        // ANAI-147: peer-agent senders (async wake / `agent_send`) resolve to
+        // their registry name here; the flag flips §9.1 to agent-to-agent
+        // attribution so a woken turn cannot be read as the human speaking.
+        let agent_sender_name = self.resolve_agent_sender_name(&sender_id);
+        let sender_is_agent = agent_sender_name.is_some();
+        let sender_name = agent_sender_name.or(sender_name);
         tracing::info!(
             target: "turn_context",
             agent_id = %agent_id,
             sender_id = ?sender_id,
             sender_name = ?sender_name,
+            sender_is_agent,
             "turn-context inject (streaming): sender -> PromptContext §9.1 (## Sender)"
         );
 
@@ -2649,6 +2675,7 @@ impl OpenFangKernel {
                 ),
                 sender_id: sender_id.clone(),
                 sender_name: sender_name.clone(),
+                sender_is_agent,
                 // Re-read context.md per turn by default so external writers
                 // (cron jobs, integrations) reach the LLM on the next message.
                 // Opt out via `cache_context = true` on the manifest. (#843)
@@ -3192,12 +3219,19 @@ impl OpenFangKernel {
         // QA (ANAI-127): trace the sender identity threaded from the channel
         // origin into the prompt — the values QA follows in the daemon log.
         // `target: "turn_context"` so it can be dialed up/down independently.
+        // ANAI-147: peer-agent senders (async wake / `agent_send`) resolve to
+        // their registry name here; the flag flips §9.1 to agent-to-agent
+        // attribution so a woken turn cannot be read as the human speaking.
+        let agent_sender_name = self.resolve_agent_sender_name(&sender_id);
+        let sender_is_agent = agent_sender_name.is_some();
+        let sender_name = agent_sender_name.or(sender_name);
         tracing::info!(
             target: "turn_context",
             agent = %entry.name,
             agent_id = %agent_id,
             sender_id = ?sender_id,
             sender_name = ?sender_name,
+            sender_is_agent,
             trigger = ?trigger,
             "turn-context inject: sender -> PromptContext §9.1 (## Sender)"
         );
@@ -3302,6 +3336,7 @@ impl OpenFangKernel {
                 ),
                 sender_id: sender_id.clone(),
                 sender_name: sender_name.clone(),
+                sender_is_agent,
                 // Re-read context.md per turn by default (#843).
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
@@ -8754,6 +8789,20 @@ impl KernelHandle for OpenFangKernel {
     }
 
     async fn send_to_agent(&self, agent_id: &str, message: &str) -> Result<String, String> {
+        self.send_to_agent_from(agent_id, message, None).await
+    }
+
+    /// ANAI-147: see [`KernelHandle::send_to_agent_from`]. `sender_agent_id` is
+    /// threaded into the funnel's `sender_id` slot; `execute_llm_agent` resolves
+    /// it against the registry and renders §9.1 as agent-to-agent attribution.
+    /// A `None`/unresolvable sender degrades to the previous unattributed
+    /// behaviour, so no existing path can regress.
+    async fn send_to_agent_from(
+        &self,
+        agent_id: &str,
+        message: &str,
+        sender_agent_id: Option<&str>,
+    ) -> Result<String, String> {
         // Try UUID first, then fall back to name lookup
         let id: AgentId = match agent_id.parse() {
             Ok(id) => id,
@@ -8775,7 +8824,8 @@ impl KernelHandle for OpenFangKernel {
                 message,
                 handle,
                 None,
-                None,
+                // ANAI-147: the caller's agent id lands in the sender slot.
+                sender_agent_id.map(str::to_string),
                 None,
                 None,
                 TurnPolicy::autonomous(),
