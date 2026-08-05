@@ -52,19 +52,115 @@ const MAX_CACHE_TTL_SECS: u64 = 86_400;
 /// Upper bound on a configured per-entry use count.
 const MAX_CACHE_MAX_USES: u32 = 100_000;
 
-/// Binaries for which the "Approve Similar" button is suppressed. The binary
-/// alone carries no risk signal — the args do — so caching a whole binary here
-/// (`rm`, `dd`, …) would hand back the very gate it exists to enforce. These
-/// always collapse to a per-command human decision (Once / [Tool] / Deny).
+/// Binaries for which the "Approve Similar" button is suppressed.
+///
+/// Two distinct reasons a binary lands here:
+///
+/// 1. **Destructive** (`rm`, `dd`, `mkfs`, …) — the binary alone carries no
+///    risk signal, the args do, so caching the binary hands back the very gate
+///    it exists to enforce.
+/// 2. **Arbitrary** (`bash`, `python`, `env`, `sudo`, …) — an interpreter or
+///    wrapper is not *dangerous*, it is *unconstrained*, which is strictly
+///    worse. `argv[0] == "bash"` tells you nothing about what will run, so an
+///    argv[0]-keyed cache is meaningless for it: one ✅ on
+///    `bash -c "rm -rf /tmp/x"` would grant 50 unreviewed `bash` invocations
+///    for an hour, routing around every entry in category 1 (ANAI-152).
+///
+/// Both categories always collapse to a per-command human decision
+/// (Once / \[Tool\] / Deny).
 pub const SIMILAR_DENYLIST: &[&str] = &[
-    "rm", "dd", "mkfs", "kill", "killall", "chmod", "chown", "mv", "shutdown", "reboot",
+    // -- destructive --------------------------------------------------------
+    "rm",
+    "dd",
+    "mkfs",
+    "kill",
+    "killall",
+    "chmod",
+    "chown",
+    "mv",
+    "shutdown",
+    "reboot",
+    // -- shells / interpreters (arbitrary code via an argument) --------------
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "ksh",
+    "dash",
+    "csh",
+    "tcsh",
+    "ash",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "python",
+    "python2",
+    "python3",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "perl",
+    "ruby",
+    "php",
+    "lua",
+    "awk",
+    "gawk",
+    "eval",
+    "exec",
+    "source",
+    // -- process wrappers (execute an inner command we cannot see) -----------
+    "env",
+    "sudo",
+    "doas",
+    "su",
+    "nohup",
+    "nice",
+    "timeout",
+    "xargs",
+    "setsid",
+    "stdbuf",
+    "flock",
+    "script",
+    "ssh",
+    "find",
+    "strace",
+    "gdb",
+    "chroot",
+    "unshare",
 ];
 
-/// Returns true if `binary` (argv\[0\], exact spelling) is on the
-/// Approve-Similar denylist. Spelling-sensitive by design: `rm` and `/bin/rm`
-/// are distinct keys, which only ever narrows the cached radius.
+/// Returns true if `binary` (argv\[0\]) resolves to anything on the
+/// Approve-Similar denylist.
+///
+/// Matching is deliberately **broader than the cache key**. The cache key stays
+/// exact-spelling (`/bin/bash` and `bash` remain distinct keys, which only ever
+/// narrows the cached radius), but the *denylist decision* folds path prefix,
+/// case, `.exe` suffix, and the obfuscations in
+/// [`crate::cmd_norm::deny_variants`] before comparing. Otherwise `/bin/bash`,
+/// `BASH.exe` and `ba""sh` would each sail past a check meant to stop `bash`
+/// (ANAI-152).
+///
+/// Union semantics: a hit on the raw spelling **or** any normalized variant
+/// denies. A normalizer bug therefore suppresses a button that could have been
+/// offered — never offers one that should have been suppressed.
 pub fn is_similar_denylisted(binary: &str) -> bool {
-    SIMILAR_DENYLIST.contains(&binary)
+    crate::cmd_norm::deny_variants(binary)
+        .iter()
+        .any(|v| denylist_hit(v))
+}
+
+/// Exact-form membership test applied to one (possibly normalized) spelling:
+/// strip any path prefix, lowercase, drop a `.exe` suffix, then compare.
+fn denylist_hit(token: &str) -> bool {
+    let trimmed = token.trim();
+    let base = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    SIMILAR_DENYLIST.contains(&base)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +483,30 @@ pub struct ApprovalPolicy {
     /// Max times a single cached approval may be reused before it is evicted.
     /// Default: 50. `0` disables caching.
     pub cache_max_uses: u32,
+    /// Master switch for the "Approve Similar" relief valve. Default: `false`.
+    ///
+    /// Approve-Similar is the widest grant in the system: one click blankets a
+    /// whole binary for `cache_max_uses` invocations over `cache_ttl_secs`,
+    /// with no further human in the loop. It exists to relieve approval
+    /// fatigue, which makes it exactly the control most likely to be clicked
+    /// without reading.
+    ///
+    /// It ships **off** (ANAI-152). The narrowing fixes in the same change
+    /// (interpreter denylist, normalized deny matching) apply underneath it
+    /// regardless, so enabling it later lands on an already-closed hole rather
+    /// than opening one. Turn it on deliberately:
+    ///
+    /// ```toml
+    /// [approval]
+    /// allow_similar = true
+    /// ```
+    ///
+    /// When `false`, the button is not offered, a crafted `custom_id` asking
+    /// for it is refused server-side, and [`CacheScope::SimilarBinary`] entries
+    /// are refused at the cache itself — three independent points, because a
+    /// gate that can be reached from more than one surface must be closed at
+    /// the surface *and* at the store.
+    pub allow_similar: bool,
 }
 
 impl Default for ApprovalPolicy {
@@ -398,6 +518,7 @@ impl Default for ApprovalPolicy {
             auto_approve: false,
             cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
             cache_max_uses: DEFAULT_CACHE_MAX_USES,
+            allow_similar: false,
         }
     }
 }
@@ -1028,6 +1149,7 @@ mod tests {
             auto_approve: false,
             cache_ttl_secs: 1800,
             cache_max_uses: 25,
+            allow_similar: true,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: ApprovalPolicy = serde_json::from_str(&json).unwrap();
@@ -1036,6 +1158,7 @@ mod tests {
         assert!(back.auto_approve_autonomous);
         assert_eq!(back.cache_ttl_secs, 1800);
         assert_eq!(back.cache_max_uses, 25);
+        assert!(back.allow_similar);
     }
 
     // -----------------------------------------------------------------------
@@ -1056,10 +1179,67 @@ mod tests {
         assert!(is_similar_denylisted("rm"));
         assert!(is_similar_denylisted("dd"));
         assert!(is_similar_denylisted("chmod"));
-        // spelling-sensitive: an absolute path is a different key
-        assert!(!is_similar_denylisted("/bin/rm"));
         assert!(!is_similar_denylisted("grep"));
         assert!(!is_similar_denylisted("ls"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-152 — interpreter hole, path/case/obfuscation folding, allow_similar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn similar_denylist_covers_interpreters_and_wrappers() {
+        for bin in [
+            "bash", "sh", "zsh", "fish", "python", "python3", "node", "perl", "ruby", "awk",
+            "xargs", "env", "nohup", "sudo", "eval", "timeout", "ssh", "find",
+        ] {
+            assert!(
+                is_similar_denylisted(bin),
+                "{bin} must not be Approve-Similar eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn similar_denylist_folds_path_prefix_and_case() {
+        // The pre-ANAI-152 behavior let every one of these through.
+        assert!(is_similar_denylisted("/bin/rm"));
+        assert!(is_similar_denylisted("/usr/local/bin/bash"));
+        assert!(is_similar_denylisted("BASH"));
+        assert!(is_similar_denylisted("Bash.exe"));
+        assert!(is_similar_denylisted("C:\\Windows\\System32\\cmd.exe"));
+    }
+
+    #[test]
+    fn similar_denylist_folds_obfuscation() {
+        assert!(is_similar_denylisted("ba\"\"sh"));
+        assert!(is_similar_denylisted("\\r\\m"));
+        assert!(is_similar_denylisted("r\u{200b}m"));
+        // Cyrillic 'с' + "hmod"
+        assert!(is_similar_denylisted("\u{0441}hmod"));
+    }
+
+    #[test]
+    fn similar_denylist_does_not_overreach() {
+        // Union folding must not start denying ordinary binaries.
+        for bin in [
+            "grep", "ls", "cat", "git", "cargo", "rustc", "jq", "rg", "make", "npm",
+        ] {
+            assert!(!is_similar_denylisted(bin), "{bin} was denied unexpectedly");
+        }
+    }
+
+    #[test]
+    fn policy_allow_similar_defaults_off() {
+        assert!(!ApprovalPolicy::default().allow_similar);
+    }
+
+    #[test]
+    fn policy_allow_similar_defaults_off_when_absent() {
+        // A config written before the field existed must not silently enable it.
+        let json = r#"{"require_approval":["shell_exec"],"timeout_secs":60}"#;
+        let p: ApprovalPolicy = serde_json::from_str(json).unwrap();
+        assert!(!p.allow_similar);
     }
 
     #[test]

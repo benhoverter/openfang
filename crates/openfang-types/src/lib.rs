@@ -8,6 +8,7 @@ pub mod agent_wake;
 pub mod approval;
 pub mod bridge_auth;
 pub mod capability;
+pub mod cmd_norm;
 pub mod commands;
 pub mod comms;
 pub mod config;

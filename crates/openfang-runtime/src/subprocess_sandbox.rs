@@ -300,7 +300,35 @@ fn decode_pwsh_encoded_command(payload: &str) -> Result<String, String> {
 /// If `segment` invokes a shell wrapper with any load-from-disk / interactive
 /// flag from `SHELL_LOAD_FROM_DISK_FLAGS` (or `bash -O extdebug`), return Err.
 /// Otherwise return Ok(()). Non-wrapper commands pass through unchanged.
+///
+/// ANAI-152: evaluated over the raw segment **and** every deobfuscated variant
+/// from [`openfang_types::cmd_norm::deny_variants`]; any hit denies. See
+/// [`deny_over_variants`] for why this is a union and not a replacement.
 fn check_load_from_disk(segment: &str) -> Result<(), String> {
+    deny_over_variants(segment, check_load_from_disk_one)
+}
+
+/// Run a deny predicate over the raw segment and every normalized variant,
+/// returning the first `Err`.
+///
+/// **Union, never replace.** The tokenizers below are `split_whitespace()`,
+/// which no shell shares; normalizing *instead of* the raw form would trade one
+/// parser differential for another, and a normalizer bug would become a silent
+/// miss. Matching both means a normalizer bug can only produce a false-positive
+/// deny — loud, and fails safe. Same shape as the
+/// `safe_bins ∪ allowed_commands ∪ trusted_commands` union in
+/// [`validate_command_allowlist`].
+///
+/// Deny checks only. Never use variants for an *approve* comparison: folding
+/// `r""m` to `rm` on the allowlist side would turn an obfuscation into a grant.
+fn deny_over_variants(segment: &str, check: fn(&str) -> Result<(), String>) -> Result<(), String> {
+    for variant in openfang_types::cmd_norm::deny_variants(segment) {
+        check(&variant)?;
+    }
+    Ok(())
+}
+
+fn check_load_from_disk_one(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
     let base = extract_base_command(trimmed);
     let base_lower = base.to_lowercase();
@@ -339,7 +367,14 @@ fn check_load_from_disk(segment: &str) -> Result<(), String> {
 
 /// Hard-deny check: if the segment's base command is in WRAPPER_BINARIES_DENY,
 /// reject regardless of allowlist contents. (S9-08.)
+///
+/// ANAI-152: evaluated over raw + normalized variants (see
+/// [`deny_over_variants`]).
 fn check_wrapper_binary_deny(segment: &str) -> Result<(), String> {
+    deny_over_variants(segment, check_wrapper_binary_deny_one)
+}
+
+fn check_wrapper_binary_deny_one(segment: &str) -> Result<(), String> {
     let base = extract_base_command(segment.trim());
     let base_lower = base.to_lowercase();
     let base_normalized = base_lower.strip_suffix(".exe").unwrap_or(&base_lower);
@@ -355,7 +390,14 @@ fn check_wrapper_binary_deny(segment: &str) -> Result<(), String> {
 /// Hard-deny check: if the segment's base is an interpreter from
 /// INLINE_SCRIPT_INTERPRETERS and any arg matches its inline-script flag
 /// list, reject. (S9-08.)
+///
+/// ANAI-152: evaluated over raw + normalized variants (see
+/// [`deny_over_variants`]).
 fn check_inline_script_interpreter(segment: &str) -> Result<(), String> {
+    deny_over_variants(segment, check_inline_script_interpreter_one)
+}
+
+fn check_inline_script_interpreter_one(segment: &str) -> Result<(), String> {
     let trimmed = segment.trim();
     let base = extract_base_command(trimmed);
     let base_lower = base.to_lowercase();
@@ -2289,5 +2331,93 @@ mod tests {
         assert!(validate_command_allowlist("git status", &p).is_ok());
         // a non-listed command still rejected.
         assert!(validate_command_allowlist("npm install", &p).is_err());
+    }
+
+    // ── ANAI-152: deny matching over deobfuscated variants ──────────────
+    //
+    // Every base-extraction site tokenizes with `split_whitespace()`, which no
+    // shell shares. These assert that the hard-deny gates fire on the
+    // *normalized* spelling as well as the raw one — union semantics, so a
+    // normalizer bug can only over-deny.
+
+    #[test]
+    fn test_anai152_obfuscated_wrapper_binary_still_hard_denied() {
+        let p = wrapper_policy();
+        for cmd in [
+            "xa\"\"rgs rm -rf /tmp/x",
+            "\\x\\a\\r\\g\\s rm -rf /tmp/x",
+            "xargs\u{200b} rm -rf /tmp/x",
+            "fi\"\"nd /tmp -delete",
+        ] {
+            let err = validate_command_allowlist(cmd, &p)
+                .expect_err("obfuscated wrapper binary must not slip the hard-deny");
+            assert!(
+                err.contains("hard-denied"),
+                "expected hard-deny for {cmd}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anai152_obfuscated_inline_interpreter_still_hard_denied() {
+        let p = wrapper_policy();
+        for cmd in [
+            // en-dash instead of hyphen
+            "python3 \u{2013}c import os",
+            // escaped flag
+            "python3 \\-c import os",
+            // zero-width space inside the flag
+            "python3 -\u{200b}c import os",
+        ] {
+            let err = validate_command_allowlist(cmd, &p)
+                .expect_err("obfuscated inline-script flag must not slip the hard-deny");
+            assert!(
+                err.contains("inline-script flag"),
+                "expected interpreter deny for {cmd}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anai152_obfuscated_load_from_disk_flag_still_denied() {
+        let p = wrapper_policy();
+        for cmd in [
+            "bash --rc\\file /tmp/evil",
+            "bash \u{2013}-rcfile /tmp/evil",
+            "bash --init\u{200b}-file /tmp/evil",
+        ] {
+            let err = validate_command_allowlist(cmd, &p)
+                .expect_err("obfuscated load-from-disk flag must not slip the hard-deny");
+            assert!(
+                err.contains("load-from-disk"),
+                "expected load-from-disk deny for {cmd}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anai152_normalization_does_not_break_ordinary_commands() {
+        // The union must not start denying legitimate commands whose *arguments*
+        // happen to mention a denied binary, or that contain quotes at all.
+        let p = trusted_policy();
+        for cmd in [
+            "git status",
+            "git commit -m \"find the bug\"",
+            "git log --grep xargs",
+        ] {
+            assert!(
+                validate_command_allowlist(cmd, &p).is_ok(),
+                "{cmd} should still validate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anai152_normalization_never_grants_on_the_approve_side() {
+        // Deny-side folding must not leak into the allowlist comparison: an
+        // obfuscated spelling of an *allowlisted* binary stays unapproved,
+        // because the wall matches raw bases only.
+        let p = trusted_policy();
+        assert!(validate_command_allowlist("gi\"\"t status", &p).is_err());
     }
 }

@@ -91,6 +91,24 @@ pub enum ApprovalEvent {
 impl ApprovalManager {
     pub fn new(policy: ApprovalPolicy) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(APPROVAL_EVENT_BUFFER);
+        // ANAI-152: the state of the widest grant in the system should be
+        // observable at boot, not inferred from a button's absence — an absent
+        // button and a broken surfacer look identical from a chat window.
+        if policy.allow_similar {
+            warn!(
+                cache_ttl_secs = policy.cache_ttl_secs,
+                cache_max_uses = policy.cache_max_uses,
+                "Approve-Similar ENABLED ([approval] allow_similar = true): one click \
+                 blankets a binary for up to {} uses / {}s",
+                policy.cache_max_uses,
+                policy.cache_ttl_secs
+            );
+        } else {
+            info!(
+                "Approve-Similar disabled (default; set [approval] allow_similar = true \
+                 to enable) — every shell approval is per-command"
+            );
+        }
         Self {
             pending: DashMap::new(),
             recent: std::sync::Mutex::new(VecDeque::new()),
@@ -311,13 +329,30 @@ impl ApprovalManager {
     /// for `Approve Once` or `Deny`. A `cache_ttl_secs` or `cache_max_uses`
     /// of `0` disables caching, so this becomes a no-op.
     pub fn cache_decision(&self, req: &ApprovalRequest, scope: CacheScope) {
-        let (ttl, max_uses) = {
+        let (ttl, max_uses, allow_similar) = {
             let p = self.policy.read().unwrap_or_else(|e| e.into_inner());
-            (p.cache_ttl_secs, p.cache_max_uses)
+            (p.cache_ttl_secs, p.cache_max_uses, p.allow_similar)
         };
         if ttl == 0 || max_uses == 0 {
             debug!("Approval caching disabled (ttl or max_uses is 0); not caching");
             return;
+        }
+        // ANAI-152: Approve-Similar ships off. This is the *store* gate — the
+        // last point before an entry exists that can auto-approve a future
+        // command with no human in the loop. The button surfacer and the
+        // resolve path refuse first; this refuses regardless of how the call
+        // arrived, so no new caller (desktop UI, API, a future gatekeeper) can
+        // reopen the valve by simply not knowing about the flag.
+        if !allow_similar {
+            if let CacheScope::SimilarBinary(bin) = &scope {
+                warn!(
+                    agent_id = %req.agent_id,
+                    binary = %bin,
+                    "Approve-Similar refused: [approval] allow_similar = false. \
+                     Decision applies to this command only."
+                );
+                return;
+            }
         }
         let key = CacheKey {
             agent_id: req.agent_id.clone(),
@@ -415,6 +450,7 @@ mod tests {
             auto_approve: false,
             cache_ttl_secs: 3600,
             cache_max_uses: 50,
+            allow_similar: false,
         };
         let mgr = ApprovalManager::new(policy);
         assert!(mgr.requires_approval("file_write"));
@@ -496,6 +532,7 @@ mod tests {
             auto_approve: false,
             cache_ttl_secs: 3600,
             cache_max_uses: 50,
+            allow_similar: false,
         };
         mgr.update_policy(new_policy);
 
@@ -855,6 +892,41 @@ mod tests {
         let mgr = ApprovalManager::new(policy);
         mgr.cache_decision(&make_request("a", "file_write", 60), CacheScope::Tool);
         assert_eq!(mgr.cache_len(), 0);
+    }
+
+    // ── ANAI-152: allow_similar is enforced at the store, not just the UI ──
+
+    #[test]
+    fn cache_decision_refuses_similar_when_allow_similar_off() {
+        // Default policy has allow_similar = false.
+        let mgr = default_manager();
+        let mut req = make_request("a", "shell_exec", 60);
+        req.cache_binary = Some("grep".into());
+        mgr.cache_decision(&req, CacheScope::SimilarBinary("grep".into()));
+        assert_eq!(mgr.cache_len(), 0, "no entry may exist with the valve off");
+        assert!(!mgr.check_cache(&req));
+    }
+
+    #[test]
+    fn cache_decision_allows_similar_when_enabled() {
+        let policy = ApprovalPolicy {
+            allow_similar: true,
+            ..ApprovalPolicy::default()
+        };
+        let mgr = ApprovalManager::new(policy);
+        let mut req = make_request("a", "shell_exec", 60);
+        req.cache_binary = Some("grep".into());
+        mgr.cache_decision(&req, CacheScope::SimilarBinary("grep".into()));
+        assert_eq!(mgr.cache_len(), 1);
+        assert!(mgr.check_cache(&req));
+    }
+
+    #[test]
+    fn cache_decision_tool_scope_unaffected_by_allow_similar() {
+        // The flag gates SimilarBinary only — Approve Tool still caches.
+        let mgr = default_manager();
+        mgr.cache_decision(&make_request("a", "file_write", 60), CacheScope::Tool);
+        assert_eq!(mgr.cache_len(), 1);
     }
 
     #[tokio::test]

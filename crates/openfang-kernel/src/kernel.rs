@@ -8601,8 +8601,16 @@ impl OpenFangKernel {
             // safe signal (`rm`, `dd`, …). Approve Tool is intentionally NOT
             // offered for shell_exec — that blanket trust is `exec_policy.mode
             // = full` in agent.toml, not a per-prompt button.
+            //
+            // ANAI-152: the whole relief valve is off unless
+            // `[approval] allow_similar = true`. This is the *surface* gate —
+            // the resolve path and the cache itself refuse independently, so a
+            // crafted custom_id cannot reach what this hides. The denylist now
+            // also covers interpreters/wrappers (`bash`, `python`, `env`, …),
+            // whose argv[0] carries no information about what will run.
+            let allow_similar = self.approval_manager.policy().allow_similar;
             if let Some(bin) = req.cache_binary.as_deref() {
-                if !openfang_types::approval::is_similar_denylisted(bin) {
+                if allow_similar && !openfang_types::approval::is_similar_denylisted(bin) {
                     buttons.push(InteractiveButton {
                         custom_id: format!("as:{id}:n0"),
                         label: "Approve Similar".to_string(),

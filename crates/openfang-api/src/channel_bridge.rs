@@ -131,18 +131,27 @@ fn classify_approver(
 /// Map a button/command cache-scope token to a concrete [`CacheScope`] for
 /// the resolved request, applying defense-in-depth guards that mirror which
 /// buttons the surfacer offers:
-/// - `"similar"`: shell_exec only, requires a parsed `cache_binary`, and is
-///   refused for the destructive denylist even if a crafted custom_id asks.
+/// - `"similar"`: refused outright unless `[approval] allow_similar = true`
+///   (ANAI-152); then shell_exec only, requires a parsed `cache_binary`, and is
+///   refused for the destructive/interpreter denylist even if a crafted
+///   custom_id asks.
 /// - `"tool"`: refused for shell_exec (that blanket trust is
 ///   `exec_policy.mode = full`, not a per-prompt cache).
 /// Any other token (incl. `"once"` / None / unknown) yields `None`.
 fn cache_scope_from_token(
     token: Option<&str>,
     req: &openfang_types::approval::ApprovalRequest,
+    allow_similar: bool,
 ) -> Option<openfang_types::approval::CacheScope> {
     use openfang_types::approval::{is_similar_denylisted, CacheScope};
     match token {
         Some("similar") => {
+            // Surface-independent: the button may be absent, but the text
+            // `/approve <id> similar` path and a hand-crafted custom_id both
+            // land here too.
+            if !allow_similar {
+                return None;
+            }
             if req.tool_name != "shell_exec" {
                 return None;
             }
@@ -837,8 +846,10 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         let mut stamp_command =
                             safe_truncate_str(&req.action_summary, 160).to_string();
                         if approve {
-                            if let Some(scope) = cache_scope_from_token(scope_token, req) {
-                                let policy = self.kernel.approval_manager.policy();
+                            let policy = self.kernel.approval_manager.policy();
+                            if let Some(scope) =
+                                cache_scope_from_token(scope_token, req, policy.allow_similar)
+                            {
                                 if policy.cache_ttl_secs > 0 && policy.cache_max_uses > 0 {
                                     self.kernel
                                         .approval_manager
@@ -2420,11 +2431,16 @@ mod tests {
         }
     }
 
+    // `allow_similar` is threaded explicitly; ON exercises the pre-ANAI-152
+    // guards, OFF exercises the new master switch.
+    const ON: bool = true;
+    const OFF: bool = false;
+
     #[test]
     fn scope_similar_ok_for_safe_shell_binary() {
         let r = req("shell_exec", Some("grep"));
         assert_eq!(
-            cache_scope_from_token(Some("similar"), &r),
+            cache_scope_from_token(Some("similar"), &r, ON),
             Some(CacheScope::SimilarBinary("grep".into()))
         );
     }
@@ -2433,43 +2449,82 @@ mod tests {
     fn scope_similar_refused_for_denylisted_binary() {
         // defense-in-depth: even a crafted `as:` custom_id can't cache `rm`
         let r = req("shell_exec", Some("rm"));
-        assert_eq!(cache_scope_from_token(Some("similar"), &r), None);
+        assert_eq!(cache_scope_from_token(Some("similar"), &r, ON), None);
+    }
+
+    #[test]
+    fn scope_similar_refused_for_interpreters_and_wrappers() {
+        // ANAI-152 fault 1: `bash -c "…"` has argv[0] == "bash", which used to
+        // sail past the denylist and blanket every later `bash` invocation.
+        for bin in ["bash", "sh", "python3", "node", "env", "sudo", "xargs"] {
+            let r = req("shell_exec", Some(bin));
+            assert_eq!(
+                cache_scope_from_token(Some("similar"), &r, ON),
+                None,
+                "{bin} must not be cacheable"
+            );
+        }
+        // …and the same via a path or an obfuscated spelling.
+        for bin in ["/bin/bash", "ba\"\"sh", "BASH.exe"] {
+            let r = req("shell_exec", Some(bin));
+            assert_eq!(
+                cache_scope_from_token(Some("similar"), &r, ON),
+                None,
+                "{bin} must not be cacheable"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_similar_refused_when_allow_similar_off() {
+        // The master switch outranks every other guard: even the binary that
+        // would otherwise be eligible is refused at the resolve site, so the
+        // text `/approve <id> similar` path and a crafted custom_id are closed
+        // whether or not the button was ever rendered.
+        let r = req("shell_exec", Some("grep"));
+        assert_eq!(cache_scope_from_token(Some("similar"), &r, OFF), None);
     }
 
     #[test]
     fn scope_similar_refused_without_binary_or_non_shell() {
         assert_eq!(
-            cache_scope_from_token(Some("similar"), &req("shell_exec", None)),
+            cache_scope_from_token(Some("similar"), &req("shell_exec", None), ON),
             None
         );
         assert_eq!(
-            cache_scope_from_token(Some("similar"), &req("file_write", Some("grep"))),
+            cache_scope_from_token(Some("similar"), &req("file_write", Some("grep")), ON),
             None
         );
     }
 
     #[test]
-    fn scope_tool_ok_for_non_shell_but_refused_for_shell() {
-        assert_eq!(
-            cache_scope_from_token(Some("tool"), &req("file_write", None)),
-            Some(CacheScope::Tool)
-        );
-        // Approve Tool for shell_exec is policy-forbidden (use exec mode=full)
-        assert_eq!(
-            cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep"))),
-            None
-        );
+    fn scope_tool_unaffected_by_allow_similar() {
+        // The flag gates Approve-Similar only; Approve Tool keeps its own rule.
+        for flag in [ON, OFF] {
+            assert_eq!(
+                cache_scope_from_token(Some("tool"), &req("file_write", None), flag),
+                Some(CacheScope::Tool)
+            );
+            // Approve Tool for shell_exec is policy-forbidden (use exec mode=full)
+            assert_eq!(
+                cache_scope_from_token(Some("tool"), &req("shell_exec", Some("grep")), flag),
+                None
+            );
+        }
     }
 
     #[test]
     fn scope_once_and_unknown_never_cache() {
-        assert_eq!(cache_scope_from_token(None, &req("file_write", None)), None);
         assert_eq!(
-            cache_scope_from_token(Some("once"), &req("file_write", None)),
+            cache_scope_from_token(None, &req("file_write", None), ON),
             None
         );
         assert_eq!(
-            cache_scope_from_token(Some("bogus"), &req("file_write", None)),
+            cache_scope_from_token(Some("once"), &req("file_write", None), ON),
+            None
+        );
+        assert_eq!(
+            cache_scope_from_token(Some("bogus"), &req("file_write", None), ON),
             None
         );
     }
