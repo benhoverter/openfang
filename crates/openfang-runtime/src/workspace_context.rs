@@ -171,6 +171,18 @@ fn read_cached_file(path: &Path) -> Option<CachedFile> {
     }
     let mtime = meta.modified().ok()?;
     let content = std::fs::read_to_string(path).ok()?;
+    // ANAI-149: advisory injection scan on the cache-miss path only, so a
+    // cache hit costs nothing. Warn-only -- content is returned unchanged.
+    if let Some(parent) = path.parent() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        crate::context_scan::scan_and_log(
+            &crate::context_scan::source_label(parent, &name),
+            &content,
+        );
+    }
     Some(CachedFile { content, mtime })
 }
 

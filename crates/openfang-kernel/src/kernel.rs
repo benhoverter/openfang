@@ -602,6 +602,13 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     if content.trim().is_empty() {
         return None;
     }
+    // ANAI-149: advisory injection scan. Identity files are agent-writable and
+    // land verbatim in the system prompt. Warn-only by design -- self-editing
+    // is a supported capability, so nothing here drops or rewrites content.
+    openfang_runtime::context_scan::scan_and_log(
+        &openfang_runtime::context_scan::source_label(state_dir, filename),
+        &content,
+    );
     if content.len() > MAX_IDENTITY_FILE_BYTES {
         Some(openfang_types::truncate_str(&content, MAX_IDENTITY_FILE_BYTES).to_string())
     } else {

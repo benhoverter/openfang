@@ -60,6 +60,13 @@ pub fn load_context_md(workspace: &Path, cache_context: bool) -> Option<String> 
 
     match read_capped(&path) {
         Ok(Some(content)) => {
+            // ANAI-149: context.md is re-read every turn by design (#843) so
+            // external writers reach the LLM -- which makes it the widest
+            // ingestion path. Advisory scan only, content unchanged.
+            crate::context_scan::scan_and_log(
+                &crate::context_scan::source_label(workspace, CONTEXT_FILENAME),
+                &content,
+            );
             store_cached(&path, &content);
             Some(content)
         }
@@ -78,6 +85,11 @@ pub fn load_context_md(workspace: &Path, cache_context: bool) -> Option<String> 
                     path = %path.display(),
                     error = %e,
                     "Failed to re-read context.md; falling back to cached content"
+                );
+                // ANAI-149: the stale-cache fallback still reaches the prompt.
+                crate::context_scan::scan_and_log(
+                    &crate::context_scan::source_label(workspace, CONTEXT_FILENAME),
+                    &prev,
                 );
                 Some(prev)
             } else {
