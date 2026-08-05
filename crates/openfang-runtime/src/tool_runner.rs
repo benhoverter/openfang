@@ -437,6 +437,7 @@ pub async fn execute_tool(
                 workspace_root,
                 file_policy,
                 prevalidated_path.as_deref(),
+                caller_agent_id,
             )
             .await
         }
@@ -458,7 +459,9 @@ pub async fn execute_tool(
             )
             .await
         }
-        "apply_patch" => tool_apply_patch(input, workspace_root, file_policy).await,
+        "apply_patch" => {
+            tool_apply_patch(input, workspace_root, file_policy, caller_agent_id).await
+        }
 
         // File conversion tool (recipe-driven, allowlisted formats)
         "file_convert" => tool_file_convert(input, workspace_root).await,
@@ -1745,6 +1748,7 @@ async fn tool_file_write(
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
     prevalidated: Option<&Path>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, true)?;
@@ -1757,9 +1761,28 @@ async fn tool_file_write(
             .await
             .map_err(|e| format!("Failed to create directories: {e}"))?;
     }
+    // ANAI-149 D2: snapshot the prior content so the audit record can carry a
+    // diff. Only for context files -- an ordinary write pays one filename
+    // comparison and no extra I/O. Auditing never gates the write.
+    let audited = crate::context_audit::is_audited(&resolved);
+    let before = if audited {
+        crate::context_audit::capture_before(&resolved).await
+    } else {
+        None
+    };
     tokio::fs::write(&resolved, content)
         .await
         .map_err(|e| format!("Failed to write file: {e}"))?;
+    if audited {
+        crate::context_audit::record_write(
+            caller_agent_id,
+            "file_write",
+            &resolved,
+            before.as_deref(),
+            Some(content),
+        )
+        .await;
+    }
     Ok(format!(
         "Successfully wrote {} bytes to {}",
         content.len(),
@@ -2363,11 +2386,12 @@ async fn tool_apply_patch(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
-    let result = crate::apply_patch::apply_patch(&ops, root, file_policy).await;
+    let result = crate::apply_patch::apply_patch(&ops, root, file_policy, caller_agent_id).await;
     if result.is_ok() {
         Ok(result.summary())
     } else {

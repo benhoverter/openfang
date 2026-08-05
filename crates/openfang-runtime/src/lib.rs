@@ -18,6 +18,7 @@ pub mod bridge_auth;
 pub mod browser;
 pub mod command_lane;
 pub mod compactor;
+pub mod context_audit;
 pub mod context_budget;
 pub mod context_overflow;
 pub mod context_scan;

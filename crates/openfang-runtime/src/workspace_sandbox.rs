@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Mirrors `openfang_types::config::openfang_home_dir` (private there). Kept
 /// local to avoid a cross-crate dependency cycle from runtime -> types.
-fn openfang_home() -> Option<PathBuf> {
+pub(crate) fn openfang_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("OPENFANG_HOME") {
         return Some(PathBuf::from(home));
     }
@@ -71,6 +71,10 @@ pub(crate) fn is_sensitive_openfang_path(path: &Path) -> Option<&'static str> {
         s if s.starts_with("daemon.stderr.log.") || s.starts_with("daemon.stdout.log.") => {
             Some("daemon-log")
         }
+        // Tamper-evidence for agent writes to their own context files
+        // (ANAI-149 D2). An agent must not be able to read or rewrite the
+        // record of what it changed.
+        "audit" => Some("audit-log"),
         _ => None,
     }
 }
@@ -523,6 +527,25 @@ mod tests {
         assert_eq!(
             is_sensitive_openfang_path(&h.path.join("daemon.stderr.log.2026-05-19")),
             Some("daemon-log")
+        );
+    }
+
+    #[test]
+    fn test_sensitive_context_audit_log() {
+        let h = FakeHome::new();
+        // ANAI-149 D2: the record of what an agent changed in its own context
+        // files must not be readable or rewritable by an agent.
+        assert_eq!(
+            is_sensitive_openfang_path(&h.path.join("audit")),
+            Some("audit-log")
+        );
+        assert_eq!(
+            is_sensitive_openfang_path(&h.path.join("audit").join("context-writes.jsonl")),
+            Some("audit-log")
+        );
+        assert_eq!(
+            is_sensitive_openfang_path(&h.path.join("audit").join("context-writes.jsonl.1")),
+            Some("audit-log")
         );
     }
 

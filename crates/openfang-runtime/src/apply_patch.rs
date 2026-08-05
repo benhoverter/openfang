@@ -312,6 +312,7 @@ pub async fn apply_patch(
     ops: &[PatchOp],
     workspace_root: &Path,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    agent_id: Option<&str>,
 ) -> PatchResult {
     let mut result = PatchResult::default();
 
@@ -340,8 +341,25 @@ pub async fn apply_patch(
                                 continue;
                             }
                         }
+                        // ANAI-149 D2: an "add" can land on an existing
+                        // context file, so snapshot before overwriting.
+                        let before = if crate::context_audit::is_audited(&resolved) {
+                            crate::context_audit::capture_before(&resolved).await
+                        } else {
+                            None
+                        };
                         match tokio::fs::write(&resolved, content).await {
-                            Ok(()) => result.files_added += 1,
+                            Ok(()) => {
+                                result.files_added += 1;
+                                crate::context_audit::record_write(
+                                    agent_id,
+                                    "apply_patch",
+                                    &resolved,
+                                    before.as_deref(),
+                                    Some(content),
+                                )
+                                .await;
+                            }
                             Err(e) => result.errors.push(format!("write {}: {}", path, e)),
                         }
                     }
@@ -394,12 +412,36 @@ pub async fn apply_patch(
                             let _ = tokio::fs::create_dir_all(parent).await;
                         }
 
-                        match tokio::fs::write(&target, patched).await {
+                        match tokio::fs::write(&target, &patched).await {
                             Ok(()) => {
                                 result.files_updated += 1;
+                                // ANAI-149 D2. On a move the destination has no
+                                // prior content of its own, so the diff is
+                                // against nothing rather than against the
+                                // source file.
+                                crate::context_audit::record_write(
+                                    agent_id,
+                                    "apply_patch",
+                                    &target,
+                                    if move_to.is_some() {
+                                        None
+                                    } else {
+                                        Some(original.as_str())
+                                    },
+                                    Some(patched.as_str()),
+                                )
+                                .await;
                                 // If moved, delete original
                                 if move_to.is_some() && target != resolved {
                                     let _ = tokio::fs::remove_file(&resolved).await;
+                                    crate::context_audit::record_write(
+                                        agent_id,
+                                        "apply_patch",
+                                        &resolved,
+                                        Some(original.as_str()),
+                                        None,
+                                    )
+                                    .await;
                                 }
                             }
                             Err(e) => {
@@ -415,12 +457,32 @@ pub async fn apply_patch(
 
             PatchOp::DeleteFile { path } => {
                 match resolve_patch_path(path, workspace_root, file_policy) {
-                    Ok(resolved) => match tokio::fs::remove_file(&resolved).await {
-                        Ok(()) => result.files_deleted += 1,
-                        Err(e) => {
-                            result.errors.push(format!("delete {}: {}", path, e));
+                    Ok(resolved) => {
+                        // ANAI-149 D2: capture the content before it is gone,
+                        // so a deleted identity file is still recoverable from
+                        // the audit record.
+                        let before = if crate::context_audit::is_audited(&resolved) {
+                            crate::context_audit::capture_before(&resolved).await
+                        } else {
+                            None
+                        };
+                        match tokio::fs::remove_file(&resolved).await {
+                            Ok(()) => {
+                                result.files_deleted += 1;
+                                crate::context_audit::record_write(
+                                    agent_id,
+                                    "apply_patch",
+                                    &resolved,
+                                    before.as_deref(),
+                                    None,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                result.errors.push(format!("delete {}: {}", path, e));
+                            }
                         }
-                    },
+                    }
                     Err(e) => result.errors.push(format!("{}: {}", path, e)),
                 }
             }
@@ -787,7 +849,7 @@ mod tests {
             },
         ];
 
-        let result = apply_patch(&ops, &dir, None).await;
+        let result = apply_patch(&ops, &dir, None, None).await;
         assert!(result.is_ok());
         assert_eq!(result.files_added, 1);
         assert_eq!(result.files_updated, 1);
@@ -821,7 +883,7 @@ mod tests {
             path: "doomed.txt".to_string(),
         }];
 
-        let result = apply_patch(&ops, &dir, None).await;
+        let result = apply_patch(&ops, &dir, None, None).await;
         assert!(result.is_ok());
         assert_eq!(result.files_deleted, 1);
         assert!(!dir.join("doomed.txt").exists());
@@ -858,7 +920,7 @@ mod tests {
             },
         ];
 
-        let result = apply_patch(&ops, &dir, Some(&policy)).await;
+        let result = apply_patch(&ops, &dir, Some(&policy), None).await;
         assert!(
             !result.is_ok(),
             "patch must be rejected when any target is policy-denied"
