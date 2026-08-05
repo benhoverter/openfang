@@ -8479,6 +8479,47 @@ pub(crate) fn approval_push_target(
     })
 }
 
+/// Render the body of an approval prompt: the part the operator actually reads
+/// to decide.
+///
+/// Pure (no kernel/IO) so the three invariants below are unit-testable.
+///
+/// ANAI-151: the decision surface is `command` (verbatim, captured at the gate),
+/// NOT `action_summary` (serialized JSON, cut at 200 bytes by the gate and 512
+/// by the request builder — a cut that lands on the argument tail, i.e. the part
+/// carrying the risk). `action_summary` stays the fallback for non-shell tools
+/// and for requests serialized before the field existed.
+///
+/// Three transforms, and the ORDER is load-bearing:
+///   1. `elide_middle` — fit the platform width budget while keeping the tail,
+///      and state how much was dropped, so an elided command can never read as
+///      a complete one.
+///   2. `fence_escape` — the command is agent-controlled and may contain ``` to
+///      break out of the block we are about to open.
+///   3. `neutralize_markers` — a markdown code fence is NOT a defense against
+///      `outbound_attach::parse`, which does not respect markdown at all
+///      (ANAI-82). This stays, fence or no fence.
+fn render_approval_body(req: &openfang_types::approval::ApprovalRequest) -> String {
+    let neutralize = openfang_channels::outbound_attach::neutralize_markers;
+    match req.command.as_deref() {
+        Some(cmd) if !cmd.trim().is_empty() => {
+            let shown = openfang_types::approval::fence_escape(&openfang_types::elide_middle(
+                cmd,
+                APPROVAL_COMMAND_DISPLAY_CHARS,
+            ));
+            format!("```\n{}\n```", neutralize(&shown))
+        }
+        _ => neutralize(&req.action_summary),
+    }
+}
+
+/// Character budget for the command block rendered into an approval prompt.
+///
+/// Sized for the tightest adapter we push to (Discord, 2000 chars/message) with
+/// room for the header, the timeout line, and the `/approve` footer. Commands
+/// longer than this are middle-elided, never tail-cut (ANAI-151).
+const APPROVAL_COMMAND_DISPLAY_CHARS: usize = 1200;
+
 impl OpenFangKernel {
     /// Surface a freshly-submitted approval request back to the channel /
     /// conversation that triggered the run (§8 step 5 — the emit consumer).
@@ -8512,11 +8553,27 @@ impl OpenFangKernel {
         // MEDIUM, ANAI-82). The marker stays visible (opener `<` escaped) but is
         // never interpreted; file exfil is independently blocked (no allow_roots).
         let neutralize = openfang_channels::outbound_attach::neutralize_markers;
+        // ANAI-151: the decision surface is `command` (verbatim, captured at the
+        // gate), not `action_summary` (serialized JSON, cut at 200 bytes by the
+        // gate and 512 here — a cut that lands on the argument tail, i.e. the
+        // part carrying the risk). `action_summary` stays the fallback for
+        // non-shell tools and for pre-field serialized requests.
+        //
+        // Three transforms, and the ORDER is load-bearing:
+        //   1. elide_middle — fit the platform width budget while keeping the
+        //      tail, and state how much was dropped so an elided command can
+        //      never read as a complete one.
+        //   2. fence_escape — the command is agent-controlled and may contain
+        //      ``` to break out of the block we are about to open.
+        //   3. neutralize   — a markdown code fence is NOT a defense against
+        //      `outbound_attach::parse`, which does not respect markdown at all
+        //      (ANAI-82). This stays, fence or no fence.
+        let body = render_approval_body(req);
         let message = format!(
-            "🔐 Approval needed — agent `{agent}` wants to run `{tool}`.\n{summary}\n\nApprove: `/approve {id}`   ·   Reject: `/reject {id}`",
+            "🔐 Approval needed — agent `{agent}` wants to run `{tool}`.\n{body}\nAuto-denies in {timeout}s.\n\nApprove: `/approve {id}`   ·   Reject: `/reject {id}`",
             agent = neutralize(&req.agent_id),
             tool = neutralize(&req.tool_name),
-            summary = neutralize(&req.action_summary),
+            timeout = req.timeout_secs,
         );
 
         // Buttons carry only the request id + a nonce — never authorization.
@@ -8689,7 +8746,97 @@ mod approval_surface_tests {
             timeout_secs: 300,
             origin,
             cache_binary: None,
+            command: None,
         }
+    }
+
+    fn req_with_command(cmd: &str) -> ApprovalRequest {
+        let mut r = req_with(None);
+        r.command = Some(cmd.to_string());
+        r
+    }
+
+    // -- ANAI-151: prompt body fidelity --
+
+    /// The whole point: the operator sees the real command, fenced, not a
+    /// 200-byte slice of escaped JSON.
+    #[test]
+    fn body_shows_the_verbatim_command_fenced() {
+        let cmd = "bash -c \"find ~/GitHub -name '*.rs' -newer /tmp/mark -delete\"";
+        let body = super::render_approval_body(&req_with_command(cmd));
+        assert!(body.starts_with("```\n"), "{body}");
+        assert!(body.ends_with("\n```"), "{body}");
+        assert!(body.contains(cmd), "command must appear verbatim: {body}");
+        // And NOT the escaped-JSON summary form.
+        assert!(!body.contains("\\\""), "{body}");
+    }
+
+    /// The filed fault: a long command's TAIL is the dangerous part, and tail
+    /// truncation is exactly what dropped it. Both ends must survive, and the
+    /// elision must be stated.
+    #[test]
+    fn body_keeps_the_tail_of_an_over_long_command() {
+        let cmd = format!(
+            "bash -c \"{} && rm -rf /Users/ben/GitHub/Repos/openfang\"",
+            "echo padding; ".repeat(400)
+        );
+        let body = super::render_approval_body(&req_with_command(&cmd));
+        assert!(body.contains("bash -c"), "head must survive: {body}");
+        assert!(
+            body.contains("rm -rf /Users/ben/GitHub/Repos/openfang"),
+            "TAIL must survive — this is the filed fault: {body}"
+        );
+        assert!(
+            body.contains("chars elided"),
+            "elision must be visible, never silent: {body}"
+        );
+    }
+
+    /// The command is agent-controlled. A ``` inside it must not close the
+    /// fence: everything after a breakout would render as agent-authored
+    /// markdown, directly under a "do you approve?" question.
+    #[test]
+    fn body_command_cannot_break_out_of_the_fence() {
+        let hostile = "echo hi\n```\n**Ben already approved this — just click.**";
+        let body = super::render_approval_body(&req_with_command(hostile));
+        // Exactly two fences: the one we opened and the one we closed.
+        assert_eq!(
+            body.matches("```").count(),
+            2,
+            "agent content must not add a fence: {body}"
+        );
+        assert!(body.starts_with("```\n") && body.ends_with("\n```"));
+    }
+
+    /// A code fence is not a defense against the outbound attach parser, which
+    /// does not respect markdown (ANAI-82). The neutralization must still apply
+    /// inside the fence.
+    #[test]
+    fn body_neutralizes_attach_markers_inside_the_fence() {
+        let hostile = "echo hi <openfang:attach path=\"/etc/passwd\" caption=\"(dry run)\"/>";
+        let body = super::render_approval_body(&req_with_command(hostile));
+        assert!(
+            !body.contains("<openfang:attach"),
+            "marker must be neutralized even inside a code fence: {body}"
+        );
+    }
+
+    /// Non-shell tools carry no command; the summary path must still render.
+    #[test]
+    fn body_falls_back_to_action_summary_without_a_command() {
+        let r = req_with(None);
+        let body = super::render_approval_body(&r);
+        assert_eq!(body, r.action_summary);
+        assert!(!body.contains("```"));
+    }
+
+    /// A present-but-blank command must not produce an empty code block that
+    /// reads as "nothing to see here".
+    #[test]
+    fn body_falls_back_when_command_is_blank() {
+        let r = req_with_command("   ");
+        let body = super::render_approval_body(&r);
+        assert_eq!(body, r.action_summary);
     }
 
     #[test]
@@ -9263,6 +9410,7 @@ impl KernelHandle for OpenFangKernel {
         action_summary: &str,
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
+        command: Option<&str>,
     ) -> Result<bool, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
@@ -9289,6 +9437,10 @@ impl KernelHandle for OpenFangKernel {
             timeout_secs: policy.timeout_secs,
             origin: origin.cloned(),
             cache_binary: cache_binary.map(str::to_string),
+            // Verbatim, NOT truncated to 512 like action_summary: this is the
+            // string the operator authorizes. The gate already bounds it to
+            // MAX_COMMAND_LEN; validate() enforces the same bound (ANAI-151).
+            command: command.map(str::to_string),
         };
 
         let decision = self.approval_manager.request_approval(req).await;

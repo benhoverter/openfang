@@ -1307,6 +1307,12 @@
                       <span class="badge" :class="{ 'badge-warn': a.status === 'pending', 'badge-success': a.status === 'approved', 'badge-error': a.status === 'rejected', 'badge-muted': a.status === 'expired' }" x-text="a.status"></span>
                     </div>
                     <div class="text-sm text-dim mb-2" x-text="a.description"></div>
+                    <!-- ANAI-151: the verbatim command is the decision surface.
+                         x-text (never x-html) so an agent-authored command can
+                         never inject markup into the operator's own console. -->
+                    <template x-if="a.command">
+                      <pre class="text-xs mb-2" style="white-space:pre-wrap;word-break:break-all;background:var(--surface-2);border:1px solid var(--border-subtle);border-radius:var(--radius-sm);padding:8px;margin:0 0 8px 0;max-height:200px;overflow:auto" x-text="a.command"></pre>
+                    </template>
                     <div class="text-xs text-dim">Agent: <span x-text="a.agent_name"></span> &middot; <span x-text="timeAgo(a.created_at)"></span></div>
                     <template x-if="a.status === 'pending'">
                       <div class="approval-actions" style="display:flex;gap:8px;margin-top:12px">

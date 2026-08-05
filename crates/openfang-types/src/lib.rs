@@ -43,6 +43,29 @@ pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Shorten `s` to roughly `max_chars` characters by eliding the *middle*,
+/// keeping both the head and the tail.
+///
+/// Tail-first truncation ([`truncate_str`]) is actively dangerous on an
+/// operator decision surface: for a shell command the risky part is usually the
+/// argument list, i.e. exactly the part a tail cut discards (ANAI-151). This
+/// keeps ~60% head / ~40% tail and states how much was dropped, so a reader can
+/// never mistake an elided command for a complete one.
+///
+/// Character-based (not byte-based) so multi-byte input can never be split.
+pub fn elide_middle(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let head_len = max_chars * 3 / 5;
+    let tail_len = max_chars - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(total - tail_len).collect();
+    let elided = total - head_len - tail_len;
+    format!("{head}\n… [{elided} chars elided] …\n{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +109,36 @@ mod tests {
     #[test]
     fn truncate_str_empty() {
         assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn elide_middle_short_input_is_unchanged() {
+        assert_eq!(elide_middle("rm -rf /tmp/x", 100), "rm -rf /tmp/x");
+    }
+
+    /// The point of the function: a tail cut drops the arguments, which is
+    /// where a shell command's risk lives. Middle elision keeps both ends.
+    #[test]
+    fn elide_middle_keeps_the_dangerous_tail() {
+        let cmd = format!("bash -c \"{} rm -rf /Users/ben/GitHub\"", "a".repeat(500));
+        let out = elide_middle(&cmd, 100);
+        assert!(out.starts_with("bash -c"), "{out}");
+        assert!(
+            out.ends_with("rm -rf /Users/ben/GitHub\""),
+            "tail must survive: {out}"
+        );
+        assert!(
+            out.contains("chars elided"),
+            "elision must be stated: {out}"
+        );
+    }
+
+    #[test]
+    fn elide_middle_never_splits_a_char() {
+        let s = "あ".repeat(100);
+        let out = elide_middle(&s, 10);
+        // Round-trips as valid UTF-8 with only whole chars retained.
+        assert!(out.starts_with("あ"));
+        assert!(out.ends_with("あ"));
     }
 }

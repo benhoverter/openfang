@@ -2207,6 +2207,7 @@ mod tests {
             timeout_secs: 300,
             origin: None,
             cache_binary: None,
+            command: None,
         };
 
         // An operator running /approvals must see the request verbatim, never a
@@ -2415,6 +2416,7 @@ mod tests {
             timeout_secs: 60,
             origin: None,
             cache_binary: binary.map(str::to_string),
+            command: None,
         }
     }
 

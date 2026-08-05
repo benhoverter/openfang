@@ -232,6 +232,11 @@ pub trait KernelHandle: Send + Sync {
 
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns `Ok(true)` if approved, `Ok(false)` if denied or timed out.
+    ///
+    /// `command` carries the verbatim `shell_exec` command string. Like
+    /// `cache_binary`, it is captured at the gate where structured tool input
+    /// still exists — render sites downstream must never re-derive it from the
+    /// truncated `action_summary` (ANAI-151). `None` for non-shell tools.
     async fn request_approval(
         &self,
         agent_id: &str,
@@ -239,8 +244,10 @@ pub trait KernelHandle: Send + Sync {
         action_summary: &str,
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
+        command: Option<&str>,
     ) -> Result<bool, String> {
         let _ = (agent_id, tool_name, action_summary, origin, cache_binary);
+        let _ = command;
         Ok(true) // Default: auto-approve
     }
 

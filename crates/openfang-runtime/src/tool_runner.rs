@@ -313,14 +313,24 @@ pub async fn execute_tool(
             // Approve-Similar cache key source: argv[0] of a shell_exec
             // command, extracted once here where structured input still
             // exists (never re-parsed from the mangled action_summary).
-            let cache_binary = if tool_name == "shell_exec" {
-                input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .and_then(extract_cache_binary)
+            //
+            // Same reasoning, same place, for the whole command string: the
+            // operator decides from `command`, not from `summary` above, which
+            // is serialized JSON cut at 200 bytes — precisely dropping the
+            // argument tail that carries the risk (ANAI-151). Bounded to
+            // MAX_COMMAND_LEN so a hostile agent cannot use the prompt as an
+            // unbounded write into every downstream render surface.
+            let raw_command = if tool_name == "shell_exec" {
+                input.get("command").and_then(|v| v.as_str())
             } else {
                 None
             };
+            let cache_binary = raw_command.and_then(extract_cache_binary);
+            let command = raw_command.map(|c| {
+                c.chars()
+                    .take(openfang_types::approval::MAX_COMMAND_LEN)
+                    .collect::<String>()
+            });
             match kh
                 .request_approval(
                     agent_id_str,
@@ -328,6 +338,7 @@ pub async fn execute_tool(
                     &summary,
                     origin,
                     cache_binary.as_deref(),
+                    command.as_deref(),
                 )
                 .await
             {
@@ -388,6 +399,9 @@ pub async fn execute_tool(
                                             tool_name,
                                             &summary,
                                             None,
+                                            None,
+                                            // Not a shell_exec path: there is no
+                                            // command string to show (ANAI-151).
                                             None,
                                         )
                                         .await,
@@ -6561,6 +6575,10 @@ mod tests {
         // Records every `wake_post` (assigned_to target, message) so a test can
         // assert the terminal reply was queued to the right initiator.
         wake_posts: std::sync::Mutex<Vec<(String, String)>>,
+        // ANAI-151: records the `command` the gate handed to request_approval,
+        // so a test can prove the operator surface receives the VERBATIM
+        // command and not the 200-byte serialized-JSON summary.
+        approval_command: std::sync::Mutex<Option<String>>,
     }
 
     impl FakeKernelHandle {
@@ -6572,6 +6590,7 @@ mod tests {
                 approval_requested: std::sync::atomic::AtomicBool::new(false),
                 reply_rights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 wake_posts: std::sync::Mutex::new(Vec::new()),
+                approval_command: std::sync::Mutex::new(None),
             }
         }
 
@@ -6723,9 +6742,11 @@ mod tests {
             _action_summary: &str,
             _origin: Option<&openfang_types::approval::ApprovalOrigin>,
             _cache_binary: Option<&str>,
+            command: Option<&str>,
         ) -> Result<bool, String> {
             self.approval_requested
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.approval_command.lock().unwrap() = command.map(str::to_string);
             Ok(true)
         }
     }
@@ -6879,6 +6900,14 @@ mod tests {
             "approval gate MUST fire for an allowlisted command that clears the \
              wall — proves the spy records gate calls and the negative test is \
              a true negative"
+        );
+        // ANAI-151: and it must hand the gate the VERBATIM command, not the
+        // serialized-JSON summary. If this ever regresses to `{"command":"…`
+        // the render sites are back to displaying escaped, tail-cut JSON.
+        assert_eq!(
+            fake.approval_command.lock().unwrap().as_deref(),
+            Some("grep --version"),
+            "the gate must carry the raw command string to the operator surface"
         );
         // And the wall did NOT block it (independent of the command's exit
         // code, so this assertion is robust across grep implementations).

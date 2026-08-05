@@ -238,11 +238,35 @@ mod tests {
 
     const ALL: &[&str] = &[ALLOW_NO_AUTH_ENV, CONTEXT_SCAN_ENV, CONTEXT_AUDIT_ENV];
 
+    /// Serializes every test in this module that touches the process
+    /// environment.
+    ///
+    /// `EnvGuard` restores state on drop, which makes each test *self*-clean —
+    /// but the environment is process-global and this binary runs tests in
+    /// parallel, so two env-touching tests still interleave: `env_parsing`
+    /// clears the vars and asserts no relaxations while
+    /// `env_mutation_after_freeze_has_no_effect` sets all three to their
+    /// relaxed values. That raced and failed order-dependently (caught under
+    /// `cargo test -p openfang-kernel -p openfang-runtime -p openfang-api
+    /// -p openfang-types`, which schedules differently than the single-crate
+    /// run). A guard alone cannot fix this; only mutual exclusion can.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // Ignore poisoning: a panicking test leaves the env restored by
+        // EnvGuard regardless, and refusing the lock would cascade one failure
+        // into every sibling.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Every parsing case in one test: this crate's test binary is
     /// multi-threaded and the environment is process-global, so splitting
     /// these into separate `#[test]` fns would race.
     #[test]
     fn env_parsing() {
+        // Declared before the guard so the lock is released *after* the env is
+        // restored.
+        let _lock = env_lock();
         let _g = EnvGuard::capture(ALL);
 
         // Absent → secure defaults on every field.
@@ -322,6 +346,7 @@ mod tests {
     /// it holds no matter which test runs first.
     #[test]
     fn env_mutation_after_freeze_has_no_effect() {
+        let _lock = env_lock();
         let _g = EnvGuard::capture(ALL);
 
         let frozen = get();

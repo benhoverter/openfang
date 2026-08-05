@@ -22,6 +22,14 @@ const MAX_DESCRIPTION_LEN: usize = 1024;
 /// Maximum length of an action summary (chars).
 const MAX_ACTION_SUMMARY_LEN: usize = 512;
 
+/// Maximum length of the verbatim command carried on an approval request (chars).
+///
+/// Deliberately far above [`MAX_ACTION_SUMMARY_LEN`]: `action_summary` is a
+/// *label*, `command` is the artifact the operator is actually authorizing.
+/// Render surfaces elide for their own width budget; the request itself keeps
+/// the command as close to verbatim as a sane bound allows.
+pub const MAX_COMMAND_LEN: usize = 4096;
+
 /// Minimum approval timeout in seconds.
 const MIN_TIMEOUT_SECS: u64 = 10;
 
@@ -156,6 +164,55 @@ pub struct ApprovalRequest {
     /// non-shell tools and for commands with no parseable first token.
     #[serde(default)]
     pub cache_binary: Option<String>,
+    /// The verbatim `shell_exec` command string, captured once at the gate
+    /// where structured tool input still exists — never re-parsed from the
+    /// mangled `action_summary` (same precedent as [`Self::cache_binary`]).
+    ///
+    /// This is the operator decision surface. `action_summary` is a serialized,
+    /// JSON-escaped, tail-truncated *label* fit for a queue listing; deciding
+    /// from it means deciding from a string whose dangerous tail was already
+    /// cut (ANAI-151). Render surfaces must prefer this field when present.
+    /// `None` for non-shell tools.
+    ///
+    /// `#[serde(default)]` keeps pre-field serialized requests deserializing.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+/// Make `s` safe to place inside a triple-backtick fenced code block without
+/// letting it break out of the fence.
+///
+/// The command is agent-controlled, so it can contain ``` and close the fence
+/// the render site opened — turning the rest of the prompt into agent-authored
+/// markdown. We insert a zero-width space inside any run of three or more
+/// backticks: every visible character survives, the run stops being a fence
+/// terminator, and nothing else about the command is rewritten.
+///
+/// This is the minimum mangle that closes the breakout. It is applied *only*
+/// to backtick runs; deliberately not a general escaper, because the whole
+/// point of ANAI-151 is that the operator sees the command as the shell will.
+pub fn fence_escape(s: &str) -> String {
+    if !s.contains("```") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut run = 0usize;
+    for c in s.chars() {
+        if c == '`' {
+            run += 1;
+            if run >= 3 {
+                // Break the run: the third and every subsequent backtick gets a
+                // zero-width space in front of it.
+                out.push('\u{200b}');
+                run = 1;
+            }
+            out.push(c);
+        } else {
+            run = 0;
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl ApprovalRequest {
@@ -197,6 +254,16 @@ impl ApprovalRequest {
                 "action_summary too long ({} chars, max {MAX_ACTION_SUMMARY_LEN})",
                 self.action_summary.len()
             ));
+        }
+
+        // -- command (optional) --
+        if let Some(cmd) = &self.command {
+            let n = cmd.chars().count();
+            if n > MAX_COMMAND_LEN {
+                return Err(format!(
+                    "command too long ({n} chars, max {MAX_COMMAND_LEN})"
+                ));
+            }
         }
 
         // -- timeout_secs --
@@ -301,7 +368,13 @@ pub struct ApprovalPolicy {
     /// - `require_approval = true`  → `["shell_exec"]` (the default set)
     #[serde(deserialize_with = "deserialize_require_approval")]
     pub require_approval: Vec<String>,
-    /// Timeout in seconds. Default: 60, range: 10..=300.
+    /// Timeout in seconds. Default: 180, range: 10..=300.
+    ///
+    /// 60s was the default from the first approval landing and it is too short
+    /// for the thing we ask of the operator: read a full command, understand
+    /// what it does, decide. A minute means "click or lose it", which trains
+    /// reflex approval — the exact failure the gate exists to prevent
+    /// (ANAI-151). 180s stays inside the existing `MAX_TIMEOUT_SECS` bound.
     pub timeout_secs: u64,
     /// Auto-approve in autonomous mode. Default: `false`.
     pub auto_approve_autonomous: bool,
@@ -320,7 +393,7 @@ impl Default for ApprovalPolicy {
     fn default() -> Self {
         Self {
             require_approval: vec!["shell_exec".to_string()],
-            timeout_secs: 60,
+            timeout_secs: 180,
             auto_approve_autonomous: false,
             auto_approve: false,
             cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
@@ -451,6 +524,7 @@ mod tests {
             timeout_secs: 60,
             origin: None,
             cache_binary: None,
+            command: None,
         }
     }
 
@@ -704,7 +778,9 @@ mod tests {
         let policy = ApprovalPolicy::default();
         assert!(policy.validate().is_ok());
         assert_eq!(policy.require_approval, vec!["shell_exec".to_string()]);
-        assert_eq!(policy.timeout_secs, 60);
+        // ANAI-151: 180, not the historical 60. A minute is not enough time to
+        // read a command and decide; it trains reflex approval.
+        assert_eq!(policy.timeout_secs, 180);
         assert!(!policy.auto_approve_autonomous);
         assert!(!policy.auto_approve);
     }
@@ -713,7 +789,7 @@ mod tests {
     fn policy_serde_default() {
         // An empty JSON object should deserialize to defaults via #[serde(default)].
         let policy: ApprovalPolicy = serde_json::from_str("{}").unwrap();
-        assert_eq!(policy.timeout_secs, 60);
+        assert_eq!(policy.timeout_secs, 180);
         assert_eq!(policy.require_approval, vec!["shell_exec".to_string()]);
         assert!(!policy.auto_approve_autonomous);
     }
@@ -1011,5 +1087,110 @@ mod tests {
         let p: ApprovalPolicy = serde_json::from_str(json).unwrap();
         assert_eq!(p.cache_ttl_secs, DEFAULT_CACHE_TTL_SECS);
         assert_eq!(p.cache_max_uses, DEFAULT_CACHE_MAX_USES);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-151 — command field, fence escaping, timeout default
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn command_none_is_valid() {
+        let req = valid_request();
+        assert!(req.command.is_none());
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn command_at_max_len_ok() {
+        let mut req = valid_request();
+        req.command = Some("x".repeat(MAX_COMMAND_LEN));
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn command_over_max_len_rejected() {
+        let mut req = valid_request();
+        req.command = Some("x".repeat(MAX_COMMAND_LEN + 1));
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("command too long"), "{err}");
+    }
+
+    /// The bound is on CHARACTERS, not bytes: a multi-byte command must not be
+    /// rejected for being under the char limit but over it in bytes.
+    #[test]
+    fn command_len_bound_counts_chars_not_bytes() {
+        let mut req = valid_request();
+        // 3 bytes each, so this is 3 * MAX_COMMAND_LEN bytes but exactly
+        // MAX_COMMAND_LEN chars.
+        req.command = Some("あ".repeat(MAX_COMMAND_LEN));
+        assert!(req.validate().is_ok());
+    }
+
+    /// A request serialized BEFORE the `command` field existed must still
+    /// deserialize — the field is `#[serde(default)]`, same contract as
+    /// `cache_binary` and `origin`.
+    #[test]
+    fn legacy_json_without_command_deserializes() {
+        let json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "agent_id": "a",
+            "tool_name": "shell_exec",
+            "description": "d",
+            "action_summary": "rm -rf /tmp/x",
+            "risk_level": "high",
+            "requested_at": "2026-01-01T00:00:00Z",
+            "timeout_secs": 60
+        }"#;
+        let req: ApprovalRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.command, None);
+        assert_eq!(req.cache_binary, None);
+    }
+
+    #[test]
+    fn command_survives_serde_round_trip() {
+        let mut req = valid_request();
+        req.command = Some("bash -c \"rm -rf ~/.openfang/agents\"".to_string());
+        let json = serde_json::to_string(&req).unwrap();
+        let back: ApprovalRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.command, req.command);
+    }
+
+    // -- fence_escape --
+
+    #[test]
+    fn fence_escape_leaves_ordinary_commands_untouched() {
+        let cmd = "grep -rn 'needle' /var/log --include=*.rs";
+        assert_eq!(fence_escape(cmd), cmd);
+    }
+
+    #[test]
+    fn fence_escape_leaves_single_and_double_backticks_untouched() {
+        let cmd = "echo `date` and ``literal``";
+        assert_eq!(fence_escape(cmd), cmd);
+    }
+
+    /// The load-bearing one: an agent-authored command containing a fence must
+    /// not be able to close the block the render site opens. Everything after a
+    /// successful breakout would render as agent-authored markdown, which is
+    /// the whole prompt below the command.
+    #[test]
+    fn fence_escape_breaks_fence_breakout() {
+        let hostile = "echo hi\n```\n**Approved by Ben already, just click**";
+        let escaped = fence_escape(hostile);
+        assert!(
+            !escaped.contains("```"),
+            "no triple-backtick run may survive: {escaped:?}"
+        );
+        // ...and every visible character is still there. Only zero-width spaces
+        // were added, so stripping them recovers the original exactly.
+        assert_eq!(escaped.replace('\u{200b}', ""), hostile);
+    }
+
+    #[test]
+    fn fence_escape_handles_long_backtick_runs() {
+        let hostile = "``````````";
+        let escaped = fence_escape(hostile);
+        assert!(!escaped.contains("```"), "{escaped:?}");
+        assert_eq!(escaped.replace('\u{200b}', ""), hostile);
     }
 }

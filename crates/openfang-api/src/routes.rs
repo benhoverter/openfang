@@ -10979,6 +10979,9 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "description": a.description,
                 "action_summary": a.action_summary,
                 "action": a.action_summary,
+                // ANAI-151: verbatim command. The dashboard is a decision
+                // surface too — it must not decide from the truncated summary.
+                "command": a.command,
                 "risk_level": a.risk_level,
                 "requested_at": a.requested_at,
                 "created_at": a.requested_at,
@@ -11004,6 +11007,7 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             "description": request.description,
             "action_summary": request.action_summary,
             "action": request.action_summary,
+            "command": request.command,
             "risk_level": request.risk_level,
             "requested_at": request.requested_at,
             "created_at": request.requested_at,
@@ -11069,6 +11073,9 @@ pub async fn create_approval(
         timeout_secs: policy.timeout_secs,
         origin: None,
         cache_binary: None,
+        // Operator-initiated manual request: there is no gate-captured
+        // structured tool input to source a verbatim command from.
+        command: None,
     };
 
     // Spawn the request in the background (it will block until resolved or timed out)

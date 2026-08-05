@@ -391,6 +391,7 @@ mod tests {
             timeout_secs,
             origin: None,
             cache_binary: None,
+            command: None,
         }
     }
 
@@ -738,7 +739,10 @@ mod tests {
         let mgr = default_manager();
         let policy = mgr.policy();
         assert_eq!(policy.require_approval, vec!["shell_exec".to_string()]);
-        assert_eq!(policy.timeout_secs, 60);
+        // ANAI-151: 180, not the historical 60 — a minute is not enough time to
+        // read a command and decide, and a deadline that short trains reflex
+        // approval, which is the failure the gate exists to prevent.
+        assert_eq!(policy.timeout_secs, 180);
         assert!(!policy.auto_approve_autonomous);
     }
 
