@@ -319,9 +319,10 @@ pub async fn agent_ws(
     let api_key_raw = &state.kernel.config.api_key;
     let api_key = api_key_raw.trim();
     let is_loopback = addr.ip().is_loopback();
-    let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false);
+    // ANAI-150: read the startup-frozen snapshot, not the live environment.
+    // This path runs per WebSocket upgrade, so a live read would let anything
+    // able to set a process env var disable authentication mid-flight.
+    let allow_no_auth = openfang_types::security_flags::allow_no_auth();
 
     // Mirror the session_secret derivation in server.rs::AuthState so cookies
     // issued by /api/auth/login verify the same way over HTTP and WS.

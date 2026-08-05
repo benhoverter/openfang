@@ -20,6 +20,7 @@ pub mod message;
 pub mod model_catalog;
 pub mod paths;
 pub mod scheduler;
+pub mod security_flags;
 pub mod serde_compat;
 pub mod taint;
 pub mod tool;

@@ -40,6 +40,19 @@ pub async fn build_router(
     kernel: Arc<OpenFangKernel>,
     listen_addr: SocketAddr,
 ) -> (Router<()>, Arc<AppState>) {
+    // ANAI-150: freeze security flags for embedders that never go through
+    // `openfang-cli::cmd_start` (openfang-desktop). Idempotent — when the CLI
+    // already froze them at process start this is a no-op, and we only log
+    // when this call is the one that took the snapshot.
+    {
+        let outcome = openfang_types::security_flags::init();
+        if !outcome.already_frozen {
+            for (var, effect) in outcome.flags.relaxations() {
+                tracing::warn!(env_var = var, "security flag relaxed: {effect}");
+            }
+        }
+    }
+
     // Start channel bridges (Telegram, etc.)
     let bridge = channel_bridge::start_channel_bridge(kernel.clone()).await;
 
@@ -121,9 +134,9 @@ pub async fn build_router(
 
     // Trim whitespace so `api_key = ""` or `api_key = "  "` both disable auth.
     let api_key = state.kernel.config.api_key.trim().to_string();
-    let allow_no_auth = std::env::var("OPENFANG_ALLOW_NO_AUTH")
-        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false);
+    // ANAI-150: startup-frozen snapshot, shared with the WS upgrade path so
+    // both gates cannot disagree.
+    let allow_no_auth = openfang_types::security_flags::allow_no_auth();
 
     // Fail-closed warning: if no api_key and no dashboard auth, and the
     // server is bound to a non-loopback address without an explicit opt-in,

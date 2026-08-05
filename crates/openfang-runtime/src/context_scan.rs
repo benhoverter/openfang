@@ -263,17 +263,15 @@ fn compiled() -> &'static [Compiled] {
     })
 }
 
-/// Whether scanning is enabled. `OPENFANG_CONTEXT_SCAN=off` (or `0`/`false`)
-/// disables it process-wide.
+/// Whether scanning is enabled. `OPENFANG_CONTEXT_SCAN=off` (or
+/// `0`/`false`/`no`/`disabled`) disables it process-wide.
+///
+/// ANAI-150: this was a lazy `OnceLock` that sampled the environment on first
+/// use. That is weaker than it looks — if the first prompt assembly happened
+/// after an agent had already mutated the variable, the poisoned value became
+/// permanent. It now reads the snapshot frozen during daemon startup.
 fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("OPENFANG_CONTEXT_SCAN") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "off" | "0" | "false" | "no" | "disabled"
-        ),
-        Err(_) => true,
-    })
+    openfang_types::security_flags::context_scan_enabled()
 }
 
 /// Collapse whitespace, drop control characters, and truncate on a char

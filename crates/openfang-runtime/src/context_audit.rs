@@ -72,12 +72,14 @@ const MAX_DIFF_LINES: usize = 120;
 /// Rotate the audit log once it exceeds this size.
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
-/// `false` when `OPENFANG_CONTEXT_AUDIT` is set to `off`/`0`/`false`.
+/// `false` when `OPENFANG_CONTEXT_AUDIT` was set to `off`/`0`/`false` **at
+/// daemon startup**.
+///
+/// ANAI-150: the value is a frozen snapshot, not a live read. Auditing is the
+/// record of what an agent changed, so an agent that could switch it off
+/// mid-process could erase its own attribution before acting.
 fn enabled() -> bool {
-    !matches!(
-        std::env::var("OPENFANG_CONTEXT_AUDIT").as_deref(),
-        Ok("off") | Ok("0") | Ok("false")
-    )
+    openfang_types::security_flags::context_audit_enabled()
 }
 
 /// Returns the canonical audited filename if `path` names a context file.

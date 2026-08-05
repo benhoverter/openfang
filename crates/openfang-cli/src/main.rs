@@ -1559,6 +1559,23 @@ fn cmd_start(config: Option<PathBuf>, yolo: bool) {
     println!("  Starting daemon...");
     ui::blank();
 
+    // ANAI-150: freeze security-relevant env flags before anything else in
+    // the daemon process reads them. Nothing has booted yet — no kernel, no
+    // agents, no HTTP listener — so this snapshot is the operator's intent
+    // and cannot be a value some later code path already sampled.
+    {
+        let outcome = openfang_types::security_flags::init();
+        if outcome.already_frozen {
+            ui::check_warn(
+                "Security flags were already frozen before daemon start — \
+                 startup ordering bug, please report",
+            );
+        }
+        for (var, effect) in outcome.flags.relaxations() {
+            ui::check_warn(&format!("{var} is set: {effect}"));
+        }
+    }
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let mut kernel_config = openfang_kernel::config::load_config(config.as_deref());
