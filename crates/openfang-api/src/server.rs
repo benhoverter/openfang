@@ -841,36 +841,26 @@ pub async fn run_daemon(
 
     kernel.start_background_agents();
 
-    // Config file hot-reload watcher (polls every 30 seconds)
-    {
-        let k = kernel.clone();
-        let config_path = kernel.config.home_dir.join("config.toml");
-        tokio::spawn(async move {
-            let mut last_modified = std::fs::metadata(&config_path)
-                .and_then(|m| m.modified())
-                .ok();
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let current = std::fs::metadata(&config_path)
-                    .and_then(|m| m.modified())
-                    .ok();
-                if current != last_modified && current.is_some() {
-                    last_modified = current;
-                    tracing::info!("Config file changed, reloading...");
-                    match k.reload_config() {
-                        Ok(plan) => {
-                            if plan.has_changes() {
-                                tracing::info!("Config hot-reload applied: {:?}", plan.hot_actions);
-                            } else {
-                                tracing::debug!("Config hot-reload: no actionable changes");
-                            }
-                        }
-                        Err(e) => tracing::warn!("Config hot-reload failed: {e}"),
-                    }
-                }
-            }
-        });
-    }
+    // SECURITY (ANAI-150 follow-up): there is deliberately NO config.toml
+    // file watcher here.
+    //
+    // The daemon used to poll `config.toml`'s mtime every 30 s and apply the
+    // resulting `ReloadPlan` automatically. That made the config file an
+    // ambient, unauthenticated control channel: any actor able to write
+    // `~/.openfang/config.toml` — which includes every agent holding
+    // `shell_exec`, via `sed`/`cp`/`tee` — could relax the approval policy
+    // (`[approval] auto_approve = true`), repoint providers, or swap the
+    // fleet model, and have the running daemon adopt it within 30 seconds
+    // with no operator in the loop.
+    //
+    // Config is now applied at startup only, plus the explicit, authenticated,
+    // audit-logged `POST /api/config/reload` endpoint. A file write alone
+    // changes nothing until an authenticated operator asks for it or the
+    // daemon restarts.
+    tracing::info!(
+        target: "config_reload",
+        "config.toml file watching is disabled; config applies at startup or via POST /api/config/reload"
+    );
 
     let (app, state) = build_router(kernel.clone(), addr).await;
 
