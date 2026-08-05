@@ -153,8 +153,32 @@ pub async fn auth(
     // any LAN-reachable bind.
     let api_key_trimmed = auth_state.api_key.trim().to_string();
     if api_key_trimmed.is_empty() && !auth_state.auth_enabled {
-        if is_loopback || auth_state.allow_no_auth {
+        // SECURITY (ANAI-161): the no-key bypass is READ-ONLY. Loopback is
+        // not a trust boundary here -- every agent subprocess runs on
+        // loopback and can reach the API with `web_fetch`. An empty key
+        // previously let any of them POST /api/approvals/{id}/approve on
+        // their own (or another agent's) pending request, making
+        // human-in-the-loop approval decorative. Mutating methods now
+        // always require a credential; GETs stay open so the dashboard
+        // SPA renders with zero config.
+        let is_read_only = matches!(
+            method,
+            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+        );
+        if is_read_only && (is_loopback || auth_state.allow_no_auth) {
             return next.run(request).await;
+        }
+        if !is_read_only && (is_loopback || auth_state.allow_no_auth) {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("www-authenticate", "Bearer")
+                .body(Body::from(
+                    serde_json::json!({
+                        "error": "API key required for mutating requests. Set api_key in config.toml (or OPENFANG_API_KEY)."
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_default();
         }
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
@@ -364,6 +388,70 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn post_router(state: AuthState) -> Router {
+        Router::new()
+            .route(
+                "/api/approvals/{id}/approve",
+                axum::routing::post(ok_handler),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(state, auth))
+    }
+
+    fn post_req_from(ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/approvals/00000000-0000-0000-0000-000000000000/approve")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    #[tokio::test]
+    async fn empty_key_blocks_loopback_mutation() {
+        // ANAI-161: every agent subprocess runs on loopback and can reach the
+        // API with `web_fetch`. With no api_key configured, POST
+        // /api/approvals/{id}/approve used to run the handler unauthenticated,
+        // letting an agent approve its own (or a peer's) pending shell_exec.
+        let app = post_router(auth_state_empty());
+        let resp = app.oneshot(post_req_from("127.0.0.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_key_blocks_mutation_even_with_allow_no_auth() {
+        // The escape hatch loosens origin checks, not the read-only rule.
+        let mut s = auth_state_empty();
+        s.allow_no_auth = true;
+        let app = post_router(s);
+        let resp = app.oneshot(post_req_from("10.0.0.9")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn empty_key_still_allows_loopback_reads() {
+        // Zero-config dashboard UX must survive: GETs stay open on loopback.
+        let app = router(auth_state_empty());
+        let resp = app.oneshot(req_from("127.0.0.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_key_allows_loopback_mutation_with_bearer() {
+        let app = post_router(auth_state_with_key("secret"));
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/approvals/00000000-0000-0000-0000-000000000000/approve")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

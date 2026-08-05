@@ -386,6 +386,10 @@ if __name__ == "__main__":
 /// intact (so Node.js, NVM, SSL, proxies, etc. all work) and only remove
 /// secrets that belong to other LLM providers.
 const SENSITIVE_ENV_EXACT: &[&str] = &[
+    // ANAI-161: OpenFang's own API key must never reach a model subprocess;
+    // holding it would let an agent authenticate to the daemon API and
+    // approve its own shell_exec requests.
+    "OPENFANG_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
@@ -2995,6 +2999,8 @@ mod tests {
     #[test]
     fn test_sensitive_env_list_coverage() {
         // Ensure all major provider keys are in the strip list
+        // ANAI-161: OpenFang's own API key must not reach a model subprocess.
+        assert!(SENSITIVE_ENV_EXACT.contains(&"OPENFANG_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"OPENAI_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"ANTHROPIC_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
