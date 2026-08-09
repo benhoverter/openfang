@@ -1205,6 +1205,32 @@ pub(crate) fn daemon_client() -> reqwest::blocking::Client {
     builder.build().expect("Failed to build HTTP client")
 }
 
+/// Walk an error's `source()` chain and render the full cause path.
+///
+/// `reqwest::Error`'s `Display` is deliberately vague for transport failures
+/// (e.g. `error sending request for url (...)`); the actionable detail lives
+/// in the source chain, which callers never see unless it is walked.
+///
+/// Depth is bounded so a pathological or cyclic chain cannot hang the CLI.
+pub(crate) fn error_chain_message(e: &dyn std::error::Error) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut cur = e.source();
+    let mut depth = 0usize;
+    while let Some(src) = cur {
+        let s = src.to_string();
+        // Skip empty frames and frames that just restate their parent.
+        if !s.is_empty() && parts.last().map(|p| p != &s).unwrap_or(true) {
+            parts.push(s);
+        }
+        cur = src.source();
+        depth += 1;
+        if depth >= 8 {
+            break;
+        }
+    }
+    parts.join(": ")
+}
+
 /// Helper: send a request to the daemon and parse the JSON body.
 /// Exits with error on connection failure.
 pub(crate) fn daemon_json(
@@ -1223,20 +1249,27 @@ pub(crate) fn daemon_json(
             body
         }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("timed out") || msg.contains("Timeout") {
+            // Classify with reqwest's typed predicates, NOT by string-matching
+            // Display output. A blocking-client timeout renders as
+            // "error sending request for url (...)" -- the words "timed out"
+            // appear only in the source chain, so string sniffing silently
+            // misroutes every timeout into the generic arm and tells the
+            // operator to restart a perfectly healthy daemon.
+            if e.is_timeout() {
                 ui::error_with_fix(
                     "Request timed out",
                     "The agent may be processing a complex request. Try again, or check `openfang status`",
                 );
-            } else if msg.contains("Connection refused") || msg.contains("connect") {
+            } else if e.is_connect() {
                 ui::error_with_fix(
                     "Cannot connect to daemon",
                     "Is the daemon running? Start it with: openfang start",
                 );
             } else {
+                // Render the whole source chain; reqwest's own Display is too
+                // vague to diagnose from.
                 ui::error_with_fix(
-                    &format!("Daemon communication error: {msg}"),
+                    &format!("Daemon communication error: {}", error_chain_message(&e)),
                     "Check `openfang status` or restart: openfang start",
                 );
             }
@@ -7175,6 +7208,84 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+
+    // --- Transport error classification (ANAI-172) ---
+
+    #[derive(Debug)]
+    struct ChainErr {
+        msg: &'static str,
+        src: Option<Box<ChainErr>>,
+    }
+
+    impl std::fmt::Display for ChainErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.msg)
+        }
+    }
+
+    impl std::error::Error for ChainErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.src
+                .as_ref()
+                .map(|b| b.as_ref() as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    fn chain(msgs: &[&'static str]) -> ChainErr {
+        let mut it = msgs.iter().rev();
+        let mut err = ChainErr {
+            msg: it.next().expect("at least one message"),
+            src: None,
+        };
+        for m in it {
+            err = ChainErr {
+                msg: m,
+                src: Some(Box::new(err)),
+            };
+        }
+        err
+    }
+
+    #[test]
+    fn test_error_chain_message_surfaces_deep_cause() {
+        // The reqwest shape this issue is about: the useful words live in the
+        // source chain, not in the top-level Display.
+        let e = chain(&[
+            "error sending request for url (http://127.0.0.1:8080/api/message)",
+            "operation timed out",
+        ]);
+        let out = super::error_chain_message(&e);
+        assert!(out.contains("error sending request for url"), "got: {out}");
+        assert!(
+            out.contains("operation timed out"),
+            "deep cause must be surfaced, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_error_chain_message_single_error() {
+        let e = chain(&["lonely failure"]);
+        assert_eq!(super::error_chain_message(&e), "lonely failure");
+    }
+
+    #[test]
+    fn test_error_chain_message_skips_duplicate_frames() {
+        let e = chain(&["same", "same", "different"]);
+        assert_eq!(super::error_chain_message(&e), "same: different");
+    }
+
+    #[test]
+    fn test_error_chain_message_is_depth_bounded() {
+        // 20 distinct frames; only the head + 8 sources may be rendered.
+        let msgs: Vec<&'static str> = vec![
+            "f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07", "f08", "f09", "f10", "f11",
+            "f12", "f13", "f14", "f15", "f16", "f17", "f18", "f19",
+        ];
+        let e = chain(&msgs);
+        let out = super::error_chain_message(&e);
+        assert_eq!(out.matches(": ").count(), 8, "got: {out}");
+        assert!(!out.contains("f19"), "must not walk the whole chain: {out}");
+    }
 
     // --- Doctor command unit tests ---
 
