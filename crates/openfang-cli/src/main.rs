@@ -277,6 +277,12 @@ enum Commands {
         /// Output as JSON for scripting.
         #[arg(long)]
         json: bool,
+        /// Seconds to wait for the agent's reply (0 = wait indefinitely).
+        ///
+        /// `/api/agents/:id/message` blocks for the whole agent turn, so the
+        /// wait tracks turn latency, not payload size.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
     /// System info and version [*].
     #[command(subcommand)]
@@ -1125,7 +1131,12 @@ fn main() {
         },
         Some(Commands::Onboard { quick }) | Some(Commands::Setup { quick }) => cmd_init(quick),
         Some(Commands::Configure) => cmd_init(false),
-        Some(Commands::Message { agent, text, json }) => cmd_message(&agent, &text, json),
+        Some(Commands::Message {
+            agent,
+            text,
+            json,
+            timeout,
+        }) => cmd_message(&agent, &text, json, timeout),
         Some(Commands::System(sub)) => match sub {
             SystemCommands::Info { json } => cmd_system_info(json),
             SystemCommands::Version { json } => cmd_system_version(json),
@@ -1191,8 +1202,37 @@ pub(crate) fn find_daemon() -> Option<String> {
 /// includes a `Authorization: Bearer <key>` header on every request.
 /// When api_key is empty or missing, no auth header is sent.
 pub(crate) fn daemon_client() -> reqwest::blocking::Client {
+    daemon_client_with_timeout(DAEMON_DEFAULT_TIMEOUT_SECS)
+}
+
+/// Default client timeout for short, control-plane daemon calls.
+pub(crate) const DAEMON_DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// Default wait for `openfang message`.
+///
+/// The route awaits the *entire* agent turn (LLM calls + tool loop) before
+/// responding, so this bounds turn latency, not payload size. 120s was low
+/// enough that ordinary long turns surfaced as transport failures.
+pub(crate) const MESSAGE_DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// Ceiling for `--timeout`, and the value used for `--timeout 0`
+/// ("wait indefinitely"). A real bound is kept so a wedged daemon can never
+/// hang a scripted caller forever.
+pub(crate) const MESSAGE_MAX_TIMEOUT_SECS: u64 = 86_400;
+
+/// Resolve the effective `openfang message` timeout from the CLI flag.
+pub(crate) fn resolve_message_timeout(flag: Option<u64>) -> u64 {
+    match flag {
+        None => MESSAGE_DEFAULT_TIMEOUT_SECS,
+        Some(0) => MESSAGE_MAX_TIMEOUT_SECS,
+        Some(n) => n.min(MESSAGE_MAX_TIMEOUT_SECS),
+    }
+}
+
+/// Same as [`daemon_client`], with an explicit request timeout.
+pub(crate) fn daemon_client_with_timeout(secs: u64) -> reqwest::blocking::Client {
     let mut builder =
-        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(120));
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(secs));
 
     if let Some(key) = read_api_key() {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -1258,7 +1298,7 @@ pub(crate) fn daemon_json(
             if e.is_timeout() {
                 ui::error_with_fix(
                     "Request timed out",
-                    "The agent may be processing a complex request. Try again, or check `openfang status`",
+                    "The agent may still be working: `openfang message` waits for the whole turn. Raise the wait with `--timeout <seconds>` (0 = wait indefinitely), or check `openfang status`",
                 );
             } else if e.is_connect() {
                 ui::error_with_fix(
@@ -6737,15 +6777,56 @@ fn cmd_webhooks_test(id: &str) {
     }
 }
 
-fn cmd_message(agent: &str, text: &str, json: bool) {
+fn cmd_message(agent: &str, text: &str, json: bool, timeout: Option<u64>) {
     let base = require_daemon("message");
-    let client = daemon_client();
-    let body = daemon_json(
-        client
-            .post(format!("{base}/api/agents/{agent}/message"))
-            .json(&serde_json::json!({"message": text}))
-            .send(),
-    );
+    let timeout_secs = resolve_message_timeout(timeout);
+    let client = daemon_client_with_timeout(timeout_secs);
+
+    // The route blocks for the entire agent turn, so a healthy call can sit
+    // silent for minutes. Without a heartbeat that is indistinguishable from
+    // a hung CLI -- and the operator kills it before the reply lands.
+    // stderr only, and only for a human at a terminal, so `--json` and piped
+    // callers stay byte-clean.
+    let show_progress = !json && std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ticker = if show_progress {
+        let done = std::sync::Arc::clone(&done);
+        let agent = agent.to_string();
+        std::thread::Builder::new()
+            .name("message-progress".into())
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                loop {
+                    // Poll frequently so the thread exits promptly on reply,
+                    // but only speak every ~15s.
+                    for _ in 0..60 {
+                        if done.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    eprintln!(
+                        "  … still waiting on {agent} ({}s elapsed, timeout {timeout_secs}s)",
+                        start.elapsed().as_secs()
+                    );
+                }
+            })
+            .ok()
+    } else {
+        None
+    };
+
+    let resp = client
+        .post(format!("{base}/api/agents/{agent}/message"))
+        .json(&serde_json::json!({"message": text}))
+        .send();
+
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(t) = ticker {
+        let _ = t.join();
+    }
+
+    let body = daemon_json(resp);
     if json {
         println!(
             "{}",
@@ -7208,6 +7289,39 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+
+    // --- `openfang message` timeout resolution (ANAI-173) ---
+
+    #[test]
+    fn message_timeout_defaults_above_control_plane_timeout() {
+        // The whole point of 173: the message wait must not inherit the 120s
+        // control-plane timeout, because it bounds a full agent turn.
+        let d = super::resolve_message_timeout(None);
+        assert_eq!(d, super::MESSAGE_DEFAULT_TIMEOUT_SECS);
+        assert!(d > super::DAEMON_DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn message_timeout_zero_means_wait_indefinitely() {
+        assert_eq!(
+            super::resolve_message_timeout(Some(0)),
+            super::MESSAGE_MAX_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn message_timeout_honors_explicit_value() {
+        assert_eq!(super::resolve_message_timeout(Some(45)), 45);
+        assert_eq!(super::resolve_message_timeout(Some(3600)), 3600);
+    }
+
+    #[test]
+    fn message_timeout_is_capped() {
+        assert_eq!(
+            super::resolve_message_timeout(Some(u64::MAX)),
+            super::MESSAGE_MAX_TIMEOUT_SECS
+        );
+    }
 
     // --- Transport error classification (ANAI-172) ---
 
