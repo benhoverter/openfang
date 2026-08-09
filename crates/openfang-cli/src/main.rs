@@ -1724,6 +1724,28 @@ fn cmd_start(config: Option<PathBuf>, yolo: bool) {
     });
 }
 
+/// Extract `api_key` from the text of a `config.toml` document.
+///
+/// Split out from [`read_api_key`] so the parse is unit-testable without
+/// touching process-global `OPENFANG_HOME`/`OPENFANG_API_KEY` state.
+///
+/// NOTE: this must use `toml::from_str` (a *document* parse), NOT
+/// `text.parse::<toml::Value>()`. `<toml::Value as FromStr>` parses a single
+/// TOML *value expression* (`42`, `"foo"`), so handing it a whole document
+/// fails with `unexpected content, expected nothing` at the first `=`. That
+/// bug silently disabled this entire branch: `read_api_key` always fell
+/// through to `OPENFANG_API_KEY`, so the CLI 401'd against an authenticated
+/// daemon for anyone without that env var set.
+fn api_key_from_config_text(text: &str) -> Option<String> {
+    let table: toml::Value = toml::from_str(text).ok()?;
+    let key = table.get("api_key")?.as_str()?.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
 /// Read the api_key from ~/.openfang/config.toml (if any).
 ///
 /// Returns `None` when the key is missing, empty, or whitespace-only —
@@ -1732,13 +1754,8 @@ fn read_api_key() -> Option<String> {
     // 1. Config file takes precedence
     let config_path = cli_openfang_home().join("config.toml");
     if let Ok(text) = std::fs::read_to_string(config_path) {
-        if let Ok(table) = text.parse::<toml::Value>() {
-            if let Some(key) = table.get("api_key").and_then(|v| v.as_str()) {
-                let key = key.trim();
-                if !key.is_empty() {
-                    return Some(key.to_string());
-                }
-            }
+        if let Some(key) = api_key_from_config_text(&text) {
+            return Some(key);
         }
     }
     // 2. Fall back to OPENFANG_API_KEY env var
@@ -7289,6 +7306,61 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+
+    // --- config.toml api_key parsing (CLI auth regression) ---
+
+    /// The document shape that actually broke: a top-level `api_key` followed
+    /// by section tables. `text.parse::<toml::Value>()` fails on this; only a
+    /// document parse succeeds.
+    #[test]
+    fn api_key_parsed_from_realistic_config_document() {
+        let text = r#"
+# OpenFang Agent OS configuration
+api_listen = "127.0.0.1:4200"
+api_key = "kwjhU-P4e5uvyjqCaTLd8V8VQVzLW0mFPLbvvEvPcSo"
+
+[default_model]
+provider = "claude-code"
+
+[[bindings]]
+channel_id = "1476626559401066688"
+agent = "openfang-alpha"
+"#;
+        assert_eq!(
+            super::api_key_from_config_text(text).as_deref(),
+            Some("kwjhU-P4e5uvyjqCaTLd8V8VQVzLW0mFPLbvvEvPcSo")
+        );
+    }
+
+    /// Guards the exact regression: a bare value parse cannot read a document,
+    /// so a future refactor back to `parse::<toml::Value>()` fails loudly here.
+    #[test]
+    fn bare_value_parse_cannot_read_a_document() {
+        let text = "api_listen = \"127.0.0.1:4200\"\napi_key = \"K\"\n";
+        assert!(text.parse::<toml::Value>().is_err());
+        assert_eq!(super::api_key_from_config_text(text).as_deref(), Some("K"));
+    }
+
+    #[test]
+    fn api_key_absent_or_blank_reads_as_none() {
+        assert!(super::api_key_from_config_text("api_listen = \"x\"\n").is_none());
+        assert!(super::api_key_from_config_text("api_key = \"\"\n").is_none());
+        assert!(super::api_key_from_config_text("api_key = \"   \"\n").is_none());
+        assert!(super::api_key_from_config_text("api_key = 42\n").is_none());
+    }
+
+    #[test]
+    fn api_key_is_trimmed() {
+        assert_eq!(
+            super::api_key_from_config_text("api_key = \"  abc  \"\n").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn malformed_config_reads_as_none_rather_than_panicking() {
+        assert!(super::api_key_from_config_text("api_key = = =").is_none());
+    }
 
     // --- `openfang message` timeout resolution (ANAI-173) ---
 
