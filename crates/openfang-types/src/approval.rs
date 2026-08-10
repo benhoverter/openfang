@@ -200,6 +200,37 @@ pub enum ApprovalDecision {
     Approved,
     Denied,
     TimedOut,
+    /// The request was never surfaced to a human: the agent already had
+    /// `MAX_PENDING_PER_AGENT` requests in flight, so the queue rejected it
+    /// at admission (ANAI-153).
+    ///
+    /// This is NOT a refusal. Nobody looked at the command. Like
+    /// [`Self::TimedOut`] it is retryable, and unlike `TimedOut` it is likely
+    /// to succeed on retry as soon as the agent's pending queue drains.
+    Backpressure,
+}
+
+impl ApprovalDecision {
+    /// Whether the caller may retry the operation.
+    ///
+    /// `Denied` is the only terminal negative — a human looked at the command
+    /// and said no, and re-asking is prompt-spam. `TimedOut` and
+    /// `Backpressure` mean the command was never judged, so retrying is
+    /// legitimate.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::TimedOut | Self::Backpressure)
+    }
+
+    /// Stable lowercase token for logs and greps. Distinct per variant so a
+    /// wave of timeouts is separable from a wave of denials (ANAI-153).
+    pub fn as_log_token(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+            Self::TimedOut => "timed_out",
+            Self::Backpressure => "backpressure",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,11 +728,44 @@ mod tests {
             ApprovalDecision::Approved,
             ApprovalDecision::Denied,
             ApprovalDecision::TimedOut,
+            ApprovalDecision::Backpressure,
         ] {
             let json = serde_json::to_string(&decision).unwrap();
             let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
             assert_eq!(decision, back);
         }
+    }
+
+    // ANAI-153: the whole point of the split is that these three negatives are
+    // not interchangeable. Pin both the retry semantics and the log tokens so a
+    // future refactor cannot quietly re-flatten them.
+    #[test]
+    fn only_denied_is_terminal() {
+        assert!(!ApprovalDecision::Denied.is_retryable());
+        assert!(ApprovalDecision::TimedOut.is_retryable());
+        assert!(ApprovalDecision::Backpressure.is_retryable());
+        assert!(!ApprovalDecision::Approved.is_retryable());
+    }
+
+    #[test]
+    fn log_tokens_are_distinct_per_variant() {
+        let tokens = [
+            ApprovalDecision::Approved.as_log_token(),
+            ApprovalDecision::Denied.as_log_token(),
+            ApprovalDecision::TimedOut.as_log_token(),
+            ApprovalDecision::Backpressure.as_log_token(),
+        ];
+        let unique: std::collections::HashSet<&str> = tokens.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            tokens.len(),
+            "a shared log token would make a wave of timeouts ungreppable from a wave of denials"
+        );
+        assert_eq!(ApprovalDecision::TimedOut.as_log_token(), "timed_out");
+        assert_eq!(
+            ApprovalDecision::Backpressure.as_log_token(),
+            "backpressure"
+        );
     }
 
     #[test]

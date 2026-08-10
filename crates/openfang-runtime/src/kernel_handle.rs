@@ -231,7 +231,12 @@ pub trait KernelHandle: Send + Sync {
     }
 
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
-    /// Returns `Ok(true)` if approved, `Ok(false)` if denied or timed out.
+    /// Returns the verbatim `ApprovalDecision`. It deliberately does NOT
+    /// collapse to a bool: "Ben said no", "nobody was looking", and "your
+    /// queue is full" are three different facts, and only the first is
+    /// terminal (ANAI-153). Callers wanting the old semantics should ask
+    /// `decision == ApprovalDecision::Approved` explicitly; callers that
+    /// report failure upward must distinguish `ApprovalDecision::is_retryable`.
     ///
     /// `command` carries the verbatim `shell_exec` command string. Like
     /// `cache_binary`, it is captured at the gate where structured tool input
@@ -245,10 +250,10 @@ pub trait KernelHandle: Send + Sync {
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
         command: Option<&str>,
-    ) -> Result<bool, String> {
+    ) -> Result<openfang_types::approval::ApprovalDecision, String> {
         let _ = (agent_id, tool_name, action_summary, origin, cache_binary);
         let _ = command;
-        Ok(true) // Default: auto-approve
+        Ok(openfang_types::approval::ApprovalDecision::Approved) // Default: auto-approve
     }
 
     /// List available Hands and their activation status.

@@ -10853,6 +10853,10 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             openfang_types::approval::ApprovalDecision::Approved => "approved",
             openfang_types::approval::ApprovalDecision::Denied => "rejected",
             openfang_types::approval::ApprovalDecision::TimedOut => "expired",
+            // ANAI-153: never surfaced to a human at all (agent's pending
+            // queue was full). Distinct from "rejected" so the dashboard does
+            // not report a refusal nobody made.
+            openfang_types::approval::ApprovalDecision::Backpressure => "backpressure",
         };
         serde_json::json!({
             "id": request.id,

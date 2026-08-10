@@ -54,6 +54,53 @@ fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
 }
 
+/// Render the agent-facing message for a non-approved approval outcome
+/// (ANAI-153).
+///
+/// The three negative outcomes are three different facts and the agent must be
+/// able to act differently on each:
+///
+/// * `Denied` is terminal. A human read the command and refused. Retrying is
+///   prompt-spam and the message says so explicitly.
+/// * `TimedOut` means nobody answered. The command was never judged. This is
+///   the one that burned unattended fan-outs: the agent read "denied",
+///   apologised, and abandoned work no human had ever looked at.
+/// * `Backpressure` means the request never reached a human at all because the
+///   agent's own pending queue was full. Retryable, and likely to succeed once
+///   the queue drains.
+///
+/// `Approved` never reaches here; it is rendered defensively rather than
+/// panicking, because a wrong string is better than a killed tool call.
+fn approval_outcome_message(
+    tool_name: &str,
+    decision: openfang_types::approval::ApprovalDecision,
+) -> String {
+    use openfang_types::approval::ApprovalDecision;
+    match decision {
+        ApprovalDecision::Approved => {
+            format!("Execution of '{tool_name}' was approved.")
+        }
+        ApprovalDecision::Denied => format!(
+            "Execution denied: '{tool_name}' requires human approval and a human explicitly \
+             denied it. This is final. Do not retry the same operation; ask the operator \
+             what they would prefer instead. The operation was not performed."
+        ),
+        ApprovalDecision::TimedOut => format!(
+            "Approval timed out: '{tool_name}' requires human approval and no human responded \
+             before the request expired. This is NOT a denial. Nobody judged the command. \
+             The operation was not performed and may be retried when someone is available; \
+             if this is an unattended run, report the pending approval rather than \
+             abandoning the task."
+        ),
+        ApprovalDecision::Backpressure => format!(
+            "Approval queue full: '{tool_name}' requires human approval but this agent already \
+             has the maximum number of approval requests pending, so the request was never \
+             surfaced to a human. This is NOT a denial. The operation was not performed and \
+             may be retried once the pending requests resolve."
+        ),
+    }
+}
+
 /// Extract argv[0] (the binary) from a `shell_exec` command for approval
 /// caching's "Approve Similar" scope. Skips leading `VAR=value` environment
 /// assignments, then returns the first whitespace-delimited token. Returns
@@ -342,17 +389,24 @@ pub async fn execute_tool(
                 )
                 .await
             {
-                Ok(true) => {
-                    debug!(tool_name, "Approval granted — proceeding with execution");
+                Ok(openfang_types::approval::ApprovalDecision::Approved) => {
+                    debug!(tool_name, "Approval granted, proceeding with execution");
                 }
-                Ok(false) => {
-                    warn!(tool_name, "Approval denied — blocking tool execution");
+                Ok(decision) => {
+                    // ANAI-153: do not flatten these into one "denied". The
+                    // outcome token is what makes a wave of timeouts (nobody
+                    // watching, adapter down) greppable apart from a wave of
+                    // real refusals, and `retryable` is what tells the agent
+                    // whether abandoning the task is the correct response.
+                    warn!(
+                        tool_name,
+                        outcome = decision.as_log_token(),
+                        retryable = decision.is_retryable(),
+                        "Approval not granted, blocking tool execution"
+                    );
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
-                        content: format!(
-                            "Execution denied: '{}' requires human approval and was denied or timed out. The operation was not performed.",
-                            tool_name
-                        ),
+                        content: approval_outcome_message(tool_name, decision),
                         is_error: true,
                     };
                 }
@@ -386,14 +440,14 @@ pub async fn execute_tool(
                         if fp.tier_for(&canon, &canon_root)
                             == openfang_types::config::FileAccessTier::Prompt
                         {
-                            let approved = match kernel {
-                                Some(kh) => {
-                                    let summary = format!(
-                                        "{} -> {} (file_policy prompt tier)",
-                                        tool_name,
-                                        canon.display()
-                                    );
-                                    matches!(
+                            let outcome: Option<openfang_types::approval::ApprovalDecision> =
+                                match kernel {
+                                    Some(kh) => {
+                                        let summary = format!(
+                                            "{} -> {} (file_policy prompt tier)",
+                                            tool_name,
+                                            canon.display()
+                                        );
                                         kh.request_approval(
                                             caller_agent_id.unwrap_or("unknown"),
                                             tool_name,
@@ -404,20 +458,37 @@ pub async fn execute_tool(
                                             // command string to show (ANAI-151).
                                             None,
                                         )
-                                        .await,
-                                        Ok(true)
-                                    )
-                                }
-                                None => false,
-                            };
-                            if !approved {
-                                warn!(tool_name, "file_policy prompt tier denied or unapproved");
+                                        .await
+                                        .ok()
+                                    }
+                                    None => None,
+                                };
+                            // Fail closed: anything that is not an explicit
+                            // Approved blocks. ANAI-153 changes only what the
+                            // agent is TOLD about why, never whether it runs.
+                            if outcome != Some(openfang_types::approval::ApprovalDecision::Approved)
+                            {
+                                warn!(
+                                    tool_name,
+                                    outcome =
+                                        outcome.map(|d| d.as_log_token()).unwrap_or("unavailable"),
+                                    retryable = outcome.map(|d| d.is_retryable()).unwrap_or(false),
+                                    "file_policy prompt tier not approved, blocking tool execution"
+                                );
                                 return ToolResult {
                                     tool_use_id: tool_use_id.to_string(),
-                                    content: format!(
-                                        "Execution denied: '{}' targets a prompt-tier path and approval was denied, timed out, or was unavailable.",
-                                        tool_name
-                                    ),
+                                    content: match outcome {
+                                        Some(d) => format!(
+                                            "{} (target is a prompt-tier path under file_policy)",
+                                            approval_outcome_message(tool_name, d)
+                                        ),
+                                        None => format!(
+                                            "Execution blocked: '{tool_name}' targets a prompt-tier \
+                                             path but the approval system was unavailable. This is \
+                                             NOT a denial; no human judged the request. The \
+                                             operation was not performed."
+                                        ),
+                                    },
                                     is_error: true,
                                 };
                             }
@@ -6579,6 +6650,10 @@ mod tests {
         // so a test can prove the operator surface receives the VERBATIM
         // command and not the 200-byte serialized-JSON summary.
         approval_command: std::sync::Mutex<Option<String>>,
+        // ANAI-153: the decision the gate should return. Defaults to Approved
+        // so every pre-existing test keeps its behaviour; a test that wants to
+        // exercise the negative outcomes overrides it.
+        approval_decision: std::sync::Mutex<openfang_types::approval::ApprovalDecision>,
     }
 
     impl FakeKernelHandle {
@@ -6591,7 +6666,19 @@ mod tests {
                 reply_rights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 wake_posts: std::sync::Mutex::new(Vec::new()),
                 approval_command: std::sync::Mutex::new(None),
+                approval_decision: std::sync::Mutex::new(
+                    openfang_types::approval::ApprovalDecision::Approved,
+                ),
             }
+        }
+
+        // ANAI-153: drive the gate to a specific non-approved outcome.
+        fn with_approval_decision(
+            self,
+            decision: openfang_types::approval::ApprovalDecision,
+        ) -> Self {
+            *self.approval_decision.lock().unwrap() = decision;
+            self
         }
 
         fn with_job(self, job: serde_json::Value) -> Self {
@@ -6743,11 +6830,11 @@ mod tests {
             _origin: Option<&openfang_types::approval::ApprovalOrigin>,
             _cache_binary: Option<&str>,
             command: Option<&str>,
-        ) -> Result<bool, String> {
+        ) -> Result<openfang_types::approval::ApprovalDecision, String> {
             self.approval_requested
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             *self.approval_command.lock().unwrap() = command.map(str::to_string);
-            Ok(true)
+            Ok(*self.approval_decision.lock().unwrap())
         }
     }
 
@@ -6915,6 +7002,95 @@ mod tests {
             !result.content.contains("not in the exec allowlist"),
             "an allowlisted command must clear the wall, got: {}",
             result.content
+        );
+    }
+
+    /// ANAI-153. The acceptance criterion, exercised end to end through
+    /// `execute_tool`: an agent whose approval request times out must receive
+    /// something it can tell apart from a refusal.
+    ///
+    /// Before this change both outcomes rendered the same sentence
+    /// ("was denied or timed out"), so an unattended run concluded it had been
+    /// refused and abandoned work no human had ever looked at.
+    #[tokio::test]
+    async fn test_timeout_and_backpressure_are_distinguishable_from_denial() {
+        use openfang_types::approval::ApprovalDecision;
+        use openfang_types::config::{ExecPolicy, ExecSecurityMode};
+
+        async fn run_with(decision: ApprovalDecision) -> ToolResult {
+            let fake = Arc::new(FakeKernelHandle::new().with_approval_decision(decision));
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let policy = ExecPolicy {
+                mode: ExecSecurityMode::Allowlist,
+                allowed_commands: vec!["grep".to_string()],
+                ..ExecPolicy::default()
+            };
+            // Clears the allowlist wall, so the gate is genuinely reached.
+            let input = serde_json::json!({ "command": "grep --version" });
+            execute_tool(
+                "test-id",
+                "shell_exec",
+                &input,
+                Some(&handle),
+                None,
+                Some("test-agent"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&policy),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+
+        let denied = run_with(ApprovalDecision::Denied).await;
+        let timed_out = run_with(ApprovalDecision::TimedOut).await;
+        let backpressure = run_with(ApprovalDecision::Backpressure).await;
+
+        // All three still BLOCK. This change never opens a gate.
+        for r in [&denied, &timed_out, &backpressure] {
+            assert!(r.is_error, "every non-approved outcome must block");
+        }
+
+        // And all three say something different.
+        assert_ne!(
+            denied.content, timed_out.content,
+            "a timeout must not read as a denial"
+        );
+        assert_ne!(
+            denied.content, backpressure.content,
+            "queue backpressure must not read as a denial"
+        );
+        assert_ne!(timed_out.content, backpressure.content);
+
+        // The distinction has to be legible to a model, not just unequal.
+        assert!(
+            timed_out.content.contains("NOT a denial"),
+            "timeout text must tell the agent it was not refused, got: {}",
+            timed_out.content
+        );
+        assert!(
+            backpressure.content.contains("NOT a denial"),
+            "backpressure text must tell the agent it was not refused, got: {}",
+            backpressure.content
+        );
+        assert!(
+            !denied.content.contains("NOT a denial"),
+            "a real denial must not disclaim itself, got: {}",
+            denied.content
+        );
+        assert!(
+            denied.content.contains("Do not retry"),
+            "a real denial is terminal and must say so, got: {}",
+            denied.content
         );
     }
 

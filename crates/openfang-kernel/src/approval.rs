@@ -155,8 +155,19 @@ impl ApprovalManager {
             .filter(|r| r.value().request.agent_id == req.agent_id)
             .count();
         if agent_pending >= MAX_PENDING_PER_AGENT {
-            warn!(agent_id = %req.agent_id, "Approval request rejected: too many pending");
-            return ApprovalDecision::Denied;
+            // ANAI-153: this is admission backpressure, NOT a refusal. The
+            // request was never surfaced, so no human ever saw the command.
+            // Reporting it as `Denied` taught agents to abandon work that was
+            // never judged.
+            warn!(
+                agent_id = %req.agent_id,
+                tool = %req.tool_name,
+                pending = agent_pending,
+                limit = MAX_PENDING_PER_AGENT,
+                outcome = ApprovalDecision::Backpressure.as_log_token(),
+                "Approval request rejected at admission: too many pending for this agent (retryable, not a denial)"
+            );
+            return ApprovalDecision::Backpressure;
         }
 
         let timeout = std::time::Duration::from_secs(req.timeout_secs);
@@ -190,7 +201,15 @@ impl ApprovalManager {
                     .unwrap_or(req_for_timeout);
                 let _ = self.events.send(ApprovalEvent::TimedOut(request.clone()));
                 self.push_recent(request, ApprovalDecision::TimedOut, None, Utc::now());
-                warn!(request_id = %id, "Approval request timed out");
+                // ANAI-153: log the timeout with a distinct, greppable outcome
+                // token. A wave of these is an operational signal (nobody
+                // watching, adapter down); a wave of `denied` is behavioral.
+                warn!(
+                    request_id = %id,
+                    timeout_secs = timeout.as_secs(),
+                    outcome = ApprovalDecision::TimedOut.as_log_token(),
+                    "Approval request timed out — no human responded (retryable, not a denial)"
+                );
                 ApprovalDecision::TimedOut
             }
         }
@@ -745,10 +764,22 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(mgr.pending_count(), MAX_PENDING_PER_AGENT);
 
-        // 6th request for the same agent should be immediately denied
+        // 6th request for the same agent is rejected at admission. ANAI-153:
+        // this is Backpressure, NOT Denied. No human ever saw the command, so
+        // reporting a refusal would be a lie and would make the caller give up
+        // on work that was never judged.
         let req6 = make_request("agent-1", "shell_exec", 300);
         let decision = mgr.request_approval(req6).await;
-        assert_eq!(decision, ApprovalDecision::Denied);
+        assert_eq!(decision, ApprovalDecision::Backpressure);
+        assert!(
+            decision.is_retryable(),
+            "backpressure must be retryable: the queue drains"
+        );
+        assert_ne!(
+            decision,
+            ApprovalDecision::Denied,
+            "admission backpressure must never be reported as a human refusal"
+        );
 
         // A different agent should still be able to submit
         let req_other = make_request("agent-2", "shell_exec", 300);

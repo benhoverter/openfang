@@ -9440,7 +9440,7 @@ impl KernelHandle for OpenFangKernel {
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
         command: Option<&str>,
-    ) -> Result<bool, String> {
+    ) -> Result<openfang_types::approval::ApprovalDecision, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
         // Hand agents are curated trusted packages — auto-approve tool execution.
@@ -9449,7 +9449,7 @@ impl KernelHandle for OpenFangKernel {
             if let Some(entry) = self.registry.get(aid) {
                 if entry.tags.iter().any(|t| t.starts_with("hand:")) {
                     info!(agent_id, tool_name, "Auto-approved for hand agent");
-                    return Ok(true);
+                    return Ok(ApprovalDecision::Approved);
                 }
             }
         }
@@ -9472,8 +9472,11 @@ impl KernelHandle for OpenFangKernel {
             command: command.map(str::to_string),
         };
 
+        // ANAI-153: return the decision verbatim. Collapsing to a bool here was
+        // the exact point where "nobody was looking" became indistinguishable
+        // from "Ben refused".
         let decision = self.approval_manager.request_approval(req).await;
-        Ok(decision == ApprovalDecision::Approved)
+        Ok(decision)
     }
 
     fn list_a2a_agents(&self) -> Vec<(String, String)> {
