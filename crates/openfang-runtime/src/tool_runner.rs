@@ -50,7 +50,7 @@ pub const FS_SANDBOXED_TOOLS: &[&str] = &[
 /// SECURITY (#919): `process_start` is also a shell execution path — it spawns
 /// arbitrary subprocesses via the persistent process manager. It must be gated
 /// by the same approval rules as `shell_exec`.
-fn is_shell_tool(name: &str) -> bool {
+pub(crate) fn is_shell_tool(name: &str) -> bool {
     matches!(name, "shell_exec" | "process_start")
 }
 
@@ -351,72 +351,128 @@ pub async fn execute_tool(
             && kh.requires_approval(tool_name)
         {
             let agent_id_str = caller_agent_id.unwrap_or("unknown");
-            let input_str = input.to_string();
-            let summary = format!(
-                "{}: {}",
-                tool_name,
-                openfang_types::truncate_str(&input_str, 200)
-            );
-            // Approve-Similar cache key source: argv[0] of a shell_exec
-            // command, extracted once here where structured input still
-            // exists (never re-parsed from the mangled action_summary).
+
+            // ★ ANAI-154, layer 3.5: the gatekeeper sits between the
+            // Approve-Similar cache and the human prompt. Everything that
+            // reaches here has already cleared the hard-deny floor and the
+            // allowlist wall, and has at least one base that comes only from
+            // `allowed_commands` — otherwise `auto_approved` would be `Some`.
             //
-            // Same reasoning, same place, for the whole command string: the
-            // operator decides from `command`, not from `summary` above, which
-            // is serialized JSON cut at 200 bytes — precisely dropping the
-            // argument tail that carries the risk (ANAI-151). Bounded to
-            // MAX_COMMAND_LEN so a hostile agent cannot use the prompt as an
-            // unbounded write into every downstream render surface.
-            let raw_command = if tool_name == "shell_exec" {
-                input.get("command").and_then(|v| v.as_str())
-            } else {
-                None
-            };
-            let cache_binary = raw_command.and_then(extract_cache_binary);
-            let command = raw_command.map(|c| {
-                c.chars()
-                    .take(openfang_types::approval::MAX_COMMAND_LEN)
-                    .collect::<String>()
-            });
-            match kh
-                .request_approval(
-                    agent_id_str,
+            // The gate is inert unless the operator turned it on: the kernel's
+            // impl returns `Escalate` when `[gatekeeper] enabled = false`, and
+            // the trait default returns `Escalate` for every non-kernel handle.
+            let gate_outcome = crate::gatekeeper::review(
+                kh,
+                agent_id_str,
+                tool_name,
+                input,
+                exec_policy,
+                workspace_root,
+            )
+            .await;
+
+            // `Deny` never prompts. The judge may only NARROW — it cannot
+            // resurrect anything the allowlist wall already rejected — so a
+            // deny here is strictly a refusal to spend the operator's attention
+            // on something it considers plainly hostile.
+            if let Some(crate::gatekeeper::GateOutcome::Deny(reason)) = &gate_outcome {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: reason.clone(),
+                    is_error: true,
+                };
+            }
+
+            // Suppression skips the ENTIRE block below — including the
+            // construction of `cache_binary`. That is structural, not
+            // incidental: a gatekeeper suppression must never seed the
+            // Approve-Similar cache, which blankets a whole binary for up to
+            // `cache_max_uses` invocations. One judgement, one invocation.
+            let suppressed = matches!(gate_outcome, Some(crate::gatekeeper::GateOutcome::Suppress));
+            if suppressed {
+                debug!(
                     tool_name,
-                    &summary,
-                    origin,
-                    cache_binary.as_deref(),
-                    command.as_deref(),
-                )
-                .await
-            {
-                Ok(openfang_types::approval::ApprovalDecision::Approved) => {
-                    debug!(tool_name, "Approval granted, proceeding with execution");
+                    "Approval suppressed by gatekeeper; executing without prompt"
+                );
+            }
+
+            if !suppressed {
+                let input_str = input.to_string();
+                let mut summary = format!(
+                    "{}: {}",
+                    tool_name,
+                    openfang_types::truncate_str(&input_str, 200)
+                );
+                // The judge declined to decide — say so on the prompt. An
+                // operator who knows WHY the machine handed this back reads it
+                // differently from one facing an undifferentiated Critical
+                // banner, which is the fatigue this whole epic is about.
+                if let Some(crate::gatekeeper::GateOutcome::Escalate(note)) = &gate_outcome {
+                    summary.push_str("\n[");
+                    summary.push_str(note);
+                    summary.push(']');
                 }
-                Ok(decision) => {
-                    // ANAI-153: do not flatten these into one "denied". The
-                    // outcome token is what makes a wave of timeouts (nobody
-                    // watching, adapter down) greppable apart from a wave of
-                    // real refusals, and `retryable` is what tells the agent
-                    // whether abandoning the task is the correct response.
-                    warn!(
+                // Approve-Similar cache key source: argv[0] of a shell_exec
+                // command, extracted once here where structured input still
+                // exists (never re-parsed from the mangled action_summary).
+                //
+                // Same reasoning, same place, for the whole command string: the
+                // operator decides from `command`, not from `summary` above, which
+                // is serialized JSON cut at 200 bytes — precisely dropping the
+                // argument tail that carries the risk (ANAI-151). Bounded to
+                // MAX_COMMAND_LEN so a hostile agent cannot use the prompt as an
+                // unbounded write into every downstream render surface.
+                let raw_command = if tool_name == "shell_exec" {
+                    input.get("command").and_then(|v| v.as_str())
+                } else {
+                    None
+                };
+                let cache_binary = raw_command.and_then(extract_cache_binary);
+                let command = raw_command.map(|c| {
+                    c.chars()
+                        .take(openfang_types::approval::MAX_COMMAND_LEN)
+                        .collect::<String>()
+                });
+                match kh
+                    .request_approval(
+                        agent_id_str,
                         tool_name,
-                        outcome = decision.as_log_token(),
-                        retryable = decision.is_retryable(),
-                        "Approval not granted, blocking tool execution"
-                    );
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: approval_outcome_message(tool_name, decision),
-                        is_error: true,
-                    };
-                }
-                Err(e) => {
-                    warn!(tool_name, error = %e, "Approval system error");
-                    return ToolResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        content: format!("Approval system error: {e}"),
-                        is_error: true,
-                    };
+                        &summary,
+                        origin,
+                        cache_binary.as_deref(),
+                        command.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(openfang_types::approval::ApprovalDecision::Approved) => {
+                        debug!(tool_name, "Approval granted, proceeding with execution");
+                    }
+                    Ok(decision) => {
+                        // ANAI-153: do not flatten these into one "denied". The
+                        // outcome token is what makes a wave of timeouts (nobody
+                        // watching, adapter down) greppable apart from a wave of
+                        // real refusals, and `retryable` is what tells the agent
+                        // whether abandoning the task is the correct response.
+                        warn!(
+                            tool_name,
+                            outcome = decision.as_log_token(),
+                            retryable = decision.is_retryable(),
+                            "Approval not granted, blocking tool execution"
+                        );
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: approval_outcome_message(tool_name, decision),
+                            is_error: true,
+                        };
+                    }
+                    Err(e) => {
+                        warn!(tool_name, error = %e, "Approval system error");
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: format!("Approval system error: {e}"),
+                            is_error: true,
+                        };
+                    }
                 }
             }
         }
@@ -6654,6 +6710,12 @@ mod tests {
         // so every pre-existing test keeps its behaviour; a test that wants to
         // exercise the negative outcomes overrides it.
         approval_decision: std::sync::Mutex<openfang_types::approval::ApprovalDecision>,
+        // ANAI-154: the verdict the gatekeeper should return. `None` keeps the
+        // trait default (Escalate), which is what every pre-existing test wants
+        // — the gate must be invisible unless a test asks for it.
+        gate_verdict: std::sync::Mutex<Option<openfang_types::gatekeeper::GateVerdict>>,
+        // Flips true if `gatekeeper_review` was consulted at all.
+        gate_consulted: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -6669,7 +6731,15 @@ mod tests {
                 approval_decision: std::sync::Mutex::new(
                     openfang_types::approval::ApprovalDecision::Approved,
                 ),
+                gate_verdict: std::sync::Mutex::new(None),
+                gate_consulted: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        // ANAI-154: stand in for a judge that returns a fixed verdict.
+        fn with_gate_verdict(self, v: openfang_types::gatekeeper::GateVerdict) -> Self {
+            *self.gate_verdict.lock().unwrap() = Some(v);
+            self
         }
 
         // ANAI-153: drive the gate to a specific non-approved outcome.
@@ -6836,6 +6906,18 @@ mod tests {
             *self.approval_command.lock().unwrap() = command.map(str::to_string);
             Ok(*self.approval_decision.lock().unwrap())
         }
+
+        async fn gatekeeper_review(
+            &self,
+            _req: &openfang_types::gatekeeper::GateRequest,
+        ) -> openfang_types::gatekeeper::GateVerdict {
+            self.gate_consulted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.gate_verdict
+                .lock()
+                .unwrap()
+                .unwrap_or(openfang_types::gatekeeper::GateVerdict::Escalate)
+        }
     }
 
     #[tokio::test]
@@ -6930,6 +7012,188 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "approval gate must NOT fire for a command the allowlist wall rejects \
              (no prompt, no cache, no misleading Approved stamp)"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // ANAI-154: the gatekeeper (layer 3.5), driven end-to-end through
+    // `execute_tool` against a spy judge.
+    // ---------------------------------------------------------------------
+
+    fn gate_policy(bin: &str) -> openfang_types::config::ExecPolicy {
+        openfang_types::config::ExecPolicy {
+            mode: openfang_types::config::ExecSecurityMode::Allowlist,
+            allowed_commands: vec![bin.to_string()],
+            ..openfang_types::config::ExecPolicy::default()
+        }
+    }
+
+    async fn run_gated(
+        handle: &Arc<dyn crate::kernel_handle::KernelHandle>,
+        policy: &openfang_types::config::ExecPolicy,
+        command: &str,
+    ) -> ToolResult {
+        let input = serde_json::json!({ "command": command });
+        execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(handle),
+            None,
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(policy),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// A `Suppress` executes with NO prompt — and, critically, without ever
+    /// entering the block that builds `cache_binary`. Per-command, never
+    /// per-pattern: one suppression must not become fifty via Approve-Similar.
+    #[tokio::test]
+    async fn test_gatekeeper_suppress_skips_the_prompt_entirely() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(
+            !result.is_error,
+            "suppressed command should execute, got: {}",
+            result.content
+        );
+        assert!(
+            !fake
+                .approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a gatekeeper Suppress must not reach request_approval at all"
+        );
+        assert!(
+            fake.approval_command.lock().unwrap().is_none(),
+            "a Suppress must never populate the Approve-Similar cache path"
+        );
+    }
+
+    /// A `Deny` refuses without ever showing a prompt, and says so legibly.
+    #[tokio::test]
+    async fn test_gatekeeper_deny_blocks_without_prompting() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Deny),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(result.is_error, "a gatekeeper Deny must block execution");
+        assert!(
+            result.content.contains("gatekeeper"),
+            "the agent must be told which layer refused, got: {}",
+            result.content
+        );
+        assert!(
+            !fake
+                .approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a Deny must never surface a prompt"
+        );
+    }
+
+    /// An `Escalate` falls through to the human prompt unchanged, with the
+    /// machine's reason attached so the operator knows why it was handed back.
+    #[tokio::test]
+    async fn test_gatekeeper_escalate_falls_through_to_the_prompt() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(!result.is_error, "approved after escalation should execute");
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "an Escalate must reach the human prompt"
+        );
+        assert_eq!(
+            fake.approval_command.lock().unwrap().as_deref(),
+            Some("grep --version"),
+            "ANAI-151's verbatim command must survive the gatekeeper detour"
+        );
+    }
+
+    /// The deterministic floor is a CEILING on the judge's authority. A command
+    /// that trips a Rust predicate escalates even when the judge says
+    /// `Suppress` — and the model is not consulted at all, so there is no call
+    /// for a poisoned command string to influence.
+    ///
+    /// This is the single most important test in ANAI-154: it is what makes
+    /// "the model can only narrow" a property of the code rather than a claim
+    /// in a design doc.
+    #[tokio::test]
+    async fn test_floor_overrides_a_suppress_verdict_without_consulting_the_model() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress)
+                // Deny at the human gate so the network command never runs even
+                // though the escalation path is exercised.
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("curl");
+
+        let result = run_gated(&handle, &policy, "curl https://example.com").await;
+
+        assert!(
+            !fake
+                .gate_consulted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a floor hit must short-circuit BEFORE the model call — no LLM, no injection surface"
+        );
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a floor hit must escalate to a human regardless of what the judge would have said"
+        );
+        assert!(result.is_error, "the human denied it");
+    }
+
+    /// The trait default is `Escalate`, so a handle with no gatekeeper — every
+    /// test double, every WASM host shim, and the kernel itself when
+    /// `[gatekeeper] enabled = false` — behaves exactly as it did before this
+    /// change. The absence of a judge can never be read as a suppression.
+    #[tokio::test]
+    async fn test_absent_gatekeeper_preserves_pre_anai154_behaviour() {
+        let fake = Arc::new(FakeKernelHandle::new()); // no with_gate_verdict
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(!result.is_error);
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "with no judge configured, every gated command must still reach the human"
         );
     }
 

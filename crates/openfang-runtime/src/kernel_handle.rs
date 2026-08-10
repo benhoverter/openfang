@@ -230,6 +230,28 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// ANAI-154: layer-3.5 judgement on ONE gated `shell_exec` invocation.
+    ///
+    /// Answers only "does the operator need to see this?" — never "is this
+    /// binary permitted?", which `agent.toml` already decided deterministically
+    /// two layers up. The kernel's impl is a single-shot
+    /// `LlmDriver::complete()` against a pinned model, in the same shape as
+    /// `compactor::compact_session`: not an agent, not a turn, no session, no
+    /// re-entrancy.
+    ///
+    /// The default is [`GateVerdict::Escalate`] — today's behaviour, every
+    /// command reaching a human — so every test double and WASM host shim
+    /// compiles untouched and the *absence* of a gatekeeper can never be
+    /// mistaken for a suppression. Same pattern as `send_to_agent_from` and
+    /// `wake_post`.
+    async fn gatekeeper_review(
+        &self,
+        req: &openfang_types::gatekeeper::GateRequest,
+    ) -> openfang_types::gatekeeper::GateVerdict {
+        let _ = req;
+        openfang_types::gatekeeper::GateVerdict::Escalate
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns the verbatim `ApprovalDecision`. It deliberately does NOT
     /// collapse to a bool: "Ben said no", "nobody was looking", and "your

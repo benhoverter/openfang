@@ -14,6 +14,7 @@ pub mod comms;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod gatekeeper;
 pub mod manifest_signing;
 pub mod media;
 pub mod memory;

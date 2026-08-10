@@ -27,6 +27,7 @@ pub mod copilot_oauth;
 pub mod docker_sandbox;
 pub mod drivers;
 pub mod embedding;
+pub mod gatekeeper;
 pub mod graceful_shutdown;
 pub mod hooks;
 pub mod host_functions;

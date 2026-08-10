@@ -117,6 +117,19 @@ pub struct OpenFangKernel {
     pub metering: Arc<MeteringEngine>,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
+    /// ANAI-154: the approval gatekeeper's judge driver, built once on first
+    /// use from `[gatekeeper]`.
+    ///
+    /// Deliberately NOT `default_driver`: the judge model is pinned so that an
+    /// agent cannot be reviewed by the model it chose, and so a fallback
+    /// provider silently becoming the reviewer is impossible. `None` inside the
+    /// `OnceLock` means construction failed — every command then escalates.
+    gatekeeper_driver: std::sync::OnceLock<Option<Arc<dyn LlmDriver>>>,
+    /// ANAI-154 circuit breaker: consecutive gatekeeper failures. Once it
+    /// crosses `[gatekeeper] failure_threshold` the gate is disabled for the
+    /// life of the process and everything escalates to a human. A judge that
+    /// keeps erroring is a judge nobody should be relying on to stay quiet.
+    gatekeeper_failures: std::sync::atomic::AtomicU32,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -1304,6 +1317,8 @@ impl OpenFangKernel {
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
             default_driver: driver,
+            gatekeeper_driver: std::sync::OnceLock::new(),
+            gatekeeper_failures: std::sync::atomic::AtomicU32::new(0),
             wasm_sandbox,
             auth,
             model_catalog: std::sync::RwLock::new(model_catalog),
@@ -9430,6 +9445,148 @@ impl KernelHandle for OpenFangKernel {
 
     fn requires_approval(&self, tool_name: &str) -> bool {
         self.approval_manager.requires_approval(tool_name)
+    }
+
+    /// ANAI-154: single-shot judge for one gated `shell_exec`.
+    ///
+    /// Shape is `compactor::compact_session`, not an agent: one
+    /// `LlmDriver::complete()` from inside the daemon, no session, no tools, no
+    /// turn. Agenthood would hand the judge context it must not have — the
+    /// caller's goals and whatever the caller ingested — which is precisely
+    /// backwards from the property we want.
+    ///
+    /// Every failure path returns `Escalate`. There is no path from an error to
+    /// a suppression, by construction: the only `Suppress` this function can
+    /// return comes from a parsed one-word answer from a live judge, and the
+    /// runtime intersects even that with the deterministic floor.
+    async fn gatekeeper_review(
+        &self,
+        req: &openfang_types::gatekeeper::GateRequest,
+    ) -> openfang_types::gatekeeper::GateVerdict {
+        use openfang_types::gatekeeper::GateVerdict;
+        use std::sync::atomic::Ordering;
+
+        let cfg = &self.config.gatekeeper;
+        if !cfg.enabled {
+            return GateVerdict::Escalate;
+        }
+
+        // Circuit breaker. A gate that has failed `failure_threshold` times in a
+        // row is not a gate; leaving it in circuit means every command pays the
+        // latency for an answer that will be `Escalate` anyway.
+        if self.gatekeeper_failures.load(Ordering::Relaxed) >= cfg.failure_threshold {
+            return GateVerdict::Escalate;
+        }
+
+        let driver = self.gatekeeper_driver.get_or_init(|| {
+            let provider = if cfg.provider.is_empty() {
+                self.config.default_model.provider.clone()
+            } else {
+                cfg.provider.clone()
+            };
+            let env_var = self.config.resolve_api_key_env(&provider);
+            let driver_config = DriverConfig {
+                provider: provider.clone(),
+                api_key: self.resolve_credential(&env_var),
+                base_url: self.lookup_provider_url(&provider),
+                skip_permissions: true,
+                subprocess_timeout_secs: None,
+            };
+            match drivers::create_driver(&driver_config, self.token_issuer()) {
+                Ok(d) => {
+                    info!(
+                        target: "openfang::gatekeeper",
+                        provider = %provider,
+                        model = %cfg.model,
+                        "Approval gatekeeper enabled"
+                    );
+                    Some(d)
+                }
+                Err(e) => {
+                    warn!(
+                        target: "openfang::gatekeeper",
+                        provider = %provider,
+                        error = %e,
+                        "Gatekeeper driver init failed — every command will escalate"
+                    );
+                    None
+                }
+            }
+        });
+        let Some(driver) = driver.as_ref() else {
+            return GateVerdict::Escalate;
+        };
+
+        let request = CompletionRequest {
+            model: cfg.model.clone(),
+            messages: vec![openfang_types::message::Message {
+                role: openfang_types::message::Role::User,
+                content: openfang_types::message::MessageContent::Blocks(vec![
+                    openfang_types::message::ContentBlock::Text {
+                        text: req.user_prompt(),
+                        provider_metadata: None,
+                    },
+                ]),
+                ..Default::default()
+            }],
+            tools: vec![],
+            // One word out. A judge that cannot say SUPPRESS in 16 tokens has
+            // not earned a suppression, and a small ceiling is itself a defense:
+            // there is no room for the model to be talked into an essay.
+            max_tokens: 16,
+            temperature: 0.0,
+            system: Some(req.system_prompt()),
+            thinking: None,
+            // No caller attribution: the judge is the daemon's, not the
+            // calling agent's, and must not inherit its identity or tools.
+            caller_agent_id: None,
+            allowed_tools: None,
+        };
+
+        let call = tokio::time::timeout(
+            std::time::Duration::from_secs(cfg.timeout_secs),
+            driver.complete(request),
+        )
+        .await;
+
+        let verdict = match call {
+            Ok(Ok(response)) => match GateVerdict::parse(&response.text()) {
+                Some(v) => {
+                    self.gatekeeper_failures.store(0, Ordering::Relaxed);
+                    return v;
+                }
+                None => {
+                    warn!(
+                        target: "openfang::gatekeeper",
+                        raw = %openfang_types::truncate_str(&response.text(), 120),
+                        "Gatekeeper returned an unparseable verdict — escalating"
+                    );
+                    GateVerdict::Escalate
+                }
+            },
+            Ok(Err(e)) => {
+                warn!(target: "openfang::gatekeeper", error = %e, "Gatekeeper call failed — escalating");
+                GateVerdict::Escalate
+            }
+            Err(_elapsed) => {
+                warn!(
+                    target: "openfang::gatekeeper",
+                    timeout_secs = cfg.timeout_secs,
+                    "Gatekeeper timed out — escalating"
+                );
+                GateVerdict::Escalate
+            }
+        };
+
+        let failures = self.gatekeeper_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures == cfg.failure_threshold {
+            warn!(
+                target: "openfang::gatekeeper",
+                failures,
+                "Gatekeeper circuit breaker OPEN — gate disabled, all commands escalate until restart"
+            );
+        }
+        verdict
     }
 
     async fn request_approval(

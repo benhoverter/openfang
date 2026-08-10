@@ -1480,6 +1480,10 @@ pub struct KernelConfig {
     /// Execution approval policy.
     #[serde(default, alias = "approval_policy")]
     pub approval: crate::approval::ApprovalPolicy,
+    /// ANAI-154: LLM approval gatekeeper (layer 3.5). Ships disabled; see
+    /// [`crate::gatekeeper::GatekeeperConfig::enabled`].
+    #[serde(default)]
+    pub gatekeeper: crate::gatekeeper::GatekeeperConfig,
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
     pub max_cron_jobs: usize,
@@ -1907,6 +1911,7 @@ impl Default for KernelConfig {
             reload: ReloadConfig::default(),
             webhook_triggers: None,
             approval: crate::approval::ApprovalPolicy::default(),
+            gatekeeper: crate::gatekeeper::GatekeeperConfig::default(),
             max_cron_jobs: default_max_cron_jobs(),
             include: Vec::new(),
             exec_policy: ExecPolicy::default(),
