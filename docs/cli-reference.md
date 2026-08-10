@@ -54,6 +54,39 @@ These options apply to all commands.
 |---|---|
 | `RUST_LOG` | Controls log verbosity (e.g. `info`, `debug`, `openfang_kernel=trace`). |
 | `OPENFANG_AGENTS_DIR` | Override the agent templates directory. |
+| `OPENFANG_HOME` | Override the OpenFang home directory (default `~/.openfang`). Determines where the CLI looks for `config.toml`, `.env`, and `daemon.json`. |
+| `OPENFANG_API_KEY` | Daemon API key, used only when `config.toml` has no usable `api_key`. See [Authentication](#authentication). |
+## Authentication
+
+When the daemon is configured with an API key, every endpoint except `/api/health` requires an `Authorization: Bearer <api_key>` header. **The CLI attaches that header for you** -- you do not pass a key on the command line, and there is no `--api-key` flag.
+
+**Where the CLI gets the key, in order:**
+
+| Order | Source | Notes |
+|---|---|---|
+| 1 | `api_key` in `$OPENFANG_HOME/config.toml` (default `~/.openfang/config.toml`) | Top-level field, not inside a section table. |
+| 2 | `OPENFANG_API_KEY` environment variable | Consulted only when the config file has no usable key. |
+
+This is **file-over-env**, the opposite of the usual convention. It is deliberate: `config.toml` is the daemon's own source of truth for `api_key`, so a CLI on the same machine cannot drift from the daemon it is talking to by way of a stale exported variable. If you need the env var to win, clear `api_key` in `config.toml`.
+
+An empty or whitespace-only key counts as **unset** in both sources. Unset means the daemon is running unauthenticated, and the CLI sends no header at all.
+
+**Calling the HTTP API directly.** Nothing is attached for you outside the CLI. curl, scripts, and other services must send the header themselves:
+
+```bash
+# Read the same key the CLI would use
+API_KEY=$(grep '^api_key' ~/.openfang/config.toml | cut -d'"' -f2)
+
+curl -s http://127.0.0.1:50051/api/agents \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Without the header an authenticated daemon answers `401` with `{"error":"Missing Authorization: Bearer <api_key> header"}`. Since the CLI exits non-zero on any non-2xx response, a `401` from a CLI command means the key is missing or wrong in *both* sources above -- check `config.toml` first.
+
+See [configuration.md](configuration.md#top-level-fields) for setting `api_key`, and [api-reference.md](api-reference.md#authentication) for per-endpoint auth.
+
+---
+
 | `EDITOR` / `VISUAL` | Editor used by `openfang config edit`. Falls back to `notepad` (Windows) or `vi` (Unix). |
 
 ---
@@ -1002,6 +1035,45 @@ openfang chat coder
 
 # Chat with a specific agent by UUID
 openfang chat a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+---
+
+### openfang message
+
+Send a one-shot message to an agent and print its reply. Requires a running daemon.
+
+```
+openfang message <AGENT> <TEXT> [--json] [--timeout <SECONDS>]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|---|---|
+| `<AGENT>` | Agent name or UUID. Names are resolved by the daemon. |
+| `<TEXT>` | Message text. Quote it. |
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--json` | Emit the reply as JSON on stdout for scripting. Progress and errors go to stderr, so `--json 2>/dev/null` yields a clean parseable stream. |
+| `--timeout <SECONDS>` | Seconds to wait for the agent's reply (`0` = wait indefinitely). The endpoint blocks for the whole agent turn, so this tracks turn latency, not payload size. |
+
+**Authentication:** handled by the CLI -- see [Authentication](#authentication). A `401` here means no usable key in `config.toml` *or* `OPENFANG_API_KEY`. Calling `POST /api/agents/:id/message` directly requires sending `Authorization: Bearer <api_key>` yourself.
+
+**Exit status:** `0` only on a 2xx response. Any HTTP error prints a diagnostic on stderr and exits `1`, leaving stdout empty.
+
+**Example:**
+
+```bash
+# By name
+openfang message researcher "Summarize the latest notes."
+
+# By UUID, scripted, with a bound wait
+openfang message a1b2c3d4-e5f6-7890-abcd-ef1234567890 "status?" \
+  --json --timeout 120 2>/dev/null
 ```
 
 ---

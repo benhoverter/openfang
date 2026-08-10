@@ -269,6 +269,21 @@ enum Commands {
     /// Interactive setup wizard for credentials and channels.
     Configure,
     /// Send a one-shot message to an agent.
+    ///
+    /// AUTHENTICATION
+    ///
+    /// The CLI attaches the daemon API key for you. It is read from the
+    /// top-level `api_key` field of `$OPENFANG_HOME/config.toml`
+    /// (default `~/.openfang/config.toml`) first, and falls back to the
+    /// `OPENFANG_API_KEY` environment variable only when the config file has
+    /// no usable key. File-over-env is deliberate: the config file is the
+    /// daemon's own source of truth, so the CLI cannot drift from the daemon
+    /// it is talking to. An empty or whitespace-only key counts as unset,
+    /// which means the daemon is running unauthenticated.
+    ///
+    /// Calling `/api/agents/:id/message` directly (curl, scripts, another
+    /// service) attaches nothing for you — send the same key yourself as
+    /// `Authorization: Bearer <api_key>`, or the daemon answers 401.
     Message {
         /// Agent name or ID.
         agent: String,
@@ -7416,6 +7431,46 @@ mod http_error_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // --- `openfang message --help` auth documentation (ANAI-175) ---
+
+    /// The auth note is the deliverable, so pin it: if someone trims the doc
+    /// comment on `Commands::Message`, the operator loses the only pointer
+    /// from the CLI to the key's two sources and the raw-HTTP header.
+    #[test]
+    fn message_long_help_documents_both_key_sources_and_the_bearer_header() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let msg = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "message")
+            .expect("`message` subcommand exists");
+        let long = msg
+            .get_long_about()
+            .expect("`message` has long help")
+            .to_string();
+
+        for needle in [
+            "config.toml",
+            "OPENFANG_API_KEY",
+            "Authorization: Bearer",
+            "401",
+        ] {
+            assert!(
+                long.contains(needle),
+                "`openfang message --help` no longer mentions {needle:?}:\n{long}"
+            );
+        }
+
+        // Precedence is file-over-env, which is the opposite of the usual
+        // convention — the order the two are named must not silently flip.
+        let file_at = long.find("config.toml").unwrap();
+        let env_at = long.find("OPENFANG_API_KEY").unwrap();
+        assert!(
+            file_at < env_at,
+            "help must name config.toml before OPENFANG_API_KEY (file takes precedence)"
+        );
+    }
 
     // --- config.toml api_key parsing (CLI auth regression) ---
 
