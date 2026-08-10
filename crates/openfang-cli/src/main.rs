@@ -269,6 +269,21 @@ enum Commands {
     /// Interactive setup wizard for credentials and channels.
     Configure,
     /// Send a one-shot message to an agent.
+    ///
+    /// AUTHENTICATION
+    ///
+    /// The CLI attaches the daemon API key for you. It is read from the
+    /// top-level `api_key` field of `$OPENFANG_HOME/config.toml`
+    /// (default `~/.openfang/config.toml`) first, and falls back to the
+    /// `OPENFANG_API_KEY` environment variable only when the config file has
+    /// no usable key. File-over-env is deliberate: the config file is the
+    /// daemon's own source of truth, so the CLI cannot drift from the daemon
+    /// it is talking to. An empty or whitespace-only key counts as unset,
+    /// which means the daemon is running unauthenticated.
+    ///
+    /// Calling `/api/agents/:id/message` directly (curl, scripts, another
+    /// service) attaches nothing for you — send the same key yourself as
+    /// `Authorization: Bearer <api_key>`, or the daemon answers 401.
     Message {
         /// Agent name or ID.
         agent: String,
@@ -1271,8 +1286,48 @@ pub(crate) fn error_chain_message(e: &dyn std::error::Error) -> String {
     parts.join(": ")
 }
 
+/// Actionable hint for a non-2xx daemon response.
+///
+/// Pure and total, so the status -> guidance mapping is unit-testable without
+/// standing up a daemon.
+pub(crate) fn http_error_fix(status: u16) -> &'static str {
+    match status {
+        400 => "Malformed request. If this is an agent handle, check for stray quotes or control characters",
+        401 | 403 => {
+            "Missing or invalid API key. Set `api_key` in ~/.openfang/config.toml, or export OPENFANG_API_KEY"
+        }
+        404 => "No such agent or resource. List what exists with `openfang agent list`",
+        408 | 504 => {
+            "The daemon timed out upstream. Retry, or raise the wait with `--timeout <seconds>`"
+        }
+        413 => "Payload too large. Trim the message, or pass a file path instead of inline content",
+        429 => "Rate limited. Back off and retry",
+        s if s >= 500 => "Daemon-side failure. Check the daemon's log output, then retry",
+        _ => "Check `openfang status`",
+    }
+}
+
+/// Extract the daemon's own error text from a JSON error body.
+///
+/// Route handlers are not uniform about the field name, so probe the three
+/// shapes actually in use before falling back.
+pub(crate) fn daemon_error_detail(body: &serde_json::Value) -> Option<String> {
+    for key in ["error", "message", "detail"] {
+        if let Some(s) = body.get(key).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Helper: send a request to the daemon and parse the JSON body.
-/// Exits with error on connection failure.
+///
+/// Exits 1 on connection failure **and on any non-2xx response**. Returning an
+/// error body to the caller was the ANAI-180 hazard: the caller printed it to
+/// stdout as if it were output and the process exited 0, so a scripted caller
+/// could not tell an agent reply from a 401.
 pub(crate) fn daemon_json(
     resp: Result<reqwest::blocking::Response, reqwest::Error>,
 ) -> serde_json::Value {
@@ -1280,11 +1335,14 @@ pub(crate) fn daemon_json(
         Ok(r) => {
             let status = r.status();
             let body = r.json::<serde_json::Value>().unwrap_or_default();
-            if status.is_server_error() {
+            if !status.is_success() {
+                let detail = daemon_error_detail(&body)
+                    .unwrap_or_else(|| "no detail in response body".to_string());
                 ui::error_with_fix(
-                    &format!("Daemon returned error ({})", status),
-                    "Check daemon logs: ~/.openfang/tui.log",
+                    &format!("Daemon returned {status}: {detail}"),
+                    http_error_fix(status.as_u16()),
                 );
+                std::process::exit(1);
             }
             body
         }
@@ -7305,7 +7363,114 @@ fn remove_self_binary(exe_path: &std::path::Path) {
 }
 
 #[cfg(test)]
+mod http_error_tests {
+    use super::{daemon_error_detail, http_error_fix};
+    use serde_json::json;
+
+    #[test]
+    fn auth_statuses_point_at_the_api_key() {
+        for s in [401u16, 403] {
+            let fix = http_error_fix(s);
+            assert!(
+                fix.contains("OPENFANG_API_KEY") && fix.contains("config.toml"),
+                "{s} should name both key sources, got: {fix}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_found_is_distinct_from_malformed() {
+        assert_ne!(http_error_fix(400), http_error_fix(404));
+        assert!(http_error_fix(404).contains("agent list"));
+    }
+
+    #[test]
+    fn every_server_error_has_a_hint() {
+        // The catch-all arm must actually cover the 5xx range -- a bare `_`
+        // fallback here would hand the operator "Check `openfang status`" for a
+        // panicking route.
+        for s in [500u16, 502, 503, 599] {
+            assert!(
+                http_error_fix(s).contains("Daemon-side"),
+                "{s} fell through to the generic arm"
+            );
+        }
+    }
+
+    #[test]
+    fn unmapped_status_still_returns_a_hint() {
+        assert!(!http_error_fix(418).is_empty());
+    }
+
+    #[test]
+    fn detail_prefers_error_then_message_then_detail() {
+        assert_eq!(
+            daemon_error_detail(&json!({"error": "a", "message": "b"})).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            daemon_error_detail(&json!({"message": "b", "detail": "c"})).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            daemon_error_detail(&json!({"detail": "c"})).as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn detail_ignores_blank_and_missing_and_nonstring() {
+        assert_eq!(daemon_error_detail(&json!({})), None);
+        assert_eq!(daemon_error_detail(&json!({"error": "   "})), None);
+        // A non-string `error` (some routes return an object) must not panic
+        // or stringify into noise -- it falls through to the generic message.
+        assert_eq!(daemon_error_detail(&json!({"error": {"code": 7}})), None);
+        assert_eq!(daemon_error_detail(&serde_json::Value::Null), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
+
+    // --- `openfang message --help` auth documentation (ANAI-175) ---
+
+    /// The auth note is the deliverable, so pin it: if someone trims the doc
+    /// comment on `Commands::Message`, the operator loses the only pointer
+    /// from the CLI to the key's two sources and the raw-HTTP header.
+    #[test]
+    fn message_long_help_documents_both_key_sources_and_the_bearer_header() {
+        use clap::CommandFactory;
+        let cmd = super::Cli::command();
+        let msg = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "message")
+            .expect("`message` subcommand exists");
+        let long = msg
+            .get_long_about()
+            .expect("`message` has long help")
+            .to_string();
+
+        for needle in [
+            "config.toml",
+            "OPENFANG_API_KEY",
+            "Authorization: Bearer",
+            "401",
+        ] {
+            assert!(
+                long.contains(needle),
+                "`openfang message --help` no longer mentions {needle:?}:\n{long}"
+            );
+        }
+
+        // Precedence is file-over-env, which is the opposite of the usual
+        // convention — the order the two are named must not silently flip.
+        let file_at = long.find("config.toml").unwrap();
+        let env_at = long.find("OPENFANG_API_KEY").unwrap();
+        assert!(
+            file_at < env_at,
+            "help must name config.toml before OPENFANG_API_KEY (file takes precedence)"
+        );
+    }
 
     // --- config.toml api_key parsing (CLI auth regression) ---
 

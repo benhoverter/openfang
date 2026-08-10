@@ -47,6 +47,10 @@ Add to `~/.openfang/config.toml`:
 api_key = "your-secret-api-key"
 ```
 
+`api_key` is a top-level field -- it does not belong to any `[section]` table.
+
+The `openfang` CLI reads this same key and attaches the header itself, so CLI users do not set anything else. It checks `config.toml` first and falls back to the `OPENFANG_API_KEY` environment variable only when the file has no usable key (empty and whitespace-only count as unset). Direct HTTP callers -- curl, scripts, other services -- get no such help and must send the header themselves. See [cli-reference.md](cli-reference.md#authentication).
+
 ### No Authentication
 
 If `api_key` is empty or not set, the API is accessible without authentication. CORS is restricted to localhost origins in this mode.

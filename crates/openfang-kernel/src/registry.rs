@@ -50,6 +50,15 @@ impl AgentRegistry {
             .and_then(|id| self.agents.get(id.value()).map(|e| e.value().clone()))
     }
 
+    /// Look up the id bound to a name without cloning the whole entry.
+    ///
+    /// Cheap pre-flight for callers that only need to know "is this name
+    /// taken, and by whom" — notably `spawn_agent_with_parent`, which must
+    /// answer that question *before* it starts mutating state.
+    pub fn id_for_name(&self, name: &str) -> Option<AgentId> {
+        self.name_index.get(name).map(|id| *id.value())
+    }
+
     /// Update agent state.
     pub fn set_state(&self, id: AgentId, state: AgentState) -> OpenFangResult<()> {
         let mut entry = self

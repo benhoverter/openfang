@@ -34,8 +34,11 @@ pub fn success(msg: &str) {
 }
 
 /// Print an error message.
+///
+/// stderr, not stdout: `--json` and piped callers must be able to redirect
+/// diagnostics away and still parse stdout byte-for-byte.
 pub fn error(msg: &str) {
-    println!("  {} {}", "\u{2718}".bright_red(), msg.bright_red());
+    eprintln!("  {} {}", "\u{2718}".bright_red(), msg.bright_red());
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +94,11 @@ pub fn suggest_cmd(label: &str, cmd: &str) {
 }
 
 /// Red error + yellow "fix:" suggestion.
+///
+/// stderr, not stdout -- see [`error`].
 pub fn error_with_fix(msg: &str, fix: &str) {
-    println!("  {} {}", "\u{2718}".bright_red(), msg.bright_red());
-    println!("    {} {}", "fix:".bright_yellow(), fix);
+    eprintln!("  {} {}", "\u{2718}".bright_red(), msg.bright_red());
+    eprintln!("    {} {}", "fix:".bright_yellow(), fix);
 }
 
 /// Yellow warning + "try:" suggestion.

@@ -36,6 +36,7 @@ fn hex_val(b: u8) -> Option<u8> {
 // without bridge support; the openfang-mcp-bridge binary itself ships as a
 // no-op stub. Proper Windows transport (named pipes / TCP loopback) is
 // tracked as a follow-up — see the upstream issue filed alongside this fix.
+pub mod agent_ref;
 #[cfg(unix)]
 pub mod bridge_auth;
 #[cfg(unix)]

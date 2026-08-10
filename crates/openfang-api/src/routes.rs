@@ -161,11 +161,38 @@ pub async fn spawn_agent(
             )
         }
         Err(e) => {
-            tracing::warn!("Spawn failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Agent spawn failed"})),
-            )
+            // ANAI-181: `spawn` used to flatten every failure mode to a bare
+            // 500 with the body "Agent spawn failed". The overwhelmingly
+            // common failure — spawning a name that is already running — is a
+            // client error, not a server error, and the caller needs to be
+            // able to tell the two apart. `clone` next door already does this.
+            match e {
+                openfang_kernel::error::KernelError::OpenFang(
+                    openfang_types::error::OpenFangError::AgentAlreadyExists(taken),
+                ) => {
+                    let existing = state
+                        .kernel
+                        .registry
+                        .find_by_name(&taken)
+                        .map(|a| a.id.to_string());
+                    tracing::warn!("Spawn rejected: agent name '{taken}' already registered");
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!("Agent name '{taken}' is already in use"),
+                            "name": taken,
+                            "existing_agent_id": existing,
+                        })),
+                    )
+                }
+                other => {
+                    tracing::warn!("Spawn failed: {other}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Agent spawn failed: {other}")})),
+                    )
+                }
+            }
         }
     }
 }
@@ -379,14 +406,9 @@ pub async fn send_message(
     Path(id): Path<String>,
     Json(req): Json<MessageRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
@@ -511,14 +533,9 @@ pub async fn get_agent_session(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // SECURITY (#935): Default to filtering out system-role messages so the
@@ -725,14 +742,9 @@ pub async fn kill_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     match state.kernel.kill_agent(agent_id) {
@@ -759,14 +771,9 @@ pub async fn uninstall_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Capture the agent name BEFORE killing — registry entry is gone after.
@@ -850,14 +857,9 @@ pub async fn restart_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Check agent exists
@@ -1476,14 +1478,9 @@ pub async fn set_agent_mode(
     Path(id): Path<String>,
     Json(body): Json<SetModeRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     match state.kernel.registry.set_mode(agent_id, body.mode) {
@@ -1528,14 +1525,9 @@ pub async fn get_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     let entry = match state.kernel.registry.get(agent_id) {
@@ -1619,15 +1611,9 @@ pub async fn send_message_stream(
             .into_response();
     }
 
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-                .into_response();
-        }
+        Err(resp) => return resp.into_response(),
     };
 
     if state.kernel.registry.get(agent_id).is_none() {
@@ -5748,14 +5734,9 @@ pub async fn agent_budget_status(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
 
     let entry = match state.kernel.registry.get(agent_id) {
@@ -5842,14 +5823,9 @@ pub async fn update_agent_budget(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
 
     let hourly = body["max_cost_per_hour_usd"].as_f64();
@@ -5976,20 +5952,9 @@ pub async fn find_session_by_label(
     State(state): State<Arc<AppState>>,
     Path((agent_id_str, label)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = match agent_id_str.parse::<uuid::Uuid>() {
-        Ok(u) => openfang_types::agent::AgentId(u),
-        Err(_) => {
-            // Try name lookup
-            match state.kernel.registry.find_by_name(&agent_id_str) {
-                Some(entry) => entry.id,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
-                    );
-                }
-            }
-        }
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &agent_id_str) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
 
     match state.kernel.memory.find_session_by_label(agent_id, &label) {
@@ -6065,14 +6030,9 @@ pub async fn update_agent(
     Path(id): Path<String>,
     Json(req): Json<AgentUpdateRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     if state.kernel.registry.get(agent_id).is_none() {
@@ -6110,14 +6070,9 @@ pub async fn patch_agent(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     if state.kernel.registry.get(agent_id).is_none() {
@@ -7292,14 +7247,9 @@ pub async fn list_agent_sessions(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     match state.kernel.list_agent_sessions(agent_id) {
         Ok(sessions) => (
@@ -7319,14 +7269,9 @@ pub async fn create_agent_session(
     Path(id): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let label = req.get("label").and_then(|v| v.as_str());
     match state.kernel.create_agent_session(agent_id, label) {
@@ -7343,14 +7288,9 @@ pub async fn switch_agent_session(
     State(state): State<Arc<AppState>>,
     Path((id, session_id_str)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let session_id = match session_id_str.parse::<uuid::Uuid>() {
         Ok(uuid) => openfang_types::agent::SessionId(uuid),
@@ -7380,14 +7320,9 @@ pub async fn reset_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     match state.kernel.reset_session(agent_id) {
         Ok(()) => (
@@ -7406,14 +7341,9 @@ pub async fn clear_agent_history(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     if state.kernel.registry.get(agent_id).is_none() {
         return (
@@ -7438,14 +7368,9 @@ pub async fn compact_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     match state.kernel.compact_agent_session(agent_id).await {
         Ok(msg) => (
@@ -7468,14 +7393,9 @@ pub async fn stop_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
 
     // If this agent is the agent of an active hand instance, deactivate the
@@ -7526,14 +7446,9 @@ pub async fn set_model(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let model = match body["model"].as_str() {
         Some(m) if !m.is_empty() => m,
@@ -7583,14 +7498,9 @@ pub async fn get_agent_tools(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -7616,14 +7526,9 @@ pub async fn set_agent_tools(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let allowlist = body
         .get("tool_allowlist")
@@ -7668,14 +7573,9 @@ pub async fn get_agent_skills(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -7713,14 +7613,9 @@ pub async fn set_agent_skills(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let skills: Vec<String> = body["skills"]
         .as_array()
@@ -7747,14 +7642,9 @@ pub async fn get_agent_mcp_servers(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let entry = match state.kernel.registry.get(agent_id) {
         Some(e) => e,
@@ -7798,14 +7688,9 @@ pub async fn set_agent_mcp_servers(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            )
-        }
+        Err(resp) => return resp,
     };
     let servers: Vec<String> = body["mcp_servers"]
         .as_array()
@@ -9803,14 +9688,9 @@ pub async fn update_agent_identity(
     Path(id): Path<String>,
     Json(req): Json<UpdateIdentityRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Validate color format if provided
@@ -9893,14 +9773,9 @@ pub async fn patch_agent_config(
     Path(id): Path<String>,
     Json(req): Json<PatchAgentConfigRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Input length limits
@@ -10401,14 +10276,9 @@ pub async fn list_agent_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     let entry = match state.kernel.registry.get(agent_id) {
@@ -10463,14 +10333,9 @@ pub async fn get_agent_file(
     State(state): State<Arc<AppState>>,
     Path((id, filename)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Validate filename whitelist
@@ -10568,14 +10433,9 @@ pub async fn set_agent_file(
     Path((id, filename)): Path<(String, String)>,
     Json(req): Json<SetAgentFileRequest>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     // Validate filename whitelist
@@ -10729,14 +10589,9 @@ pub async fn upload_file(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    let _agent_id: AgentId = match id.parse() {
+    let _agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "Invalid agent ID"})),
-            );
-        }
+        Err(resp) => return resp,
     };
 
     let mut file_data: Option<(Option<String>, String, axum::body::Bytes)> = None;
@@ -11459,20 +11314,9 @@ pub async fn get_agent_deliveries(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            // Try name lookup
-            match state.kernel.registry.find_by_name(&id) {
-                Some(entry) => entry.id,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
-                    );
-                }
-            }
-        }
+        Err(resp) => return resp,
     };
 
     let limit = params
@@ -11793,22 +11637,9 @@ pub async fn webhook_agent(
 
     // Resolve the agent by name or ID (if not specified, use the first running agent)
     let agent_id: AgentId = match &body.agent {
-        Some(agent_ref) => match agent_ref.parse() {
+        Some(agent_ref) => match crate::agent_ref::resolve_agent_ref(&state, agent_ref) {
             Ok(id) => id,
-            Err(_) => {
-                // Try name lookup
-                match state.kernel.registry.find_by_name(agent_ref) {
-                    Some(entry) => entry.id,
-                    None => {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(
-                                serde_json::json!({"error": format!("Agent not found: {}", agent_ref)}),
-                            ),
-                        );
-                    }
-                }
-            }
+            Err(resp) => return resp,
         },
         None => {
             // No agent specified — use the first available agent

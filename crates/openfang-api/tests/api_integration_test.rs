@@ -711,37 +711,104 @@ async fn test_trigger_crud() {
     assert_eq!(triggers.len(), 0);
 }
 
+/// ANAI-174: agent handles resolve as UUID-or-name, and the failure surface
+/// is split. This test replaces `test_invalid_agent_id_returns_400`, which
+/// asserted the old behaviour where every failure collapsed into one 400.
+///
+/// `not-a-uuid` is a perfectly legal *name* shape, so it is no longer a
+/// malformed handle — it is a lookup miss, and a lookup miss is a 404.
 #[tokio::test]
-async fn test_invalid_agent_id_returns_400() {
+async fn test_unknown_agent_handle_returns_404() {
     let server = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Send message to invalid ID
+    // Message to an unknown name
     let resp = client
         .post(format!("{}/api/agents/not-a-uuid/message", server.base_url))
         .json(&serde_json::json!({"message": "hello"}))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 404);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"].as_str().unwrap().contains("Invalid"));
+    assert!(body["error"].as_str().unwrap().contains("No such agent"));
 
-    // Kill invalid ID
+    // Kill an unknown name
     let resp = client
         .delete(format!("{}/api/agents/not-a-uuid", server.base_url))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 400);
+    assert_eq!(resp.status(), 404);
 
-    // Session for invalid ID
+    // Session for an unknown name
     let resp = client
         .get(format!("{}/api/agents/not-a-uuid/session", server.base_url))
         .send()
         .await
         .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// ANAI-174: a handle that could never be a name *or* a UUID stays a 400.
+/// This is the half of the split that keeps 400 meaningful.
+#[tokio::test]
+async fn test_malformed_agent_handle_returns_400() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // %00 decodes to a NUL — a control character, which no agent name holds.
+    let resp = client
+        .get(format!("{}/api/agents/bad%00name/session", server.base_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("control"));
+}
+
+/// ANAI-174: the feature itself — routes that took only a UUID now take the
+/// agent's name, which is what the CLI help text has always advertised.
+#[tokio::test]
+async fn test_agent_handle_resolves_by_name() {
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/agents", server.base_url))
+        .json(&serde_json::json!({"manifest_toml": TEST_MANIFEST}))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let agent_id = body["agent_id"].as_str().unwrap().to_string();
+
+    // Same endpoint, addressed by name instead of UUID.
+    let resp = client
+        .get(format!("{}/api/agents/test-agent/session", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let by_name: serde_json::Value = resp.json().await.unwrap();
+
+    let resp = client
+        .get(format!(
+            "{}/api/agents/{}/session",
+            server.base_url, agent_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let by_uuid: serde_json::Value = resp.json().await.unwrap();
+
+    // Both handles must land on the same agent — and on the *right* one.
+    // Asserting against the spawned UUID keeps this from passing vacuously
+    // if the field ever stops being emitted.
+    assert_eq!(by_name["agent_id"].as_str().unwrap(), agent_id);
+    assert_eq!(by_name["agent_id"], by_uuid["agent_id"]);
 }
 
 #[tokio::test]
