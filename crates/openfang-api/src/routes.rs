@@ -5952,20 +5952,9 @@ pub async fn find_session_by_label(
     State(state): State<Arc<AppState>>,
     Path((agent_id_str, label)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = match agent_id_str.parse::<uuid::Uuid>() {
-        Ok(u) => openfang_types::agent::AgentId(u),
-        Err(_) => {
-            // Try name lookup
-            match state.kernel.registry.find_by_name(&agent_id_str) {
-                Some(entry) => entry.id,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
-                    );
-                }
-            }
-        }
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &agent_id_str) {
+        Ok(id) => id,
+        Err(resp) => return resp,
     };
 
     match state.kernel.memory.find_session_by_label(agent_id, &label) {
@@ -11325,20 +11314,9 @@ pub async fn get_agent_deliveries(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let agent_id: AgentId = match id.parse() {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
         Ok(id) => id,
-        Err(_) => {
-            // Try name lookup
-            match state.kernel.registry.find_by_name(&id) {
-                Some(entry) => entry.id,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "Agent not found"})),
-                    );
-                }
-            }
-        }
+        Err(resp) => return resp,
     };
 
     let limit = params
@@ -11659,22 +11637,9 @@ pub async fn webhook_agent(
 
     // Resolve the agent by name or ID (if not specified, use the first running agent)
     let agent_id: AgentId = match &body.agent {
-        Some(agent_ref) => match agent_ref.parse() {
+        Some(agent_ref) => match crate::agent_ref::resolve_agent_ref(&state, agent_ref) {
             Ok(id) => id,
-            Err(_) => {
-                // Try name lookup
-                match state.kernel.registry.find_by_name(agent_ref) {
-                    Some(entry) => entry.id,
-                    None => {
-                        return (
-                            StatusCode::NOT_FOUND,
-                            Json(
-                                serde_json::json!({"error": format!("Agent not found: {}", agent_ref)}),
-                            ),
-                        );
-                    }
-                }
-            }
+            Err(resp) => return resp,
         },
         None => {
             // No agent specified — use the first available agent
