@@ -1762,6 +1762,27 @@ impl OpenFangKernel {
 
         info!(agent = %name, id = %agent_id, parent = ?parent, "Spawning agent");
 
+        // PRE-FLIGHT: reject a duplicate name BEFORE touching any state.
+        //
+        // `registry.register()` below is the authoritative uniqueness gate, but
+        // it runs at the very end of this function — by which point we have
+        // already created a session row, granted capabilities, and registered
+        // with the scheduler. On rejection none of that was unwound, so every
+        // failed duplicate spawn leaked one SQLite session row plus two
+        // in-memory registrations that nothing ever reaped (ANAI-181).
+        //
+        // This check is not atomic with the `register()` below, and it is not
+        // meant to be: `register()` remains the real gate, so a lost race
+        // degrades to exactly the old behaviour rather than to a duplicate.
+        // What it buys is that the overwhelmingly common case — an operator
+        // re-spawning an agent that is already running — costs nothing.
+        if let Some(existing) = self.registry.id_for_name(&name) {
+            warn!(agent = %name, existing = %existing, "Spawn rejected: name already registered");
+            return Err(KernelError::OpenFang(OpenFangError::AgentAlreadyExists(
+                name,
+            )));
+        }
+
         // Create session — use the returned session_id so the registry
         // and database are in sync (fixes duplicate session bug #651).
         let session = self
@@ -10525,6 +10546,59 @@ mod tests {
         let long = "x".repeat(500);
         let out = super::sanitize_cron_job_name(&long);
         assert!(out.chars().count() <= 128);
+    }
+
+    /// ANAI-181: spawning a name that is already registered must fail *before*
+    /// the spawn prelude mutates anything. The old code validated last — in
+    /// `registry.register()`, at the very end — so a rejected spawn still left
+    /// an orphan session row, a capability grant, and a scheduler entry behind.
+    #[test]
+    fn test_duplicate_spawn_rejects_without_leaking_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-dup-spawn");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+
+        let first = kernel
+            .spawn_agent(test_manifest("dup-spawn", "first", vec![]))
+            .expect("first spawn succeeds");
+        let sessions_after_first = kernel.memory.list_sessions().unwrap().len();
+        // Boot may register agents of its own, so compare against a measured
+        // baseline rather than a hard-coded 1.
+        let agents_after_first = kernel.registry.count();
+
+        let err = kernel
+            .spawn_agent(test_manifest("dup-spawn", "second", vec![]))
+            .expect_err("duplicate name must be rejected");
+        assert!(
+            matches!(
+                err,
+                KernelError::OpenFang(OpenFangError::AgentAlreadyExists(ref n)) if n == "dup-spawn"
+            ),
+            "expected AgentAlreadyExists, got {err:?}"
+        );
+
+        // The regression proper: nothing was mutated on the failure path.
+        assert_eq!(
+            kernel.memory.list_sessions().unwrap().len(),
+            sessions_after_first,
+            "rejected spawn leaked a session row"
+        );
+        assert_eq!(
+            kernel.registry.count(),
+            agents_after_first,
+            "rejected spawn leaked a registry entry"
+        );
+        assert_eq!(
+            kernel.registry.find_by_name("dup-spawn").map(|a| a.id),
+            Some(first),
+            "the original agent must still own the name"
+        );
     }
 
     /// Register a minimal test agent in a booted kernel and return its ID.

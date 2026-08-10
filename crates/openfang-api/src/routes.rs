@@ -161,11 +161,38 @@ pub async fn spawn_agent(
             )
         }
         Err(e) => {
-            tracing::warn!("Spawn failed: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Agent spawn failed"})),
-            )
+            // ANAI-181: `spawn` used to flatten every failure mode to a bare
+            // 500 with the body "Agent spawn failed". The overwhelmingly
+            // common failure — spawning a name that is already running — is a
+            // client error, not a server error, and the caller needs to be
+            // able to tell the two apart. `clone` next door already does this.
+            match e {
+                openfang_kernel::error::KernelError::OpenFang(
+                    openfang_types::error::OpenFangError::AgentAlreadyExists(taken),
+                ) => {
+                    let existing = state
+                        .kernel
+                        .registry
+                        .find_by_name(&taken)
+                        .map(|a| a.id.to_string());
+                    tracing::warn!("Spawn rejected: agent name '{taken}' already registered");
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!("Agent name '{taken}' is already in use"),
+                            "name": taken,
+                            "existing_agent_id": existing,
+                        })),
+                    )
+                }
+                other => {
+                    tracing::warn!("Spawn failed: {other}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Agent spawn failed: {other}")})),
+                    )
+                }
+            }
         }
     }
 }
