@@ -7,6 +7,18 @@
 //! I/O, so both crates share one definition of the security surface instead of
 //! agreeing by convention.
 //!
+//! # What the floor covers
+//!
+//! The deterministic predicates in this module match **syntax, not semantics**.
+//! They recognise binary names, subcommand verbs, fence fragments and path
+//! shapes in a command string. They do not model what a command will *do*, and
+//! they cannot: `make deploy` and `./ship.sh` are opaque to any string
+//! predicate. `GateFlags::any() == false` therefore means "no predicate
+//! matched", never "safe" — it is the absence of a *ceiling* on the judge's
+//! authority, not a grant. Every downstream reader must treat a clean floor as
+//! "the model decides", which is exactly how [`GateVerdict::narrowed_by`] uses
+//! it. (ANAI-184)
+//!
 //! # Trust model
 //!
 //! Every field of a [`GateRequest`] is composed by the daemon from a trusted
@@ -89,6 +101,172 @@ pub const CONTROL_PATH_FRAGMENTS: &[&str] = &[
 /// See [`contains_fence_marker`]. Matched with all whitespace removed, so
 /// `< / command >` folds onto the same hit as `</command>`.
 pub const FENCE_MARKERS: &[&str] = &["<command", "command>"];
+
+// ---------------------------------------------------------------------------
+// ANAI-184: mutation / egress floor
+//
+// ANAI-154 shipped four predicates: destructive bins, network bins, control
+// paths, and `>` redirects. The security review's F3 observed that the operator
+// policy tells the judge to escalate on publish / push / install / manifest
+// edits and **none of those classes had a Rust predicate** — so for that whole
+// class the model was the only control, and per F1 the model is the steerable
+// part. These lists are that floor. Deliberately coarse: a false escalation
+// costs one Discord prompt.
+// ---------------------------------------------------------------------------
+
+/// Control-plane root, matched broadly. See [`touches_control_plane`].
+pub const CONTROL_PLANE_ROOT: &str = ".openfang/";
+
+/// Subtrees under [`CONTROL_PLANE_ROOT`] that are *not* control plane.
+///
+/// ANAI-184 scope item 4, the F2 generalization: enumerating the bad parts of
+/// `~/.openfang` keeps losing — `gatekeeper.md` was missed for exactly that
+/// reason. Inverting it (match the root, allowlist the benign subtrees) means a
+/// new control file added next month is escalated by default instead of
+/// silently uncovered. Agent workspaces and logs are the only subtrees agents
+/// have ordinary business writing.
+pub const CONTROL_PLANE_BENIGN_PREFIXES: &[&str] =
+    &[".openfang/workspaces/", ".openfang/logs/", ".openfang/tmp/"];
+
+/// Binaries whose ordinary job is to move bytes off this machine or pull code
+/// onto it. Coarse by design: there is no read-only mode of `npm` or `gh` that
+/// a string predicate can tell apart from a publishing one.
+pub const EGRESS_BINS: &[&str] = &[
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "pip",
+    "pip3",
+    "pipx",
+    "poetry",
+    "gem",
+    "bundle",
+    "brew",
+    "apt",
+    "apt-get",
+    "yum",
+    "dnf",
+    "apk",
+    "gh",
+    "glab",
+    "aws",
+    "gcloud",
+    "az",
+    "doctl",
+    "docker",
+    "podman",
+    "kubectl",
+    "helm",
+    "terraform",
+    "open",
+    "osascript",
+    "mail",
+    "sendmail",
+];
+
+/// Binaries that write or relink state somewhere other than their own stdout.
+/// Not destructive in the `rm` sense, which is precisely why they were missing:
+/// `cp x /etc/y` and `tee` into a launchd plist both left the ANAI-154 floor
+/// completely clean.
+pub const MUTATION_BINS: &[&str] = &[
+    "mv", "cp", "ln", "tee", "install", "patch", "crontab", "rename", "unlink", "mkfifo",
+];
+
+/// Binaries that execute text this floor cannot read. `xargs` builds its argv
+/// at runtime from stdin; `eval` / `watch` / `parallel` take a command as a
+/// string argument. Unlike `bash -c`, none of them are decomposed into
+/// `GateRequest::inner`, so their payload is invisible to every other predicate
+/// here.
+pub const OPAQUE_EXEC_BINS: &[&str] = &["xargs", "eval", "watch", "parallel"];
+
+/// Binaries whose path *arguments* are write targets. See
+/// [`writes_outside_workspace`] — the sibling to the redirect predicate.
+pub const PATH_WRITING_BINS: &[&str] = &[
+    "cp", "mv", "ln", "tee", "install", "rsync", "dd", "touch", "mkdir", "truncate", "patch",
+    "chmod", "chown", "shred", "rm", "rmdir", "sed",
+];
+
+/// `(binary, verbs)` pairs where the binary alone is too coarse to be useful:
+/// `git status` is routine, `git push --force origin main` is the case F3 was
+/// written about, and both are `git`.
+///
+/// Egress side — publishes, fetches code, or crosses the machine boundary.
+pub const EGRESS_VERBS: &[(&str, &[&str])] = &[
+    (
+        "git",
+        &[
+            "push",
+            "clone",
+            "fetch",
+            "pull",
+            "remote",
+            "submodule",
+            "send-email",
+        ],
+    ),
+    (
+        "cargo",
+        &[
+            "publish",
+            "install",
+            "yank",
+            "owner",
+            "login",
+            "add",
+            "uninstall",
+        ],
+    ),
+    ("go", &["get", "install"]),
+    ("rustup", &["update", "install", "toolchain"]),
+    (
+        "make",
+        &["install", "publish", "deploy", "release", "upload"],
+    ),
+];
+
+/// `(binary, verbs)` pairs that mutate local state in a way a human should see.
+/// `git reset` and `git clean` destroy uncommitted work with a clean floor
+/// under the ANAI-154 predicate set.
+pub const MUTATION_VERBS: &[(&str, &[&str])] = &[
+    (
+        "git",
+        &[
+            "reset",
+            "clean",
+            "checkout",
+            "restore",
+            "rebase",
+            "merge",
+            "revert",
+            "cherry-pick",
+            "filter-branch",
+            "gc",
+            "prune",
+            "worktree",
+            "config",
+            "am",
+            "apply",
+        ],
+    ),
+    ("sed", &["-i"]),
+    ("perl", &["-i"]),
+    ("find", &["-delete", "-exec", "-execdir", "-ok", "-okdir"]),
+    ("crontab", &["-r"]),
+];
+
+/// `(binary, verbs)` pairs that run inline source. `python3 -c "urllib..."` is
+/// a network client, a file writer, or a no-op depending on a string this floor
+/// does not parse — so it is judged as unreadable rather than as `python3`.
+pub const OPAQUE_EXEC_VERBS: &[(&str, &[&str])] = &[
+    ("python", &["-c", "-m"]),
+    ("python3", &["-c", "-m"]),
+    ("node", &["-e", "--eval", "-p", "--print"]),
+    ("ruby", &["-e"]),
+    ("perl", &["-e"]),
+    ("php", &["-r"]),
+];
 
 // ---------------------------------------------------------------------------
 // Verdict
@@ -197,6 +375,18 @@ pub struct GateFlags {
     /// it in the prompt — i.e. it is trying to close its own quarantine and
     /// write in the trusted span below it. See [`contains_fence_marker`].
     pub fence_escape: bool,
+    /// ANAI-184: a binary or verb that mutates state beyond the command's own
+    /// output — `mv`, `cp`, `tee`, `git reset`, `sed -i`, `find -delete`.
+    pub mutation_verb: bool,
+    /// ANAI-184: a binary or verb that publishes, installs, or otherwise
+    /// crosses the machine boundary — `git push`, `cargo publish`, `npm`, `gh`.
+    pub egress_verb: bool,
+    /// ANAI-184: the command executes text this floor cannot read — `xargs`,
+    /// `eval`, `python3 -c`, `node -e`.
+    pub opaque_execution: bool,
+    /// ANAI-184: a write-target *argument* — not just a `>` redirect — resolves
+    /// outside the agent's workspace.
+    pub writes_outside_workspace: bool,
     /// `collect_command_bases()` returned `Err`. Unparseable means unjudgeable.
     pub parse_failed: bool,
 }
@@ -209,6 +399,10 @@ impl GateFlags {
             || self.redirect_outside_workspace
             || self.network_binary
             || self.fence_escape
+            || self.mutation_verb
+            || self.egress_verb
+            || self.opaque_execution
+            || self.writes_outside_workspace
             || self.parse_failed
     }
 
@@ -229,6 +423,18 @@ impl GateFlags {
         }
         if self.fence_escape {
             hit.push("fence_escape");
+        }
+        if self.mutation_verb {
+            hit.push("mutation");
+        }
+        if self.egress_verb {
+            hit.push("egress");
+        }
+        if self.opaque_execution {
+            hit.push("opaque_exec");
+        }
+        if self.writes_outside_workspace {
+            hit.push("write_escape");
         }
         if self.parse_failed {
             hit.push("parse_failed");
@@ -501,9 +707,28 @@ fn strip_line_comment(line: &str) -> &str {
 pub fn touches_control_plane(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
         let lowered = v.to_ascii_lowercase();
-        CONTROL_PATH_FRAGMENTS
+        if CONTROL_PATH_FRAGMENTS
             .iter()
             .any(|frag| lowered.contains(frag))
+        {
+            return true;
+        }
+        // ANAI-184 scope item 4: inverted rule. Any *other* reference to
+        // `.openfang/` counts, unless it names a known-benign subtree. The
+        // explicit fragment list above is kept as documentation of the cases we
+        // know about and as belt to a future edit of the benign list.
+        let mut rest: &str = &lowered;
+        while let Some(idx) = rest.find(CONTROL_PLANE_ROOT) {
+            let tail = &rest[idx..];
+            if !CONTROL_PLANE_BENIGN_PREFIXES
+                .iter()
+                .any(|p| tail.starts_with(p))
+            {
+                return true;
+            }
+            rest = &rest[idx + CONTROL_PLANE_ROOT.len()..];
+        }
+        false
     })
 }
 
@@ -560,6 +785,128 @@ pub fn has_network_binary(bases: &[String], inner: &[String]) -> bool {
         .any(|b| NETWORK_BINS.contains(&basename(b).as_str()))
 }
 
+/// True if the command mutates state beyond its own output. (ANAI-184)
+pub fn has_mutation_verb(command: &str, bases: &[String], inner: &[String]) -> bool {
+    any_base_in(bases, inner, MUTATION_BINS) || has_verb_pair(command, MUTATION_VERBS)
+}
+
+/// True if the command publishes, installs, or crosses the machine boundary.
+/// (ANAI-184)
+pub fn has_egress_verb(command: &str, bases: &[String], inner: &[String]) -> bool {
+    any_base_in(bases, inner, EGRESS_BINS) || has_verb_pair(command, EGRESS_VERBS)
+}
+
+/// True if the command executes text this floor cannot read. (ANAI-184)
+pub fn has_opaque_execution(command: &str, bases: &[String], inner: &[String]) -> bool {
+    any_base_in(bases, inner, OPAQUE_EXEC_BINS) || has_verb_pair(command, OPAQUE_EXEC_VERBS)
+}
+
+fn any_base_in(bases: &[String], inner: &[String], list: &[&str]) -> bool {
+    bases
+        .iter()
+        .chain(inner.iter())
+        .any(|b| list.contains(&basename(b).as_str()))
+}
+
+/// True if any `(binary, verb)` pair in `table` both appear as tokens.
+///
+/// # Why this is not anchored to argv\[0\]
+///
+/// A verb check anchored to the segment's base command misses every wrapper
+/// form the exec wall already has to handle: `env X=1 git push`, `git -C /repo
+/// push`, and — the one that matters — `bash -c "git push origin main"`, whose
+/// `inner` list carries the base name `git` but no arguments at all. So the
+/// match is unanchored: the binary and one of its verbs need only both occur as
+/// whitespace-separated tokens somewhere in the same variant.
+///
+/// That is deliberately over-broad. `git commit -m push` escalates. Under
+/// union-with-`deny_variants` semantics the cost of over-breadth is a Discord
+/// prompt and the cost of under-breadth is an unreviewed force-push, so the
+/// asymmetry is priced correctly.
+fn has_verb_pair(command: &str, table: &[(&str, &[&str])]) -> bool {
+    for variant in crate::cmd_norm::deny_variants(command) {
+        let tokens: Vec<String> = variant.split_whitespace().map(basename).collect();
+        for (bin, verbs) in table {
+            if !tokens.iter().any(|t| t == bin) {
+                continue;
+            }
+            if tokens
+                .iter()
+                .any(|t| verbs.iter().any(|v| token_matches_verb(t, v)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Exact token match, plus short-flag bundles: `sed -ie 's/a/b/'` carries `-i`.
+fn token_matches_verb(token: &str, verb: &str) -> bool {
+    if token == verb {
+        return true;
+    }
+    // Only single-letter short flags bundle. `--eval` and `-delete` are matched
+    // by equality alone.
+    if verb.len() == 2 && verb.starts_with('-') && token.len() > 2 && !token.starts_with("--") {
+        if let (Some(v), Some(t)) = (verb.strip_prefix('-'), token.strip_prefix('-')) {
+            return t.chars().all(|c| c.is_ascii_alphanumeric()) && t.contains(v);
+        }
+    }
+    false
+}
+
+/// True if a write-target *argument* of a path-writing binary resolves outside
+/// the workspace. (ANAI-184 scope item 2.)
+///
+/// [`redirects_outside_workspace`] only ever scanned `>` / `>>`, so it read
+/// `echo x > /etc/hosts` as an escape and `tee /etc/hosts` as clean — same
+/// write, same target, opposite verdict. This closes that by checking the
+/// arguments themselves whenever a path-writing binary is present.
+///
+/// Fails closed on the same terms as the redirect predicate: any `..`, and any
+/// absolute or `~`-rooted target when the workspace root is unknown or does not
+/// contain it. Tokens that are themselves one of the path-writing binaries are
+/// skipped so `/bin/cp` is not read as its own argument.
+pub fn writes_outside_workspace(command: &str, workspace_root: Option<&str>) -> bool {
+    for variant in crate::cmd_norm::deny_variants(command) {
+        let tokens: Vec<&str> = variant.split_whitespace().collect();
+        if !tokens
+            .iter()
+            .any(|t| PATH_WRITING_BINS.contains(&basename(t).as_str()))
+        {
+            continue;
+        }
+        for token in &tokens {
+            if token.starts_with('-') || PATH_WRITING_BINS.contains(&basename(token).as_str()) {
+                continue;
+            }
+            if token.contains("..") {
+                return true;
+            }
+            if token.starts_with('/') || token.starts_with('~') {
+                match workspace_root {
+                    Some(root) if is_inside_workspace(token, root) => {}
+                    _ => return true,
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Path containment with a component boundary.
+///
+/// `"/ws-evil".starts_with("/ws")` is true and `/ws-evil` is not inside `/ws`.
+/// A bare prefix test here would have read a sibling directory as in-workspace.
+fn is_inside_workspace(target: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return false;
+    }
+    target == root || target.starts_with(&format!("{root}/"))
+}
+
 /// True if a `>` / `>>` redirect targets a path outside the workspace.
 ///
 /// Fails closed on ambiguity: an absolute target that is not under
@@ -592,7 +939,7 @@ pub fn redirects_outside_workspace(command: &str, workspace_root: Option<&str>) 
                 }
                 if target.starts_with('/') || target.starts_with('~') {
                     match workspace_root {
-                        Some(root) if target.starts_with(root) => {}
+                        Some(root) if is_inside_workspace(&target, root) => {}
                         _ => return true,
                     }
                 }
@@ -831,6 +1178,134 @@ mod tests {
             "cargo test --all",
             Some("/ws")
         ));
+    }
+
+    // -- mutation / egress floor (ANAI-184) ---------------------------------
+
+    #[test]
+    fn git_push_is_egress() {
+        // F3's concrete case: no destructive bin, no network bin, no control
+        // path, no redirect. Clean floor before ANAI-184.
+        let bases = vec!["git".to_string()];
+        assert!(has_egress_verb("git push --force origin main", &bases, &[]));
+        assert!(has_egress_verb("git clone https://x/y.git", &bases, &[]));
+        // Reads stay clean, which is the whole point of verb granularity.
+        assert!(!has_egress_verb("git status --short", &bases, &[]));
+        assert!(!has_egress_verb("git log --oneline -5", &bases, &[]));
+        assert!(!has_mutation_verb("git status --short", &bases, &[]));
+    }
+
+    #[test]
+    fn egress_verb_survives_a_shell_wrapper() {
+        // `bash -c "git push"` yields inner == ["git"] with no arguments, so an
+        // argv[0]-anchored verb check would miss it entirely.
+        let bases = vec!["bash".to_string()];
+        let inner = vec!["git".to_string()];
+        assert!(has_egress_verb(
+            "bash -c \"git push origin main\"",
+            &bases,
+            &inner
+        ));
+    }
+
+    #[test]
+    fn egress_and_mutation_bins_are_coarse() {
+        assert!(has_egress_verb("", &["npm".to_string()], &[]));
+        assert!(has_egress_verb("", &["/usr/local/bin/gh".to_string()], &[]));
+        assert!(has_mutation_verb("", &["tee".to_string()], &[]));
+        assert!(has_mutation_verb("", &["cp".to_string()], &[]));
+        assert!(!has_egress_verb("", &["cargo".to_string()], &[]));
+        assert!(!has_mutation_verb("", &["cat".to_string()], &[]));
+    }
+
+    #[test]
+    fn inline_interpreter_source_is_opaque() {
+        let py = vec!["python3".to_string()];
+        assert!(has_opaque_execution(
+            "python3 -c 'import urllib.request; urllib.request.urlopen(x)'",
+            &py,
+            &[]
+        ));
+        assert!(has_opaque_execution(
+            "node -e 'require(\"fs\")'",
+            &["node".to_string()],
+            &[]
+        ));
+        assert!(has_opaque_execution("", &["xargs".to_string()], &[]));
+        // Running a script file is readable text on disk, not inline source.
+        assert!(!has_opaque_execution("python3 tools/build.py", &py, &[]));
+    }
+
+    #[test]
+    fn short_flag_bundles_still_match() {
+        assert!(has_mutation_verb(
+            "sed -ie 's/a/b/' notes.md",
+            &["sed".to_string()],
+            &[]
+        ));
+        assert!(!has_mutation_verb(
+            "sed -n '1,5p' notes.md",
+            &["sed".to_string()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn write_target_arguments_are_checked_not_just_redirects() {
+        // Same write, same target — one via redirect, one via argument. Before
+        // ANAI-184 only the first was seen.
+        assert!(redirects_outside_workspace(
+            "echo x > /etc/hosts",
+            Some("/ws")
+        ));
+        assert!(writes_outside_workspace("tee /etc/hosts", Some("/ws")));
+        assert!(writes_outside_workspace(
+            "cp report.md /etc/motd",
+            Some("/ws")
+        ));
+        assert!(writes_outside_workspace("cp ../../secrets .", Some("/ws")));
+        // In-workspace argument writes stay suppressible.
+        assert!(!writes_outside_workspace(
+            "cp src/a.txt build/b.txt",
+            Some("/ws")
+        ));
+        assert!(!writes_outside_workspace(
+            "cp /ws/a.txt /ws/b.txt",
+            Some("/ws")
+        ));
+        // No path-writing binary → the predicate does not apply at all.
+        assert!(!writes_outside_workspace("cat /etc/hosts", Some("/ws")));
+        // Unknown workspace fails closed.
+        assert!(writes_outside_workspace("cp a.txt /tmp/b.txt", None));
+    }
+
+    #[test]
+    fn workspace_containment_respects_component_boundaries() {
+        // `/ws-evil`.starts_with(`/ws`) is true; it is not inside `/ws`.
+        assert!(writes_outside_workspace("cp a /ws-evil/b", Some("/ws")));
+        assert!(redirects_outside_workspace(
+            "echo x > /ws-evil/b",
+            Some("/ws")
+        ));
+        assert!(!redirects_outside_workspace("echo x > /ws/b", Some("/ws")));
+    }
+
+    /// ANAI-184 scope item 4: enumerate-the-good under `.openfang/`, so a
+    /// control file nobody has thought of yet is escalated by default.
+    #[test]
+    fn control_plane_rule_is_inverted() {
+        // Not in CONTROL_PATH_FRAGMENTS, still control plane.
+        assert!(touches_control_plane("cat ~/.openfang/approvals.db"));
+        assert!(touches_control_plane(
+            "cp x ~/.openfang/some-future-file.toml"
+        ));
+        // Benign subtrees: an agent's own workspace and the log dir.
+        assert!(!touches_control_plane(
+            "cp a.md ~/.openfang/workspaces/openfang-alpha/output/a.md"
+        ));
+        assert!(!touches_control_plane("ls ~/.openfang/logs/daemon/"));
+        // ...but the enumerated control paths win over a benign-looking prefix.
+        assert!(touches_control_plane("tee ~/.openfang/scripts/x.sh"));
     }
 
     // -- verdict algebra -----------------------------------------------------
