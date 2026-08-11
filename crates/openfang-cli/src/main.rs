@@ -877,12 +877,46 @@ fn config_log_level() -> String {
     "info".to_string()
 }
 
+/// Tracing target the gatekeeper's verdict log is emitted on.
+const GATEKEEPER_LOG_TARGET: &str = "openfang::gatekeeper";
+
+/// Build the tracing filter, pinning the gatekeeper's verdict log on top of it.
+///
+/// ANAI-186: `RUST_LOG` replaces the filter WHOLESALE, and the daemon's
+/// `RUST_LOG` lives in a launchd plist — so a narrowing edit made to quiet one
+/// noisy subsystem silently takes the gatekeeper's verdict log with it. That
+/// log is a security record, not diagnostics: it is the only human-readable
+/// trace of a command the gate decided an operator would never see.
+///
+/// So: parse the operator's filter first, then add `openfang::gatekeeper=info`
+/// — UNLESS the operator named that target explicitly. An explicit mention is
+/// deliberate (raising it to `debug`, say, or a considered decision to mute
+/// it) and is respected verbatim. Silence is not deliberate, and gets the pin.
+///
+/// Note this pins the *stderr* copy only. It is a convenience, not the record:
+/// the durable ledger is the Merkle audit chain in sqlite, which no logging
+/// configuration can reach.
+fn gatekeeper_pinned_filter() -> tracing_subscriber::EnvFilter {
+    let env = std::env::var("RUST_LOG").ok();
+    let base = match env.as_deref() {
+        Some(v) if !v.trim().is_empty() => tracing_subscriber::EnvFilter::new(v),
+        _ => tracing_subscriber::EnvFilter::new(config_log_level()),
+    };
+    if env
+        .as_deref()
+        .is_some_and(|v| v.contains(GATEKEEPER_LOG_TARGET))
+    {
+        return base;
+    }
+    match format!("{GATEKEEPER_LOG_TARGET}=info").parse() {
+        Ok(directive) => base.add_directive(directive),
+        Err(_) => base,
+    }
+}
+
 fn init_tracing_stderr() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config_log_level())),
-        )
+        .with_env_filter(gatekeeper_pinned_filter())
         .with_writer(std::io::stderr)
         .init();
 }
@@ -906,10 +940,7 @@ fn init_tracing_file() {
     match std::fs::File::create(&log_path) {
         Ok(file) => {
             tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config_log_level())),
-                )
+                .with_env_filter(gatekeeper_pinned_filter())
                 .with_writer(std::sync::Mutex::new(file))
                 .with_ansi(false)
                 .init();

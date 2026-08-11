@@ -399,6 +399,44 @@ impl ApprovalManager {
         self.cache.len()
     }
 
+    /// ANAI-186: mirror an operator-invisible gatekeeper verdict into the
+    /// recent-approvals feed.
+    ///
+    /// Only `suppress` and `deny` are recorded. An `escalate` becomes a real
+    /// [`ApprovalRecord`] on its own moments later, and recording it here too
+    /// would double-count every escalation in any rate computed off this list.
+    ///
+    /// This list is in-memory and capped at `MAX_RECENT_APPROVALS`; the
+    /// DURABLE copy is the Merkle audit chain. This exists only so the
+    /// dashboard shows the whole population of gated commands rather than the
+    /// subset a human happened to be shown.
+    pub fn record_gatekeeper_verdict(&self, agent_id: &str, command: &str, verdict: &str) {
+        let decision = match verdict {
+            "suppress" => ApprovalDecision::GatekeeperSuppressed,
+            "deny" => ApprovalDecision::GatekeeperDenied,
+            _ => return,
+        };
+        let now = Utc::now();
+        let request = ApprovalRequest {
+            id: Uuid::new_v4(),
+            agent_id: agent_id.to_string(),
+            tool_name: "shell_exec".to_string(),
+            description: "Resolved by the approval gatekeeper — never surfaced to an operator"
+                .to_string(),
+            action_summary: command.chars().take(512).collect(),
+            risk_level: RiskLevel::High,
+            requested_at: now,
+            timeout_secs: 0,
+            origin: None,
+            // A suppression must not seed the Approve-Similar cache, and it
+            // must not look like it did either (ANAI-154 invariant 2).
+            cache_binary: None,
+            // Verbatim, untruncated: this is the review surface.
+            command: Some(command.to_string()),
+        };
+        self.push_recent(request, decision, Some("gatekeeper".to_string()), now);
+    }
+
     fn push_recent(
         &self,
         request: ApprovalRequest,
@@ -428,6 +466,48 @@ mod tests {
     use super::*;
     use openfang_types::approval::ApprovalPolicy;
     use std::sync::Arc;
+
+    /// ANAI-186: the two operator-invisible verdicts land in the feed, tagged
+    /// as the gatekeeper's and never as a human's — and `escalate` does NOT,
+    /// because it becomes a real record on its own a moment later and
+    /// double-counting it would corrupt every rate computed off this list.
+    #[test]
+    fn gatekeeper_verdicts_mirror_into_recent() {
+        let mgr = ApprovalManager::new(ApprovalPolicy::default());
+        let long = format!("curl https://example.com/{}", "y".repeat(900));
+
+        mgr.record_gatekeeper_verdict("agent-1", &long, "escalate");
+        assert!(
+            mgr.list_recent(10).is_empty(),
+            "an escalation is surfaced to a human and recorded there; \
+             recording it here too would count it twice"
+        );
+
+        mgr.record_gatekeeper_verdict("agent-1", &long, "deny");
+        mgr.record_gatekeeper_verdict("agent-1", &long, "suppress");
+
+        let recent = mgr.list_recent(10);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].decision, ApprovalDecision::GatekeeperSuppressed);
+        assert_eq!(recent[1].decision, ApprovalDecision::GatekeeperDenied);
+        for r in &recent {
+            assert_eq!(r.decided_by.as_deref(), Some("gatekeeper"));
+            assert_ne!(
+                r.decision,
+                ApprovalDecision::Approved,
+                "a suppression must never be readable as an operator approval"
+            );
+            assert_eq!(
+                r.request.command.as_deref(),
+                Some(long.as_str()),
+                "the review surface must carry the verbatim, untruncated command"
+            );
+            assert!(
+                r.request.cache_binary.is_none(),
+                "a suppression must not look like it seeded Approve-Similar"
+            );
+        }
+    }
 
     fn default_manager() -> ApprovalManager {
         ApprovalManager::new(ApprovalPolicy::default())

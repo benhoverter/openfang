@@ -29,6 +29,13 @@ pub enum AuditAction {
     AuthAttempt,
     WireConnect,
     ConfigChange,
+    /// ANAI-186: one layer-3.5 gatekeeper verdict on a gated `shell_exec`.
+    ///
+    /// Recorded for EVERY verdict, not only `Suppress`. A `Deny` is equally
+    /// invisible to the operator — the judge blocked a command and no human
+    /// was ever shown it — and the `Escalate` rows are the denominator that
+    /// makes a suppression rate readable at all.
+    GatekeeperVerdict,
 }
 
 impl std::fmt::Display for AuditAction {
@@ -133,6 +140,7 @@ impl AuditLog {
                         "AuthAttempt" => AuditAction::AuthAttempt,
                         "WireConnect" => AuditAction::WireConnect,
                         "ConfigChange" => AuditAction::ConfigChange,
+                        "GatekeeperVerdict" => AuditAction::GatekeeperVerdict,
                         _ => AuditAction::ToolInvoke, // fallback
                     };
                     Ok(AuditEntry {
@@ -472,5 +480,44 @@ mod tests {
         // Verify tip is correct
         let entries = log2.recent(3);
         assert_eq!(entries[2].prev_hash, entries[1].hash);
+    }
+
+    /// ANAI-186: the DB stores `AuditAction`'s Display output as a bare string
+    /// and `with_db` maps it back by EXACT match, falling back to `ToolInvoke`
+    /// for anything unrecognised. So a rename of this variant does not fail a
+    /// build — it silently re-labels every historical gatekeeper row as an
+    /// ordinary tool invocation. Pin the wire spelling and the round trip.
+    #[test]
+    fn gatekeeper_action_wire_spelling_round_trips() {
+        assert_eq!(
+            AuditAction::GatekeeperVerdict.to_string(),
+            "GatekeeperVerdict"
+        );
+
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        db.lock()
+            .unwrap()
+            .execute(
+                "CREATE TABLE audit_entries (seq INTEGER PRIMARY KEY, timestamp TEXT, \
+                 agent_id TEXT, action TEXT, detail TEXT, outcome TEXT, prev_hash TEXT, hash TEXT)",
+                [],
+            )
+            .unwrap();
+
+        let log = AuditLog::with_db(Arc::clone(&db));
+        log.record(
+            "agent-1",
+            AuditAction::GatekeeperVerdict,
+            "tool=shell_exec command=curl https://example.com",
+            "suppress",
+        );
+
+        let reloaded = AuditLog::with_db(db);
+        assert!(reloaded.verify_integrity().is_ok());
+        let entries = reloaded.recent(1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action.to_string(), "GatekeeperVerdict");
+        assert_eq!(entries[0].outcome, "suppress");
+        assert!(entries[0].detail.contains("curl https://example.com"));
     }
 }

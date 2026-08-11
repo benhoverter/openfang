@@ -208,6 +208,19 @@ pub enum ApprovalDecision {
     /// [`Self::TimedOut`] it is retryable, and unlike `TimedOut` it is likely
     /// to succeed on retry as soon as the agent's pending queue drains.
     Backpressure,
+    /// ANAI-186: the layer-3.5 gatekeeper judged the command routine and
+    /// resolved it without ever surfacing it to an operator.
+    ///
+    /// RECORD-ONLY. `request_approval` never returns this variant; it exists
+    /// so a suppression appears in the approvals feed instead of being a
+    /// silent hole in it. Read it as "allowed, unseen" — never as a human
+    /// approval, and never as evidence of operator intent.
+    GatekeeperSuppressed,
+    /// ANAI-186: the gatekeeper judged the command hostile or catastrophic and
+    /// blocked it without surfacing it. RECORD-ONLY, exactly as
+    /// [`Self::GatekeeperSuppressed`] — in particular this is NOT a human
+    /// denial, so it must never be mined as one.
+    GatekeeperDenied,
 }
 
 impl ApprovalDecision {
@@ -217,6 +230,10 @@ impl ApprovalDecision {
     /// and said no, and re-asking is prompt-spam. `TimedOut` and
     /// `Backpressure` mean the command was never judged, so retrying is
     /// legitimate.
+    ///
+    /// The two ANAI-186 record-only variants are both non-retryable: a
+    /// suppression already ran, and a gatekeeper denial is a decision, not an
+    /// absence of one. Neither is ever returned to a caller in any case.
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::TimedOut | Self::Backpressure)
     }
@@ -229,6 +246,8 @@ impl ApprovalDecision {
             Self::Denied => "denied",
             Self::TimedOut => "timed_out",
             Self::Backpressure => "backpressure",
+            Self::GatekeeperSuppressed => "gatekeeper_suppressed",
+            Self::GatekeeperDenied => "gatekeeper_denied",
         }
     }
 }
@@ -729,6 +748,8 @@ mod tests {
             ApprovalDecision::Denied,
             ApprovalDecision::TimedOut,
             ApprovalDecision::Backpressure,
+            ApprovalDecision::GatekeeperSuppressed,
+            ApprovalDecision::GatekeeperDenied,
         ] {
             let json = serde_json::to_string(&decision).unwrap();
             let back: ApprovalDecision = serde_json::from_str(&json).unwrap();
@@ -754,6 +775,8 @@ mod tests {
             ApprovalDecision::Denied.as_log_token(),
             ApprovalDecision::TimedOut.as_log_token(),
             ApprovalDecision::Backpressure.as_log_token(),
+            ApprovalDecision::GatekeeperSuppressed.as_log_token(),
+            ApprovalDecision::GatekeeperDenied.as_log_token(),
         ];
         let unique: std::collections::HashSet<&str> = tokens.iter().copied().collect();
         assert_eq!(
@@ -766,6 +789,30 @@ mod tests {
             ApprovalDecision::Backpressure.as_log_token(),
             "backpressure"
         );
+        // ANAI-186: a suppression must never be greppable as a human approval.
+        assert_eq!(
+            ApprovalDecision::GatekeeperSuppressed.as_log_token(),
+            "gatekeeper_suppressed"
+        );
+        assert_eq!(
+            ApprovalDecision::GatekeeperDenied.as_log_token(),
+            "gatekeeper_denied"
+        );
+    }
+
+    /// ANAI-186: the record-only variants are not human decisions. Anything
+    /// mining this history for operator intent (ANAI-155) must be able to tell
+    /// them apart from `Approved` / `Denied`, and `is_retryable` must not
+    /// invite a retry of a command that already ran.
+    #[test]
+    fn gatekeeper_variants_are_not_human_decisions() {
+        assert!(!ApprovalDecision::GatekeeperSuppressed.is_retryable());
+        assert!(!ApprovalDecision::GatekeeperDenied.is_retryable());
+        assert_ne!(
+            ApprovalDecision::GatekeeperSuppressed,
+            ApprovalDecision::Approved
+        );
+        assert_ne!(ApprovalDecision::GatekeeperDenied, ApprovalDecision::Denied);
     }
 
     #[test]

@@ -10857,6 +10857,13 @@ pub async fn list_approvals(State(state): State<Arc<AppState>>) -> impl IntoResp
             // queue was full). Distinct from "rejected" so the dashboard does
             // not report a refusal nobody made.
             openfang_types::approval::ApprovalDecision::Backpressure => "backpressure",
+            // ANAI-186: resolved by the gatekeeper, never shown to a human.
+            // Distinct from "approved"/"rejected" so the dashboard never
+            // reports operator intent that no operator ever expressed.
+            openfang_types::approval::ApprovalDecision::GatekeeperSuppressed => {
+                "gatekeeper_suppressed"
+            }
+            openfang_types::approval::ApprovalDecision::GatekeeperDenied => "gatekeeper_denied",
         };
         serde_json::json!({
             "id": request.id,

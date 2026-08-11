@@ -98,6 +98,13 @@ fn approval_outcome_message(
              surfaced to a human. This is NOT a denial. The operation was not performed and \
              may be retried once the pending requests resolve."
         ),
+        // ANAI-186: record-only variants. `request_approval` never returns
+        // these — they exist to label rows in the approvals feed — but a
+        // wrong string still beats a killed tool call.
+        ApprovalDecision::GatekeeperSuppressed | ApprovalDecision::GatekeeperDenied => format!(
+            "Execution of '{tool_name}' was resolved by the approval gatekeeper without \
+             human review."
+        ),
     }
 }
 
@@ -6716,6 +6723,10 @@ mod tests {
         gate_verdict: std::sync::Mutex<Option<openfang_types::gatekeeper::GateVerdict>>,
         // Flips true if `gatekeeper_review` was consulted at all.
         gate_consulted: std::sync::atomic::AtomicBool,
+        // ANAI-186: every (agent_id, command, metadata, outcome) handed to the
+        // audit sink, so a test can prove one verdict writes exactly one row
+        // and that the row carries the VERBATIM command.
+        gate_audits: std::sync::Mutex<Vec<(String, String, String, String)>>,
     }
 
     impl FakeKernelHandle {
@@ -6733,6 +6744,7 @@ mod tests {
                 ),
                 gate_verdict: std::sync::Mutex::new(None),
                 gate_consulted: std::sync::atomic::AtomicBool::new(false),
+                gate_audits: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -6918,6 +6930,21 @@ mod tests {
                 .unwrap()
                 .unwrap_or(openfang_types::gatekeeper::GateVerdict::Escalate)
         }
+
+        fn audit_gatekeeper_verdict(
+            &self,
+            agent_id: &str,
+            command: &str,
+            metadata: &str,
+            outcome: &str,
+        ) {
+            self.gate_audits.lock().unwrap().push((
+                agent_id.to_string(),
+                command.to_string(),
+                metadata.to_string(),
+                outcome.to_string(),
+            ));
+        }
     }
 
     #[tokio::test]
@@ -7087,6 +7114,49 @@ mod tests {
             fake.approval_command.lock().unwrap().is_none(),
             "a Suppress must never populate the Approve-Similar cache path"
         );
+    }
+
+    /// ANAI-186: every verdict leaves exactly one durable row, and the row
+    /// carries the FULL command.
+    ///
+    /// The suppressed and denied rows are the whole point — those commands are
+    /// never shown to an operator, so an absent or truncated row here is not a
+    /// logging gap, it is the only evidence of the decision going missing. The
+    /// `escalate` row matters too: without a denominator, a suppression count
+    /// is a number with no scale.
+    #[tokio::test]
+    async fn test_every_gatekeeper_verdict_writes_one_durable_row() {
+        use openfang_types::gatekeeper::GateVerdict;
+
+        // Long enough to trip the 200- and 512-char truncations that exist on
+        // every neighbouring string in this path.
+        let tail = "x".repeat(600);
+        for (verdict, token) in [
+            (GateVerdict::Suppress, "suppress"),
+            (GateVerdict::Escalate, "escalate"),
+            (GateVerdict::Deny, "deny"),
+        ] {
+            let fake = Arc::new(FakeKernelHandle::new().with_gate_verdict(verdict));
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let policy = gate_policy("grep");
+            let command = format!("grep --version {tail}");
+
+            let _ = run_gated(&handle, &policy, &command).await;
+
+            let rows = fake.gate_audits.lock().unwrap().clone();
+            assert_eq!(rows.len(), 1, "{token}: expected exactly one audit row");
+            let (agent, cmd, metadata, outcome) = &rows[0];
+            assert_eq!(agent, "test-agent");
+            assert_eq!(outcome, token, "the row must name the verdict it recorded");
+            assert_eq!(
+                cmd, &command,
+                "{token}: the audit row must carry the verbatim, untruncated command"
+            );
+            assert!(
+                metadata.contains("consulted_model="),
+                "{token}: the row must say whether a model was in the decision"
+            );
+        }
     }
 
     /// A `Deny` refuses without ever showing a prompt, and says so legibly.

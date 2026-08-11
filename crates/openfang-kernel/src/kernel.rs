@@ -9447,6 +9447,29 @@ impl KernelHandle for OpenFangKernel {
         self.approval_manager.requires_approval(tool_name)
     }
 
+    /// ANAI-186: durable row for one gatekeeper verdict.
+    ///
+    /// Two sinks, deliberately: the Merkle chain is the tamper-evident record
+    /// that survives a daemon bounce, and the recent-approvals feed is what
+    /// the operator actually looks at. Neither alone is sufficient — the first
+    /// nobody reads day to day, the second is in-memory and capped.
+    fn audit_gatekeeper_verdict(
+        &self,
+        agent_id: &str,
+        command: &str,
+        metadata: &str,
+        outcome: &str,
+    ) {
+        self.audit_log.record(
+            agent_id,
+            openfang_runtime::audit::AuditAction::GatekeeperVerdict,
+            format!("{metadata} command={command}"),
+            outcome,
+        );
+        self.approval_manager
+            .record_gatekeeper_verdict(agent_id, command, outcome);
+    }
+
     /// ANAI-154: single-shot judge for one gated `shell_exec`.
     ///
     /// Shape is `compactor::compact_session`, not an agent: one

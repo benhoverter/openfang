@@ -183,6 +183,22 @@ pub async fn review(
         "Gatekeeper verdict"
     );
 
+    // ANAI-186: the durable half. The line above is diagnostics; this is the
+    // record. Every verdict, full command, hash-chained — because the
+    // suppressed and denied ones are precisely the commands no human will ever
+    // be in a position to review after the fact.
+    kernel.audit_gatekeeper_verdict(
+        agent_id,
+        raw_command,
+        &format!(
+            "tool=shell_exec consulted_model={} latency_ms={} floor={}",
+            consulted,
+            latency_ms,
+            req.flags.as_log_string()
+        ),
+        verdict.as_log_token(),
+    );
+
     Some(match verdict {
         GateVerdict::Suppress => GateOutcome::Suppress,
         GateVerdict::Escalate => GateOutcome::Escalate(format!(

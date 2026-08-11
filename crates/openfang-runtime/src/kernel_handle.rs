@@ -252,6 +252,35 @@ pub trait KernelHandle: Send + Sync {
         openfang_types::gatekeeper::GateVerdict::Escalate
     }
 
+    /// ANAI-186: append one gatekeeper verdict to the Merkle audit chain.
+    ///
+    /// The gatekeeper's `tracing::info!` is not a ledger. The daemon's stderr
+    /// is a plain append-only file with no rotation configured (verified on
+    /// the reference macOS/launchd deployment: no `newsyslog.d` entry, tens of
+    /// MB and growing), it is freely editable by anything that can write the
+    /// file, and it can be filtered to nothing by a `RUST_LOG` edit made for
+    /// an unrelated subsystem. A suppressed command is one no operator will
+    /// ever see, so the only honest record of it is the hash-chained,
+    /// sqlite-backed trail.
+    ///
+    /// `command` is the VERBATIM `shell_exec` string, never truncated, for the
+    /// same reason `ApprovalRequest::command` is (ANAI-151): a record whose
+    /// dangerous tail was cut is not a record. `metadata` carries the decision
+    /// context (floor flags, whether the model was consulted, latency).
+    ///
+    /// Synchronous and infallible by design — a gate must never block or fail
+    /// on its own bookkeeping. The default is a no-op: a host with no audit
+    /// log loses the row, but must never lose the verdict.
+    fn audit_gatekeeper_verdict(
+        &self,
+        agent_id: &str,
+        command: &str,
+        metadata: &str,
+        outcome: &str,
+    ) {
+        let _ = (agent_id, command, metadata, outcome);
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns the verbatim `ApprovalDecision`. It deliberately does NOT
     /// collapse to a bool: "Ben said no", "nobody was looking", and "your
