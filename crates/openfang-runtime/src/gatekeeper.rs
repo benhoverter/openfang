@@ -181,6 +181,19 @@ pub async fn review(
     };
     let latency_ms = started.elapsed().as_millis();
 
+    // ANAI-187: in shadow mode the verdict is data, not a decision. Read once,
+    // so a config reload mid-flight cannot record a row as observation and act
+    // on it as policy (or the reverse). The verdict is logged and recorded
+    // exactly as computed — writing `escalate` here for a command the judge
+    // wanted to suppress would zero out the one number the flip decision turns
+    // on — and then discarded in favour of `Escalate`.
+    let shadow = kernel.gatekeeper_shadow();
+    let effective = if shadow {
+        GateVerdict::Escalate
+    } else {
+        verdict
+    };
+
     // §5 logging contract. FULL command, never truncated: this log IS the
     // review mechanism for every command the judge suppresses, so a truncation
     // here is a hole in the audit trail, not a cosmetic choice.
@@ -188,6 +201,7 @@ pub async fn review(
         target: "openfang::gatekeeper",
         agent = %agent_id,
         verdict = %verdict.as_log_token(),
+        shadow = %shadow,
         latency_ms = %latency_ms,
         consulted_model = %consulted,
         floor_hit = %req.flags.as_log_string(),
@@ -210,10 +224,30 @@ pub async fn review(
             latency_ms,
             req.flags.as_log_string()
         ),
-        verdict.as_log_token(),
+        // ANAI-187: a shadow verdict carries a `shadow_` prefix. Two reasons,
+        // both load-bearing. A reader of the chain must never mistake an
+        // observation for something that happened. And
+        // `record_gatekeeper_verdict` matches the bare tokens exactly, so the
+        // prefix *structurally* suppresses the recent-approvals mirror — which
+        // is correct: the command really did prompt, and lands in that feed as
+        // a genuine record moments later. Mirroring it twice would corrupt
+        // every rate computed off the list.
+        &if shadow {
+            format!("shadow_{}", verdict.as_log_token())
+        } else {
+            verdict.as_log_token().to_string()
+        },
     );
 
-    Some(match verdict {
+    Some(match effective {
+        // ANAI-187: shadow escalations say what they would have done, so the
+        // operator reading the prompt is reading the judge's opinion rather
+        // than guessing at it.
+        GateVerdict::Escalate if shadow => GateOutcome::Escalate(format!(
+            "gatekeeper: shadow mode, would have said {} (floor: {})",
+            verdict.as_log_token(),
+            req.flags.as_log_string()
+        )),
         GateVerdict::Suppress => GateOutcome::Suppress,
         GateVerdict::Escalate => GateOutcome::Escalate(format!(
             "gatekeeper: escalated (floor: {})",

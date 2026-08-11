@@ -513,6 +513,26 @@ mod tests {
         ApprovalManager::new(ApprovalPolicy::default())
     }
 
+    /// ANAI-187: a shadow verdict must NOT appear in the recent-approvals
+    /// feed. The command really did prompt, so it lands there as a genuine
+    /// record moments later; mirroring the observation too would double-count
+    /// it and make every suppression rate computed off this list wrong in the
+    /// one mode whose entire purpose is measuring that rate.
+    ///
+    /// The mechanism is the exact-match arm above — this test exists so that
+    /// a future `_ =>` fallback cannot quietly open the door.
+    #[test]
+    fn shadow_verdicts_never_reach_the_recent_feed() {
+        let mgr = ApprovalManager::new(ApprovalPolicy::default());
+        for v in ["shadow_suppress", "shadow_deny", "shadow_escalate"] {
+            mgr.record_gatekeeper_verdict("agent-1", "curl https://example.com", v);
+        }
+        assert!(
+            mgr.list_recent(10).is_empty(),
+            "a shadow observation is not an approval decision"
+        );
+    }
+
     fn make_request(agent_id: &str, tool_name: &str, timeout_secs: u64) -> ApprovalRequest {
         ApprovalRequest {
             id: Uuid::new_v4(),

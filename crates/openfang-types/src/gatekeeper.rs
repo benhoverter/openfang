@@ -983,10 +983,37 @@ pub struct GatekeeperConfig {
     /// Enabling it means some approval prompts stop being shown to a human, on
     /// a live fleet, silently. That is not a default anyone should inherit from
     /// a version bump — it is a decision an operator makes once, deliberately,
-    /// after reading `grep gatekeeper daemon.stderr.log` for a while. Off, this
-    /// whole module is inert and the gate behaves exactly as it did before
-    /// ANAI-154.
+    /// after a week of [`GatekeeperConfig::shadow`] and a look at the
+    /// `shadow_*` rows in the audit chain. Off (and not shadowing), this whole
+    /// module is inert and the gate behaves exactly as it did before ANAI-154.
     pub enabled: bool,
+    /// Shadow mode: consult the judge, record the verdict, then **escalate
+    /// anyway**.
+    ///
+    /// `enabled`'s own doc comment tells the operator to watch the logs before
+    /// flipping it — but with `enabled = false` the module is inert and there
+    /// is nothing to watch. That advice was uncheckable as written. Shadow is
+    /// the missing state: it produces exactly the corpus the flip decision
+    /// needs (what *would* have been suppressed, on this fleet, on real
+    /// traffic) while every command still reaches a human.
+    ///
+    /// **Shadow wins over `enabled`.** With both true the gate observes and
+    /// never suppresses. The more restrictive setting winning is the only
+    /// resolution that cannot surprise an operator who set one flag and forgot
+    /// the other.
+    ///
+    /// Costs the judge's latency and tokens, and nothing else. The verdict is
+    /// written to the Merkle audit chain with a `shadow_` prefix so a shadow
+    /// row can never be mistaken for an executed decision, and is deliberately
+    /// NOT mirrored into the recent-approvals feed: the command really did
+    /// prompt, and it will land there as a genuine `ApprovalRecord` moments
+    /// later. (ANAI-187)
+    pub shadow: bool,
+    ///
+    /// Pinned to a **canonical catalog id, never an alias**. `"sonnet"`
+    /// resolves through the alias table to whatever the newest Sonnet happens
+    /// to be, which would let a catalog bump silently swap the judge — the
+    /// same class of regression as inheriting the fallback chain.
     /// Pinned judge model. Never the caller's model, never the fallback chain:
     /// an agent must not be able to pick its own reviewer, and a
     /// cheaper/weaker fallback silently becoming the judge is a security
@@ -1005,7 +1032,8 @@ impl Default for GatekeeperConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model: "claude-sonnet-4-20250514".to_string(),
+            shadow: false,
+            model: "claude-sonnet-4-6".to_string(),
             provider: String::new(),
             timeout_secs: 5,
             failure_threshold: 3,
@@ -1016,6 +1044,25 @@ impl Default for GatekeeperConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- config --------------------------------------------------------------
+
+    /// ANAI-187: the shipped defaults are the safe ones, and the judge model is
+    /// a canonical catalog id rather than an alias. `"sonnet"` would resolve
+    /// through the alias table to whatever the newest Sonnet happens to be,
+    /// which is exactly the "a model the operator did not choose became the
+    /// reviewer" regression the pin exists to prevent.
+    #[test]
+    fn config_defaults_are_inert_and_the_judge_is_pinned_by_id() {
+        let cfg = GatekeeperConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.shadow);
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
+        assert!(
+            cfg.model.contains('-') && cfg.model != "sonnet",
+            "the judge must be pinned to a canonical id, never an alias"
+        );
+    }
 
     // -- comment stripping ---------------------------------------------------
 

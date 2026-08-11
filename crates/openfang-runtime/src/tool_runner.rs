@@ -6727,6 +6727,9 @@ mod tests {
         // audit sink, so a test can prove one verdict writes exactly one row
         // and that the row carries the VERBATIM command.
         gate_audits: std::sync::Mutex<Vec<(String, String, String, String)>>,
+        // ANAI-187: shadow mode. Defaults false, matching the trait default,
+        // so every pre-existing test still acts on verdicts.
+        gate_shadow: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -6745,12 +6748,20 @@ mod tests {
                 gate_verdict: std::sync::Mutex::new(None),
                 gate_consulted: std::sync::atomic::AtomicBool::new(false),
                 gate_audits: std::sync::Mutex::new(Vec::new()),
+                gate_shadow: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
         // ANAI-154: stand in for a judge that returns a fixed verdict.
         fn with_gate_verdict(self, v: openfang_types::gatekeeper::GateVerdict) -> Self {
             *self.gate_verdict.lock().unwrap() = Some(v);
+            self
+        }
+
+        // ANAI-187: put the gate in shadow mode.
+        fn with_gate_shadow(self) -> Self {
+            self.gate_shadow
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             self
         }
 
@@ -6929,6 +6940,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .unwrap_or(openfang_types::gatekeeper::GateVerdict::Escalate)
+        }
+
+        fn gatekeeper_shadow(&self) -> bool {
+            self.gate_shadow.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn audit_gatekeeper_verdict(
@@ -7157,6 +7172,75 @@ mod tests {
                 "{token}: the row must say whether a model was in the decision"
             );
         }
+    }
+
+    /// ANAI-187: shadow mode. The judge is consulted, its verdict is recorded
+    /// honestly, and the command prompts anyway.
+    ///
+    /// This is the test that makes the flip decision checkable. If the row
+    /// said `escalate` — the thing that actually happened — the corpus would
+    /// contain zero would-have-suppressed rows and a week of shadow traffic
+    /// would tell the operator nothing at all.
+    #[tokio::test]
+    async fn test_shadow_records_the_verdict_and_prompts_anyway() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress)
+                .with_gate_shadow(),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(!result.is_error, "shadow must not change the outcome");
+        assert!(
+            fake.gate_consulted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "shadow mode exists to consult the judge; not consulting it \
+             produces no data"
+        );
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a shadow Suppress must still reach the human"
+        );
+
+        let rows = fake.gate_audits.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].3, "shadow_suppress",
+            "the row must record what the judge said, prefixed so it can never \
+             be read as something that happened"
+        );
+    }
+
+    /// ANAI-187: a shadow Deny is an escalation too. Shadow means the judge
+    /// cannot block, not merely that it cannot suppress — a judge that can
+    /// still refuse execution is being tested in production.
+    #[tokio::test]
+    async fn test_shadow_deny_does_not_block() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Deny)
+                .with_gate_shadow(),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let result = run_gated(&handle, &policy, "grep --version").await;
+
+        assert!(
+            !result.is_error,
+            "a shadow Deny must not block execution, got: {}",
+            result.content
+        );
+        assert!(
+            fake.approval_requested
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a shadow Deny falls through to the human like everything else"
+        );
+        assert_eq!(fake.gate_audits.lock().unwrap()[0].3, "shadow_deny");
     }
 
     /// A `Deny` refuses without ever showing a prompt, and says so legibly.

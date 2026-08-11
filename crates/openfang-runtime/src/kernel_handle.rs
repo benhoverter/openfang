@@ -252,6 +252,22 @@ pub trait KernelHandle: Send + Sync {
         openfang_types::gatekeeper::GateVerdict::Escalate
     }
 
+    /// ANAI-187: is the gatekeeper in shadow mode?
+    ///
+    /// Shadow is a *runtime* concern, not a kernel one: the judge still runs
+    /// and its verdict is still real, so `gatekeeper_review` must keep
+    /// returning the honest answer. What changes is whether the runtime acts
+    /// on it. Collapsing the two in the kernel would make the audit row say
+    /// `escalate` for a command the judge wanted to suppress, which destroys
+    /// the only data shadow mode exists to collect.
+    ///
+    /// Defaults to `false` so every existing test double and host shim
+    /// compiles untouched, and so the *absence* of an answer means "act on
+    /// verdicts", matching pre-ANAI-187 behaviour exactly.
+    fn gatekeeper_shadow(&self) -> bool {
+        false
+    }
+
     /// ANAI-186: append one gatekeeper verdict to the Merkle audit chain.
     ///
     /// The gatekeeper's `tracing::info!` is not a ledger. The daemon's stderr

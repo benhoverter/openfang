@@ -9470,6 +9470,16 @@ impl KernelHandle for OpenFangKernel {
             .record_gatekeeper_verdict(agent_id, command, outcome);
     }
 
+    /// ANAI-187: shadow mode — consult the judge, record it, escalate anyway.
+    ///
+    /// Shadow deliberately WINS over `enabled`. With both set the gate
+    /// observes and never suppresses. Any other resolution means an operator
+    /// who set one flag and forgot the other gets the *less* restrictive
+    /// behaviour, which is the wrong direction to be surprised in.
+    fn gatekeeper_shadow(&self) -> bool {
+        self.config.gatekeeper.shadow
+    }
+
     /// ANAI-154: single-shot judge for one gated `shell_exec`.
     ///
     /// Shape is `compactor::compact_session`, not an agent: one
@@ -9490,7 +9500,11 @@ impl KernelHandle for OpenFangKernel {
         use std::sync::atomic::Ordering;
 
         let cfg = &self.config.gatekeeper;
-        if !cfg.enabled {
+        // ANAI-187: shadow mode needs the judge to actually run — that is the
+        // entire point — so `enabled` alone no longer gates the call. Inert
+        // still means inert: both off, nothing is consulted and the gate
+        // behaves exactly as it did before ANAI-154.
+        if !cfg.enabled && !cfg.shadow {
             return GateVerdict::Escalate;
         }
 
@@ -9521,6 +9535,7 @@ impl KernelHandle for OpenFangKernel {
                         target: "openfang::gatekeeper",
                         provider = %provider,
                         model = %cfg.model,
+                        shadow = %cfg.shadow,
                         "Approval gatekeeper enabled"
                     );
                     Some(d)
