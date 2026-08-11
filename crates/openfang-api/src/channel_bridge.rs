@@ -873,6 +873,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                                 }
                             }
                         }
+                        // ANAI-188: the note's home is the PROMPT now, not this
+                        // stamp — but `edit_approval_prompt` REPLACES the prompt
+                        // message, so without this the judge's opinion vanishes
+                        // from chat the instant the button is clicked. Appended
+                        // AFTER the caching branch, which rebuilds the stamp
+                        // from `action_summary` and would otherwise drop it.
+                        if let Some(note) = req.gatekeeper_note.as_deref() {
+                            if !note.trim().is_empty() {
+                                stamp_command =
+                                    format!("{stamp_command} · {}", safe_truncate_str(note, 200));
+                            }
+                        }
                         self.kernel
                             .edit_approval_prompt(req.id, stamp_verb, &stamp_command)
                             .await;
@@ -2219,6 +2231,7 @@ mod tests {
             origin: None,
             cache_binary: None,
             command: None,
+            gatekeeper_note: None,
         };
 
         // An operator running /approvals must see the request verbatim, never a
@@ -2428,6 +2441,7 @@ mod tests {
             origin: None,
             cache_binary: binary.map(str::to_string),
             command: None,
+            gatekeeper_note: None,
         }
     }
 

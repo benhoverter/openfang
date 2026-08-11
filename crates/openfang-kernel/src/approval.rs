@@ -433,6 +433,10 @@ impl ApprovalManager {
             cache_binary: None,
             // Verbatim, untruncated: this is the review surface.
             command: Some(command.to_string()),
+            // No note: a suppressed command was never prompted, so there is no
+            // prompt for an annotation to appear on. The verdict itself is the
+            // `GatekeeperVerdict` audit row (ANAI-186).
+            gatekeeper_note: None,
         };
         self.push_recent(request, decision, Some("gatekeeper".to_string()), now);
     }
@@ -546,6 +550,7 @@ mod tests {
             origin: None,
             cache_binary: None,
             command: None,
+            gatekeeper_note: None,
         }
     }
 

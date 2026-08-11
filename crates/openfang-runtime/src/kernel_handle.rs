@@ -309,6 +309,13 @@ pub trait KernelHandle: Send + Sync {
     /// `cache_binary`, it is captured at the gate where structured tool input
     /// still exists — render sites downstream must never re-derive it from the
     /// truncated `action_summary` (ANAI-151). `None` for non-shell tools.
+    ///
+    /// `gatekeeper_note` carries the gate's one-line opinion for rendering on
+    /// the prompt itself (ANAI-188). A separate parameter rather than a prefix
+    /// on `action_summary` on purpose: `action_summary` is agent-controlled,
+    /// and an annotation the operator reads as the machine's verdict must not
+    /// share a channel with text the requesting agent can author. `None` when
+    /// the gate is inert or the tool is not gateable.
     async fn request_approval(
         &self,
         agent_id: &str,
@@ -317,9 +324,10 @@ pub trait KernelHandle: Send + Sync {
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
         command: Option<&str>,
+        gatekeeper_note: Option<&str>,
     ) -> Result<openfang_types::approval::ApprovalDecision, String> {
         let _ = (agent_id, tool_name, action_summary, origin, cache_binary);
-        let _ = command;
+        let _ = (command, gatekeeper_note);
         Ok(openfang_types::approval::ApprovalDecision::Approved) // Default: auto-approve
     }
 

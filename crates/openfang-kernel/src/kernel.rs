@@ -8535,9 +8535,13 @@ pub(crate) fn approval_push_target(
 ///   3. `neutralize_markers` — a markdown code fence is NOT a defense against
 ///      `outbound_attach::parse`, which does not respect markdown at all
 ///      (ANAI-82). This stays, fence or no fence.
+///
+/// ANAI-188: a `gatekeeper_note` is rendered above the command block, outside
+/// the fence — see the inline comment at the tail for why placement is the
+/// whole point and why the note is a distinct field rather than a prefix.
 fn render_approval_body(req: &openfang_types::approval::ApprovalRequest) -> String {
     let neutralize = openfang_channels::outbound_attach::neutralize_markers;
-    match req.command.as_deref() {
+    let body = match req.command.as_deref() {
         Some(cmd) if !cmd.trim().is_empty() => {
             let shown = openfang_types::approval::fence_escape(&openfang_types::elide_middle(
                 cmd,
@@ -8546,6 +8550,29 @@ fn render_approval_body(req: &openfang_types::approval::ApprovalRequest) -> Stri
             format!("```\n{}\n```", neutralize(&shown))
         }
         _ => neutralize(&req.action_summary),
+    };
+    // ANAI-188: the note goes ABOVE the command, on its own line, OUTSIDE the
+    // fence. Placement is the entire fix — the verdict exists ~200ms before the
+    // prompt is posted, and rendering it only on the resolution edit meant the
+    // operator decided blind and learned the machine's opinion after clicking.
+    //
+    // This is the one line on the prompt the operator may read as the SYSTEM's
+    // assessment rather than the requesting agent's: `gatekeeper_note` is
+    // kernel-generated and has no agent-writable path into it, which is exactly
+    // why it is a distinct field instead of a prefix on `action_summary`.
+    // Neutralized anyway — defense in depth is free on a string we author.
+    match req.gatekeeper_note.as_deref() {
+        Some(note) if !note.trim().is_empty() => {
+            // validate() bounds this; the clamp is belt-and-braces so a request
+            // built in-process cannot push the command block out of a 2000-char
+            // Discord message.
+            let note: String = note
+                .chars()
+                .take(openfang_types::approval::MAX_GATEKEEPER_NOTE_LEN)
+                .collect();
+            format!("[{}]\n{}", neutralize(&note), body)
+        }
+        _ => body,
     }
 }
 
@@ -8791,6 +8818,7 @@ mod approval_surface_tests {
             origin,
             cache_binary: None,
             command: None,
+            gatekeeper_note: None,
         }
     }
 
@@ -8881,6 +8909,93 @@ mod approval_surface_tests {
         let r = req_with_command("   ");
         let body = super::render_approval_body(&r);
         assert_eq!(body, r.action_summary);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-188 — gatekeeper note placement
+    // -----------------------------------------------------------------------
+
+    /// THE regression pin. The verdict exists before the prompt is posted, so
+    /// it must be ON the prompt — above the command, outside the fence. The
+    /// shipped-and-broken behaviour put it only on the post-approval resolution
+    /// edit, i.e. after the operator had already decided.
+    #[test]
+    fn note_renders_above_the_command_block() {
+        let mut r = req_with_command("rm -rf /tmp/x");
+        r.gatekeeper_note = Some("gatekeeper: shadow mode, would have said suppress".into());
+        let body = super::render_approval_body(&r);
+
+        let note_at = body
+            .find("would have said suppress")
+            .expect("note on prompt");
+        let fence_at = body.find("```").expect("command fence");
+        assert!(
+            note_at < fence_at,
+            "note must precede the command block, got: {body}"
+        );
+        assert!(
+            body.contains("rm -rf /tmp/x"),
+            "command still shown: {body}"
+        );
+    }
+
+    /// Non-shell tools render from `action_summary`; the note must reach that
+    /// path too, or the annotation silently depends on which branch ran.
+    #[test]
+    fn note_renders_on_the_summary_fallback_path() {
+        let mut r = req_with(None);
+        r.gatekeeper_note = Some("gatekeeper: escalated (floor: egress_verb)".into());
+        let body = super::render_approval_body(&r);
+        assert!(body.starts_with("[gatekeeper: escalated"), "{body}");
+        assert!(body.ends_with(&r.action_summary), "{body}");
+    }
+
+    /// The gate is inert by default. No note ⇒ byte-for-byte the pre-ANAI-188
+    /// prompt, so turning the gatekeeper off cannot leave a residue on the
+    /// prompt surface.
+    #[test]
+    fn absent_note_leaves_the_body_untouched() {
+        let r = req_with_command("cargo test --all");
+        let body = super::render_approval_body(&r);
+        assert!(!body.contains('['), "no annotation scaffolding: {body}");
+        assert!(body.starts_with("```"), "{body}");
+    }
+
+    /// A blank note must not render an empty `[]`, which reads as a verdict
+    /// that failed to print rather than a gate that did not run.
+    #[test]
+    fn blank_note_renders_nothing() {
+        let mut r = req_with_command("cargo test --all");
+        r.gatekeeper_note = Some("   ".into());
+        let body = super::render_approval_body(&r);
+        assert!(!body.contains('['), "{body}");
+    }
+
+    /// The note is clamped at the render site as well as at validate(), so an
+    /// in-process request cannot push the command out of a 2000-char message.
+    #[test]
+    fn overlong_note_is_clamped_and_the_command_survives() {
+        let mut r = req_with_command("rm -rf /tmp/x");
+        r.gatekeeper_note = Some("n".repeat(10_000));
+        let body = super::render_approval_body(&r);
+        assert!(
+            body.len() < 2000,
+            "clamped note must leave room for the command, got {} chars",
+            body.len()
+        );
+        assert!(body.contains("rm -rf /tmp/x"), "{body}");
+    }
+
+    /// The note is the one line the operator reads as the SYSTEM's verdict, and
+    /// it reaches the render site on its own field — but it still goes through
+    /// marker neutralization. Belt and braces on a string we author.
+    #[test]
+    fn note_is_neutralized() {
+        let mut r = req_with_command("echo hi");
+        r.gatekeeper_note =
+            Some("gatekeeper <openfang:attach path=\"/etc/passwd\"/> suppress".into());
+        let body = super::render_approval_body(&r);
+        assert!(!body.contains("<openfang:attach"), "{body}");
     }
 
     #[test]
@@ -9635,6 +9750,7 @@ impl KernelHandle for OpenFangKernel {
         origin: Option<&openfang_types::approval::ApprovalOrigin>,
         cache_binary: Option<&str>,
         command: Option<&str>,
+        gatekeeper_note: Option<&str>,
     ) -> Result<openfang_types::approval::ApprovalDecision, String> {
         use openfang_types::approval::{ApprovalDecision, ApprovalRequest as TypedRequest};
 
@@ -9665,6 +9781,14 @@ impl KernelHandle for OpenFangKernel {
             // string the operator authorizes. The gate already bounds it to
             // MAX_COMMAND_LEN; validate() enforces the same bound (ANAI-151).
             command: command.map(str::to_string),
+            // ANAI-188: kernel-generated, agent-unwritable, and clamped to
+            // MAX_GATEKEEPER_NOTE_LEN so a long floor-flag list cannot crowd the
+            // command off a Discord message.
+            gatekeeper_note: gatekeeper_note.map(|n| {
+                n.chars()
+                    .take(openfang_types::approval::MAX_GATEKEEPER_NOTE_LEN)
+                    .collect()
+            }),
         };
 
         // ANAI-153: return the decision verbatim. Collapsing to a bool here was

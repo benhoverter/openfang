@@ -405,7 +405,7 @@ pub async fn execute_tool(
 
             if !suppressed {
                 let input_str = input.to_string();
-                let mut summary = format!(
+                let summary = format!(
                     "{}: {}",
                     tool_name,
                     openfang_types::truncate_str(&input_str, 200)
@@ -414,11 +414,22 @@ pub async fn execute_tool(
                 // operator who knows WHY the machine handed this back reads it
                 // differently from one facing an undifferentiated Critical
                 // banner, which is the fatigue this whole epic is about.
-                if let Some(crate::gatekeeper::GateOutcome::Escalate(note)) = &gate_outcome {
-                    summary.push_str("\n[");
-                    summary.push_str(note);
-                    summary.push(']');
-                }
+                //
+                // ANAI-188: this rides its OWN field to the render site, not a
+                // suffix on `summary`. Two reasons, and the second is the one
+                // that mattered in the field. (1) `summary` is agent-controlled
+                // — an annotation the operator reads as the machine's verdict
+                // must not share a channel with text the requesting agent can
+                // author. (2) `render_approval_body` prefers `command` over
+                // `action_summary` for shell_exec (ANAI-151), so a suffix on
+                // `summary` never reached the prompt at all: it surfaced only on
+                // the post-approval resolution edit, which renders the summary.
+                // The operator decided blind and read the judge's opinion after
+                // clicking — the exact inversion of what annotating is for.
+                let gatekeeper_note = match &gate_outcome {
+                    Some(crate::gatekeeper::GateOutcome::Escalate(note)) => Some(note.clone()),
+                    _ => None,
+                };
                 // Approve-Similar cache key source: argv[0] of a shell_exec
                 // command, extracted once here where structured input still
                 // exists (never re-parsed from the mangled action_summary).
@@ -448,6 +459,7 @@ pub async fn execute_tool(
                         origin,
                         cache_binary.as_deref(),
                         command.as_deref(),
+                        gatekeeper_note.as_deref(),
                     )
                     .await
                 {
@@ -519,6 +531,10 @@ pub async fn execute_tool(
                                             None,
                                             // Not a shell_exec path: there is no
                                             // command string to show (ANAI-151).
+                                            None,
+                                            // ...and the gatekeeper only sits on
+                                            // the shell path, so there is no
+                                            // verdict to annotate (ANAI-188).
                                             None,
                                         )
                                         .await
@@ -6713,6 +6729,10 @@ mod tests {
         // so a test can prove the operator surface receives the VERBATIM
         // command and not the 200-byte serialized-JSON summary.
         approval_command: std::sync::Mutex<Option<String>>,
+        // ANAI-188: recorded separately from `approval_summary` on purpose —
+        // the whole point of the fix is that these are two channels.
+        approval_note: std::sync::Mutex<Option<String>>,
+        approval_summary: std::sync::Mutex<Option<String>>,
         // ANAI-153: the decision the gate should return. Defaults to Approved
         // so every pre-existing test keeps its behaviour; a test that wants to
         // exercise the negative outcomes overrides it.
@@ -6742,6 +6762,8 @@ mod tests {
                 reply_rights: std::sync::Mutex::new(std::collections::HashMap::new()),
                 wake_posts: std::sync::Mutex::new(Vec::new()),
                 approval_command: std::sync::Mutex::new(None),
+                approval_note: std::sync::Mutex::new(None),
+                approval_summary: std::sync::Mutex::new(None),
                 approval_decision: std::sync::Mutex::new(
                     openfang_types::approval::ApprovalDecision::Approved,
                 ),
@@ -6919,14 +6941,17 @@ mod tests {
             &self,
             _agent_id: &str,
             _tool_name: &str,
-            _action_summary: &str,
+            action_summary: &str,
             _origin: Option<&openfang_types::approval::ApprovalOrigin>,
             _cache_binary: Option<&str>,
             command: Option<&str>,
+            gatekeeper_note: Option<&str>,
         ) -> Result<openfang_types::approval::ApprovalDecision, String> {
             self.approval_requested
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             *self.approval_command.lock().unwrap() = command.map(str::to_string);
+            *self.approval_note.lock().unwrap() = gatekeeper_note.map(str::to_string);
+            *self.approval_summary.lock().unwrap() = Some(action_summary.to_string());
             Ok(*self.approval_decision.lock().unwrap())
         }
 
@@ -7292,6 +7317,26 @@ mod tests {
             fake.approval_command.lock().unwrap().as_deref(),
             Some("grep --version"),
             "ANAI-151's verbatim command must survive the gatekeeper detour"
+        );
+
+        // ANAI-188. The reason must ride its own parameter to the render site.
+        // Folded into `action_summary` it never reached the prompt at all:
+        // `render_approval_body` prefers `command` for shell_exec (ANAI-151),
+        // so the annotation surfaced only on the post-approval resolution edit.
+        let note = fake.approval_note.lock().unwrap().clone();
+        assert!(
+            note.as_deref().is_some_and(|n| n.contains("gatekeeper")),
+            "the escalation reason must reach request_approval as its own \
+             argument, got {note:?}"
+        );
+        let summary = fake.approval_summary.lock().unwrap().clone();
+        assert!(
+            !summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("gatekeeper"),
+            "the note must NOT be folded into the agent-controlled summary — \
+             separate channels is the whole fix, got {summary:?}"
         );
     }
 

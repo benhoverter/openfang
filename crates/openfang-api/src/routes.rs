@@ -10942,6 +10942,8 @@ pub async fn create_approval(
         // Operator-initiated manual request: there is no gate-captured
         // structured tool input to source a verbatim command from.
         command: None,
+        // ...and no gate ran, so there is no verdict to annotate with.
+        gatekeeper_note: None,
     };
 
     // Spawn the request in the background (it will block until resolved or timed out)

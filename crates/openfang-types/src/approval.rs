@@ -30,6 +30,15 @@ const MAX_ACTION_SUMMARY_LEN: usize = 512;
 /// the command as close to verbatim as a sane bound allows.
 pub const MAX_COMMAND_LEN: usize = 4096;
 
+/// Maximum length of the gatekeeper note carried on an approval request (chars).
+///
+/// Small on purpose. The note is a one-line machine annotation rendered *above*
+/// the command block, on the operator's decision surface — not a second
+/// description. A generous bound here would let the annotation push the command
+/// itself off the visible part of a Discord message, which inverts what the
+/// field is for.
+pub const MAX_GATEKEEPER_NOTE_LEN: usize = 200;
+
 /// Minimum approval timeout in seconds.
 const MIN_TIMEOUT_SECS: u64 = 10;
 
@@ -323,6 +332,24 @@ pub struct ApprovalRequest {
     /// `#[serde(default)]` keeps pre-field serialized requests deserializing.
     #[serde(default)]
     pub command: Option<String>,
+
+    /// The gatekeeper's one-line opinion on this command, rendered on the
+    /// prompt itself (ANAI-188).
+    ///
+    /// A DISTINCT FIELD, not a prefix folded into [`Self::action_summary`], and
+    /// that separation is the whole point. `action_summary` is agent-controlled
+    /// and render sites treat it as such; this is kernel-generated and is the
+    /// only string on the prompt the operator may read as the *machine's*
+    /// assessment rather than the requesting agent's. Folding the two together
+    /// would let an agent author text that reads as a gatekeeper verdict.
+    ///
+    /// Set only by the runtime approval gate from a
+    /// `GateOutcome::Escalate` reason. `None` when the gate is inert, when the
+    /// tool is not gateable, or for any non-gate caller.
+    ///
+    /// `#[serde(default)]` keeps pre-field serialized requests deserializing.
+    #[serde(default)]
+    pub gatekeeper_note: Option<String>,
 }
 
 /// Make `s` safe to place inside a triple-backtick fenced code block without
@@ -408,6 +435,16 @@ impl ApprovalRequest {
             if n > MAX_COMMAND_LEN {
                 return Err(format!(
                     "command too long ({n} chars, max {MAX_COMMAND_LEN})"
+                ));
+            }
+        }
+
+        // -- gatekeeper_note (optional) --
+        if let Some(note) = &self.gatekeeper_note {
+            let n = note.chars().count();
+            if n > MAX_GATEKEEPER_NOTE_LEN {
+                return Err(format!(
+                    "gatekeeper_note too long ({n} chars, max {MAX_GATEKEEPER_NOTE_LEN})"
                 ));
             }
         }
@@ -696,6 +733,7 @@ mod tests {
             origin: None,
             cache_binary: None,
             command: None,
+            gatekeeper_note: None,
         }
     }
 
@@ -932,6 +970,44 @@ mod tests {
         let mut req = valid_request();
         req.action_summary = "x".repeat(512);
         assert!(req.validate().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // ApprovalRequest — gatekeeper_note (ANAI-188)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_gatekeeper_note_too_long() {
+        let mut req = valid_request();
+        req.gatekeeper_note = Some("x".repeat(MAX_GATEKEEPER_NOTE_LEN + 1));
+        let err = req.validate().unwrap_err();
+        assert!(err.contains("gatekeeper_note"), "{err}");
+        assert!(err.contains("too long"), "{err}");
+    }
+
+    #[test]
+    fn request_gatekeeper_note_at_bound_ok() {
+        let mut req = valid_request();
+        req.gatekeeper_note = Some("x".repeat(MAX_GATEKEEPER_NOTE_LEN));
+        assert!(req.validate().is_ok());
+    }
+
+    /// Pre-ANAI-188 serialized requests must still deserialize — the field is
+    /// `#[serde(default)]` and every render site treats `None` as "no note".
+    #[test]
+    fn request_without_gatekeeper_note_field_deserializes() {
+        let json = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "agent_id": "a",
+            "tool_name": "shell_exec",
+            "description": "d",
+            "action_summary": "rm -rf /tmp/x",
+            "risk_level": "high",
+            "requested_at": Utc::now(),
+            "timeout_secs": 60,
+        });
+        let req: ApprovalRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.gatekeeper_note, None);
     }
 
     // -----------------------------------------------------------------------
