@@ -1777,6 +1777,24 @@ impl OpenFangKernel {
 
         info!(agent = %name, id = %agent_id, parent = ?parent, "Spawning agent");
 
+        // ANAI-185(b). PRE-FLIGHT, before the duplicate check and before any
+        // state is touched. The name is rendered verbatim into the approval
+        // gatekeeper's judge prompt as a header line — the span the judge reads
+        // as daemon-asserted fact — so a name carrying a newline forges an
+        // extra header line and steers the judge that reviews the spawning
+        // agent's own commands. `agent_spawn` is a gated capability, which
+        // makes the threat model narrow, but "an agent that can spawn children
+        // can influence its own review" is privilege escalation, not cosmetics.
+        //
+        // Spawn is the enforcing edge because it is the one place a human is
+        // present to be told why. Render-time neutralization in
+        // `openfang_types::gatekeeper::neutralize_header_field` is the floor
+        // under this, and does not depend on this check staying wired up.
+        if let Err(reason) = openfang_types::agent::validate_agent_name(&name) {
+            warn!(agent = %name, %reason, "Spawn rejected: invalid agent name");
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(reason)));
+        }
+
         // PRE-FLIGHT: reject a duplicate name BEFORE touching any state.
         //
         // `registry.register()` below is the authoritative uniqueness gate, but
