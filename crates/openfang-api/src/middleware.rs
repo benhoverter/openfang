@@ -119,8 +119,14 @@ pub async fn auth(
         || (path.starts_with("/api/budget/agents/") && is_get)
         || (path == "/api/network/status" && is_get)
         || (path == "/api/a2a/agents" && is_get)
-        || (path == "/api/approvals" && is_get)
-        || (path.starts_with("/api/approvals/") && is_get)
+        // NOTE: /api/approvals is deliberately NOT public. It was, until
+        // ANAI-191: an unauthenticated GET returned every pending approval's
+        // id, agent, risk level and verbatim `command` -- the same command
+        // text the gatekeeper work (185/186/189) exists to keep in front of a
+        // human. Reading the queue is half of answering it, and the ids are
+        // the address of the POST /{id}/approve route. The dashboard still
+        // renders with zero config: an empty api_key on loopback falls
+        // through to the read-only path below.
         || (path == "/api/channels" && is_get)
         || (path == "/api/hands" && is_get)
         || (path == "/api/hands/active" && is_get)
@@ -461,6 +467,68 @@ mod tests {
         let app = router(s);
         let resp = app.oneshot(req_from("10.0.0.9")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-191: GET /api/approvals is not a public endpoint.
+    // -----------------------------------------------------------------------
+
+    fn approvals_get_router(state: AuthState) -> Router {
+        Router::new()
+            .route("/api/approvals", get(ok_handler))
+            .route_layer(axum::middleware::from_fn_with_state(state, auth))
+    }
+
+    fn approvals_get_req_from(ip: &str) -> Request<Body> {
+        let addr: SocketAddr = format!("{ip}:40000").parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/approvals")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
+    }
+
+    #[tokio::test]
+    async fn approvals_list_requires_auth_with_key_configured() {
+        // The regression this guards: /api/approvals was in the public-endpoint
+        // allowlist, so a configured api_key bought nothing on it. The response
+        // carries each pending request's id, agent, risk level and verbatim
+        // `command` -- and the ids address POST /{id}/approve.
+        let app = approvals_get_router(auth_state_with_key("secret"));
+        let resp = app
+            .oneshot(approvals_get_req_from("127.0.0.1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn approvals_list_allowed_with_bearer() {
+        let app = approvals_get_router(auth_state_with_key("secret"));
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/approvals")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn approvals_list_blocked_from_lan_without_key() {
+        // Zero-config still renders the dashboard on loopback (the read-only
+        // empty-key path below the allowlist), but a LAN reader gets nothing.
+        let app = approvals_get_router(auth_state_empty());
+        let resp = app
+            .oneshot(approvals_get_req_from("192.168.1.50"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
