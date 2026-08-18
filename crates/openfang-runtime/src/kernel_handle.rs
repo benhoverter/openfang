@@ -239,17 +239,26 @@ pub trait KernelHandle: Send + Sync {
     /// `compactor::compact_session`: not an agent, not a turn, no session, no
     /// re-entrancy.
     ///
-    /// The default is [`GateVerdict::Escalate`] — today's behaviour, every
-    /// command reaching a human — so every test double and WASM host shim
-    /// compiles untouched and the *absence* of a gatekeeper can never be
-    /// mistaken for a suppression. Same pattern as `send_to_agent_from` and
-    /// `wake_post`.
+    /// The default is a fail-closed `Escalate` carrying `JudgeOutcome::Inert`
+    /// — today's behaviour, every command reaching a human — so every test
+    /// double and WASM host shim compiles untouched and the *absence* of a
+    /// gatekeeper can never be mistaken for a suppression. Same pattern as
+    /// `send_to_agent_from` and `wake_post`.
+    ///
+    /// ANAI-189: returns `GateReview`, not a bare verdict. A timeout and a
+    /// considered escalation are the same `GateVerdict` and must not be the
+    /// same audit row; the outcome discriminant is the only thing that tells
+    /// them apart, and it has to cross the trait boundary because the kernel
+    /// is where the timeout is observed and the runtime is where the row is
+    /// written.
     async fn gatekeeper_review(
         &self,
         req: &openfang_types::gatekeeper::GateRequest,
-    ) -> openfang_types::gatekeeper::GateVerdict {
+    ) -> openfang_types::gatekeeper::GateReview {
         let _ = req;
-        openfang_types::gatekeeper::GateVerdict::Escalate
+        openfang_types::gatekeeper::GateReview::failed(
+            openfang_types::gatekeeper::JudgeOutcome::Inert,
+        )
     }
 
     /// ANAI-187: is the gatekeeper in shadow mode?

@@ -352,6 +352,108 @@ impl GateVerdict {
     }
 }
 
+/// ANAI-189: *why* a [`GateVerdict`] is the verdict it is.
+///
+/// Before this existed, `gatekeeper_review` returned a bare [`GateVerdict`] and
+/// every failure path — timeout, provider error, unparseable answer, open
+/// circuit — returned `Escalate` indistinguishably from a judge that looked at
+/// the command and genuinely decided a human should see it. The caller then
+/// recorded `consulted_model=true` because it was on the branch where the floor
+/// had not hit, which is a statement about the *floor*, not about the model.
+///
+/// That corrupts the one statistic the `enabled = true` decision turns on: a
+/// timeout counted as a real escalation makes the judge look more conservative
+/// than it is, and hides latency-budget failures inside the escalate rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeOutcome {
+    /// A live judge answered and the answer parsed to exactly one verdict.
+    /// This is the ONLY outcome whose verdict is a model opinion.
+    Answered,
+    /// The judge answered, but the answer was empty, prose, or named two
+    /// verdicts. The model was billed; its output was unusable.
+    Unparseable,
+    /// The call exceeded `timeout_secs`. No answer exists — the `Escalate` is
+    /// the fail-closed default, not a judgement.
+    TimedOut,
+    /// The driver errored, or could not be constructed at all.
+    ProviderError,
+    /// The circuit breaker was open: the gate had already failed
+    /// `failure_threshold` times in a row, so no call was made.
+    CircuitOpen,
+    /// Neither `enabled` nor `shadow` is set. The gate is inert and nothing was
+    /// consulted.
+    Inert,
+    /// The deterministic floor hit, so the judge was deliberately not billed —
+    /// the floor is a ceiling on its authority and the answer could not change.
+    FloorShortCircuit,
+}
+
+impl JudgeOutcome {
+    /// Stable token for logs, audit rows, and dashboards.
+    pub fn as_log_token(self) -> &'static str {
+        match self {
+            JudgeOutcome::Answered => "answered",
+            JudgeOutcome::Unparseable => "unparseable",
+            JudgeOutcome::TimedOut => "timed_out",
+            JudgeOutcome::ProviderError => "provider_error",
+            JudgeOutcome::CircuitOpen => "circuit_open",
+            JudgeOutcome::Inert => "inert",
+            JudgeOutcome::FloorShortCircuit => "floor",
+        }
+    }
+
+    /// Did a model actually produce output for this verdict?
+    ///
+    /// `Unparseable` counts: the call was made, the tokens were spent, and the
+    /// latency is real — what failed was the parse, and the distinct outcome
+    /// token is what records that. Every other non-`Answered` variant is a
+    /// verdict no model contributed to, and must not inflate the consult rate.
+    pub fn consulted(self) -> bool {
+        matches!(self, JudgeOutcome::Answered | JudgeOutcome::Unparseable)
+    }
+
+    /// Is this verdict a model opinion, as opposed to a fail-closed default?
+    ///
+    /// This is the predicate to filter on when computing suppress/escalate
+    /// rates. `consulted()` answers "were we billed"; this answers "does the
+    /// verdict mean anything".
+    pub fn is_judgement(self) -> bool {
+        matches!(self, JudgeOutcome::Answered)
+    }
+}
+
+/// One judge call's result: the verdict, and why it is that verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateReview {
+    pub verdict: GateVerdict,
+    pub outcome: JudgeOutcome,
+}
+
+impl GateReview {
+    /// A judge that genuinely answered.
+    pub fn answered(verdict: GateVerdict) -> Self {
+        Self {
+            verdict,
+            outcome: JudgeOutcome::Answered,
+        }
+    }
+
+    /// A fail-closed `Escalate` with the reason it was reached. There is no
+    /// constructor pairing a non-`Answered` outcome with `Suppress`, by design:
+    /// every path that did not get a real answer escalates.
+    pub fn failed(outcome: JudgeOutcome) -> Self {
+        debug_assert!(
+            !outcome.is_judgement(),
+            "GateReview::failed is for non-judgement outcomes"
+        );
+        Self {
+            verdict: GateVerdict::Escalate,
+            outcome,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request
 // ---------------------------------------------------------------------------
@@ -1388,6 +1490,57 @@ mod tests {
         assert_eq!(GateVerdict::parse("I think it's fine"), None);
         // Two verdicts in one answer is unjudgeable, not a majority vote.
         assert_eq!(GateVerdict::parse("suppress, not escalate"), None);
+    }
+
+    /// ANAI-189. `consulted` answers "were we billed"; `is_judgement` answers
+    /// "does this verdict mean anything". Conflating them is the original bug
+    /// in miniature — a timeout billed nothing and judged nothing, yet was
+    /// recorded as both.
+    #[test]
+    fn judge_outcome_separates_billed_from_judged() {
+        assert!(JudgeOutcome::Answered.consulted());
+        assert!(JudgeOutcome::Answered.is_judgement());
+
+        // Billed, but the answer was unusable — real latency, no opinion.
+        assert!(JudgeOutcome::Unparseable.consulted());
+        assert!(!JudgeOutcome::Unparseable.is_judgement());
+
+        for o in [
+            JudgeOutcome::TimedOut,
+            JudgeOutcome::ProviderError,
+            JudgeOutcome::CircuitOpen,
+            JudgeOutcome::Inert,
+            JudgeOutcome::FloorShortCircuit,
+        ] {
+            assert!(
+                !o.consulted(),
+                "{} must not read as a consult",
+                o.as_log_token()
+            );
+            assert!(!o.is_judgement(), "{} is not a judgement", o.as_log_token());
+        }
+    }
+
+    /// Every non-answered path escalates. There is no constructor and no code
+    /// path from "the judge did not answer" to a suppression.
+    #[test]
+    fn failed_review_always_escalates() {
+        for o in [
+            JudgeOutcome::Unparseable,
+            JudgeOutcome::TimedOut,
+            JudgeOutcome::ProviderError,
+            JudgeOutcome::CircuitOpen,
+            JudgeOutcome::Inert,
+            JudgeOutcome::FloorShortCircuit,
+        ] {
+            let review = GateReview::failed(o);
+            assert_eq!(review.verdict, GateVerdict::Escalate);
+            assert_eq!(review.outcome, o);
+        }
+        assert_eq!(
+            GateReview::answered(GateVerdict::Suppress).verdict,
+            GateVerdict::Suppress
+        );
     }
 
     #[test]

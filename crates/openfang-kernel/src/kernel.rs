@@ -9610,8 +9610,11 @@ impl KernelHandle for OpenFangKernel {
     async fn gatekeeper_review(
         &self,
         req: &openfang_types::gatekeeper::GateRequest,
-    ) -> openfang_types::gatekeeper::GateVerdict {
-        use openfang_types::gatekeeper::GateVerdict;
+    ) -> openfang_types::gatekeeper::GateReview {
+        // ANAI-189: each failure path carries its own `JudgeOutcome`, so the
+        // audit row can distinguish "the judge escalated" from "the judge never
+        // answered and we failed closed". Same verdict, very different facts.
+        use openfang_types::gatekeeper::{GateReview, GateVerdict, JudgeOutcome};
         use std::sync::atomic::Ordering;
 
         let cfg = &self.config.gatekeeper;
@@ -9620,14 +9623,14 @@ impl KernelHandle for OpenFangKernel {
         // still means inert: both off, nothing is consulted and the gate
         // behaves exactly as it did before ANAI-154.
         if !cfg.enabled && !cfg.shadow {
-            return GateVerdict::Escalate;
+            return GateReview::failed(JudgeOutcome::Inert);
         }
 
         // Circuit breaker. A gate that has failed `failure_threshold` times in a
         // row is not a gate; leaving it in circuit means every command pays the
         // latency for an answer that will be `Escalate` anyway.
         if self.gatekeeper_failures.load(Ordering::Relaxed) >= cfg.failure_threshold {
-            return GateVerdict::Escalate;
+            return GateReview::failed(JudgeOutcome::CircuitOpen);
         }
 
         let driver = self.gatekeeper_driver.get_or_init(|| {
@@ -9667,7 +9670,7 @@ impl KernelHandle for OpenFangKernel {
             }
         });
         let Some(driver) = driver.as_ref() else {
-            return GateVerdict::Escalate;
+            return GateReview::failed(JudgeOutcome::ProviderError);
         };
 
         let request = CompletionRequest {
@@ -9702,11 +9705,11 @@ impl KernelHandle for OpenFangKernel {
         )
         .await;
 
-        let verdict = match call {
+        let outcome = match call {
             Ok(Ok(response)) => match GateVerdict::parse(&response.text()) {
                 Some(v) => {
                     self.gatekeeper_failures.store(0, Ordering::Relaxed);
-                    return v;
+                    return GateReview::answered(v);
                 }
                 None => {
                     warn!(
@@ -9714,12 +9717,12 @@ impl KernelHandle for OpenFangKernel {
                         raw = %openfang_types::truncate_str(&response.text(), 120),
                         "Gatekeeper returned an unparseable verdict — escalating"
                     );
-                    GateVerdict::Escalate
+                    JudgeOutcome::Unparseable
                 }
             },
             Ok(Err(e)) => {
                 warn!(target: "openfang::gatekeeper", error = %e, "Gatekeeper call failed — escalating");
-                GateVerdict::Escalate
+                JudgeOutcome::ProviderError
             }
             Err(_elapsed) => {
                 warn!(
@@ -9727,7 +9730,7 @@ impl KernelHandle for OpenFangKernel {
                     timeout_secs = cfg.timeout_secs,
                     "Gatekeeper timed out — escalating"
                 );
-                GateVerdict::Escalate
+                JudgeOutcome::TimedOut
             }
         };
 
@@ -9739,7 +9742,7 @@ impl KernelHandle for OpenFangKernel {
                 "Gatekeeper circuit breaker OPEN — gate disabled, all commands escalate until restart"
             );
         }
-        verdict
+        GateReview::failed(outcome)
     }
 
     async fn request_approval(

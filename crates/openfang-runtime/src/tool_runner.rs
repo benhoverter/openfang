@@ -6958,13 +6958,20 @@ mod tests {
         async fn gatekeeper_review(
             &self,
             _req: &openfang_types::gatekeeper::GateRequest,
-        ) -> openfang_types::gatekeeper::GateVerdict {
+        ) -> openfang_types::gatekeeper::GateReview {
             self.gate_consulted
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            self.gate_verdict
-                .lock()
-                .unwrap()
-                .unwrap_or(openfang_types::gatekeeper::GateVerdict::Escalate)
+            // ANAI-189: a configured verdict stands in for a judge that
+            // actually answered; the unset default stands in for a gate that
+            // was never wired up at all, which is `Inert` and NOT a
+            // consultation. Collapsing the two here would rebuild the exact
+            // conflation this issue removed.
+            match *self.gate_verdict.lock().unwrap() {
+                Some(v) => openfang_types::gatekeeper::GateReview::answered(v),
+                None => openfang_types::gatekeeper::GateReview::failed(
+                    openfang_types::gatekeeper::JudgeOutcome::Inert,
+                ),
+            }
         }
 
         fn gatekeeper_shadow(&self) -> bool {
@@ -7197,6 +7204,72 @@ mod tests {
                 "{token}: the row must say whether a model was in the decision"
             );
         }
+    }
+
+    /// ANAI-189: `consulted_model` must describe the MODEL, not the floor.
+    ///
+    /// The bug this pins: `consulted` was a structural constant on the
+    /// not-floor branch, so every row where the floor missed claimed a model
+    /// consultation — including timeouts, provider errors, and an inert gate.
+    /// A timed-out `escalate` counted as a considered one, which biases the
+    /// exact escalate-rate the `enabled = true` flip is decided on.
+    #[tokio::test]
+    async fn test_floor_short_circuit_records_no_consultation() {
+        // `curl` trips the network-binary floor, so the judge is deliberately
+        // never billed. `--version` keeps the executed command harmless.
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("curl");
+
+        let _ = run_gated(&handle, &policy, "curl --version").await;
+
+        assert!(
+            !fake
+                .gate_consulted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a floor hit must not reach the judge at all"
+        );
+        let rows = fake.gate_audits.lock().unwrap().clone();
+        assert_eq!(rows.len(), 1);
+        let metadata = &rows[0].2;
+        assert!(
+            metadata.contains("consulted_model=false"),
+            "floor short-circuit claimed a consultation: {metadata}"
+        );
+        assert!(
+            metadata.contains("judge=floor"),
+            "the row must name WHY no model answered: {metadata}"
+        );
+    }
+
+    /// The other half: a judge that genuinely answered is recorded as such,
+    /// and is distinguishable from every fail-closed path that produces the
+    /// same `escalate` token.
+    #[tokio::test]
+    async fn test_answered_and_inert_are_distinguishable_rows() {
+        // A configured verdict stands in for a live judge.
+        let answered = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = answered.clone();
+        let _ = run_gated(&handle, &gate_policy("grep"), "grep --version").await;
+        let metadata = answered.gate_audits.lock().unwrap()[0].2.clone();
+        assert!(
+            metadata.contains("consulted_model=true") && metadata.contains("judge=answered"),
+            "a real judgement must record as one: {metadata}"
+        );
+
+        // No configured verdict = no gate wired up = inert. Same `escalate`
+        // outcome token, and it must NOT read as a consultation.
+        let inert = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = inert.clone();
+        let _ = run_gated(&handle, &gate_policy("grep"), "grep --version").await;
+        let metadata = inert.gate_audits.lock().unwrap()[0].2.clone();
+        assert!(
+            metadata.contains("consulted_model=false") && metadata.contains("judge=inert"),
+            "an unanswered escalate must not read as a judgement: {metadata}"
+        );
     }
 
     /// ANAI-187: shadow mode. The judge is consulted, its verdict is recorded

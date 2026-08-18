@@ -27,7 +27,9 @@
 
 use std::sync::OnceLock;
 
-use openfang_types::gatekeeper::{GateFlags, GateRequest, GateVerdict, DEFAULT_POLICY};
+use openfang_types::gatekeeper::{
+    GateFlags, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
+};
 
 /// What the caller of the gate should do next.
 pub enum GateOutcome {
@@ -173,12 +175,22 @@ pub async fn review(
     // Floor hit → do not bill the model. The answer cannot change: the floor is
     // a ceiling on the judge's authority, so a consult here can only produce
     // `Escalate` more slowly and more expensively.
-    let (verdict, consulted) = if floor == GateVerdict::Escalate {
-        (GateVerdict::Escalate, false)
+    //
+    // ANAI-189: `consulted` is no longer synthesised by the caller. It used to
+    // be a structural constant on the else-branch — hardcoded `true` because
+    // the floor had not hit, which is a fact about the floor and says nothing
+    // about whether a model answered. A judge that timed out at 10.1s was
+    // recorded as `consulted_model=true` with a considered `escalate`, which
+    // inflates the escalate rate with failures and hides the latency-budget
+    // breach inside the one statistic the `enabled = true` flip turns on. The
+    // outcome now comes from the same place the timeout is observed.
+    let (verdict, outcome) = if floor == GateVerdict::Escalate {
+        (GateVerdict::Escalate, JudgeOutcome::FloorShortCircuit)
     } else {
-        let model_verdict = kernel.gatekeeper_review(&req).await;
-        (model_verdict.narrowed_by(floor), true)
+        let review = kernel.gatekeeper_review(&req).await;
+        (review.verdict.narrowed_by(floor), review.outcome)
     };
+    let consulted = outcome.consulted();
     let latency_ms = started.elapsed().as_millis();
 
     // ANAI-187: in shadow mode the verdict is data, not a decision. Read once,
@@ -204,6 +216,7 @@ pub async fn review(
         shadow = %shadow,
         latency_ms = %latency_ms,
         consulted_model = %consulted,
+        judge = %outcome.as_log_token(),
         floor_hit = %req.flags.as_log_string(),
         bases = ?req.bases,
         inner = ?req.inner,
@@ -219,8 +232,9 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "tool=shell_exec consulted_model={} latency_ms={} floor={}",
+            "tool=shell_exec consulted_model={} judge={} latency_ms={} floor={}",
             consulted,
+            outcome.as_log_token(),
             latency_ms,
             req.flags.as_log_string()
         ),
