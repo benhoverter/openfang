@@ -199,10 +199,6 @@ pub(crate) struct WsAuthCtx<'a> {
     pub auth_enabled: bool,
     /// Secret used to verify session cookies (api_key when set, else password hash).
     pub session_secret: &'a str,
-    /// Whether the request originated from a loopback address.
-    pub is_loopback: bool,
-    /// True iff `OPENFANG_ALLOW_NO_AUTH=1` is set (loose mode for LAN binds).
-    pub allow_no_auth: bool,
     pub headers: &'a axum::http::HeaderMap,
     pub uri: &'a axum::http::Uri,
 }
@@ -214,8 +210,10 @@ pub(crate) struct WsAuthCtx<'a> {
 ///   1. `Authorization: Bearer <api_key>` header
 ///   2. `?token=<api_key>` query parameter
 ///   3. `openfang_session=<token>` cookie when dashboard auth is enabled
-///   4. Loopback origin when no api_key is configured
-///   5. Any origin when `OPENFANG_ALLOW_NO_AUTH=1`
+///
+/// There is no unauthenticated path. A credential is always required, from
+/// every origin (ANAI-191) — see the empty-key branch for why loopback and
+/// `OPENFANG_ALLOW_NO_AUTH=1` are not exceptions here.
 ///
 /// Fix for issue #1085: previously only (1), (2), and (4) were honored, so
 /// dashboard users logged in via session cookie saw "No active connection"
@@ -246,11 +244,23 @@ pub(crate) fn check_ws_auth(ctx: &WsAuthCtx<'_>) -> Result<(), axum::http::Statu
             }
             return Err(StatusCode::UNAUTHORIZED);
         }
-        // No api_key AND dashboard auth disabled: keep the dev convenience
-        // path (loopback or explicit OPENFANG_ALLOW_NO_AUTH=1).
-        if ctx.is_loopback || ctx.allow_no_auth {
-            return Ok(());
-        }
+        // ANAI-191: no api_key and no dashboard auth -- fail closed, from
+        // every origin including loopback.
+        //
+        // This used to be a "dev convenience" path. It was never method-
+        // gated, and that is the whole problem: the HTTP middleware treats an
+        // empty key as READ-ONLY (ANAI-161), because loopback is not a trust
+        // boundary -- every agent subprocess runs on loopback. A WS upgrade
+        // is a GET, but the socket it returns is a fully mutating channel:
+        // whoever holds it can drive an arbitrary agent, spend its budget and
+        // trigger its tools while wearing the operator's face. So the same
+        // request the middleware would 401 as a POST was being handed a
+        // strictly more powerful primitive one route over.
+        //
+        // `allow_no_auth` is intentionally NOT an escape hatch here, for
+        // parity: the HTTP middleware refuses mutating requests on an empty
+        // key even when it is set. The supported fix is to configure an
+        // api_key (or dashboard auth); both are then accepted below.
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -314,15 +324,10 @@ pub async fn agent_ws(
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
     // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
-    // Trim whitespace so empty/whitespace-only api_key still triggers the
-    // fail-closed path for non-loopback origins (see issue #1034 B2).
+    // Trim whitespace so an empty/whitespace-only api_key still triggers the
+    // fail-closed path (see issue #1034 B2 and ANAI-191).
     let api_key_raw = &state.kernel.config.api_key;
     let api_key = api_key_raw.trim();
-    let is_loopback = addr.ip().is_loopback();
-    // ANAI-150: read the startup-frozen snapshot, not the live environment.
-    // This path runs per WebSocket upgrade, so a live read would let anything
-    // able to set a process env var disable authentication mid-flight.
-    let allow_no_auth = openfang_types::security_flags::allow_no_auth();
 
     // Mirror the session_secret derivation in server.rs::AuthState so cookies
     // issued by /api/auth/login verify the same way over HTTP and WS.
@@ -339,17 +344,28 @@ pub async fn agent_ws(
         api_key,
         auth_enabled,
         session_secret: &session_secret_owned,
-        is_loopback,
-        allow_no_auth,
         headers: &headers,
         uri: &uri,
     };
 
     if let Err(status) = check_ws_auth(&auth_ctx) {
-        warn!(
-            ip = %addr.ip(),
-            "WebSocket upgrade rejected: no valid Bearer token, ?token=, or openfang_session cookie"
-        );
+        // ANAI-191: distinguish "wrong credential" from "no credential is
+        // configurable yet", so an operator whose zero-config setup just
+        // started failing gets told what to do instead of reading it as an
+        // attack.
+        if api_key.is_empty() && !auth_enabled {
+            warn!(
+                ip = %addr.ip(),
+                "WebSocket upgrade rejected: no api_key and no dashboard auth configured. \
+                 A WS session can drive the agent, so it is never granted unauthenticated \
+                 (not even on loopback). Set api_key in config.toml (or OPENFANG_API_KEY)."
+            );
+        } else {
+            warn!(
+                ip = %addr.ip(),
+                "WebSocket upgrade rejected: no valid Bearer token, ?token=, or openfang_session cookie"
+            );
+        }
         return status.into_response();
     }
 
@@ -1738,8 +1754,6 @@ mod tests {
             api_key: "secret",
             auth_enabled: false,
             session_secret: "secret",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1754,8 +1768,6 @@ mod tests {
             api_key: "secret",
             auth_enabled: false,
             session_secret: "secret",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1775,8 +1787,6 @@ mod tests {
             api_key: secret,
             auth_enabled: true,
             session_secret: secret,
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1801,8 +1811,6 @@ mod tests {
             api_key: secret,
             auth_enabled: false,
             session_secret: secret,
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1823,8 +1831,6 @@ mod tests {
             api_key: "secret",
             auth_enabled: true,
             session_secret: "secret",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1842,8 +1848,6 @@ mod tests {
             api_key: "secret",
             auth_enabled: true,
             session_secret: "secret",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1862,8 +1866,6 @@ mod tests {
             api_key: "secret",
             auth_enabled: false,
             session_secret: "secret",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1874,32 +1876,23 @@ mod tests {
     }
 
     #[test]
-    fn ws_auth_empty_key_loopback_ok() {
+    fn ws_auth_empty_key_rejected_regardless_of_origin() {
+        // ANAI-191: with no api_key and no dashboard auth there is no
+        // unauthenticated WS path left. Origin is not an input to this
+        // decision any more -- loopback is not a trust boundary, because
+        // every agent subprocess runs on it, and OPENFANG_ALLOW_NO_AUTH=1
+        // does not reopen it (the HTTP middleware refuses mutating requests
+        // on an empty key even when that flag is set).
+        //
+        // Supersedes ws_auth_empty_key_loopback_ok and
+        // ws_auth_empty_key_allow_no_auth_opens, and subsumes the #1034 B2
+        // non-loopback guard, all of which are now the same case.
         let headers = axum::http::HeaderMap::new();
         let uri = empty_uri();
         let ctx = WsAuthCtx {
             api_key: "",
             auth_enabled: false,
             session_secret: "",
-            is_loopback: true,
-            allow_no_auth: false,
-            headers: &headers,
-            uri: &uri,
-        };
-        assert!(check_ws_auth(&ctx).is_ok());
-    }
-
-    #[test]
-    fn ws_auth_empty_key_non_loopback_rejected() {
-        // Issue #1034 B2 regression guard.
-        let headers = axum::http::HeaderMap::new();
-        let uri = empty_uri();
-        let ctx = WsAuthCtx {
-            api_key: "",
-            auth_enabled: false,
-            session_secret: "",
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1907,22 +1900,6 @@ mod tests {
             check_ws_auth(&ctx).unwrap_err(),
             axum::http::StatusCode::UNAUTHORIZED
         );
-    }
-
-    #[test]
-    fn ws_auth_empty_key_allow_no_auth_opens() {
-        let headers = axum::http::HeaderMap::new();
-        let uri = empty_uri();
-        let ctx = WsAuthCtx {
-            api_key: "",
-            auth_enabled: false,
-            session_secret: "",
-            is_loopback: false,
-            allow_no_auth: true,
-            headers: &headers,
-            uri: &uri,
-        };
-        assert!(check_ws_auth(&ctx).is_ok());
     }
 
     #[test]
@@ -1941,8 +1918,6 @@ mod tests {
             api_key: "",
             auth_enabled: true,
             session_secret: secret,
-            is_loopback: false,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1967,8 +1942,6 @@ mod tests {
             api_key: "",
             auth_enabled: true,
             session_secret: secret,
-            is_loopback: true,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -1995,8 +1968,6 @@ mod tests {
             api_key: "",
             auth_enabled: true,
             session_secret: secret,
-            is_loopback: true,
-            allow_no_auth: false,
             headers: &headers,
             uri: &uri,
         };
@@ -2007,23 +1978,19 @@ mod tests {
     }
 
     #[test]
-    fn ws_auth_dashboard_off_loopback_empty_key_accepted() {
-        // Preserve the development convenience path: when dashboard auth is
-        // NOT configured AND api_key is empty, loopback still upgrades.
+    fn ws_auth_api_key_restores_zero_config_access() {
+        // ANAI-191 removed the no-credential dev path. The replacement for it
+        // is "configure an api_key" -- pin that this actually works, so the
+        // migration story in the rejection log is a real one.
         let headers = axum::http::HeaderMap::new();
-        let uri = empty_uri();
+        let uri = uri_with_token("dev-key");
         let ctx = WsAuthCtx {
-            api_key: "",
+            api_key: "dev-key",
             auth_enabled: false,
-            session_secret: "",
-            is_loopback: true,
-            allow_no_auth: false,
+            session_secret: "dev-key",
             headers: &headers,
             uri: &uri,
         };
-        assert!(
-            check_ws_auth(&ctx).is_ok(),
-            "loopback dev path must work when dashboard auth is disabled"
-        );
+        assert!(check_ws_auth(&ctx).is_ok());
     }
 }
