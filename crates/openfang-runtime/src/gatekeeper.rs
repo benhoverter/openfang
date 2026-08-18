@@ -26,6 +26,7 @@
 //! No 65-manifest migration; the gatekeeper intercepts the existing funnel.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use openfang_types::gatekeeper::{
     GateFlags, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
@@ -48,6 +49,47 @@ pub enum GateOutcome {
     Escalate(String),
     /// Refuse without prompting. The string is the agent-facing reason.
     Deny(String),
+}
+
+/// ANAI-185(a). Running totals for gate outcomes, process-lifetime.
+///
+/// `Deny` is the reason this exists. It is the one verdict that terminates a
+/// request with no human in the loop: the agent is told not to retry, and
+/// nothing surfaces a prompt. A judge that has been steered — or is merely
+/// having a bad day — therefore takes the fleet down in a way that is
+/// indistinguishable from a quiet fleet until somebody thinks to query the
+/// audit table. That is an availability surface, and an unmetered one is an
+/// unobserved one.
+///
+/// `shadow_deny` is counted separately and deliberately. Before the
+/// shadow→enforce flip a deny costs nothing, so it is exactly the period in
+/// which a rising deny rate is free to observe and catastrophic to discover
+/// afterwards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GateCounters {
+    pub suppress: u64,
+    pub escalate: u64,
+    pub deny: u64,
+    pub shadow_deny: u64,
+}
+
+static SUPPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
+static ESCALATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static DENY_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHADOW_DENY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the gate counters.
+///
+/// Not atomic across fields — four independent loads. Callers get a slightly
+/// skewed picture under concurrency, which is the right trade for a metering
+/// read: a diagnostic must never contend with the path it measures.
+pub fn counters() -> GateCounters {
+    GateCounters {
+        suppress: SUPPRESS_COUNT.load(Ordering::Relaxed),
+        escalate: ESCALATE_COUNT.load(Ordering::Relaxed),
+        deny: DENY_COUNT.load(Ordering::Relaxed),
+        shadow_deny: SHADOW_DENY_COUNT.load(Ordering::Relaxed),
+    }
 }
 
 /// Operator policy text: `~/.openfang/gatekeeper.md` when present, else the
@@ -237,6 +279,45 @@ pub async fn review(
         command = %raw_command,
         "Gatekeeper verdict"
     );
+
+    // ANAI-185(a). The runtime half of observability. Everything above this
+    // point is durable-but-passive: the row is written, and a human learns of
+    // it only by going and looking. Metering is what makes a deny *arrive*.
+    //
+    // Counted on `effective`, not `verdict`, because the counters describe
+    // what happened to the agent — a shadow deny did not deny anything, and
+    // folding it into the same total would put a number in front of an
+    // operator that means two different things depending on a config flag.
+    if shadow && verdict == GateVerdict::Deny {
+        SHADOW_DENY_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    match effective {
+        GateVerdict::Suppress => {
+            SUPPRESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        GateVerdict::Escalate => {
+            ESCALATE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        GateVerdict::Deny => {
+            // `fetch_add` returns the previous value; +1 is this deny.
+            let deny_total = DENY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // WARN, and distinguishable from an escalate at a glance. An
+            // escalate is the gate working — a human is about to be asked. A
+            // deny is the gate deciding alone, and the only trace it leaves
+            // outside the audit chain is this line.
+            tracing::warn!(
+                target: "openfang::gatekeeper",
+                agent = %agent_id,
+                deny_total = %deny_total,
+                escalate_total = %ESCALATE_COUNT.load(Ordering::Relaxed),
+                suppress_total = %SUPPRESS_COUNT.load(Ordering::Relaxed),
+                judge = %outcome.as_log_token(),
+                floor_hit = %req.flags.as_log_string(),
+                command = %raw_command,
+                "Gatekeeper DENIED a command; no human was prompted"
+            );
+        }
+    }
 
     // ANAI-186: the durable half. The line above is diagnostics; this is the
     // record. Every verdict, full command, hash-chained — because the

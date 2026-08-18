@@ -7349,6 +7349,10 @@ mod tests {
     /// A `Deny` refuses without ever showing a prompt, and says so legibly.
     #[tokio::test]
     async fn test_gatekeeper_deny_blocks_without_prompting() {
+        // ANAI-185(a): counters are process-global statics, so assert the
+        // delta this call produces rather than an absolute — the test binary
+        // runs these in parallel and an absolute would be a flake generator.
+        let before = crate::gatekeeper::counters();
         let fake = Arc::new(
             FakeKernelHandle::new()
                 .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Deny),
@@ -7369,6 +7373,13 @@ mod tests {
                 .approval_requested
                 .load(std::sync::atomic::Ordering::SeqCst),
             "a Deny must never surface a prompt"
+        );
+        // ANAI-185(a). The whole point of the ticket: a deny that prompts
+        // nobody must still increment something a human can read.
+        let after = crate::gatekeeper::counters();
+        assert!(
+            after.deny > before.deny,
+            "an enforced Deny must be metered; before={before:?} after={after:?}"
         );
     }
 
