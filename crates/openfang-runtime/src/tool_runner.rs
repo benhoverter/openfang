@@ -375,6 +375,11 @@ pub async fn execute_tool(
                 input,
                 exec_policy,
                 workspace_root,
+                // ANAI-190: shell bypasses `file_policy` entirely — only
+                // `file_write` and `apply_patch` route through `tier_for`. The
+                // gate is therefore the one place that can ask whether a
+                // command reaches past what the agent's own file tools grant.
+                file_policy,
             )
             .await;
 

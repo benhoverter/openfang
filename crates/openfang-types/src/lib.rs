@@ -20,6 +20,7 @@ pub mod media;
 pub mod memory;
 pub mod message;
 pub mod model_catalog;
+pub mod path_facts;
 pub mod paths;
 pub mod scheduler;
 pub mod security_flags;
