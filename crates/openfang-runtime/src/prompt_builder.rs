@@ -6,6 +6,44 @@
 
 use crate::str_utils::safe_truncate_str;
 
+// ---------------------------------------------------------------------------
+// Prompt section character budgets
+//
+// Every capped section gets a named budget so the sizes are auditable in one
+// place instead of being scattered magic numbers at the call sites (ANAI-167).
+// Truncation is reported via `cap_str` — it logs and leaves a visible marker,
+// so a section silently losing 87% of its content can't happen unnoticed again.
+// ---------------------------------------------------------------------------
+
+/// AGENTS.md — behavioral guidance.
+const BUDGET_AGENTS_MD: usize = 2000;
+/// HEARTBEAT.md — autonomous checklist.
+const BUDGET_HEARTBEAT_MD: usize = 1000;
+/// BOOTSTRAP.md — first-run ritual.
+const BUDGET_BOOTSTRAP_MD: usize = 1500;
+/// Workspace context section (project type, context files).
+const BUDGET_WORKSPACE_CONTEXT: usize = 1000;
+/// `context.md` — live per-turn context.
+const BUDGET_CONTEXT_MD: usize = 8000;
+/// Cross-channel canonical conversation summary.
+const BUDGET_CANONICAL_CONTEXT: usize = 500;
+/// A single recalled memory row.
+const BUDGET_RECALLED_MEMORY: usize = 500;
+/// Prompt context contributed by prompt-only skills.
+const BUDGET_SKILL_PROMPT_CONTEXT: usize = 2000;
+/// IDENTITY.md — personality frontmatter.
+const BUDGET_IDENTITY_MD: usize = 500;
+/// SOUL.md — persona.
+const BUDGET_SOUL_MD: usize = 1000;
+/// USER.md — user context.
+const BUDGET_USER_MD: usize = 500;
+/// MEMORY.md — curated long-term memory index.
+///
+/// Raised from 500 (ANAI-167): the scaffold OpenFang writes at agent creation
+/// is already ~4 KB, so the old budget discarded ~87% of the file before the
+/// model ever saw it. 8 KB fits the scaffold plus room for curated growth.
+const BUDGET_MEMORY_MD: usize = 8000;
+
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
@@ -107,7 +145,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         if let Some(ref agents) = ctx.agents_md {
             if !agents.trim().is_empty() {
-                sections.push(cap_str(agents, 2000));
+                sections.push(cap_str(agents, BUDGET_AGENTS_MD, "AGENTS.md"));
             }
         }
     }
@@ -155,7 +193,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             if !heartbeat.trim().is_empty() {
                 sections.push(format!(
                     "## Heartbeat Checklist\n{}",
-                    cap_str(heartbeat, 1000)
+                    cap_str(heartbeat, BUDGET_HEARTBEAT_MD, "HEARTBEAT.md")
                 ));
             }
         }
@@ -221,7 +259,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 if !has_user_name && ctx.user_name.is_none() {
                     sections.push(format!(
                         "## First-Run Protocol\n{}",
-                        cap_str(bootstrap, 1500)
+                        cap_str(bootstrap, BUDGET_BOOTSTRAP_MD, "BOOTSTRAP.md")
                     ));
                 }
             }
@@ -232,7 +270,11 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         if let Some(ref ws_ctx) = ctx.workspace_context {
             if !ws_ctx.trim().is_empty() {
-                sections.push(cap_str(ws_ctx, 1000));
+                sections.push(cap_str(
+                    ws_ctx,
+                    BUDGET_WORKSPACE_CONTEXT,
+                    "workspace context",
+                ));
             }
         }
     }
@@ -245,7 +287,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if !trimmed.is_empty() {
             sections.push(format!(
                 "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
-                cap_str(trimmed, 8000)
+                cap_str(trimmed, BUDGET_CONTEXT_MD, "context.md")
             ));
         }
     }
@@ -329,7 +371,12 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
     ctx.canonical_context
         .as_ref()
         .filter(|c| !c.is_empty())
-        .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
+        .map(|c| {
+            format!(
+                "[Previous conversation context]\n{}",
+                cap_str(c, BUDGET_CANONICAL_CONTEXT, "canonical context")
+            )
+        })
 }
 
 /// Build the memory section (Section 4).
@@ -350,7 +397,7 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
         );
         out.push_str("\n\nRecalled memories:\n");
         for (key, content) in memories.iter().take(5) {
-            let capped = cap_str(content, 500);
+            let capped = cap_str(content, BUDGET_RECALLED_MEMORY, "recalled memory");
             if key.is_empty() {
                 out.push_str(&format!("- {capped}\n"));
             } else {
@@ -371,7 +418,11 @@ fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
     }
     if !prompt_context.is_empty() {
         out.push('\n');
-        out.push_str(&cap_str(prompt_context, 2000));
+        out.push_str(&cap_str(
+            prompt_context,
+            BUDGET_SKILL_PROMPT_CONTEXT,
+            "skill prompt context",
+        ));
     }
     out
 }
@@ -396,7 +447,10 @@ fn build_persona_section(
     // Identity file (IDENTITY.md) — personality at a glance, before SOUL.md
     if let Some(identity) = identity_md {
         if !identity.trim().is_empty() {
-            parts.push(format!("## Identity\n{}", cap_str(identity, 500)));
+            parts.push(format!(
+                "## Identity\n{}",
+                cap_str(identity, BUDGET_IDENTITY_MD, "IDENTITY.md")
+            ));
         }
     }
 
@@ -405,20 +459,26 @@ fn build_persona_section(
             let sanitized = strip_code_blocks(soul);
             parts.push(format!(
                 "## Persona\nEmbody this identity in your tone and communication style. Be natural, not stiff or generic.\n{}",
-                cap_str(&sanitized, 1000)
+                cap_str(&sanitized, BUDGET_SOUL_MD, "SOUL.md")
             ));
         }
     }
 
     if let Some(user) = user_md {
         if !user.trim().is_empty() {
-            parts.push(format!("## User Context\n{}", cap_str(user, 500)));
+            parts.push(format!(
+                "## User Context\n{}",
+                cap_str(user, BUDGET_USER_MD, "USER.md")
+            ));
         }
     }
 
     if let Some(memory) = memory_md {
         if !memory.trim().is_empty() {
-            parts.push(format!("## Long-Term Memory\n{}", cap_str(memory, 500)));
+            parts.push(format!(
+                "## Long-Term Memory\n{}",
+                cap_str(memory, BUDGET_MEMORY_MD, "MEMORY.md")
+            ));
         }
     }
 
@@ -723,17 +783,33 @@ fn strip_code_blocks(content: &str) -> String {
     result.trim().to_string()
 }
 
-fn cap_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        let end = s
-            .char_indices()
-            .nth(max_chars)
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        safe_truncate_str(s, end).to_string() + "..."
+/// Cap `s` to `max_chars`, logging and marking the cut when it happens.
+///
+/// `label` names the section for the log line and the in-prompt marker. Before
+/// ANAI-167 this truncated silently, which is how MEMORY.md spent months losing
+/// ~87% of its content with nothing in the logs to show for it.
+fn cap_str(s: &str, max_chars: usize, label: &str) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
     }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let dropped = total - max_chars;
+    tracing::warn!(
+        section = label,
+        budget_chars = max_chars,
+        actual_chars = total,
+        dropped_chars = dropped,
+        "prompt section truncated to fit its budget"
+    );
+    format!(
+        "{}\n[… {label} truncated: {max_chars} of {total} chars shown, {dropped} omitted …]",
+        safe_truncate_str(s, end)
+    )
 }
 
 /// Capitalize the first letter of a string.
@@ -921,9 +997,10 @@ mod tests {
         let long_content = "x".repeat(1000);
         let memories = vec![("k".to_string(), long_content)];
         let section = build_memory_section(&memories);
-        // Should be capped at 500 + "..."
-        assert!(section.contains("..."));
-        assert!(section.len() < 1200);
+        // Capped at BUDGET_RECALLED_MEMORY, with a visible truncation marker.
+        assert!(section.contains("recalled memory truncated"));
+        assert!(section.contains("500 of 1000 chars shown, 500 omitted"));
+        assert!(section.len() < 1400);
     }
 
     #[test]
@@ -971,9 +1048,29 @@ mod tests {
     fn test_persona_soul_capped_at_1000() {
         let long_soul = "x".repeat(2000);
         let section = build_persona_section(None, Some(&long_soul), None, None, None);
-        assert!(section.contains("..."));
-        // The raw soul content in the section should be at most 1003 chars (1000 + "...")
-        assert!(section.len() < 1200);
+        assert!(section.contains("SOUL.md truncated"));
+        assert!(section.contains("1000 of 2000 chars shown, 1000 omitted"));
+        assert!(section.len() < 1400);
+    }
+
+    /// ANAI-167: the MEMORY.md scaffold is ~4 KB. Under the old 500-char budget
+    /// ~87% of it never reached the model. It must now survive intact.
+    #[test]
+    fn test_memory_md_scaffold_not_truncated() {
+        let scaffold = "m".repeat(4096);
+        let section = build_persona_section(None, None, None, Some(&scaffold), None);
+        assert!(section.contains("## Long-Term Memory"));
+        assert!(section.contains(&scaffold));
+        assert!(!section.contains("MEMORY.md truncated"));
+    }
+
+    /// ...but the budget is still a real ceiling, and hitting it is visible.
+    #[test]
+    fn test_memory_md_truncates_past_budget_with_marker() {
+        let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
+        let section = build_persona_section(None, None, None, Some(&huge), None);
+        assert!(section.contains("MEMORY.md truncated"));
+        assert!(section.contains("8000 of 8001 chars shown, 1 omitted"));
     }
 
     #[test]
@@ -1091,30 +1188,31 @@ mod tests {
 
     #[test]
     fn test_cap_str_short() {
-        assert_eq!(cap_str("hello", 10), "hello");
+        assert_eq!(cap_str("hello", 10, "test"), "hello");
     }
 
     #[test]
     fn test_cap_str_long() {
-        let result = cap_str("hello world", 5);
-        assert_eq!(result, "hello...");
+        let result = cap_str("hello world", 5, "test");
+        assert!(result.starts_with("hello\n[… test truncated:"));
+        assert!(result.contains("5 of 11 chars shown, 6 omitted"));
     }
 
     #[test]
     fn test_cap_str_multibyte_utf8() {
         // This was panicking with "byte index is not a char boundary" (#38)
         let chinese = "你好世界这是一个测试字符串";
-        let result = cap_str(chinese, 4);
-        assert_eq!(result, "你好世界...");
+        let result = cap_str(chinese, 4, "test");
+        assert!(result.starts_with("你好世界\n[… test truncated:"));
         // Exact boundary
-        assert_eq!(cap_str(chinese, 100), chinese);
+        assert_eq!(cap_str(chinese, 100, "test"), chinese);
     }
 
     #[test]
     fn test_cap_str_emoji() {
         let emoji = "👋🌍🚀✨💯";
-        let result = cap_str(emoji, 3);
-        assert_eq!(result, "👋🌍🚀...");
+        let result = cap_str(emoji, 3, "test");
+        assert!(result.starts_with("👋🌍🚀\n[… test truncated:"));
     }
 
     #[test]
