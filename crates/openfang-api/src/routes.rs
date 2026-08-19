@@ -3426,13 +3426,24 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 
 /// GET /api/memory/agents/:id/kv — List KV pairs for an agent.
 ///
-/// Note: memory_store tool writes to a shared namespace, so we read from that
-/// same namespace regardless of which agent ID is in the URL.
+/// ANAI-165: reads the namespace named in the URL. It previously ignored `:id`
+/// entirely and read the one shared namespace, because that was where the
+/// `memory_store` tool put everything; now that writes are agent-scoped, the
+/// id in the path is the answer. The cross-agent namespace is still reachable
+/// as the well-known all-zeros-but-one UUID.
 pub async fn get_agent_kv(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
 
     match state.kernel.memory.list_kv(agent_id) {
         Ok(pairs) => {
@@ -3455,9 +3466,17 @@ pub async fn get_agent_kv(
 /// GET /api/memory/agents/:id/kv/:key — Get a specific KV value.
 pub async fn get_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
 
     match state.kernel.memory.structured_get(agent_id, &key) {
         Ok(Some(val)) => (
@@ -3481,10 +3500,18 @@ pub async fn get_agent_kv_key(
 /// PUT /api/memory/agents/:id/kv/:key — Set a KV value.
 pub async fn set_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
 
     let value = body.get("value").cloned().unwrap_or(body);
 
@@ -3506,9 +3533,17 @@ pub async fn set_agent_kv_key(
 /// DELETE /api/memory/agents/:id/kv/:key — Delete a KV value.
 pub async fn delete_agent_kv_key(
     State(state): State<Arc<AppState>>,
-    Path((_id, key)): Path<(String, String)>,
+    Path((id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
 
     match state.kernel.memory.structured_delete(agent_id, &key) {
         Ok(()) => (
@@ -5084,22 +5119,24 @@ pub async fn hand_stats(
         }
     };
 
-    // Read dashboard metrics from shared structured memory (memory_store uses shared namespace)
+    // ANAI-165: the hand's own namespace is now where its `memory_store` calls
+    // land, so it is read FIRST. The shared namespace stays as a fallback only
+    // because metrics written before scoping still live there; without it every
+    // pre-existing hand dashboard would read as empty after the upgrade.
     let shared_id = openfang_kernel::kernel::shared_memory_agent_id();
     let mut metrics = serde_json::Map::new();
     for metric in &def.dashboard.metrics {
-        // Try shared memory first (where memory_store tool writes), fall back to agent-specific
         let value = state
             .kernel
             .memory
-            .structured_get(shared_id, &metric.memory_key)
+            .structured_get(agent_id, &metric.memory_key)
             .ok()
             .flatten()
             .or_else(|| {
                 state
                     .kernel
                     .memory
-                    .structured_get(agent_id, &metric.memory_key)
+                    .structured_get(shared_id, &metric.memory_key)
                     .ok()
                     .flatten()
             })

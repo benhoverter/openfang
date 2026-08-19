@@ -745,9 +745,9 @@ pub async fn execute_tool(
         "agent_kill" => tool_agent_kill(input, kernel),
         "agent_activate" => tool_agent_activate(input, kernel),
 
-        // Shared memory tools
-        "memory_store" => tool_memory_store(input, kernel),
-        "memory_recall" => tool_memory_recall(input, kernel),
+        // Memory tools (agent-scoped; `shared:` prefix opts into cross-agent)
+        "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
+        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1228,14 +1228,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["agent_id"]
             }),
         },
-        // --- Shared memory tools ---
+        // --- Memory tools (ANAI-165: agent-scoped by default) ---
         ToolDefinition {
             name: "memory_store".to_string(),
-            description: "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.".to_string(),
+            description: "Store a value in YOUR OWN memory namespace, private to you. Prefix the key with 'shared:' to write to the cross-agent namespace instead (e.g. 'shared:release_freeze') - use that only for state other agents genuinely need to read.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key" },
+                    "key": { "type": "string", "description": "The storage key. Prefix with 'shared:' for cross-agent state." },
                     "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
                 },
                 "required": ["key", "value"]
@@ -1243,11 +1243,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Recall a value from shared memory by key.".to_string(),
+            description: "Recall a value from YOUR OWN memory namespace by key. Prefix the key with 'shared:' to read the cross-agent namespace.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
+                    "key": { "type": "string", "description": "The storage key to recall. Prefix with 'shared:' for cross-agent state." }
                 },
                 "required": ["key"]
             }),
@@ -3382,30 +3382,55 @@ fn tool_agent_activate(
 }
 
 // ---------------------------------------------------------------------------
-// Shared memory tools
+// Memory tools (ANAI-165: agent-scoped by default)
 // ---------------------------------------------------------------------------
 
 fn tool_memory_store(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     let value = input.get("value").ok_or("Missing 'value' parameter")?;
-    kh.memory_store(key, value.clone())?;
-    Ok(format!("Stored value under key '{key}'."))
+    kh.memory_store(caller_agent_id, key, value.clone())?;
+    match key.strip_prefix(crate::kernel_handle::SHARED_KEY_PREFIX) {
+        Some(bare) => Ok(format!(
+            "Stored value under key '{bare}' in SHARED memory (visible to all agents)."
+        )),
+        None => Ok(format!(
+            "Stored value under key '{key}' in your own memory."
+        )),
+    }
 }
 
 fn tool_memory_recall(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
-    match kh.memory_recall(key)? {
-        Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
-        None => Ok(format!("No value found for key '{key}'.")),
+    if let Some(val) = kh.memory_recall(caller_agent_id, key)? {
+        return Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()));
     }
+
+    // ANAI-165 migration path. Every pre-scoping write from every agent landed
+    // in the one shared namespace, so a bare miss here is ambiguous: the key
+    // may simply predate scoping. Retry against shared and, on a hit, SAY SO —
+    // an unlabelled fallback would quietly hand this agent another agent's
+    // value and read exactly like its own memory. Store never falls back.
+    if !key.starts_with(crate::kernel_handle::SHARED_KEY_PREFIX) {
+        let shared_key = format!("{}{key}", crate::kernel_handle::SHARED_KEY_PREFIX);
+        if let Some(val) = kh.memory_recall(caller_agent_id, &shared_key)? {
+            let body = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            return Ok(format!(
+                "[not in your own memory — found in the SHARED namespace, which may have been \
+                 written by another agent; re-store it under '{key}' if it is yours]\n{body}"
+            ));
+        }
+    }
+    Ok(format!("No value found for key '{key}'."))
 }
 
 // ---------------------------------------------------------------------------
@@ -6768,6 +6793,13 @@ mod tests {
         // ANAI-187: shadow mode. Defaults false, matching the trait default,
         // so every pre-existing test still acts on verdicts.
         gate_shadow: std::sync::atomic::AtomicBool,
+        // ANAI-165: a stand-in namespace store, keyed by the VERBATIM key the
+        // tool handed down (so `shared:` prefixes are visible to assertions),
+        // plus the caller recorded on every call. The real scoping decision is
+        // the kernel's; what these prove is that the tool layer threads an
+        // identity at all and labels a shared-namespace hit.
+        memory: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
+        memory_calls: std::sync::Mutex<Vec<(Option<String>, String)>>,
     }
 
     impl FakeKernelHandle {
@@ -6789,6 +6821,8 @@ mod tests {
                 gate_consulted: std::sync::atomic::AtomicBool::new(false),
                 gate_audits: std::sync::Mutex::new(Vec::new()),
                 gate_shadow: std::sync::atomic::AtomicBool::new(false),
+                memory: std::sync::Mutex::new(std::collections::HashMap::new()),
+                memory_calls: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -6830,6 +6864,107 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // ANAI-165: the memory tools carry the caller's identity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn memory_store_threads_the_caller_identity_down() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_store(
+            &serde_json::json!({"key": "note", "value": "hi"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("your own memory"), "unexpected result: {out}");
+        let calls = fake.memory_calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            [(Some("agent-x".to_string()), "note".to_string())],
+            "the kernel must receive the caller, not None"
+        );
+    }
+
+    #[test]
+    fn memory_store_labels_a_shared_write_as_shared() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_store(
+            &serde_json::json!({"key": "shared:freeze", "value": "on"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("SHARED"), "a shared write must say so: {out}");
+    }
+
+    #[test]
+    fn memory_recall_prefers_the_agents_own_namespace() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        tool_memory_store(
+            &serde_json::json!({"key": "note", "value": "mine"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        tool_memory_store(
+            &serde_json::json!({"key": "shared:note", "value": "theirs"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        let out = tool_memory_recall(
+            &serde_json::json!({"key": "note"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("mine"), "own value must win: {out}");
+        assert!(!out.contains("theirs"));
+        assert!(!out.contains("SHARED namespace"));
+    }
+
+    #[test]
+    fn memory_recall_falls_back_to_shared_but_says_so() {
+        // Pre-ANAI-165 rows all live in the shared namespace. Recall may serve
+        // them, but it must never present another agent's value as this
+        // agent's own memory.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        tool_memory_store(
+            &serde_json::json!({"key": "shared:legacy", "value": "old"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        let out = tool_memory_recall(
+            &serde_json::json!({"key": "legacy"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(
+            out.contains("old"),
+            "legacy value should still be reachable: {out}"
+        );
+        assert!(
+            out.contains("SHARED namespace"),
+            "the fallback must be labelled, not silent: {out}"
+        );
+    }
+
+    #[test]
+    fn memory_recall_misses_cleanly_when_nothing_exists() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_recall(
+            &serde_json::json!({"key": "nope"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("No value found"), "unexpected result: {out}");
+    }
+
     #[async_trait::async_trait]
     impl crate::kernel_handle::KernelHandle for FakeKernelHandle {
         async fn spawn_agent(
@@ -6848,11 +6983,29 @@ mod tests {
         fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
             Ok(())
         }
-        fn memory_store(&self, _key: &str, _value: serde_json::Value) -> Result<(), String> {
+        fn memory_store(
+            &self,
+            caller: Option<&str>,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Result<(), String> {
+            self.memory_calls
+                .lock()
+                .unwrap()
+                .push((caller.map(|c| c.to_string()), key.to_string()));
+            self.memory.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
-        fn memory_recall(&self, _key: &str) -> Result<Option<serde_json::Value>, String> {
-            Ok(None)
+        fn memory_recall(
+            &self,
+            caller: Option<&str>,
+            key: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            self.memory_calls
+                .lock()
+                .unwrap()
+                .push((caller.map(|c| c.to_string()), key.to_string()));
+            Ok(self.memory.lock().unwrap().get(key).cloned())
         }
         fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
             vec![]

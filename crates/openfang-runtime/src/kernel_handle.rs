@@ -10,6 +10,17 @@ use std::sync::Arc;
 
 use crate::bridge_auth::TokenIssuer;
 
+/// ANAI-165: key prefix that routes a memory operation to the deliberate
+/// cross-agent namespace instead of the caller's own.
+///
+/// A prefix rather than a `scope` parameter on purpose. The scope has to
+/// survive every transport the memory tools already cross — the WASM host
+/// shim, the MCP bridge's tool declarations, the bridge-IPC arg bundle, and
+/// the Claude Code driver's tool schema — and a new parameter would have to be
+/// threaded (and could be dropped) at each one. A prefix travels inside the
+/// key that all of them already carry, and lands in the audit log verbatim.
+pub const SHARED_KEY_PREFIX: &str = "shared:";
+
 /// Agent info returned by list and discovery operations.
 #[derive(Debug, Clone)]
 pub struct AgentInfo {
@@ -77,11 +88,38 @@ pub trait KernelHandle: Send + Sync {
         Err("Agent activation not available".to_string())
     }
 
-    /// Store a value in shared memory (cross-agent accessible).
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String>;
+    /// ANAI-165: store a value in the CALLER's own memory namespace.
+    ///
+    /// `caller_agent_id` is the calling agent's UUID or registered name. It is
+    /// required, not optional-in-practice: before ANAI-165 every agent in the
+    /// fleet wrote into one hardcoded namespace (`shared_memory_agent_id()`),
+    /// which made provenance unanswerable at the source — 879 rows whose
+    /// authors are unrecoverable. A `None` caller must therefore FAIL, never
+    /// fall back to the shared bucket: a silent fallback would recreate the
+    /// exact bug this fixes, one unattributed call at a time.
+    ///
+    /// Deliberate cross-agent state stays available through a `shared:` key
+    /// prefix, resolved by the implementor. The prefix rides into the audit
+    /// log verbatim, so "who wrote to shared" is answerable from the key
+    /// alone — sharing is an explicit, visible act rather than the default.
+    fn memory_store(
+        &self,
+        caller_agent_id: Option<&str>,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String>;
 
-    /// Recall a value from shared memory.
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
+    /// ANAI-165: recall a value from the CALLER's own memory namespace.
+    ///
+    /// Same contract as [`Self::memory_store`], including the `shared:` prefix
+    /// and the fail-closed treatment of a `None` caller. Reads are scoped for
+    /// the same reason writes are: an agent that can read every other agent's
+    /// keys by guessing them has no namespace at all.
+    fn memory_recall(
+        &self,
+        caller_agent_id: Option<&str>,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String>;
 
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;

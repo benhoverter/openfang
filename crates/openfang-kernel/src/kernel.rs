@@ -8303,13 +8303,63 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
     }
 }
 
-/// A well-known agent ID used for shared memory operations across agents.
-/// This is a fixed UUID so all agents read/write to the same namespace.
+/// A well-known agent ID used for DELIBERATE cross-agent shared memory.
+///
+/// Before ANAI-165 this was the destination for every `memory_store` call in
+/// the fleet, which is why the 879 rows written under it have unrecoverable
+/// authorship. It is now reached only through the explicit
+/// [`openfang_runtime::kernel_handle::SHARED_KEY_PREFIX`] key prefix (plus a
+/// handful of kernel-internal readers such as `user_name`, which is genuinely
+/// cross-channel user state).
 pub fn shared_memory_agent_id() -> AgentId {
     AgentId(uuid::Uuid::from_bytes([
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x01,
     ]))
+}
+
+/// ANAI-165: resolve one memory operation to `(namespace, bare key)`.
+///
+/// Two rules, both deliberate:
+///
+/// 1. A `shared:` key prefix routes to [`shared_memory_agent_id`] with the
+///    prefix stripped. Anything else is the caller's own namespace.
+/// 2. An absent or unresolvable caller is a hard error. Defaulting to the
+///    shared namespace here is precisely the bug ANAI-165 fixes: it is how
+///    every agent's memory ended up in one anonymous bucket, and a fallback
+///    would quietly refill that bucket from whichever call path forgot to
+///    thread an identity.
+///
+/// The caller string may be a UUID or a registered agent name, matching
+/// `activate_agent`'s accept-either contract — `caller_agent_id` reaches us as
+/// a string from the tool runner, the bridge IPC handler, and the WASM host
+/// shim, and not all of them carry a parsed id.
+fn resolve_memory_scope<'k>(
+    registry: &AgentRegistry,
+    caller_agent_id: Option<&str>,
+    key: &'k str,
+) -> Result<(AgentId, &'k str), String> {
+    if let Some(bare) = key.strip_prefix(openfang_runtime::kernel_handle::SHARED_KEY_PREFIX) {
+        if bare.is_empty() {
+            return Err("Memory key is empty after the 'shared:' prefix".to_string());
+        }
+        return Ok((shared_memory_agent_id(), bare));
+    }
+
+    let caller = caller_agent_id.ok_or_else(|| {
+        "Memory tools require a caller identity; this call arrived unattributed and was refused \
+         rather than written to the shared namespace (ANAI-165)"
+            .to_string()
+    })?;
+
+    let id: AgentId = match caller.parse() {
+        Ok(id) => id,
+        Err(_) => registry
+            .find_by_name(caller)
+            .map(|e| e.id)
+            .ok_or_else(|| format!("Memory caller not found: {caller}"))?,
+    };
+    Ok((id, key))
 }
 
 /// Sanitize a human-readable string into a valid `CronJob.name`.
@@ -9228,15 +9278,24 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::activate_agent(self, id).map_err(|e| format!("Activate failed: {e}"))
     }
 
-    fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_store(
+        &self,
+        caller_agent_id: Option<&str>,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let (agent_id, key) = resolve_memory_scope(&self.registry, caller_agent_id, key)?;
         self.memory
             .structured_set(agent_id, key, value)
             .map_err(|e| format!("Memory store failed: {e}"))
     }
 
-    fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let agent_id = shared_memory_agent_id();
+    fn memory_recall(
+        &self,
+        caller_agent_id: Option<&str>,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let (agent_id, key) = resolve_memory_scope(&self.registry, caller_agent_id, key)?;
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
@@ -10208,6 +10267,76 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    // -----------------------------------------------------------------------
+    // ANAI-165: memory scope resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn memory_scope_defaults_to_the_caller_not_the_shared_bucket() {
+        let registry = AgentRegistry::new();
+        let caller = AgentId(uuid::Uuid::new_v4());
+        let (id, key) =
+            resolve_memory_scope(&registry, Some(&caller.to_string()), "user_name").unwrap();
+        assert_eq!(
+            id, caller,
+            "an ordinary key must land in the caller's own namespace"
+        );
+        assert_ne!(id, shared_memory_agent_id());
+        assert_eq!(
+            key, "user_name",
+            "an unprefixed key is passed through verbatim"
+        );
+    }
+
+    #[test]
+    fn memory_scope_shared_prefix_routes_to_shared_and_strips() {
+        let registry = AgentRegistry::new();
+        let caller = AgentId(uuid::Uuid::new_v4());
+        let (id, key) = resolve_memory_scope(
+            &registry,
+            Some(&caller.to_string()),
+            "shared:release_freeze",
+        )
+        .unwrap();
+        assert_eq!(id, shared_memory_agent_id());
+        assert_eq!(
+            key, "release_freeze",
+            "the prefix must not be stored as part of the key"
+        );
+    }
+
+    #[test]
+    fn memory_scope_shared_prefix_works_without_a_caller() {
+        // Deliberate cross-agent state is addressable even on a path that
+        // carries no identity — the prefix, not the caller, selects it.
+        let registry = AgentRegistry::new();
+        let (id, key) = resolve_memory_scope(&registry, None, "shared:k").unwrap();
+        assert_eq!(id, shared_memory_agent_id());
+        assert_eq!(key, "k");
+    }
+
+    #[test]
+    fn memory_scope_rejects_a_bare_shared_prefix() {
+        let registry = AgentRegistry::new();
+        assert!(resolve_memory_scope(&registry, None, "shared:").is_err());
+    }
+
+    #[test]
+    fn memory_scope_fails_closed_on_an_unattributed_caller() {
+        // The regression this whole issue is about: an unattributed write must
+        // NOT silently become a shared write.
+        let registry = AgentRegistry::new();
+        let err = resolve_memory_scope(&registry, None, "user_name").unwrap_err();
+        assert!(err.contains("caller identity"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn memory_scope_fails_closed_on_an_unknown_caller_name() {
+        let registry = AgentRegistry::new();
+        let err = resolve_memory_scope(&registry, Some("no-such-agent"), "k").unwrap_err();
+        assert!(err.contains("not found"), "unexpected error: {err}");
+    }
 
     #[test]
     fn test_manifest_to_capabilities() {

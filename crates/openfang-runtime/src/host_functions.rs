@@ -335,7 +335,9 @@ fn host_kv_get(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
         Some(k) => k,
         None => return json!({"error": "No kernel handle available"}),
     };
-    match kernel.memory_recall(key) {
+    // ANAI-165: the guest's own agent id is already in `GuestState` and has
+    // been capability-checked above, so scoping this path is free.
+    match kernel.memory_recall(Some(&state.agent_id), key) {
         Ok(Some(val)) => json!({"ok": val}),
         Ok(None) => json!({"ok": null}),
         Err(e) => json!({"error": e}),
@@ -361,7 +363,7 @@ fn host_kv_set(state: &GuestState, params: &serde_json::Value) -> serde_json::Va
         Some(k) => k,
         None => return json!({"error": "No kernel handle available"}),
     };
-    match kernel.memory_store(key, value) {
+    match kernel.memory_store(Some(&state.agent_id), key, value) {
         Ok(()) => json!({"ok": true}),
         Err(e) => json!({"error": e}),
     }

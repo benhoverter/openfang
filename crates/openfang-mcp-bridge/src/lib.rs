@@ -446,11 +446,11 @@ pub fn built_in_tools() -> Vec<Tool> {
         // managed shared memory; no FS sandbox needed (kernel scopes writes).
         Tool::new(
             "memory_store",
-            "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.",
+            "Store a value in YOUR OWN memory namespace, private to you. Prefix the key with 'shared:' to write to the cross-agent namespace instead (e.g. 'shared:release_freeze') - use that only for state other agents genuinely need to read.",
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key" },
+                    "key": { "type": "string", "description": "The storage key. Prefix with 'shared:' for cross-agent state." },
                     "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
                 },
                 "required": ["key", "value"]
@@ -460,11 +460,11 @@ pub fn built_in_tools() -> Vec<Tool> {
         // companion to memory_store.
         Tool::new(
             "memory_recall",
-            "Recall a value from shared memory by key.",
+            "Recall a value from YOUR OWN memory namespace by key. Prefix the key with 'shared:' to read the cross-agent namespace.",
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
+                    "key": { "type": "string", "description": "The storage key to recall. Prefix with 'shared:' for cross-agent state." }
                 },
                 "required": ["key"]
             })),
