@@ -2149,6 +2149,11 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// Whether the deterministic MEMORY.md managed-block sweep runs (ANAI-168).
+    /// On by default; it makes no model calls and only rewrites the fenced
+    /// region of each agent's MEMORY.md. Set false to disable entirely.
+    #[serde(default = "default_memory_md_sweep")]
+    pub memory_md_sweep: bool,
     /// Memory backend: "sqlite" (default) or "http".
     #[serde(default = "default_memory_backend")]
     pub backend: String,
@@ -2165,6 +2170,10 @@ fn default_consolidation_interval() -> u64 {
     24
 }
 
+fn default_memory_md_sweep() -> bool {
+    true
+}
+
 fn default_memory_backend() -> String {
     "sqlite".to_string()
 }
@@ -2179,6 +2188,7 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            memory_md_sweep: default_memory_md_sweep(),
             backend: default_memory_backend(),
             http_url: None,
             http_token_env: None,

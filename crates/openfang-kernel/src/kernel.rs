@@ -629,6 +629,49 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     }
 }
 
+/// Outcome of one MEMORY.md managed-block sweep (ANAI-168).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryMdSweepReport {
+    /// Files whose managed block changed and were rewritten.
+    pub written: usize,
+    /// Files already byte-identical to the rendered block; not written.
+    pub unchanged: usize,
+    /// Agents with no stored facts and no existing block; left untouched.
+    pub skipped_empty: usize,
+    /// Files whose markers are malformed; refused rather than repaired.
+    pub skipped_malformed: usize,
+    /// Read / query / write failures.
+    pub errors: usize,
+}
+
+impl MemoryMdSweepReport {
+    /// True when the sweep made no filesystem change at all.
+    pub fn is_noop(&self) -> bool {
+        self.written == 0 && self.errors == 0 && self.skipped_malformed == 0
+    }
+}
+
+/// Write `content` to `path` via a same-directory temp file plus rename, so a
+/// crash mid-write can never leave a half-written MEMORY.md in a workspace.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("MEMORY.md");
+    let tmp = dir.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Get the system hostname as a String.
 fn gethostname() -> Option<String> {
     #[cfg(unix)]
@@ -5367,9 +5410,17 @@ impl OpenFangKernel {
         // Periodic memory consolidation (decays stale memory confidence)
         {
             let interval_hours = self.config.memory.consolidation_interval_hours;
+            let md_sweep_enabled = self.config.memory.memory_md_sweep;
             if interval_hours > 0 {
                 let kernel = Arc::clone(self);
                 tokio::spawn(async move {
+                    // ANAI-168: the interval below skips its first tick, so
+                    // without this the sweep would not run until `interval_hours`
+                    // after boot -- on a daemon that restarts often, that is
+                    // "never". Sweep once at startup so agents wake warm.
+                    if md_sweep_enabled {
+                        kernel.run_memory_md_sweep();
+                    }
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                         interval_hours * 3600,
                     ));
@@ -5378,6 +5429,9 @@ impl OpenFangKernel {
                         interval.tick().await;
                         if kernel.supervisor.is_shutting_down() {
                             break;
+                        }
+                        if md_sweep_enabled {
+                            kernel.run_memory_md_sweep();
                         }
                         match kernel.memory.consolidate().await {
                             Ok(report) => {
@@ -6427,6 +6481,126 @@ impl OpenFangKernel {
                 warn!("Schedule migration: cron persist failed: {e}");
             }
         }
+    }
+
+    /// Run the deterministic MEMORY.md managed-block sweep over every
+    /// registered agent (ANAI-168, Layer 1).
+    ///
+    /// For each agent this renders a block from that agent's *own* KV
+    /// namespace (correctly scoped since ANAI-165) and splices it into the
+    /// fenced region of its `MEMORY.md`. Everything outside the markers is
+    /// preserved byte-for-byte. No model is called and no new state is
+    /// created: the block is a regenerable view of `kv_store`, safe to delete
+    /// by hand.
+    ///
+    /// The sweep is conservative by construction:
+    /// * an agent with no stored facts and no existing block is left alone,
+    ///   so the 100-odd untouched scaffolds are not rewritten for nothing;
+    /// * malformed markers are skipped with a warning, never repaired;
+    /// * a render that matches what is already on disk performs no write, so
+    ///   mtimes stay meaningful.
+    pub(crate) fn sweep_memory_md(&self) -> MemoryMdSweepReport {
+        use openfang_memory::memory_md::{
+            render_managed_block, splice_managed_block, MANAGED_BEGIN,
+        };
+
+        /// Upper bound on facts pulled per agent. The block's own char budget
+        /// cuts in well before this; the limit only bounds the query.
+        const FACT_LIMIT: usize = 200;
+
+        let mut report = MemoryMdSweepReport::default();
+
+        for entry in self.registry.list() {
+            let Some(state_dir) = entry.manifest.state_dir.as_ref() else {
+                continue;
+            };
+            if !state_dir.is_dir() {
+                continue;
+            }
+            let path = state_dir.join("MEMORY.md");
+
+            let existing = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: read failed");
+                    report.errors += 1;
+                    continue;
+                }
+            };
+
+            let facts = match self.memory.list_kv_ranked(entry.id, FACT_LIMIT) {
+                Ok(f) => f,
+                Err(e) => {
+                    warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: KV query failed");
+                    report.errors += 1;
+                    continue;
+                }
+            };
+
+            // Nothing to say and nothing said before: don't touch the file.
+            if facts.is_empty() && !existing.contains(MANAGED_BEGIN) {
+                report.skipped_empty += 1;
+                continue;
+            }
+
+            let block = render_managed_block(&facts);
+            let updated = match splice_managed_block(&existing, &block) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        agent = %entry.name,
+                        path = %path.display(),
+                        error = %e,
+                        "MEMORY.md sweep: refusing to write, markers are malformed"
+                    );
+                    report.skipped_malformed += 1;
+                    continue;
+                }
+            };
+
+            if updated == existing {
+                report.unchanged += 1;
+                continue;
+            }
+
+            match write_atomic(&path, &updated) {
+                Ok(()) => report.written += 1,
+                Err(e) => {
+                    warn!(
+                        agent = %entry.name,
+                        path = %path.display(),
+                        error = %e,
+                        "MEMORY.md sweep: write failed"
+                    );
+                    report.errors += 1;
+                }
+            }
+        }
+
+        report
+    }
+
+    /// Run [`Self::sweep_memory_md`] and log its outcome. Silent when the
+    /// sweep changed nothing, so a healthy daemon does not narrate hourly.
+    pub(crate) fn run_memory_md_sweep(&self) {
+        let report = self.sweep_memory_md();
+        if report.is_noop() {
+            debug!(
+                unchanged = report.unchanged,
+                skipped_empty = report.skipped_empty,
+                "MEMORY.md sweep: no changes"
+            );
+            return;
+        }
+        info!(
+            written = report.written,
+            unchanged = report.unchanged,
+            skipped_empty = report.skipped_empty,
+            skipped_malformed = report.skipped_malformed,
+            errors = report.errors,
+            "MEMORY.md sweep completed"
+        );
     }
 
     /// Convert a single legacy schedule entry into a `CronJob` and add it to
@@ -12253,6 +12427,201 @@ system_prompt = "You are a test agent."
             assert_eq!(mo.provider, "openrouter");
             assert_eq!(mo.model, "z-ai/glm-4.6");
         }
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-168: MEMORY.md managed-block sweep.
+    // -----------------------------------------------------------------------
+
+    fn sweep_test_kernel(tag: &str) -> (tempfile::TempDir, OpenFangKernel) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join(tag);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel = OpenFangKernel::boot_with_config(config).expect("kernel boots");
+        (tmp, kernel)
+    }
+
+    /// Register an agent whose `state_dir` is a real directory, so the sweep
+    /// has a MEMORY.md to act on.
+    fn register_agent_with_state_dir(
+        kernel: &OpenFangKernel,
+        name: &str,
+        state_dir: &std::path::Path,
+    ) -> AgentId {
+        std::fs::create_dir_all(state_dir).unwrap();
+        let agent_id = AgentId::new();
+        let mut manifest = test_manifest(name, "sweep test", vec![]);
+        manifest.state_dir = Some(state_dir.to_path_buf());
+        let entry = AgentEntry {
+            id: agent_id,
+            name: name.to_string(),
+            manifest,
+            state: AgentState::Running,
+            mode: AgentMode::default(),
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+            parent: None,
+            children: vec![],
+            session_id: SessionId::new(),
+            tags: vec![],
+            identity: Default::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+        };
+        kernel.registry.register(entry).unwrap();
+        agent_id
+    }
+
+    /// The sweep renders the agent's own KV facts into the managed block and
+    /// leaves every byte of hand-written prose alone.
+    #[test]
+    fn test_memory_md_sweep_writes_block_and_preserves_prose() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-write");
+        let ws = tmp.path().join("ws-writer");
+        let agent = register_agent_with_state_dir(&kernel, "writer", &ws);
+        let path = ws.join("MEMORY.md");
+
+        let prose = "# Long-Term Memory\n\nFORGE transform layer is Erik's.\n";
+        std::fs::write(&path, prose).unwrap();
+
+        kernel
+            .memory
+            .structured_set(
+                agent,
+                "forge_build_cmd",
+                serde_json::json!("cargo xtask forge"),
+            )
+            .unwrap();
+
+        let report = kernel.sweep_memory_md();
+        assert_eq!(report.written, 1, "one file should be rewritten");
+        assert_eq!(report.errors, 0);
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.starts_with(prose), "hand prose must survive verbatim");
+        assert!(out.contains("forge_build_cmd"));
+        assert!(out.contains(openfang_memory::memory_md::MANAGED_BEGIN));
+
+        kernel.shutdown();
+    }
+
+    /// An agent with no stored facts and no existing block must not have its
+    /// scaffold touched — 100-odd workspaces are in exactly that state and a
+    /// sweep that rewrites them all destroys the only mtime signal we have.
+    #[test]
+    fn test_memory_md_sweep_leaves_factless_scaffold_untouched() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-empty");
+        let ws = tmp.path().join("ws-empty");
+        let _agent = register_agent_with_state_dir(&kernel, "empty", &ws);
+        let path = ws.join("MEMORY.md");
+        let scaffold = "# Long-Term Memory\n<!-- Curated knowledge -->\n";
+        std::fs::write(&path, scaffold).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let report = kernel.sweep_memory_md();
+        assert_eq!(report.written, 0);
+        // >= 1: the kernel registers its own default agent at boot, which is
+        // also factless, so it lands in the same bucket.
+        assert!(report.skipped_empty >= 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), scaffold);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Re-sweeping with unchanged facts performs no write at all.
+    #[test]
+    fn test_memory_md_sweep_is_idempotent() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-idem");
+        let ws = tmp.path().join("ws-idem");
+        let agent = register_agent_with_state_dir(&kernel, "idem", &ws);
+        let path = ws.join("MEMORY.md");
+        std::fs::write(&path, "# Long-Term Memory\n").unwrap();
+        kernel
+            .memory
+            .structured_set(agent, "k", serde_json::json!("v"))
+            .unwrap();
+
+        let first = kernel.sweep_memory_md();
+        assert_eq!(first.written, 1);
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        let second = kernel.sweep_memory_md();
+        assert_eq!(second.written, 0, "no facts changed, so no write");
+        assert_eq!(second.unchanged, 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+        assert!(second.is_noop());
+
+        kernel.shutdown();
+    }
+
+    /// Half-mangled markers are refused, not repaired: the file is left
+    /// exactly as the human (or agent) left it.
+    #[test]
+    fn test_memory_md_sweep_refuses_malformed_markers() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-malformed");
+        let ws = tmp.path().join("ws-malformed");
+        let agent = register_agent_with_state_dir(&kernel, "malformed", &ws);
+        let path = ws.join("MEMORY.md");
+        let mangled = format!(
+            "# Long-Term Memory\n{}\nhalf a block, no end marker\n",
+            openfang_memory::memory_md::MANAGED_BEGIN
+        );
+        std::fs::write(&path, &mangled).unwrap();
+        kernel
+            .memory
+            .structured_set(agent, "k", serde_json::json!("v"))
+            .unwrap();
+
+        let report = kernel.sweep_memory_md();
+        assert_eq!(report.skipped_malformed, 1);
+        assert_eq!(report.written, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mangled);
+        assert!(!report.is_noop(), "a refusal is not a clean no-op");
+
+        kernel.shutdown();
+    }
+
+    /// The block is rendered from the agent's OWN namespace (ANAI-165). A
+    /// value living in the legacy shared bucket must not leak into it.
+    #[test]
+    fn test_memory_md_sweep_uses_own_namespace_not_shared() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-scope");
+        let ws = tmp.path().join("ws-scope");
+        let agent = register_agent_with_state_dir(&kernel, "scoped", &ws);
+        let path = ws.join("MEMORY.md");
+        std::fs::write(&path, "# Long-Term Memory\n").unwrap();
+
+        kernel
+            .memory
+            .structured_set(agent, "mine", serde_json::json!("own-value"))
+            .unwrap();
+        kernel
+            .memory
+            .structured_set(
+                super::shared_memory_agent_id(),
+                "theirs",
+                serde_json::json!("shared-value"),
+            )
+            .unwrap();
+
+        kernel.sweep_memory_md();
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("own-value"));
+        assert!(
+            !out.contains("shared-value"),
+            "shared-namespace rows must not appear in an agent's block"
+        );
 
         kernel.shutdown();
     }
