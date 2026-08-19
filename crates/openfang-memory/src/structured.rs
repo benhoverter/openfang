@@ -1,5 +1,6 @@
 //! SQLite structured store for key-value pairs and agent persistence.
 
+use crate::memory_md::KvFact;
 use chrono::Utc;
 use openfang_types::agent::{AgentEntry, AgentId};
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -108,6 +109,60 @@ impl StructuredStore {
             pairs.push((key, value));
         }
         Ok(pairs)
+    }
+
+    /// List an agent's KV pairs ranked for surfacing in MEMORY.md (ANAI-168).
+    ///
+    /// Ranked by **write recency** (`updated_at DESC`), tie-broken by key for
+    /// determinism. `kv_store` records no read counters, so recency of write is
+    /// the only ranking signal that exists today; adding access tracking would
+    /// mean a schema migration plus a write on every read of the hot table.
+    ///
+    /// Rows whose blob is not decodable are skipped with a warning rather than
+    /// failing the whole sweep.
+    pub fn list_kv_ranked(&self, agent_id: AgentId, limit: usize) -> OpenFangResult<Vec<KvFact>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, value, updated_at FROM kv_store WHERE agent_id = ?1
+                 ORDER BY updated_at DESC, key ASC LIMIT ?2",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![agent_id.0.to_string(), limit as i64],
+                |row| {
+                    let key: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    let updated_at: String = row.get(2)?;
+                    Ok((key, blob, updated_at))
+                },
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut facts = Vec::new();
+        for row in rows {
+            let (key, blob, updated_at) = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let value = match serde_json::from_slice(&blob) {
+                Ok(v) => v,
+                Err(_) => match String::from_utf8(blob) {
+                    Ok(s) => serde_json::Value::String(s),
+                    Err(_) => {
+                        tracing::warn!(%key, "Skipping undecodable KV row in MEMORY.md sweep");
+                        continue;
+                    }
+                },
+            };
+            facts.push(KvFact {
+                key,
+                value,
+                updated_at,
+            });
+        }
+        Ok(facts)
     }
 
     /// Save an agent entry to the database.

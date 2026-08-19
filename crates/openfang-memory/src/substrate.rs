@@ -173,6 +173,16 @@ impl MemorySubstrate {
         self.structured.list_kv(agent_id)
     }
 
+    /// List an agent's KV pairs ranked by write recency, for the MEMORY.md
+    /// managed-block sweep (ANAI-168).
+    pub fn list_kv_ranked(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> OpenFangResult<Vec<crate::memory_md::KvFact>> {
+        self.structured.list_kv_ranked(agent_id, limit)
+    }
+
     /// Delete a KV entry for an agent.
     pub fn structured_delete(&self, agent_id: AgentId, key: &str) -> OpenFangResult<()> {
         self.structured.delete(agent_id, key)
