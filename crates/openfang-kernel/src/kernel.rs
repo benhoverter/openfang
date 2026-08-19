@@ -2639,13 +2639,7 @@ impl OpenFangKernel {
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
+            let user_name = resolve_user_name(&self.memory, agent_id);
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -3300,13 +3294,7 @@ impl OpenFangKernel {
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
+            let user_name = resolve_user_name(&self.memory, agent_id);
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -8320,6 +8308,9 @@ pub fn shared_memory_agent_id() -> AgentId {
 
 /// ANAI-165: resolve one memory operation to `(namespace, bare key)`.
 ///
+/// (See [`resolve_user_name`] for the read-side counterpart used by the prompt
+/// builder, which must span both namespaces.)
+///
 /// Two rules, both deliberate:
 ///
 /// 1. A `shared:` key prefix routes to [`shared_memory_agent_id`] with the
@@ -8360,6 +8351,29 @@ fn resolve_memory_scope<'k>(
             .ok_or_else(|| format!("Memory caller not found: {caller}"))?,
     };
     Ok((id, key))
+}
+
+/// ANAI-165: read `user_name` for the prompt builder's `## User Profile`.
+///
+/// Checks the agent's OWN namespace first, then the shared one. Both halves
+/// are load-bearing:
+///
+/// - Own first, because after scoping that is where an agent's own
+///   `memory_store("user_name", ...)` now lands — the onboarding prompt tells
+///   every new agent to make exactly that call, and reading only the shared
+///   namespace would mean the answer it just stored never reaches its prompt.
+/// - Shared second, because `user_name` is the genuine cross-channel case: it
+///   is where every pre-scoping agent already wrote it, and where an operator
+///   can set it once (`shared:user_name`) for the whole fleet.
+fn resolve_user_name(memory: &MemorySubstrate, agent_id: AgentId) -> Option<String> {
+    let read = |ns: AgentId| {
+        memory
+            .structured_get(ns, "user_name")
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_str().map(String::from))
+    };
+    read(agent_id).or_else(|| read(shared_memory_agent_id()))
 }
 
 /// Sanitize a human-readable string into a valid `CronJob.name`.
