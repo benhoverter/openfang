@@ -630,7 +630,7 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
 }
 
 /// Outcome of one MEMORY.md managed-block sweep (ANAI-168).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct MemoryMdSweepReport {
     /// Files whose managed block changed and were rewritten.
     pub written: usize,
@@ -649,6 +649,76 @@ impl MemoryMdSweepReport {
     pub fn is_noop(&self) -> bool {
         self.written == 0 && self.errors == 0 && self.skipped_malformed == 0
     }
+}
+
+/// Whether a sweep actually writes, or only reports what it would do.
+///
+/// `DryRun` runs the *identical* code path -- same registry walk, same query,
+/// same render, same splice, same equality check -- and stops immediately
+/// before [`write_atomic`]. The plan it produces is therefore what an apply
+/// run would do, not a separate estimate of it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    /// Write changed files.
+    Apply,
+    /// Touch nothing; report only.
+    #[default]
+    DryRun,
+}
+
+/// What the sweep did (or, in a dry run, would do) to one agent's MEMORY.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMdAction {
+    /// The managed block changed; the file is (or would be) rewritten.
+    Write,
+    /// The rendered block already matches disk byte-for-byte.
+    Unchanged,
+    /// No facts and no existing block; the file is left alone entirely.
+    SkippedEmpty,
+    /// Markers are malformed; refused rather than repaired.
+    SkippedMalformed,
+    /// Read / query / write failure.
+    Error,
+}
+
+/// Per-agent detail for one sweep, in registry order.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryMdSweepPlan {
+    /// Agent name, for humans.
+    pub agent: String,
+    /// Agent ID, for scripts.
+    pub agent_id: String,
+    /// Absolute path to the MEMORY.md considered.
+    pub path: String,
+    /// Outcome for this agent.
+    pub action: MemoryMdAction,
+    /// File size on disk before the sweep (0 when the file is absent).
+    pub bytes_before: usize,
+    /// File size after the splice. Equals `bytes_before` when nothing changes.
+    pub bytes_after: usize,
+    /// Bytes of the resulting file that live *outside* the managed markers --
+    /// the hand-written prose the sweep must never touch. Reported so a dry
+    /// run can show at a glance how much of a file is not the sweep's.
+    pub prose_bytes: usize,
+    /// Facts available in this agent's namespace, before the block's budget.
+    pub facts: usize,
+    /// Keys the sweep would add to the block.
+    pub keys_added: Vec<String>,
+    /// Keys the sweep would drop from the block (evicted by the char budget,
+    /// or the key no longer exists).
+    pub keys_removed: Vec<String>,
+    /// Failure reason for `SkippedMalformed` / `Error`.
+    pub detail: Option<String>,
+}
+
+/// A sweep's counters plus its per-agent plan.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MemoryMdSweepOutcome {
+    /// Aggregate counters.
+    pub report: MemoryMdSweepReport,
+    /// One entry per agent the sweep considered, in registry order.
+    pub plans: Vec<MemoryMdSweepPlan>,
 }
 
 /// Write `content` to `path` via a same-directory temp file plus rename, so a
@@ -6500,15 +6570,50 @@ impl OpenFangKernel {
     /// * a render that matches what is already on disk performs no write, so
     ///   mtimes stay meaningful.
     pub(crate) fn sweep_memory_md(&self) -> MemoryMdSweepReport {
+        self.sweep_memory_md_with(SweepMode::Apply).report
+    }
+
+    /// Plan a sweep without touching a single file (ANAI-168, dry run).
+    ///
+    /// Same registry walk, same query, same render, same splice -- it just
+    /// stops before the write. Use this to see exactly what the first sweep
+    /// would do across every live workspace before letting it loose on them.
+    pub fn plan_memory_md_sweep(&self) -> MemoryMdSweepOutcome {
+        self.sweep_memory_md_with(SweepMode::DryRun)
+    }
+
+    /// Shared implementation behind [`Self::sweep_memory_md`] and
+    /// [`Self::plan_memory_md_sweep`]. `mode` gates exactly one statement --
+    /// the write itself -- so a dry run cannot drift from what an apply run
+    /// would actually do.
+    pub fn sweep_memory_md_with(&self, mode: SweepMode) -> MemoryMdSweepOutcome {
         use openfang_memory::memory_md::{
-            render_managed_block, splice_managed_block, MANAGED_BEGIN,
+            managed_block_keys, render_managed_block, splice_managed_block, MANAGED_BEGIN,
         };
 
         /// Upper bound on facts pulled per agent. The block's own char budget
         /// cuts in well before this; the limit only bounds the query.
         const FACT_LIMIT: usize = 200;
 
+        /// Skeleton plan for one agent; the arms below fill in the outcome.
+        fn base_plan(agent: &str, agent_id: String, path: &Path) -> MemoryMdSweepPlan {
+            MemoryMdSweepPlan {
+                agent: agent.to_string(),
+                agent_id,
+                path: path.display().to_string(),
+                action: MemoryMdAction::Error,
+                bytes_before: 0,
+                bytes_after: 0,
+                prose_bytes: 0,
+                facts: 0,
+                keys_added: Vec::new(),
+                keys_removed: Vec::new(),
+                detail: None,
+            }
+        }
+
         let mut report = MemoryMdSweepReport::default();
+        let mut plans: Vec<MemoryMdSweepPlan> = Vec::new();
 
         for entry in self.registry.list() {
             let Some(state_dir) = entry.manifest.state_dir.as_ref() else {
@@ -6518,6 +6623,7 @@ impl OpenFangKernel {
                 continue;
             }
             let path = state_dir.join("MEMORY.md");
+            let mut plan = base_plan(&entry.name, entry.id.to_string(), &path);
 
             let existing = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
@@ -6525,22 +6631,32 @@ impl OpenFangKernel {
                 Err(e) => {
                     warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: read failed");
                     report.errors += 1;
+                    plan.detail = Some(format!("read failed: {e}"));
+                    plans.push(plan);
                     continue;
                 }
             };
+            plan.bytes_before = existing.len();
+            plan.bytes_after = existing.len();
 
             let facts = match self.memory.list_kv_ranked(entry.id, FACT_LIMIT) {
                 Ok(f) => f,
                 Err(e) => {
                     warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: KV query failed");
                     report.errors += 1;
+                    plan.detail = Some(format!("KV query failed: {e}"));
+                    plans.push(plan);
                     continue;
                 }
             };
+            plan.facts = facts.len();
 
             // Nothing to say and nothing said before: don't touch the file.
             if facts.is_empty() && !existing.contains(MANAGED_BEGIN) {
                 report.skipped_empty += 1;
+                plan.action = MemoryMdAction::SkippedEmpty;
+                plan.prose_bytes = existing.len();
+                plans.push(plan);
                 continue;
             }
 
@@ -6555,17 +6671,49 @@ impl OpenFangKernel {
                         "MEMORY.md sweep: refusing to write, markers are malformed"
                     );
                     report.skipped_malformed += 1;
+                    plan.action = MemoryMdAction::SkippedMalformed;
+                    plan.detail = Some(e.to_string());
+                    plans.push(plan);
                     continue;
                 }
             };
 
+            plan.bytes_after = updated.len();
+            plan.prose_bytes = updated.len().saturating_sub(block.len());
+            let before_keys = managed_block_keys(&existing);
+            let after_keys = managed_block_keys(&block);
+            plan.keys_added = after_keys
+                .iter()
+                .filter(|k| !before_keys.contains(k))
+                .cloned()
+                .collect();
+            plan.keys_removed = before_keys
+                .iter()
+                .filter(|k| !after_keys.contains(k))
+                .cloned()
+                .collect();
+
             if updated == existing {
                 report.unchanged += 1;
+                plan.action = MemoryMdAction::Unchanged;
+                plans.push(plan);
+                continue;
+            }
+
+            // The only statement `mode` gates: everything above ran the same
+            // in both modes, so the plan is the apply run, minus the write.
+            if mode == SweepMode::DryRun {
+                report.written += 1;
+                plan.action = MemoryMdAction::Write;
+                plans.push(plan);
                 continue;
             }
 
             match write_atomic(&path, &updated) {
-                Ok(()) => report.written += 1,
+                Ok(()) => {
+                    report.written += 1;
+                    plan.action = MemoryMdAction::Write;
+                }
                 Err(e) => {
                     warn!(
                         agent = %entry.name,
@@ -6574,11 +6722,13 @@ impl OpenFangKernel {
                         "MEMORY.md sweep: write failed"
                     );
                     report.errors += 1;
+                    plan.detail = Some(format!("write failed: {e}"));
                 }
             }
+            plans.push(plan);
         }
 
-        report
+        MemoryMdSweepOutcome { report, plans }
     }
 
     /// Run [`Self::sweep_memory_md`] and log its outcome. Silent when the
@@ -12622,6 +12772,144 @@ system_prompt = "You are a test agent."
             !out.contains("shared-value"),
             "shared-namespace rows must not appear in an agent's block"
         );
+
+        kernel.shutdown();
+    }
+
+    /// A dry run must not touch the filesystem: same bytes, same mtime, no
+    /// file created where none existed. This is the whole point of the mode.
+    #[test]
+    fn test_memory_md_dry_run_writes_nothing() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-dry");
+        let ws = tmp.path().join("ws-dry");
+        let agent = register_agent_with_state_dir(&kernel, "dry", &ws);
+        let path = ws.join("MEMORY.md");
+        let prose = "# Long-Term Memory\n\nHand-written.\n";
+        std::fs::write(&path, prose).unwrap();
+        let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        kernel
+            .memory
+            .structured_set(agent, "dry_key", serde_json::json!("dry-value"))
+            .unwrap();
+
+        let outcome = kernel.plan_memory_md_sweep();
+        assert_eq!(outcome.report.written, 1, "it would write one file");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            prose,
+            "dry run must leave the file byte-identical"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_mtime,
+            "dry run must not even touch the mtime"
+        );
+
+        let plan = outcome
+            .plans
+            .iter()
+            .find(|p| p.agent == "dry")
+            .expect("the agent must appear in the plan");
+        assert_eq!(plan.action, MemoryMdAction::Write);
+        assert_eq!(plan.facts, 1);
+        assert_eq!(plan.keys_added, vec!["dry_key".to_string()]);
+        assert!(plan.keys_removed.is_empty());
+        assert_eq!(plan.bytes_before, prose.len());
+        assert!(plan.bytes_after > plan.bytes_before);
+        assert_eq!(
+            plan.prose_bytes,
+            prose.len() + 2,
+            "prose bytes = the file minus the block; appending a fresh block \
+             adds a blank-line separator and a trailing newline"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// The dry run's counters must match what the apply run then actually
+    /// does. If these ever diverge the preview is lying, which is worse than
+    /// having no preview at all.
+    #[test]
+    fn test_memory_md_dry_run_matches_the_apply_run() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-parity");
+        let write_ws = tmp.path().join("ws-parity-write");
+        let empty_ws = tmp.path().join("ws-parity-empty");
+        let bad_ws = tmp.path().join("ws-parity-bad");
+        let agent = register_agent_with_state_dir(&kernel, "parity-write", &write_ws);
+        register_agent_with_state_dir(&kernel, "parity-empty", &empty_ws);
+        let bad_agent = register_agent_with_state_dir(&kernel, "parity-bad", &bad_ws);
+
+        std::fs::write(write_ws.join("MEMORY.md"), "# Long-Term Memory\n").unwrap();
+        std::fs::write(empty_ws.join("MEMORY.md"), "# Long-Term Memory\n").unwrap();
+        std::fs::write(
+            bad_ws.join("MEMORY.md"),
+            format!(
+                "# Long-Term Memory\n{}\nno end marker\n",
+                openfang_memory::memory_md::MANAGED_BEGIN
+            ),
+        )
+        .unwrap();
+        kernel
+            .memory
+            .structured_set(agent, "k", serde_json::json!("v"))
+            .unwrap();
+        kernel
+            .memory
+            .structured_set(bad_agent, "k", serde_json::json!("v"))
+            .unwrap();
+
+        let planned = kernel.plan_memory_md_sweep();
+        let applied = kernel.sweep_memory_md_with(SweepMode::Apply);
+
+        assert_eq!(planned.report, applied.report, "preview must not lie");
+        assert_eq!(planned.plans.len(), applied.plans.len());
+        for (a, b) in planned.plans.iter().zip(applied.plans.iter()) {
+            assert_eq!(a.agent, b.agent);
+            assert_eq!(a.action, b.action, "action drift for {}", a.agent);
+            assert_eq!(a.bytes_after, b.bytes_after, "size drift for {}", a.agent);
+            assert_eq!(a.keys_added, b.keys_added);
+        }
+        assert_eq!(applied.report.written, 1);
+        assert_eq!(applied.report.skipped_malformed, 1);
+
+        kernel.shutdown();
+    }
+
+    /// A key that falls out of the namespace shows up as removed, so an
+    /// operator can see what a sweep would drop before it drops it.
+    #[test]
+    fn test_memory_md_dry_run_reports_removed_keys() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-removed");
+        let ws = tmp.path().join("ws-removed");
+        let agent = register_agent_with_state_dir(&kernel, "removed", &ws);
+        let path = ws.join("MEMORY.md");
+        std::fs::write(&path, "# Long-Term Memory\n").unwrap();
+
+        kernel
+            .memory
+            .structured_set(agent, "gone_soon", serde_json::json!("v"))
+            .unwrap();
+        assert_eq!(kernel.sweep_memory_md().written, 1);
+
+        kernel.memory.structured_delete(agent, "gone_soon").unwrap();
+        kernel
+            .memory
+            .structured_set(agent, "brand_new", serde_json::json!("v"))
+            .unwrap();
+
+        let outcome = kernel.plan_memory_md_sweep();
+        let plan = outcome
+            .plans
+            .iter()
+            .find(|p| p.agent == "removed")
+            .expect("agent present in plan");
+        assert_eq!(plan.keys_added, vec!["brand_new".to_string()]);
+        assert_eq!(plan.keys_removed, vec!["gone_soon".to_string()]);
+        // ...and it still has not written anything.
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("gone_soon"));
 
         kernel.shutdown();
     }

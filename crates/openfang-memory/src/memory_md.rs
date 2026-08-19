@@ -202,6 +202,36 @@ fn append_block(existing: &str, block: &str) -> String {
     format!("{existing}{sep}{block}\n")
 }
 
+/// Extract the keys currently listed inside `text`'s managed region.
+///
+/// Used by the dry-run planner to report which keys a sweep would add or drop
+/// without diffing whole files. Parsing is deliberately literal — it reads the
+/// exact `- \`key\` — ` shape [`render_managed_block`] emits and ignores
+/// anything else, so hand-written prose (inside or outside the block) never
+/// shows up as a phantom key. Returns an empty vec when there is no block, and
+/// never errors: this is reporting, not a write path.
+pub fn managed_block_keys(text: &str) -> Vec<String> {
+    let Some(begin) = text.find(MANAGED_BEGIN) else {
+        return Vec::new();
+    };
+    let after = &text[begin + MANAGED_BEGIN.len()..];
+    let region = match after.find(MANAGED_END) {
+        Some(end) => &after[..end],
+        None => after,
+    };
+
+    region
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("- `")?;
+            let (key, tail) = rest.split_once('`')?;
+            // Only count entries in the rendered shape; a stray backticked
+            // word in prose is not a fact.
+            tail.trim_start().starts_with('—').then(|| key.to_string())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +359,26 @@ mod tests {
         let block = render_managed_block(&[fact("k", json!("v"))]);
         let out = splice_managed_block("", &block).unwrap();
         assert_eq!(out, format!("{block}\n"));
+    }
+
+    #[test]
+    fn block_keys_round_trip_from_a_rendered_block() {
+        let block = render_managed_block(&[fact("a_key", json!("v")), fact("b_key", json!(2))]);
+        assert_eq!(managed_block_keys(&block), vec!["a_key", "b_key"]);
+    }
+
+    #[test]
+    fn block_keys_ignores_prose_outside_and_inside_the_markers() {
+        let block = render_managed_block(&[fact("real_key", json!("v"))]);
+        let file = format!(
+            "# Memory\n\n- `not_a_fact` is prose above the block\n\n{block}\n\n\
+             - `also_prose` below the block\n"
+        );
+        assert_eq!(managed_block_keys(&file), vec!["real_key"]);
+    }
+
+    #[test]
+    fn block_keys_is_empty_when_no_block_present() {
+        assert!(managed_block_keys("# Memory\n\njust prose\n").is_empty());
     }
 }

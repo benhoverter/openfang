@@ -3560,6 +3560,60 @@ pub async fn delete_agent_kv_key(
     }
 }
 
+/// GET /api/memory/memory-md-sweep — dry-run the MEMORY.md managed-block sweep.
+///
+/// ANAI-168: reports exactly what a sweep would do to every registered agent's
+/// MEMORY.md without touching a single file. GET is the read-only verb on
+/// purpose — the applying variant is the POST below, so a curl typo cannot
+/// rewrite 100 live workspaces.
+pub async fn plan_memory_md_sweep(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    run_sweep(state, openfang_kernel::SweepMode::DryRun).await
+}
+
+/// POST /api/memory/memory-md-sweep — run the sweep for real.
+///
+/// Same code path as the dry run above; this one is allowed to write.
+pub async fn apply_memory_md_sweep(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    run_sweep(state, openfang_kernel::SweepMode::Apply).await
+}
+
+/// Shared body for the two handlers above. The sweep walks every workspace on
+/// disk, so it runs on a blocking thread rather than a tokio worker.
+async fn run_sweep(
+    state: Arc<AppState>,
+    mode: openfang_kernel::SweepMode,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let kernel = state.kernel.clone();
+    let outcome = match tokio::task::spawn_blocking(move || kernel.sweep_memory_md_with(mode)).await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!("MEMORY.md sweep task failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Sweep failed"})),
+            );
+        }
+    };
+
+    let dry_run = mode == openfang_kernel::SweepMode::DryRun;
+    match serde_json::to_value(&outcome) {
+        Ok(mut body) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("dry_run".to_string(), serde_json::Value::Bool(dry_run));
+            }
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => {
+            tracing::warn!("MEMORY.md sweep serialization failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Sweep failed"})),
+            )
+        }
+    }
+}
+
 /// GET /api/health — Minimal liveness probe (public, no auth required).
 /// Returns only status and version to prevent information leakage.
 /// Use GET /api/health/detail for full diagnostics (requires auth).

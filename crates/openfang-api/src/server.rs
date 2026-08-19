@@ -350,6 +350,11 @@ pub async fn build_router(
                 .put(routes::set_agent_kv_key)
                 .delete(routes::delete_agent_kv_key),
         )
+        // ANAI-168: GET plans the MEMORY.md sweep (writes nothing), POST runs it.
+        .route(
+            "/api/memory/memory-md-sweep",
+            axum::routing::get(routes::plan_memory_md_sweep).post(routes::apply_memory_md_sweep),
+        )
         // Trigger endpoints
         .route(
             "/api/triggers",

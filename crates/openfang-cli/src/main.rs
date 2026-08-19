@@ -790,6 +790,24 @@ enum MemoryCommands {
         /// Key name.
         key: String,
     },
+    /// Preview (or run) the MEMORY.md managed-block sweep across all agents.
+    ///
+    /// Dry run by default: it reports what would change and writes nothing.
+    /// Pass --apply to actually rewrite the managed blocks.
+    Sweep {
+        /// Write the changes instead of only reporting them.
+        #[arg(long)]
+        apply: bool,
+        /// Explicitly request a dry run (the default).
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Show every agent, not just the ones that would change.
+        #[arg(long)]
+        all: bool,
+        /// Output as JSON for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1162,6 +1180,12 @@ fn main() {
             MemoryCommands::Get { agent, key, json } => cmd_memory_get(&agent, &key, json),
             MemoryCommands::Set { agent, key, value } => cmd_memory_set(&agent, &key, &value),
             MemoryCommands::Delete { agent, key } => cmd_memory_delete(&agent, &key),
+            MemoryCommands::Sweep {
+                apply,
+                dry_run: _,
+                all,
+                json,
+            } => cmd_memory_sweep(apply, all, json),
         },
         Some(Commands::Devices(sub)) => match sub {
             DevicesCommands::List { json } => cmd_devices_list(json),
@@ -6655,6 +6679,112 @@ fn cmd_memory_list(agent: &str, json: bool) {
             "{}",
             serde_json::to_string_pretty(&body).unwrap_or_default()
         );
+    }
+}
+
+/// `openfang memory sweep [--apply]` — ANAI-168 MEMORY.md managed-block sweep.
+///
+/// The default is a dry run against the daemon's read-only planning endpoint,
+/// so the safe thing is what you get when you forget the flag. `--apply` is
+/// the only path that writes, and it POSTs to a different route.
+fn cmd_memory_sweep(apply: bool, all: bool, json: bool) {
+    let base = require_daemon("memory sweep");
+    let client = daemon_client();
+    let url = format!("{base}/api/memory/memory-md-sweep");
+    let body = if apply {
+        daemon_json(client.post(&url).send())
+    } else {
+        daemon_json(client.get(&url).send())
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return;
+    }
+
+    let report = &body["report"];
+    let count = |k: &str| report[k].as_u64().unwrap_or(0);
+    let verb = if apply { "Swept" } else { "Would sweep" };
+
+    let empty = Vec::new();
+    let plans = body["plans"].as_array().unwrap_or(&empty);
+    let interesting: Vec<&serde_json::Value> = plans
+        .iter()
+        .filter(|p| {
+            all || !matches!(
+                p["action"].as_str().unwrap_or(""),
+                "unchanged" | "skipped_empty"
+            )
+        })
+        .collect();
+
+    if interesting.is_empty() {
+        println!(
+            "No MEMORY.md changes pending across {} agent(s).",
+            plans.len()
+        );
+    } else {
+        println!(
+            "{:<28} {:<18} {:>13} {:>7}",
+            "AGENT", "ACTION", "BYTES", "FACTS"
+        );
+        println!("{}", "-".repeat(70));
+        for p in &interesting {
+            let before = p["bytes_before"].as_u64().unwrap_or(0);
+            let after = p["bytes_after"].as_u64().unwrap_or(0);
+            println!(
+                "{:<28} {:<18} {:>13} {:>7}",
+                p["agent"].as_str().unwrap_or("?"),
+                p["action"].as_str().unwrap_or("?"),
+                format!("{before} → {after}"),
+                p["facts"].as_u64().unwrap_or(0),
+            );
+            // Key churn and refusals are the two things worth reading in full.
+            let keys = |field: &str| -> String {
+                p[field]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            };
+            let added = keys("keys_added");
+            let removed = keys("keys_removed");
+            if !added.is_empty() {
+                println!("    + {added}");
+            }
+            if !removed.is_empty() {
+                println!("    - {removed}");
+            }
+            if let Some(detail) = p["detail"].as_str() {
+                println!("    ! {detail}");
+            }
+        }
+        if !all {
+            println!(
+                "\n({} unchanged, {} untouched-empty hidden; --all to show)",
+                count("unchanged"),
+                count("skipped_empty"),
+            );
+        }
+    }
+
+    println!(
+        "\n{verb}: {} written, {} unchanged, {} empty-skipped, {} malformed-skipped, {} errors",
+        count("written"),
+        count("unchanged"),
+        count("skipped_empty"),
+        count("skipped_malformed"),
+        count("errors"),
+    );
+    if !apply && count("written") > 0 {
+        ui::hint("Nothing was written. Re-run with --apply to make these changes.");
     }
 }
 
