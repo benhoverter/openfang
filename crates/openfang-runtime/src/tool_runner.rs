@@ -714,13 +714,26 @@ pub async fn execute_tool(
                     };
                 }
             }
-            tool_shell_exec(
+            // A shell command is opaque: we cannot know which files it wrote.
+            // So snapshot the workspace's context files, run it, then diff.
+            // Reconcile runs on the error path too -- a command that fails
+            // part-way can still have rewritten SOUL.md. Auditing never gates
+            // the command and never changes its result.
+            let context_snapshot = crate::context_audit::snapshot_workspace(workspace_root).await;
+            let shell_result = tool_shell_exec(
                 input,
                 allowed_env_vars.unwrap_or(&[]),
                 workspace_root,
                 exec_policy,
             )
-            .await
+            .await;
+            crate::context_audit::reconcile_workspace(
+                caller_agent_id,
+                "shell_exec",
+                context_snapshot,
+            )
+            .await;
+            shell_result
         }
 
         // Inter-agent tools (require kernel handle)

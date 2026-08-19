@@ -26,11 +26,28 @@
 //!
 //! # Coverage
 //!
-//! Hooked into the two runtime tools that can write a context file:
-//! `file_write` and `apply_patch`. Writes performed by `shell_exec` (e.g. a
-//! `tee` or `sed -i` from an agent with shell access) are **not** covered —
-//! they bypass the tool layer entirely. That gap is known and deliberate for
-//! v1; closing it means watching the filesystem, not the toolchain.
+//! Three paths can write a context file, and all three are hooked:
+//!
+//! * `file_write` and `apply_patch` — audited at the write itself, so the
+//!   record is exact: this tool wrote these bytes to this path.
+//! * `shell_exec` — audited by **reconciliation**, not interception. A shell
+//!   command is opaque; we cannot know what it touched. So the audited
+//!   filenames in the agent's workspace root are snapshotted before the
+//!   command runs and compared after it returns, and any difference is
+//!   recorded with `via = "shell_exec"`. Attribution is to the agent and the
+//!   command's turn, which is the question the audit exists to answer.
+//!
+//! What reconciliation does not cover, and why:
+//!
+//! * **Other workspaces.** Only the calling agent's workspace root is
+//!   snapshotted. `shell_exec` has no path sandbox, so an agent with shell
+//!   access can still write a *sibling's* `SOUL.md` unrecorded. Watching every
+//!   workspace on every shell call is the wrong shape; that gap closes with a
+//!   filesystem watcher or a path sandbox on `shell_exec`, not here.
+//! * **`process_start`.** Backgrounded processes outlive the tool call, so
+//!   there is no "after" to compare against at return time.
+//! * **Intermediate states.** A command that writes a file and then restores
+//!   it reads as a no-op. Reconciliation reports net change, not history.
 //!
 //! # Output
 //!
@@ -433,9 +450,267 @@ async fn restrict_permissions(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 async fn restrict_permissions(_path: &Path, _mode: u32) {}
 
+// ---------------------------------------------------------------------------
+// Shell-side coverage: snapshot / reconcile
+// ---------------------------------------------------------------------------
+
+/// Largest context file whose prior content is captured before a shell command.
+///
+/// The kernel truncates identity files at 32 KiB when assembling a prompt, so
+/// anything near this bound is already well past the size that can influence a
+/// turn. Skipping the outliers keeps `shell_exec`'s fixed overhead bounded.
+const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+
+/// Prior state of one audited file, captured before a shell command ran.
+///
+/// `before == None` means the file did not exist. A file that exists but is
+/// unreadable, over [`MAX_SNAPSHOT_BYTES`], or not valid UTF-8 gets no entry at
+/// all — such a file cannot reach a system prompt (the kernel's reader is also
+/// `read_to_string`), so there is nothing to attribute.
+struct SnapshotEntry {
+    path: PathBuf,
+    before: Option<String>,
+}
+
+/// Pre-command state of every audited context file in one workspace.
+pub struct WorkspaceSnapshot {
+    entries: Vec<SnapshotEntry>,
+}
+
+/// Capture the audited context files at `workspace_root` before a shell command.
+///
+/// Returns `None` when auditing is off or no workspace root is known, which
+/// makes [`reconcile_workspace`] a no-op. Cost is one `stat` per audited
+/// filename plus a read of those that exist — nine small files, paid once per
+/// `shell_exec` call.
+pub async fn snapshot_workspace(workspace_root: Option<&Path>) -> Option<WorkspaceSnapshot> {
+    if !enabled() {
+        return None;
+    }
+    let root = workspace_root?;
+    let mut entries = Vec::with_capacity(AUDITED_FILENAMES.len());
+    for name in AUDITED_FILENAMES {
+        let path = root.join(name);
+        match tokio::fs::metadata(&path).await {
+            Err(_) => entries.push(SnapshotEntry { path, before: None }),
+            Ok(m) if !m.is_file() => {}
+            Ok(m) if m.len() > MAX_SNAPSHOT_BYTES => {
+                debug!(
+                    target: "context_audit",
+                    path = %path.display(), bytes = m.len(),
+                    "Context file too large to snapshot; shell writes to it are not audited"
+                );
+            }
+            Ok(_) => match tokio::fs::read_to_string(&path).await {
+                Ok(before) => entries.push(SnapshotEntry {
+                    path,
+                    before: Some(before),
+                }),
+                Err(e) => debug!(
+                    target: "context_audit",
+                    path = %path.display(), error = %e,
+                    "Context file unreadable at snapshot; shell writes to it are not audited"
+                ),
+            },
+        }
+    }
+    Some(WorkspaceSnapshot { entries })
+}
+
+/// Reconciliation verdict for one snapshot entry.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryDiff {
+    /// Absent before and after, or byte-identical.
+    Unchanged,
+    /// A recordable change. `before == None` is a create, `after == None` a delete.
+    Changed {
+        before: Option<String>,
+        after: Option<String>,
+    },
+    /// The file is there but its bytes are no longer readable as UTF-8.
+    /// Recording that as a delete would be a lie, so it gets its own verdict.
+    Opaque,
+}
+
+/// Compare one snapshot entry against the file as it now stands.
+///
+/// Split out from [`reconcile_workspace`] so the create/modify/delete decision
+/// is testable without writing to the audit log.
+async fn diff_entry(entry: &SnapshotEntry) -> EntryDiff {
+    let exists_now = tokio::fs::metadata(&entry.path)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false);
+    if !exists_now {
+        return match &entry.before {
+            Some(before) => EntryDiff::Changed {
+                before: Some(before.clone()),
+                after: None,
+            },
+            None => EntryDiff::Unchanged,
+        };
+    }
+    match tokio::fs::read_to_string(&entry.path).await {
+        Ok(after) => {
+            if entry.before.as_deref() == Some(after.as_str()) {
+                EntryDiff::Unchanged
+            } else {
+                EntryDiff::Changed {
+                    before: entry.before.clone(),
+                    after: Some(after),
+                }
+            }
+        }
+        Err(_) => EntryDiff::Opaque,
+    }
+}
+
+/// Record every context-file change a shell command left behind.
+///
+/// Pass the snapshot taken before the command. Call this whether the command
+/// succeeded or failed — a command that errors part-way can still have written.
+/// Like everything else here, it never gates and never fails a tool call.
+pub async fn reconcile_workspace(
+    agent_id: Option<&str>,
+    via: &'static str,
+    snapshot: Option<WorkspaceSnapshot>,
+) {
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    for entry in &snapshot.entries {
+        match diff_entry(entry).await {
+            EntryDiff::Unchanged => {}
+            EntryDiff::Opaque => warn!(
+                target: "context_audit",
+                agent = agent_id.unwrap_or("unknown"), via,
+                path = %entry.path.display(),
+                "Context file is no longer valid UTF-8 after a shell command; change detected but content not recorded"
+            ),
+            EntryDiff::Changed { before, after } => {
+                record_write(
+                    agent_id,
+                    via,
+                    &entry.path,
+                    before.as_deref(),
+                    after.as_deref(),
+                )
+                .await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- shell-side reconciliation ---------------------------------------
+    //
+    // These drive `diff_entry` rather than `reconcile_workspace` so nothing
+    // touches the real audit log: `record_write` falls back to `~/.openfang`
+    // when OPENFANG_HOME is unset, and a unit test must never append there.
+
+    fn entry(dir: &Path, name: &str, before: Option<&str>) -> SnapshotEntry {
+        SnapshotEntry {
+            path: dir.join(name),
+            before: before.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_snapshot_captures_existing_context_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "soul").unwrap();
+        std::fs::write(dir.path().join("notes.md"), "not audited").unwrap();
+
+        let snap = snapshot_workspace(Some(dir.path())).await.unwrap();
+        assert_eq!(snap.entries.len(), AUDITED_FILENAMES.len());
+        let soul = snap
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("SOUL.md"))
+            .unwrap();
+        assert_eq!(soul.before.as_deref(), Some("soul"));
+        assert!(snap.entries.iter().all(|e| !e.path.ends_with("notes.md")));
+        let memory = snap
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("MEMORY.md"))
+            .unwrap();
+        assert!(memory.before.is_none(), "absent file must snapshot as None");
+    }
+
+    #[tokio::test]
+    async fn shell_snapshot_needs_a_workspace_root() {
+        assert!(snapshot_workspace(None).await.is_none());
+    }
+
+    /// `sed -i` / `tee` shape: the file existed and the command rewrote it.
+    #[tokio::test]
+    async fn shell_modify_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "new").unwrap();
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "SOUL.md", Some("old"))).await,
+            EntryDiff::Changed {
+                before: Some("old".into()),
+                after: Some("new".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_create_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "planted").unwrap();
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "AGENTS.md", None)).await,
+            EntryDiff::Changed {
+                before: None,
+                after: Some("planted".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_delete_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "MEMORY.md", Some("gone"))).await,
+            EntryDiff::Changed {
+                before: Some("gone".into()),
+                after: None,
+            }
+        );
+    }
+
+    /// A command that touched nothing must produce no record, or every `ls`
+    /// would write nine lines to the audit log.
+    #[tokio::test]
+    async fn shell_untouched_files_produce_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "same").unwrap();
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "SOUL.md", Some("same"))).await,
+            EntryDiff::Unchanged
+        );
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "USER.md", None)).await,
+            EntryDiff::Unchanged
+        );
+    }
+
+    /// Binary content must not masquerade as a delete.
+    #[tokio::test]
+    async fn shell_non_utf8_result_is_opaque_not_a_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(
+            diff_entry(&entry(dir.path(), "SOUL.md", Some("text"))).await,
+            EntryDiff::Opaque
+        );
+    }
 
     #[test]
     fn recognises_every_audited_filename() {
