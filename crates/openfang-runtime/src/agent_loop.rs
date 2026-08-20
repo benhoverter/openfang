@@ -15,7 +15,7 @@ use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
-use openfang_memory::capture::should_capture_turn;
+use openfang_memory::capture::{should_capture_turn, CaptureDecision};
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
@@ -293,13 +293,18 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
 
 /// ADR 0001 §2.2: resolve the episode this turn is captured into.
 ///
-/// Returns `None` — no episode — for a turn the ANAI-76 predicate would drop.
-/// That exclusion is load-bearing, not tidiness: heartbeats fire on a timer
-/// forever, so letting an inert one touch the episode clock would keep every
-/// idle agent's episode open indefinitely and make close-on-timer unreachable.
-/// A quiet agent must be *seen* as quiet. Shadow-dropped rows (ANAI-77) are
-/// already marked as not-really-wanted evidence, so leaving them unassigned
-/// also keeps them out of consolidation's input set for free.
+/// **Only call this for a turn that is actually being captured.** Dropped
+/// turns must not reach here, and the exclusion is load-bearing rather than
+/// tidiness: heartbeats fire on a timer forever, so letting an inert one touch
+/// the episode clock would keep every idle agent's episode open indefinitely.
+/// A quiet agent must be *seen* as quiet.
+///
+/// This used to re-run the ANAI-76 predicate itself and return `None` on a
+/// drop. Since ANAI-85 the caller gates on the verdict before doing any capture
+/// work at all, so re-deciding here would be a second evaluation of the same
+/// predicate on the same inputs — two places that must agree forever, and
+/// eventually will not. One evaluation per turn, threaded; see the capture
+/// sites.
 ///
 /// Failure is non-fatal: an episode-store error degrades this turn to a legacy
 /// (episode-less) row rather than losing the capture. Memory bookkeeping must
@@ -307,13 +312,7 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
 async fn resolve_episode(
     memory: &MemorySubstrate,
     agent_id: openfang_types::agent::AgentId,
-    trigger: TurnTrigger,
-    effects: &TurnEffects,
-    observer_live: bool,
 ) -> Option<uuid::Uuid> {
-    if should_capture_turn(trigger, effects, observer_live).is_drop() {
-        return None;
-    }
     match memory.ensure_open_episode_async(agent_id).await {
         Ok(id) => Some(id),
         Err(e) => {
@@ -323,16 +322,31 @@ async fn resolve_episode(
     }
 }
 
-/// ANAI-77: build the episodic capture metadata for a completed turn,
-/// stamping the **shadow** would-drop verdict when the conservative predicate
-/// (ANAI-76) would drop this turn (an inert heartbeat). Observe-only: callers
-/// always `remember`; nothing is skipped. The real skip is deferred to
-/// ANAI-85, which reads `metadata["would_drop"]` fleet-wide to size the change.
+/// Build the episodic capture metadata for a completed turn.
+///
+/// Takes the turn's capture `verdict` rather than recomputing it: since
+/// ANAI-85 the caller decides once, gates the whole capture on it, and threads
+/// it here, so the metadata can never claim something different from what the
+/// gate did.
+///
+/// `would_drop` is stamped **only on heartbeat turns with a live observer** —
+/// the one population where the classifier actually renders a judgement:
+///
+/// * `true`  — this turn was judged droppable. Post-enforce no such row should
+///   exist, so one appearing in the corpus means something captured a turn it
+///   was told to drop. A canary, deliberately left armed.
+/// * `false` — judged and kept. This is the ANAI-85 instrumentation: with drops
+///   no longer written, a dropped row can no longer be counted, so the standing
+///   proof that the classifier is still firing (rather than having silently
+///   died and taken the savings with it) is the presence of negatives.
+/// * absent  — no judgement was rendered: a non-heartbeat turn, or an
+///   observer-blind driver. Absence must stay distinguishable from `false`;
+///   collapsing them would erase the difference between "kept on the merits"
+///   and "kept because we could not see", which is the safety property the
+///   whole flip rests on.
 ///
 /// On heartbeat turns it also stamps the ANAI-77 confirmation notch: the
-/// content-free `side_effecting_tools` / `tools_observed` counts that let the
-/// shadow window prove the drop classifier partitions correctly before the
-/// enforce flip.
+/// content-free `side_effecting_tools` / `tools_observed` counts.
 ///
 /// ADR 0001 §2.2: also stamps `episode_id` when the turn belongs to one (see
 /// [`resolve_episode`]). `semantic.rs` lifts that key into a real column.
@@ -348,6 +362,7 @@ fn capture_metadata(
     trigger: TurnTrigger,
     effects: &TurnEffects,
     observer_live: bool,
+    verdict: CaptureDecision,
     episode_id: Option<uuid::Uuid>,
 ) -> HashMap<String, serde_json::Value> {
     let mut meta = base.clone();
@@ -361,12 +376,17 @@ fn capture_metadata(
             serde_json::json!(ep.to_string()),
         );
     }
-    if should_capture_turn(trigger, effects, observer_live).is_drop() {
-        meta.insert("would_drop".to_string(), serde_json::json!(true));
+    if trigger == TurnTrigger::Heartbeat && observer_live {
         meta.insert(
-            "would_drop_reason".to_string(),
-            serde_json::json!("heartbeat_inert"),
+            "would_drop".to_string(),
+            serde_json::json!(verdict.is_drop()),
         );
+        if verdict.is_drop() {
+            meta.insert(
+                "would_drop_reason".to_string(),
+                serde_json::json!("heartbeat_inert"),
+            );
+        }
     }
     // ANAI-77 field-confirmation notch (enforce-gate evidence before the
     // shadow->enforce flip): on every heartbeat turn, stamp two content-free
@@ -1059,64 +1079,83 @@ pub async fn run_agent_loop(
                 // binary reports `false` → pure keep-mode until a deployed observe
                 // binary reports `true`; cannot over-delete pre-deploy.
                 let observer_live = response.observer_live;
-                let episode_id = resolve_episode(
-                    memory,
-                    session.agent_id,
-                    trigger,
-                    &turn_effects,
-                    observer_live,
-                )
-                .await;
-                let capture_meta = capture_metadata(
-                    &trigger_meta,
-                    trigger,
-                    &turn_effects,
-                    observer_live,
-                    episode_id,
-                );
+                // ANAI-85 (enforce): ONE evaluation of the capture predicate
+                // per turn, threaded from here. Everything downstream — the
+                // episode clock, the metadata stamp, the write itself — reads
+                // this verdict instead of re-deriving it, so the gate and the
+                // record it leaves cannot disagree.
+                let verdict = should_capture_turn(trigger, &turn_effects, observer_live);
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    capture_meta.clone(),
-                                    Some(&vec),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("Embedding for remember failed: {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    capture_meta.clone(),
-                                )
-                                .await;
-                        }
-                    }
+                // ANAI-85: an inert heartbeat writes NOTHING. The gate sits
+                // above the embedding call, not just above `remember` — 63%
+                // of fleet rows are heartbeat_inert, and embedding text you
+                // are about to throw away is a model call spent on nothing.
+                //
+                // Skipped together, and this is deliberate: no episode is
+                // opened or touched (an idle agent must read as idle), no
+                // metadata is built, no embedding is computed, no row is
+                // written. `should_capture_turn` only ever drops a heartbeat
+                // whose observer was live and whose side-effect count was
+                // zero, so nothing durable is being discarded.
+                if verdict.is_drop() {
+                    debug!(
+                        agent = %manifest.name,
+                        "Inert heartbeat: episodic capture skipped (ANAI-85)"
+                    );
                 } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            capture_meta.clone(),
-                        )
-                        .await;
+                    let episode_id = resolve_episode(memory, session.agent_id).await;
+                    let capture_meta = capture_metadata(
+                        &trigger_meta,
+                        trigger,
+                        &turn_effects,
+                        observer_live,
+                        verdict,
+                        episode_id,
+                    );
+
+                    // Remember this interaction (with embedding if available)
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        capture_meta.clone(),
+                                        Some(&vec),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed: {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        capture_meta.clone(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                capture_meta.clone(),
+                            )
+                            .await;
+                    }
                 }
 
                 // Notify phase: Done
@@ -2740,64 +2779,83 @@ pub async fn run_agent_loop_streaming(
                 // binary reports `false` → pure keep-mode until a deployed observe
                 // binary reports `true`; cannot over-delete pre-deploy.
                 let observer_live = response.observer_live;
-                let episode_id = resolve_episode(
-                    memory,
-                    session.agent_id,
-                    trigger,
-                    &turn_effects,
-                    observer_live,
-                )
-                .await;
-                let capture_meta = capture_metadata(
-                    &trigger_meta,
-                    trigger,
-                    &turn_effects,
-                    observer_live,
-                    episode_id,
-                );
+                // ANAI-85 (enforce): ONE evaluation of the capture predicate
+                // per turn, threaded from here. Everything downstream — the
+                // episode clock, the metadata stamp, the write itself — reads
+                // this verdict instead of re-deriving it, so the gate and the
+                // record it leaves cannot disagree.
+                let verdict = should_capture_turn(trigger, &turn_effects, observer_live);
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    capture_meta.clone(),
-                                    Some(&vec),
-                                )
-                                .await;
-                        }
-                        Err(e) => {
-                            warn!("Embedding for remember failed (streaming): {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    capture_meta.clone(),
-                                )
-                                .await;
-                        }
-                    }
+                // ANAI-85: an inert heartbeat writes NOTHING. The gate sits
+                // above the embedding call, not just above `remember` — 63%
+                // of fleet rows are heartbeat_inert, and embedding text you
+                // are about to throw away is a model call spent on nothing.
+                //
+                // Skipped together, and this is deliberate: no episode is
+                // opened or touched (an idle agent must read as idle), no
+                // metadata is built, no embedding is computed, no row is
+                // written. `should_capture_turn` only ever drops a heartbeat
+                // whose observer was live and whose side-effect count was
+                // zero, so nothing durable is being discarded.
+                if verdict.is_drop() {
+                    debug!(
+                        agent = %manifest.name,
+                        "Inert heartbeat: episodic capture skipped (ANAI-85)"
+                    );
                 } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            capture_meta.clone(),
-                        )
-                        .await;
+                    let episode_id = resolve_episode(memory, session.agent_id).await;
+                    let capture_meta = capture_metadata(
+                        &trigger_meta,
+                        trigger,
+                        &turn_effects,
+                        observer_live,
+                        verdict,
+                        episode_id,
+                    );
+
+                    // Remember this interaction (with embedding if available)
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        capture_meta.clone(),
+                                        Some(&vec),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed (streaming): {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        capture_meta.clone(),
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                capture_meta.clone(),
+                            )
+                            .await;
+                    }
                 }
 
                 // Notify phase: Done
@@ -4438,48 +4496,82 @@ mod tests {
     /// ANAI-77 notch: heartbeat rows carry the content-free tool counts, and the
     /// `would_drop` safety property (inert heartbeat => side_effecting_tools == 0)
     /// holds in the stamped metadata. Non-heartbeat turns carry neither key.
+    ///
+    /// Since the ANAI-85 flip a KEPT observable heartbeat stamps
+    /// `would_drop = false` rather than omitting the key: with dropped rows no
+    /// longer written, negatives are the only remaining evidence that the
+    /// classifier is still running.
     #[test]
     fn capture_metadata_stamps_heartbeat_notch() {
         use openfang_types::turn::{TurnEffects, TurnTrigger};
         let base = HashMap::new();
+        let drop = CaptureDecision::Drop;
+        let keep = CaptureDecision::Keep;
 
         // Inert heartbeat: dropped, and the notch records zero side-effects.
         let inert = TurnEffects::new();
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true, None);
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true, drop, None);
         assert_eq!(m.get("would_drop"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            m.get("would_drop_reason"),
+            Some(&serde_json::json!("heartbeat_inert"))
+        );
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
         assert_eq!(m.get("observer_live"), Some(&serde_json::json!(true)));
 
-        // Active heartbeat: kept (no would_drop), notch counts the side-effect.
+        // Active heartbeat: kept, and says so. The reason key belongs only to
+        // an actual drop -- a kept row has no reason to explain.
         let mut active = TurnEffects::new();
         active.observe_tool("memory_recall"); // read-only
         active.observe_tool("agent_send"); // side-effecting
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active, true, None);
-        assert!(!m.contains_key("would_drop"), "active heartbeat is kept");
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active, true, keep, None);
+        assert_eq!(
+            m.get("would_drop"),
+            Some(&serde_json::json!(false)),
+            "a kept observable heartbeat records the negative verdict"
+        );
+        assert!(!m.contains_key("would_drop_reason"));
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(1)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(2)));
 
-        // Non-heartbeat turn: no notch keys, no would_drop.
-        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, None);
+        // Non-heartbeat turn: no notch keys, no would_drop. The predicate never
+        // judges these, so there is no verdict to record.
+        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, keep, None);
         assert!(!m.contains_key("side_effecting_tools"));
         assert!(!m.contains_key("tools_observed"));
         assert!(!m.contains_key("would_drop"));
     }
 
-    /// ANAI-77 (c): an observer-blind driver (observer_live = false) must
-    /// never stamp would_drop on an inert heartbeat -- the enforce gate
-    /// depends on this so it can never over-delete a row whose work the
-    /// observer could not see. The content-free counts are still stamped.
+    /// ANAI-77 (c): an observer-blind driver (observer_live = false) stamps NO
+    /// would_drop key on an inert heartbeat -- not `true`, and specifically not
+    /// `false` either.
+    ///
+    /// Absence is the third state and it has to stay distinguishable: `false`
+    /// means "judged and kept on the merits", absence means "no judgement was
+    /// possible, kept because we could not see". Collapse them and you can no
+    /// longer tell suppression from a negative verdict, which is exactly the
+    /// safety property the enforce gate rests on. The content-free counts are
+    /// still stamped -- they are what makes the blindness visible in field.
     #[test]
     fn capture_metadata_observer_blind_suppresses_would_drop() {
         use openfang_types::turn::{TurnEffects, TurnTrigger};
         let base = HashMap::new();
         let inert = TurnEffects::new();
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, false, None);
+        // Keep is the only verdict a blind driver can produce (ANAI-77c), so
+        // that is what the gate would thread in.
+        let m = capture_metadata(
+            &base,
+            TurnTrigger::Heartbeat,
+            &inert,
+            false,
+            CaptureDecision::Keep,
+            None,
+        );
         assert!(
             !m.contains_key("would_drop"),
-            "blind-observer inert heartbeat must not be marked would_drop"
+            "blind-observer inert heartbeat must not be marked would_drop, \
+             and must not be marked would_drop = false either"
         );
         assert_eq!(m.get("observer_live"), Some(&serde_json::json!(false)));
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
@@ -4497,13 +4589,27 @@ mod tests {
         let inert = TurnEffects::new();
         let ep = uuid::Uuid::new_v4();
 
-        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, Some(ep));
+        let m = capture_metadata(
+            &base,
+            TurnTrigger::User,
+            &inert,
+            true,
+            CaptureDecision::Keep,
+            Some(ep),
+        );
         assert_eq!(
             m.get(openfang_memory::episode::EPISODE_ID_KEY),
             Some(&serde_json::json!(ep.to_string()))
         );
 
-        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, None);
+        let m = capture_metadata(
+            &base,
+            TurnTrigger::User,
+            &inert,
+            true,
+            CaptureDecision::Keep,
+            None,
+        );
         assert!(!m.contains_key(openfang_memory::episode::EPISODE_ID_KEY));
     }
 
@@ -4518,7 +4624,7 @@ mod tests {
         let inert = TurnEffects::new();
 
         for trigger in [TurnTrigger::User, TurnTrigger::Heartbeat] {
-            let m = capture_metadata(&base, trigger, &inert, true, None);
+            let m = capture_metadata(&base, trigger, &inert, true, CaptureDecision::Keep, None);
             assert_eq!(
                 m.get(openfang_memory::semantic::KIND_KEY),
                 Some(&serde_json::json!("turn")),
@@ -4528,7 +4634,14 @@ mod tests {
 
         // `kind` is a row type, not a trigger: a heartbeat is still a `turn`,
         // and the trigger stays in its own key.
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true, None);
+        let m = capture_metadata(
+            &base,
+            TurnTrigger::Heartbeat,
+            &inert,
+            true,
+            CaptureDecision::Keep,
+            None,
+        );
         assert_ne!(
             m.get(openfang_memory::semantic::KIND_KEY),
             Some(&serde_json::json!("heartbeat"))
@@ -4539,7 +4652,14 @@ mod tests {
             openfang_memory::semantic::KIND_KEY.to_string(),
             serde_json::json!("summary"),
         )]);
-        let m = capture_metadata(&declared, TurnTrigger::User, &inert, true, None);
+        let m = capture_metadata(
+            &declared,
+            TurnTrigger::User,
+            &inert,
+            true,
+            CaptureDecision::Keep,
+            None,
+        );
         assert_eq!(
             m.get(openfang_memory::semantic::KIND_KEY),
             Some(&serde_json::json!("summary"))
