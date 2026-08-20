@@ -234,6 +234,24 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// ANAI-197: per-agent **wake-turn** lock. Serializes the whole woken-turn
+    /// critical section — mint reply-right -> run turn -> cleanup — so the
+    /// mint cannot be clobbered by a second wake for the same target.
+    ///
+    /// `agent_msg_locks` alone was NOT sufficient: it is acquired inside
+    /// `send_message_with_handle_and_blocks`, i.e. strictly *downstream* of the
+    /// mint in `run_woken_agent_loop`. Two senders waking the same target both
+    /// minted before either reached the lock, so the second mint overwrote the
+    /// first and the target's single `agent_reply_async` paid the WRONG debt:
+    /// sender A's answer was delivered to sender B, labelled as a reply to B's
+    /// request, and A got nothing. This lock is acquired *before* the mint, so
+    /// the mint/consume pair is inside one critical section.
+    ///
+    /// Costs no concurrency: woken turns for the same agent already serialized
+    /// on `agent_msg_locks`. This only moves the wait earlier. Always acquired
+    /// OUTSIDE `agent_msg_locks` (never the reverse), so no lock-order
+    /// inversion is possible.
+    wake_turn_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// ANAI-122: kernel-held one-shot reply-right registry. Replaces the
     /// `WAKE_REPLY_RIGHT` task-local, which could not cross the process/IPC
     /// boundary to a subprocess-driven agent (Claude Code driver): the tool
@@ -243,10 +261,15 @@ pub struct OpenFangKernel {
     /// `agent_reply_async` already holds via `require_kernel` — so the native
     /// (in-process) and subprocess (IPC) drivers read it identically.
     ///
-    /// Keyed by `AgentId`, which is race-free ONLY because `agent_msg_locks`
-    /// serializes an agent to one woken turn in flight. TODO(ANAI-125): re-key
-    /// by turn_id/correlation-id before the team-collaboration epic lets an
-    /// agent hold >1 concurrent right and breaks the single-turn invariant.
+    /// Keyed by `AgentId`. Race-free because `wake_turn_locks` (ANAI-197) holds
+    /// the mint -> turn -> cleanup span in one per-agent critical section, so an
+    /// agent has at most one live right at any instant and a concurrent wake for
+    /// the same target blocks *before* minting rather than clobbering.
+    /// (Superseded the ANAI-125 TODO, which relied on `agent_msg_locks` — a lock
+    /// acquired downstream of the mint, and therefore too late to protect it.)
+    ///
+    /// The correlation the right carries is the inbound wake's task id; that is
+    /// the durable id ANAI-201's outstanding-correlation rows key on.
     ///
     /// Lifecycle: inserted at wake-dispatch for an origination turn; removed on
     /// first read (consume-on-read keeps the reply one-shot) OR at turn end
@@ -1471,6 +1494,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             model_override: std::sync::RwLock::new(boot_model_override),
             agent_msg_locks: dashmap::DashMap::new(),
+            wake_turn_locks: dashmap::DashMap::new(),
             reply_rights: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
             approval_prompt_coords: dashmap::DashMap::new(),
@@ -6017,6 +6041,31 @@ impl OpenFangKernel {
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
 
+        // ANAI-197: enter the per-agent wake-turn critical section BEFORE
+        // minting the reply-right. Everything from here to the cleanup below —
+        // mint, run, consume, cleanup — is serialized per target agent, which is
+        // what makes the agent-id keying of `reply_rights` sound.
+        //
+        // Why this is not redundant with `agent_msg_locks`: that lock is taken
+        // inside `send_message_with_handle_and_blocks`, i.e. DOWNSTREAM of the
+        // mint below. Two wakes for the same target therefore both minted before
+        // either serialized; the second clobbered the first, and the target's one
+        // `agent_reply_async` answered the WRONG initiator — sender A's answer
+        // delivered to sender B, labelled as a reply to B's request, with A left
+        // waiting forever. Cross-talk, not just silence. Acquiring here closes
+        // that window.
+        //
+        // Costs no parallelism: same-target woken turns already serialized one
+        // frame deeper, so this only moves the wait earlier. Distinct targets are
+        // unaffected. Always acquired OUTSIDE `agent_msg_locks`, never the
+        // reverse, so the lock order is total and no inversion is possible.
+        let wake_lock = self
+            .wake_turn_locks
+            .entry(target_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _wake_guard = wake_lock.lock().await;
+
         // origin threading (audit finding #3) is a documented follow-up: a wake
         // that raises an approval prompt has no inbound route yet, so pass None.
         let send_fut = self.send_message_with_handle_and_blocks(
@@ -6059,10 +6108,10 @@ impl OpenFangKernel {
         // `envelope.sender`) and is consumed by the first `agent_reply_async`
         // call; a second reply this turn finds nothing.
         //
-        // Keying by agent_id is race-free ONLY because `agent_msg_locks`
-        // serializes an agent to one woken turn in flight. TODO(ANAI-125):
-        // re-key by turn_id/correlation before fan-out lets an agent hold >1
-        // concurrent right.
+        // Keying by agent_id is race-free because `_wake_guard` above holds the
+        // mint/consume/cleanup span in one per-agent critical section (ANAI-197).
+        // The pre-ANAI-197 comment credited `agent_msg_locks` for this; that lock
+        // is acquired downstream of this mint and so never protected it.
         if envelope.is_reply {
             self.reply_rights.remove(&target_id);
         } else {
@@ -13254,6 +13303,121 @@ system_prompt = "You are a test agent."
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("gone_soon"));
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-197: the reply-right mint must be inside the wake-turn lock
+    // -----------------------------------------------------------------------
+
+    /// Two senders wake the SAME target concurrently. Each woken dispatch mints
+    /// a one-shot reply-right naming its own initiator, then (after an await
+    /// point, standing in for the agent turn) consumes it and answers.
+    ///
+    /// Before ANAI-197 the mint happened OUTSIDE any lock — `agent_msg_locks` is
+    /// acquired one frame deeper, inside `send_message_with_handle_and_blocks`,
+    /// so both dispatches minted before either serialized. The second mint
+    /// clobbered the first and the target's single `agent_reply_async` answered
+    /// the WRONG initiator: A's answer delivered to B, A left waiting forever.
+    /// That is cross-talk, not silence, and it is why fan-out onto a shared
+    /// target scrambled the interagent web.
+    ///
+    /// The fix is ordering, not re-keying: `wake_turn_locks` wraps
+    /// mint -> turn -> consume in one per-agent critical section, so a second
+    /// wake for the same target BLOCKS BEFORE MINTING. This test fails (one task
+    /// reads the other's initiator) if that guard is removed.
+    #[tokio::test]
+    async fn concurrent_wakes_on_one_target_do_not_clobber_each_others_reply_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-anai197");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+
+        // One shared target, two distinct initiators — the fan-out shape.
+        let target: AgentId = AgentId(uuid::Uuid::new_v4());
+
+        // Mirrors `run_woken_agent_loop`'s critical section exactly: take the
+        // wake-turn lock, mint, run the turn (the await), consume, clean up.
+        async fn one_woken_dispatch(
+            kernel: std::sync::Arc<OpenFangKernel>,
+            target: AgentId,
+            initiator: &str,
+            correlation: &str,
+            turn_millis: u64,
+        ) -> String {
+            let wake_lock = kernel
+                .wake_turn_locks
+                .entry(target)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _wake_guard = wake_lock.lock().await;
+
+            kernel.reply_rights.insert(
+                target,
+                openfang_runtime::tool_runner::ReplyRight::new(initiator, correlation, None),
+            );
+
+            // Stand-in for the agent turn. Any await here is enough: it is the
+            // yield point the clobbering wake used to slip through.
+            tokio::time::sleep(std::time::Duration::from_millis(turn_millis)).await;
+
+            // The turn calls `agent_reply_async`, which consumes the right and
+            // is told who to answer by the token — nothing else.
+            let answered = kernel
+                .reply_rights
+                .remove(&target)
+                .map(|(_, right)| right.reply_to().to_string())
+                .expect("a woken origination turn must find its reply-right");
+
+            // Turn-end cleanup (idempotent; the consume above already removed it).
+            kernel.reply_rights.remove(&target);
+            answered
+        }
+
+        let a = tokio::spawn(one_woken_dispatch(
+            kernel.clone(),
+            target,
+            "initiator-a",
+            "corr-a",
+            120,
+        ));
+        // Start B while A's turn is mid-flight — the exact interleaving that
+        // used to clobber.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let b = tokio::spawn(one_woken_dispatch(
+            kernel.clone(),
+            target,
+            "initiator-b",
+            "corr-b",
+            10,
+        ));
+
+        let answered_a = a.await.expect("dispatch A completes");
+        let answered_b = b.await.expect("dispatch B completes");
+
+        assert_eq!(
+            answered_a, "initiator-a",
+            "A's woken turn answered the wrong initiator — its reply-right was \
+             clobbered by a concurrent wake for the same target (ANAI-197)"
+        );
+        assert_eq!(
+            answered_b, "initiator-b",
+            "B's woken turn answered the wrong initiator — its reply-right was \
+             clobbered by a concurrent wake for the same target (ANAI-197)"
+        );
+
+        // And no token outlives the turns that minted them.
+        assert!(
+            kernel.reply_rights.is_empty(),
+            "no reply-right may survive turn end"
+        );
 
         kernel.shutdown();
     }
