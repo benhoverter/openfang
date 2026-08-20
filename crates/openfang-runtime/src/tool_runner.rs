@@ -1150,13 +1150,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                           Accepts UUID or agent name."
                 .to_string()
                 + " Optionally pass surface_to (\"<channel>:<recipient>\") to have the target's \
-                   eventual agent_reply_async answer auto-posted to that channel.",
+                   eventual agent_reply_async answer auto-posted to that channel."
+                + " You are GUARANTEED exactly one reply per call: if the target answers, you \
+                   get its answer; if it cannot or does not, the daemon closes the correlation \
+                   itself and tells you why. Pass timeout_secs to bound how long that takes.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" },
-                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." }
+                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." },
+                    "timeout_secs": { "type": "integer", "description": "Optional deadline in seconds. You are guaranteed a reply within roughly this long: if the target has not answered by then, its turn is ABORTED and the daemon sends you a timeout reply instead. Set it to how long you actually expect the work to take, with headroom — an over-tight value kills legitimate work, and partial side effects from the aborted turn may persist. Clamped into the operator's configured band; omit to accept the configured default." }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -3099,6 +3103,28 @@ async fn tool_agent_send_async(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
+    // ANAI-201: the sender's deadline for this correlation. This is what makes
+    // the reply guarantee *bounded* rather than merely eventual — the
+    // wake-consumer races the callee's whole turn against it and, on elapse,
+    // aborts the turn and mints a `Timeout` reply.
+    //
+    // Clamped HERE, once, and the result stamped into the durable envelope, so
+    // the queue row is the single source of truth for this correlation's
+    // deadline. Deriving it at enforcement time instead would let a config edit
+    // silently move the deadline of an already-dispatched send.
+    //
+    // A non-integer / negative value is treated as "omitted" rather than
+    // rejected: refusing the whole send over a malformed optional knob would
+    // trade a bounded reply for no reply at all, which is backwards.
+    let requested_timeout = input["timeout_secs"].as_u64();
+    let timeout_secs = openfang_types::async_reply::clamp_timeout_secs(requested_timeout);
+    // Recorded only when the clamp actually rewrote the request, so the common
+    // in-band case stays absent on the wire. Two consumers: the `Timeout` body
+    // (so an orchestrator is told its deadline was moved rather than inferring
+    // it was honored) and the requested-vs-enforced distribution these knobs
+    // are meant to be tuned from once real data exists.
+    let requested_timeout_secs = requested_timeout.filter(|r| *r != timeout_secs);
+
     // Canonicalize the target to a stable agent-id BEFORE the cycle check.
     // `sender` is always a UUID (the caller's agent id); a caller may address
     // `target` by NAME. would_cycle is a plain string compare, so without
@@ -3207,6 +3233,9 @@ async fn tool_agent_send_async(
         surface_to: surface_to.clone(),
         // Not a reply at all, so the kind is inert here (ANAI-199).
         reply_kind: openfang_types::wake::ReplyKind::Explicit,
+        // ANAI-201: the clamped deadline rides the durable payload; see above.
+        timeout_secs: Some(timeout_secs),
+        requested_timeout_secs,
     };
 
     if let Some(route) = surface_to.as_deref() {
@@ -3244,9 +3273,26 @@ async fn tool_agent_send_async(
         Err(_) => String::new(),
     };
 
+    // ANAI-201: state the enforced deadline, and say so explicitly when it is
+    // NOT the number the caller passed. An orchestrator that asked for 30s and
+    // silently got 60s would mis-plan every downstream step on a deadline it
+    // never agreed to; the clamp is policy, but hiding it is a bug.
+    let deadline_note = match requested_timeout_secs {
+        Some(asked) => format!(
+            " You will receive exactly one reply for this correlation. Deadline: {timeout_secs}s \
+             (you requested {asked}s; CLAMPED into the operator's configured band). If the \
+             target has not replied by then its turn is aborted and you get a timeout reply."
+        ),
+        None => format!(
+            " You will receive exactly one reply for this correlation. Deadline: {timeout_secs}s; \
+             if the target has not replied by then its turn is aborted and you get a timeout \
+             reply."
+        ),
+    };
+
     Ok(format!(
         "Async wake queued for '{target}' (task {task_id}). \
-         The target runs on its own; no reply is returned inline.{depth_note}"
+         The target runs on its own; no reply is returned inline.{deadline_note}{depth_note}"
     ))
 }
 
@@ -3367,6 +3413,13 @@ async fn tool_agent_reply_async(
         // the daemon on the callee's behalf, and only the daemon may set them —
         // this is the one construction site that is allowed to say `Explicit`.
         reply_kind: openfang_types::wake::ReplyKind::Explicit,
+        // ANAI-201: a reply-woken turn mints no reply-right, so there is no
+        // debt on leg 4 for a deadline to bound the payment of. Leave it unset
+        // and let dispatch apply the configured default: leg 4 is still a real
+        // turn that can hang, and bounding it keeps the queue row from sitting
+        // `in_progress` until the far coarser stale-wake reaper notices.
+        timeout_secs: None,
+        requested_timeout_secs: None,
     };
 
     debug!(

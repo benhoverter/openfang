@@ -1355,6 +1355,8 @@ mod tests {
             is_reply: false,
             surface_to: None,
             reply_kind: Default::default(),
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
         }
     }
 
@@ -1731,6 +1733,13 @@ mod tests {
             is_reply: false,
             surface_to: None,
             reply_kind: Default::default(),
+            // ANAI-201: the sender's deadline is durable state, so it must
+            // survive the substrate reload this test exists to prove. A
+            // deadline that did not survive a restart would silently revert to
+            // the configured default, changing the contract the orchestrator
+            // set — the exact failure clamp-at-send exists to prevent.
+            timeout_secs: Some(1234),
+            requested_timeout_secs: Some(9),
         };
 
         // --- Producer half: post the wake into a file-backed WAL substrate. ---

@@ -1557,6 +1557,10 @@ pub struct KernelConfig {
     /// Agent-wake emission limits (`agent_send_async` amplification bounds).
     #[serde(default)]
     pub agent_wake: AgentWakeConfig,
+    /// Async-reply deadline bounds (the sender-supplied `timeout` on
+    /// `agent_send_async`, ANAI-201).
+    #[serde(default)]
+    pub async_reply: AsyncReplyConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -1686,6 +1690,47 @@ impl Default for AgentWakeConfig {
             max_inflight: crate::agent_wake::MAX_INFLIGHT_WAKES,
             per_caller_max: crate::agent_wake::WAKE_PER_CALLER_MAX,
             stale_wake_secs: crate::agent_wake::WAKE_STALE_SECS,
+        }
+    }
+}
+
+/// Async-reply deadline bounds exposed in the `[async_reply]` config section
+/// (ANAI-201). Governs the sender-supplied `timeout` on `agent_send_async`,
+/// which is what turns the reply *debt* (ANAI-196) from an eventual guarantee
+/// into a bounded one.
+///
+/// Runtime reads go through
+/// `openfang_types::async_reply::{default_timeout_secs, min_timeout_secs,
+/// max_timeout_secs, clamp_timeout_secs}`, which layer env-var overrides on top
+/// of whatever the kernel installs from this section at boot.
+///
+/// These are knobs rather than constants on purpose: there is no empirical
+/// distribution of woken-turn durations yet, so every value below is an
+/// admitted guess. Each correlation records both the requested and the clamped
+/// timeout, so the real distribution accumulates for free and these can be set
+/// from data later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AsyncReplyConfig {
+    /// Deadline applied when the sender omits `timeout_secs`. Default: 900
+    /// (15m). Not clamped into the min/max band — an operator who sets it
+    /// outside their own band has expressed intent for the omitted case.
+    pub default_timeout_secs: u64,
+    /// Lower bound on a sender-supplied deadline. Default: 60. Stops an
+    /// optimistic caller from shredding legitimate long turns fleet-wide.
+    pub min_timeout_secs: u64,
+    /// Upper bound on a sender-supplied deadline. Default: 3600 (1h). Caps how
+    /// long one correlation may hold a per-caller in-flight slot, and stops a
+    /// caller opting out of the guarantee with an absurd value.
+    pub max_timeout_secs: u64,
+}
+
+impl Default for AsyncReplyConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: crate::async_reply::DEFAULT_TIMEOUT_SECS,
+            min_timeout_secs: crate::async_reply::MIN_TIMEOUT_SECS,
+            max_timeout_secs: crate::async_reply::MAX_TIMEOUT_SECS,
         }
     }
 }
@@ -1934,6 +1979,7 @@ impl Default for KernelConfig {
             heartbeat: HeartbeatSettings::default(),
             watchdog: WatchdogConfig::default(),
             agent_wake: AgentWakeConfig::default(),
+            async_reply: AsyncReplyConfig::default(),
             skills: HashMap::new(),
             turn_context: TurnContextConfig::default(),
         }
@@ -2074,6 +2120,15 @@ impl std::fmt::Debug for KernelConfig {
                     self.agent_wake.max_inflight,
                     self.agent_wake.per_caller_max,
                     self.agent_wake.stale_wake_secs
+                ),
+            )
+            .field(
+                "async_reply",
+                &format!(
+                    "default={}s min={}s max={}s",
+                    self.async_reply.default_timeout_secs,
+                    self.async_reply.min_timeout_secs,
+                    self.async_reply.max_timeout_secs
                 ),
             )
             .field("skills", &format!("{} skill config(s)", self.skills.len()))
@@ -5157,6 +5212,40 @@ mod tests {
         assert_eq!(c.agent_wake.max_inflight, 16);
         assert_eq!(c.agent_wake.per_caller_max, 6);
         assert_eq!(c.agent_wake.stale_wake_secs, 900);
+    }
+
+    #[test]
+    fn test_async_reply_config_defaults() {
+        let c = KernelConfig::default();
+        assert_eq!(c.async_reply.default_timeout_secs, 900);
+        assert_eq!(c.async_reply.min_timeout_secs, 60);
+        assert_eq!(c.async_reply.max_timeout_secs, 3600);
+    }
+
+    #[test]
+    fn test_async_reply_config_from_toml() {
+        let toml_str = r#"
+            [async_reply]
+            default_timeout_secs = 300
+            min_timeout_secs = 30
+            max_timeout_secs = 1800
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.async_reply.default_timeout_secs, 300);
+        assert_eq!(c.async_reply.min_timeout_secs, 30);
+        assert_eq!(c.async_reply.max_timeout_secs, 1800);
+    }
+
+    /// A config file written before ANAI-201 has no `[async_reply]` section at
+    /// all. It must still load — and land on the compiled defaults — or every
+    /// existing deployment fails to boot on upgrade.
+    #[test]
+    fn test_async_reply_absent_section_uses_defaults() {
+        let c: KernelConfig = toml::from_str("[agent_wake]\nemit_max = 200\n").unwrap();
+        assert_eq!(c.agent_wake.emit_max, 200);
+        assert_eq!(c.async_reply.default_timeout_secs, 900);
+        assert_eq!(c.async_reply.min_timeout_secs, 60);
+        assert_eq!(c.async_reply.max_timeout_secs, 3600);
     }
 
     #[test]

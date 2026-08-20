@@ -6,6 +6,7 @@
 pub mod agent;
 pub mod agent_wake;
 pub mod approval;
+pub mod async_reply;
 pub mod bridge_auth;
 pub mod capability;
 pub mod cmd_norm;
