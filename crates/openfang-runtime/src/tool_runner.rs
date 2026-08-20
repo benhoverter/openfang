@@ -3273,8 +3273,14 @@ async fn tool_agent_send_async(
 ///   initiator's root, which the initiator's own fan-out may have exhausted;
 ///   gagging a legitimate terminal answer for the initiator's spending buys no
 ///   safety, since the reply is one-shot and cannot itself fan out.
-/// * **Aggregate ceiling:** still enforced — a reply is a real emission, and
-///   the fleet-wide backstop only ever refuses, never permits.
+/// * **Aggregate ceiling:** deliberately NOT enforced either, as of ANAI-200.
+///   It guards amplification, and a reply cannot amplify — it is 1:1 with a
+///   wake the ceiling already charged, and terminal. Worse, the gate used to
+///   sit AFTER the token was consumed, so a trip destroyed the debt without
+///   emitting anything and the kernel's turn-end auto-close (ANAI-198) saw
+///   nothing owed: a ceiling trip turned a real answer into permanent silence,
+///   exactly under the load that makes the guarantee matter. See the inline
+///   note at the former gate site and `Kernel::emit_synthetic_reply`.
 async fn tool_agent_reply_async(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -3322,19 +3328,24 @@ async fn tool_agent_reply_async(
     // auto-post. `None` when the origin dispatched without `surface_to`.
     let surface_to = right.surface_to().map(str::to_string);
 
-    // Aggregate cross-tree ceiling still applies (defense-in-depth): a reply is
-    // a real wake emission. The per-tree budget is intentionally skipped (see
-    // the doc comment) — it would gag a legitimate answer for the initiator's
-    // own fan-out spending, and the reply cannot itself fan out.
-    if !wake_emit_admit() {
-        return Err(format!(
-            "Refusing async reply: aggregate wake-emission ceiling exceeded \
-             ({} wakes / {}s window across all trees). It clears once emissions \
-             go quiet.",
-            openfang_types::agent_wake::emit_max(),
-            openfang_types::agent_wake::window_secs()
-        ));
-    }
+    // ANAI-200: NO rate gate on this path — neither the per-tree budget nor the
+    // aggregate ceiling. Both guard *amplification*, and a reply cannot amplify:
+    // the one-shot right was minted by an already-admitted wake and consumed
+    // above, so this emission is 1:1 bounded by a wake the gates already
+    // charged, and `is_reply = true` makes it terminal (the consumer mints no
+    // further right, so it cannot bounce).
+    //
+    // The ceiling used to be checked HERE, after `take_reply_right` — which
+    // meant a refusal ate the token and emitted nothing, so the turn-end
+    // sweep in `run_woken_agent_loop` saw the debt already settled and never
+    // auto-closed (ANAI-198). A ceiling trip converted a real answer into
+    // permanent silence for that correlation: precisely the failure this stack
+    // exists to kill, firing exactly when the fleet is busy enough to need the
+    // guarantee. Reordering the check ahead of the take would only downgrade
+    // answers to `AutoClose` fallbacks — and the daemon's synthesized replies
+    // are ungated anyway, so the ceiling would suppress the good message while
+    // admitting the worse one. Dropping it is the correct fix, and it matches
+    // the reasoning already documented on `Kernel::emit_synthetic_reply`.
 
     // Terminal edge: root a FRESH single-element lineage at the replier. This is
     // the *completion* of a correlation, not an extension of the inbound chain;
@@ -5797,25 +5808,12 @@ mod tests {
             ));
         let input = serde_json::json!({ "message": "here is my answer" });
 
-        // ANAI-122: the first call reaches the real emit path (`wake_emit_admit`),
-        // which stamps the process-global ceiling window. Serialize behind the
-        // shared guard and drain first so this test neither pollutes nor is
-        // polluted by the ceiling test — the two are the only emit-touching tests.
-        let _guard = WAKE_EMIT_TEST_GUARD
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        reset_wake_emit_window();
-
-        // First call: the seeded right MUST clear the token gate. Whatever the
-        // downstream outcome (the aggregate ceiling is process-global and may be
-        // exhausted by a parallel test), it must NOT be the reply-right refusal.
+        // ANAI-200: the reply path no longer touches the process-global emit
+        // window at all, so this test needs neither the shared guard nor a
+        // window drain — it cannot pollute the ceiling test, nor be polluted by
+        // it. (Pre-ANAI-200 it stamped the window and had to serialize.)
         let first = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent")).await;
-        if let Err(e) = &first {
-            assert!(
-                !e.contains("reply-right"),
-                "a seeded right must pass the token gate; got refusal: {e}"
-            );
-        }
+        first.expect("a seeded right must produce a queued reply");
 
         // Second call, same turn: the right was consumed on first read, so the
         // registry is empty and the tool refuses. This is the one-shot property,
@@ -5825,6 +5823,46 @@ mod tests {
         assert!(
             err.contains("reply-right"),
             "second call must refuse at the reply-right gate; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_reply_survives_an_exhausted_aggregate_ceiling() {
+        // ANAI-200 regression. The aggregate ceiling used to be checked AFTER
+        // `take_reply_right` consumed the one-shot token: a ceiling trip ate the
+        // debt and emitted nothing, so the kernel's turn-end sweep saw the
+        // correlation as already settled and never auto-closed it (ANAI-198).
+        // Net effect: under fleet-wide load — the one condition where the reply
+        // guarantee earns its keep — a real answer became permanent silence.
+        //
+        // A reply cannot amplify (1:1 with an already-admitted wake, terminal by
+        // `is_reply`), so the correct fix was to drop the gate, not reorder it.
+        // Saturate the window and assert the reply still goes out.
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        for _ in 0..openfang_types::agent_wake::emit_max() {
+            assert!(wake_emit_admit(), "priming the window must admit");
+        }
+        assert!(
+            !wake_emit_admit(),
+            "precondition: the aggregate ceiling must now be refusing"
+        );
+
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> =
+            Arc::new(FakeKernelHandle::new().with_reply_right(
+                "callee-agent",
+                ReplyRight::new("origin-agent", "corr-ceiling", None),
+            ));
+        let input = serde_json::json!({ "message": "answer under load" });
+
+        let out = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent"))
+            .await
+            .expect("a reply must not be refused by the aggregate ceiling");
+        assert!(
+            out.contains("corr-ceiling"),
+            "the queued reply must name its correlation; got: {out}"
         );
     }
 

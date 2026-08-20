@@ -41,6 +41,12 @@
 //!   fleet-wide aggregate backstop. Both are tunable via the `[agent_wake]`
 //!   config section (see [`crate::agent_wake`]).
 //!
+//! Both gates apply to **originations only**. Terminal replies — whether an
+//! agent's `agent_reply_async` or a daemon-synthesized close (ANAI-198/199) —
+//! are ungated by design (ANAI-200): each is 1:1 with a wake already charged
+//! and grants no further reply-right, so it cannot amplify, while gating it
+//! would break the reply guarantee precisely when the fleet is busy.
+//!
 //! Origin turns (channel / cron / API — no inbound lineage) root the chain at
 //! the sender, so only self-wake is a cycle for them; that is correct, not a
 //! gap — such a turn has no ancestry to inherit.
