@@ -6194,21 +6194,13 @@ impl OpenFangKernel {
 
         match result {
             Ok(loop_result) => {
-                // ANAI-124: terminal-reply surfacing. Origin's leg-4 turn was
-                // woken by a reply (`is_reply`); if the round-trip carried a
-                // surfacing route (`surface_to`), the DAEMON — not origin's own
-                // turn — guarantees exactly one channel post of origin's shaped
-                // answer. This closes the 2026-07-04 failure: a woken turn runs
-                // under `TurnPolicy::woken()` (non-delivery), so its text never
-                // auto-routes and the delegated answer otherwise dies in the
-                // loop. We shape-in-origin, emit-in-daemon: `loop_result` IS
-                // origin's reply text, and the daemon guarantees the emit.
-                if envelope.is_reply {
-                    if let Some(route) = envelope.surface_to.as_deref() {
-                        self.surface_reply_to_channel(&task_id, &envelope, route, &loop_result)
-                            .await;
-                    }
-                }
+                self.close_completed_woken_turn(
+                    &envelope,
+                    &task_id,
+                    debt_outstanding,
+                    &loop_result,
+                )
+                .await;
                 self.audit_wake_completion(
                     &envelope.sender,
                     &envelope.target,
@@ -6252,6 +6244,71 @@ impl OpenFangKernel {
                     .task_complete(&task_id, &format!("wake dispatch failed: {e}"))
                     .await;
             }
+        }
+    }
+
+    /// Close out a woken turn that ran to completion: surface a terminal reply
+    /// to its channel (ANAI-124), or auto-close the sender's outstanding reply
+    /// debt (ANAI-198).
+    ///
+    /// Split out of [`Self::run_woken_agent_loop`]'s `Ok` arm so the branch is
+    /// reachable in tests: exercising it in place would need a live LLM driver,
+    /// and a leg of the reply *guarantee* that is only ever checked by hand is
+    /// not a guarantee. Everything here takes the turn's result as data, so a
+    /// test supplies an [`AgentLoopResult`] directly.
+    ///
+    /// The two arms are mutually exclusive by construction, not by luck: a
+    /// reply-woken turn mints no reply-right (see the mint above), so
+    /// `debt_outstanding` is always false when `is_reply` is set. The `else` is
+    /// belt-and-braces on top of that.
+    async fn close_completed_woken_turn(
+        &self,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        task_id: &str,
+        debt_outstanding: bool,
+        loop_result: &AgentLoopResult,
+    ) {
+        // ANAI-124: terminal-reply surfacing. Origin's leg-4 turn was woken by
+        // a reply (`is_reply`); if the round-trip carried a surfacing route
+        // (`surface_to`), the DAEMON — not origin's own turn — guarantees
+        // exactly one channel post of origin's shaped answer. This closes the
+        // 2026-07-04 failure: a woken turn runs under `TurnPolicy::woken()`
+        // (non-delivery), so its text never auto-routes and the delegated
+        // answer otherwise dies in the loop. We shape-in-origin,
+        // emit-in-daemon: `loop_result` IS origin's reply text, and the daemon
+        // guarantees the emit.
+        if envelope.is_reply {
+            if let Some(route) = envelope.surface_to.as_deref() {
+                self.surface_reply_to_channel(task_id, envelope, route, loop_result)
+                    .await;
+            }
+            return;
+        }
+
+        // ANAI-198 (L1): turn-end auto-close. The turn ran to completion and
+        // the callee never called `agent_reply_async`, so the debt is still
+        // open. Before this, the turn-end `remove()` silently discarded the
+        // token and the sender waited forever on an agent that had already
+        // finished and gone idle — the worst shape of the failure, because
+        // nothing anywhere reports it: no error, no warn, no audit line, just a
+        // successful dispatch and a sender that never hears back.
+        //
+        // The turn's final text becomes the answer BY DEFAULT, marked
+        // `AutoClose` and never `Explicit`: the callee did not address it to the
+        // sender, so it may be a summary written for nobody, or empty.
+        // `is_synthetic()` is the bit an initiator branches on; the body says so
+        // in words too, for the model that reads prose rather than flags.
+        //
+        // `debt_outstanding` false means the callee already replied explicitly —
+        // synthesizing here would double-answer one correlation.
+        if debt_outstanding {
+            self.emit_synthetic_reply(
+                envelope,
+                task_id,
+                openfang_types::wake::ReplyKind::AutoClose,
+                auto_close_body(&envelope.target, task_id, loop_result),
+            )
+            .await;
         }
     }
 
@@ -8694,6 +8751,75 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
         disk.file_policy = entry.file_policy.clone();
     }
     disk
+}
+
+/// ANAI-198: upper bound on the callee's final text carried into an auto-close
+/// reply.
+///
+/// The initiator is woken with this body as its prompt, so an unbounded paste
+/// of a long turn's final text would blow a hole in the orchestrator's context
+/// window on a path it never asked for. Truncation is announced in the body —
+/// a silently clipped answer would be worse than a loud one.
+const AUTO_CLOSE_MAX_BODY_CHARS: usize = 8_000;
+
+/// ANAI-198: compose the body of a turn-end auto-close reply.
+///
+/// Pure, and free rather than associated, so the wording — which is the entire
+/// deliverable of this leg — is unit-testable without booting a kernel.
+///
+/// The wording carries real weight: the reader is a model, and the difference
+/// between "here is the answer" and "the target finished without answering you"
+/// determines whether it proceeds on a non-answer. So the body states, in
+/// prose and not only in [`ReplyKind`](openfang_types::wake::ReplyKind):
+/// the turn COMPLETED (this is neither an error nor a timeout), no reply was
+/// addressed to the sender, and the text below — if any — is the callee's final
+/// turn text, evidence rather than a considered reply.
+fn auto_close_body(target: &str, correlation: &str, loop_result: &AgentLoopResult) -> String {
+    let header = format!(
+        "[kernel] '{target}' COMPLETED its turn for your async request but never called \
+         `agent_reply_async`, so nothing was addressed to you (correlation {correlation}).\n\n\
+         The kernel is closing this correlation on the target's behalf. The turn ran to \
+         completion — this is NOT a delivery failure, NOT an error, and NOT a timeout. Any text \
+         below was written by the target for its own turn, not as an answer to your request: \
+         treat it as evidence, not as a considered reply.\n\n"
+    );
+
+    // A declined turn and an empty one are reported identically on purpose: in
+    // both cases the sender has no text, and the actionable fact is the same —
+    // look at side effects, not at this message.
+    let text = if loop_result.silent {
+        ""
+    } else {
+        loop_result.response.trim()
+    };
+    if text.is_empty() {
+        return format!(
+            "{header}--- no final text ---\n\
+             The target produced no final text{}. Whatever it accomplished is in its side \
+             effects, which are NOT enumerated here.",
+            if loop_result.silent {
+                " (it explicitly declined to respond)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    if text.chars().count() > AUTO_CLOSE_MAX_BODY_CHARS {
+        let cut = text
+            .char_indices()
+            .nth(AUTO_CLOSE_MAX_BODY_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        return format!(
+            "{header}--- final turn text from '{target}' (TRUNCATED to the first \
+             {AUTO_CLOSE_MAX_BODY_CHARS} characters) ---\n{}\n\n[kernel] …truncated. The full \
+             text is in the target's transcript.",
+            &text[..cut]
+        );
+    }
+
+    format!("{header}--- final turn text from '{target}' ---\n{text}")
 }
 
 fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
@@ -13890,5 +14016,252 @@ system_prompt = "You are a test agent."
         );
 
         kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-198: a completed turn that never replied still closes the
+    // correlation
+    // -----------------------------------------------------------------------
+
+    /// A finished turn's result, as `run_woken_agent_loop` would receive it.
+    fn test_turn_result(response: &str, silent: bool) -> AgentLoopResult {
+        AgentLoopResult {
+            response: response.to_string(),
+            total_usage: Default::default(),
+            iterations: 1,
+            cost_usd: None,
+            silent,
+            directives: Default::default(),
+        }
+    }
+
+    fn anai198_envelope(sender: &str, target: &str) -> openfang_types::wake::WakeEnvelope {
+        openfang_types::wake::WakeEnvelope {
+            target: target.into(),
+            sender: sender.into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at(sender),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: Default::default(),
+        }
+    }
+
+    /// THE failure mode this stack exists for: the target woke, ran a full
+    /// turn, and simply never called `agent_reply_async`. Nothing errored, so
+    /// no error leg fires; the turn-end cleanup used to drop the unused token on
+    /// the floor and the sender waited forever on an agent that had already
+    /// finished and gone idle.
+    ///
+    /// The kernel must now close the correlation with the turn's own final text,
+    /// marked `AutoClose` so the initiator cannot mistake an unaddressed summary
+    /// for a considered answer.
+    #[tokio::test]
+    async fn completed_turn_that_never_replied_is_auto_closed_with_its_final_text() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ac");
+
+        let envelope = anai198_envelope("initiator-ac", "deep-target");
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-autoclose",
+                true, // the token survived the turn: the callee never replied
+                &test_turn_result("I refactored the parser and ran the suite.", false),
+            )
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "a turn that completed without replying must still close the sender's \
+                 correlation — otherwise the sender waits forever on an idle agent (ANAI-198)",
+            );
+
+        assert_eq!(reply.target, "initiator-ac", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "deep-target",
+            "attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "an auto-close is terminal");
+        assert_eq!(
+            reply.reply_kind,
+            openfang_types::wake::ReplyKind::AutoClose,
+            "an unaddressed final text is NOT an explicit answer and must not claim to be"
+        );
+        assert!(reply.reply_kind.is_synthetic());
+        // The turn's own words are the payload — that is the whole point of
+        // auto-close over a bare "no reply" notice.
+        assert!(
+            reply.message.contains("I refactored the parser"),
+            "the turn's final text must be carried to the sender: {}",
+            reply.message
+        );
+        // ...but framed, so a model does not read it as an answer to its request.
+        assert!(
+            reply.message.contains("never called"),
+            "the body must say the target never replied: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("NOT a delivery failure"),
+            "the body must distinguish itself from the error/timeout kinds: {}",
+            reply.message
+        );
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510"),
+            "an auto-close inherits the inbound surfacing route"
+        );
+        assert_eq!(reply.lineage.depth(), 1);
+
+        kernel.shutdown();
+    }
+
+    /// The other half of the contract: a callee that DID call
+    /// `agent_reply_async` has already answered, and its reply-right was
+    /// consumed on read. Auto-closing anyway would deliver two terminal replies
+    /// for one correlation — the initiator would wake twice and could act twice
+    /// on the same request.
+    #[tokio::test]
+    async fn an_explicitly_answered_turn_is_not_auto_closed_twice() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ad");
+
+        let envelope = anai198_envelope("initiator-ad", "deep-target");
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-already-answered",
+                false, // the token was consumed: `agent_reply_async` already ran
+                &test_turn_result("done, see my reply", false),
+            )
+            .await;
+
+        // Count rows rather than claim: a claim resolves the target against the
+        // registry and would hide a misaddressed row (the ANAI-199 trap).
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "a correlation the callee already answered must not be answered again by the \
+             kernel — one request, one terminal reply; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A reply-woken turn (leg 4) owes nobody anything: it is the end of the
+    /// chain. Auto-closing here would bounce a reply back at the callee forever.
+    ///
+    /// Note this asserts the BEHAVIOUR, which is guarded twice: by the
+    /// `is_reply` early return in `close_completed_woken_turn` and again inside
+    /// `emit_synthetic_reply`. Removing either one alone leaves this green —
+    /// checked, not assumed. That redundancy is deliberate: termination is the
+    /// one property whose failure mode is an unbounded queue.
+    #[tokio::test]
+    async fn a_reply_woken_turn_is_never_auto_closed() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ae");
+
+        let mut envelope = anai198_envelope("initiator-ae", "deep-target");
+        envelope.is_reply = true;
+        envelope.surface_to = None; // keep the ANAI-124 channel emit out of this
+
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-terminal-leg",
+                // Deliberately the "debt outstanding" value: the `is_reply`
+                // guard must win on its own, not because this happens to be
+                // false in production.
+                true,
+                &test_turn_result("thanks, noted", false),
+            )
+            .await;
+
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "a terminal reply leg must not be auto-closed — that is a reply-to-a-reply and \
+             recurses without bound; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Wording is the deliverable: the reader is a model deciding what to do
+    /// next. "No text" must not look like "empty answer", and a declined turn
+    /// must say so.
+    #[test]
+    fn auto_close_body_reports_a_textless_turn_as_such() {
+        let silent = auto_close_body("worker", "corr-1", &test_turn_result("", true));
+        assert!(silent.contains("no final text"), "{silent}");
+        assert!(
+            silent.contains("explicitly declined"),
+            "a NO_REPLY turn must be reported as a choice, not as an absence: {silent}"
+        );
+        assert!(
+            silent.contains("side effects"),
+            "the sender must be pointed at where the work actually is: {silent}"
+        );
+
+        // A turn whose text is only whitespace is textless, not an answer.
+        let empty = auto_close_body("worker", "corr-2", &test_turn_result("   \n  ", false));
+        assert!(empty.contains("no final text"), "{empty}");
+        assert!(
+            !empty.contains("explicitly declined"),
+            "an empty turn did not decline — do not put words in its mouth: {empty}"
+        );
+
+        // A silent turn that nonetheless carries text: `silent` wins, because
+        // the agent asked for its text not to be delivered.
+        let silent_with_text = auto_close_body(
+            "worker",
+            "corr-3",
+            &test_turn_result("internal notes", true),
+        );
+        assert!(
+            !silent_with_text.contains("internal notes"),
+            "a NO_REPLY turn's text must not be surfaced against its wishes: {silent_with_text}"
+        );
+    }
+
+    /// The body becomes the initiator's prompt, so an unbounded paste of a long
+    /// turn would eat the orchestrator's context on a path it never asked for.
+    /// Truncation is fine; SILENT truncation is not.
+    #[test]
+    fn auto_close_body_truncates_a_long_turn_loudly() {
+        let long = "x".repeat(AUTO_CLOSE_MAX_BODY_CHARS * 2);
+        let body = auto_close_body("worker", "corr-4", &test_turn_result(&long, false));
+
+        assert!(
+            body.contains("TRUNCATED"),
+            "a clipped body must announce it, or the sender reasons over a half-sentence"
+        );
+        assert!(
+            body.contains("transcript"),
+            "say where the full text lives: {}",
+            &body[..200.min(body.len())]
+        );
+        assert!(
+            body.chars().count() < long.chars().count(),
+            "the cap must actually bound the body"
+        );
+
+        // And a body just under the cap is passed through untouched.
+        let short = "y".repeat(AUTO_CLOSE_MAX_BODY_CHARS - 1);
+        let body = auto_close_body("worker", "corr-5", &test_turn_result(&short, false));
+        assert!(!body.contains("TRUNCATED"));
+        assert!(body.contains(&short));
     }
 }
