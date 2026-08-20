@@ -106,6 +106,21 @@ impl SemanticStore {
         let now = Utc::now().to_rfc3339();
         let source_str = serde_json::to_string(&source)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
+        // The column is the store of record for `episode_id`; the metadata JSON
+        // is a projection hydrated back on read (see `recall_with_embedding`).
+        // Lift the key out before serializing so the fact is written once and
+        // cannot drift, and so an episode filter can hit `idx_memories_episode`
+        // instead of scanning `json_extract` over the whole corpus.
+        //
+        // Only a well-formed (string, non-empty) value is lifted. A malformed
+        // one stays in the JSON untouched rather than being silently dropped:
+        // it is not an episode id, so the column must not claim it, but
+        // destroying a caller's data on the way past would be worse.
+        let mut metadata = metadata;
+        let episode_id = episode_id_from_metadata(&metadata);
+        if episode_id.is_some() {
+            metadata.remove(crate::episode::EPISODE_ID_KEY);
+        }
         let meta_str = serde_json::to_string(&metadata)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
@@ -122,7 +137,7 @@ impl SemanticStore {
                 meta_str,
                 now,
                 embedding_bytes,
-                episode_id_from_metadata(&metadata),
+                episode_id,
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -216,7 +231,7 @@ impl SemanticStore {
         };
 
         let mut sql = String::from(
-            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
+            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding, episode_id
              FROM memories WHERE deleted = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -291,9 +306,22 @@ impl SemanticStore {
                 // json_extract returns SQL NULL for an absent key, so a row
                 // missing the key never matches — which is what "filter by
                 // kind" has to mean for the 46k pre-`kind` rows.
-                sql.push_str(&format!(
-                    " AND json_extract(metadata, '$.{key}') = ?{param_idx}"
-                ));
+                if key == crate::episode::EPISODE_ID_KEY {
+                    // `episode_id` is promoted to a real column, so filter on
+                    // the column and use `idx_memories_episode` rather than
+                    // running `json_extract` over every undeleted row. This is
+                    // the reason the column exists (ADR 0001 §2.2); until now
+                    // it was written and never read.
+                    //
+                    // Pre-v12 rows have neither the column nor the key, so
+                    // they are excluded either way — the semantics are
+                    // unchanged, only the plan is.
+                    sql.push_str(&format!(" AND episode_id = ?{param_idx}"));
+                } else {
+                    sql.push_str(&format!(
+                        " AND json_extract(metadata, '$.{key}') = ?{param_idx}"
+                    ));
+                }
                 // Compare as text for strings; JSON-encode anything else so a
                 // number or bool round-trips instead of arriving quoted.
                 let bound = match &f.metadata[key] {
@@ -328,6 +356,7 @@ impl SemanticStore {
                 let accessed_str: String = row.get(8)?;
                 let access_count: i64 = row.get(9)?;
                 let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
+                let episode_id: Option<String> = row.get(11)?;
                 Ok((
                     id_str,
                     agent_str,
@@ -340,6 +369,7 @@ impl SemanticStore {
                     accessed_str,
                     access_count,
                     embedding_bytes,
+                    episode_id,
                 ))
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -358,6 +388,7 @@ impl SemanticStore {
                 accessed_str,
                 access_count,
                 embedding_bytes,
+                episode_id,
             ) = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
             let id = uuid::Uuid::parse_str(&id_str)
@@ -368,8 +399,20 @@ impl SemanticStore {
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
             let source: MemorySource =
                 serde_json::from_str(&source_str).unwrap_or(MemorySource::System);
-            let metadata: HashMap<String, serde_json::Value> =
+            let mut metadata: HashMap<String, serde_json::Value> =
                 serde_json::from_str(&meta_str).unwrap_or_default();
+            // Hydrate the column back into the metadata map so every consumer
+            // (kernel's recall payload, consolidation, tests) keeps reading
+            // `episode_id` where it always has. `or_insert` rather than an
+            // overwrite: rows written before the inversion still carry the key
+            // in their JSON, and the JSON is the value the column was derived
+            // from, so they agree by construction — this just avoids a
+            // pointless clone-and-replace on that population.
+            if let Some(ep) = episode_id {
+                metadata
+                    .entry(crate::episode::EPISODE_ID_KEY.to_string())
+                    .or_insert(serde_json::Value::String(ep));
+            }
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -710,6 +753,142 @@ mod tests {
             ..Default::default()
         };
         assert!(store.recall("", 10, Some(filter)).unwrap().is_empty());
+    }
+
+    fn episode_meta(episode: &str) -> HashMap<String, serde_json::Value> {
+        HashMap::from([(
+            crate::episode::EPISODE_ID_KEY.to_string(),
+            serde_json::json!(episode),
+        )])
+    }
+
+    /// The column is the store of record: `episode_id` is written there and
+    /// nowhere else, so the two can never disagree. Asserted at the storage
+    /// layer rather than through `recall`, because `recall` hydrates the key
+    /// back and would hide a double-write.
+    #[test]
+    fn episode_id_is_written_to_the_column_and_not_mirrored_in_metadata() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "a captured turn",
+                MemorySource::Conversation,
+                "episodic",
+                episode_meta("ep-1"),
+            )
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let (column, in_json): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT episode_id, json_extract(metadata, '$.episode_id') FROM memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column.as_deref(), Some("ep-1"));
+        assert_eq!(
+            in_json, None,
+            "episode_id must not be mirrored into the metadata JSON"
+        );
+    }
+
+    /// Consumers read `episode_id` out of `MemoryFragment::metadata` (the
+    /// kernel's recall payload does exactly this). Moving the fact to a column
+    /// is only safe because the read path puts it back.
+    #[test]
+    fn recall_hydrates_episode_id_back_into_metadata() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "a captured turn",
+                MemorySource::Conversation,
+                "episodic",
+                episode_meta("ep-1"),
+            )
+            .unwrap();
+
+        let results = store.recall("captured", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].metadata.get(crate::episode::EPISODE_ID_KEY),
+            Some(&serde_json::json!("ep-1"))
+        );
+    }
+
+    /// Filtering by episode now compiles to `episode_id = ?` against the
+    /// index. The observable contract is unchanged, which is the point: this
+    /// test fails if the special case selects the wrong rows.
+    #[test]
+    fn episode_filter_selects_only_that_episode() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        for (content, episode) in [("turn one", "ep-1"), ("turn two", "ep-2")] {
+            store
+                .remember(
+                    agent_id,
+                    content,
+                    MemorySource::Conversation,
+                    "episodic",
+                    episode_meta(episode),
+                )
+                .unwrap();
+        }
+        // A pre-v12 row: no column, no key. Must not match any episode.
+        store
+            .remember(
+                agent_id,
+                "turn zero",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let filter = MemoryFilter {
+            agent_id: Some(agent_id),
+            metadata: HashMap::from([(
+                crate::episode::EPISODE_ID_KEY.to_string(),
+                serde_json::json!("ep-1"),
+            )]),
+            ..Default::default()
+        };
+        let results = store.recall("", 10, Some(filter)).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].content, "turn one");
+    }
+
+    /// A non-string episode id is not an episode id. It must not be promoted
+    /// to the column (that would fabricate a grouping key) and it must not be
+    /// silently discarded either — it stays in the JSON as the caller wrote it.
+    #[test]
+    fn a_malformed_episode_id_is_left_in_metadata_and_leaves_the_column_null() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "a malformed turn",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::from([(
+                    crate::episode::EPISODE_ID_KEY.to_string(),
+                    serde_json::json!(42),
+                )]),
+            )
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let (column, in_json): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT episode_id, json_extract(metadata, '$.episode_id') FROM memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column, None);
+        assert_eq!(in_json, Some(42));
     }
 
     /// The metadata key is interpolated into a JSON path literal, which cannot
