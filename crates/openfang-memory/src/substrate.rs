@@ -4,6 +4,7 @@
 //! session store, and consolidation engine behind a single async API.
 
 use crate::consolidation::ConsolidationEngine;
+use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore};
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
@@ -36,6 +37,7 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+    episodes: EpisodeStore,
 }
 
 impl MemorySubstrate {
@@ -64,6 +66,10 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
+            episodes: EpisodeStore::with_idle_timeout(
+                Arc::clone(&shared),
+                memory_config.episode_idle_timeout_minutes,
+            ),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -118,6 +124,8 @@ impl MemorySubstrate {
             knowledge: KnowledgeStore::new(Arc::clone(&shared)),
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
+            episodes: EpisodeStore::new(Arc::clone(&shared)),
+
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -125,6 +133,86 @@ impl MemorySubstrate {
     /// Get a reference to the usage store.
     pub fn usage(&self) -> &UsageStore {
         &self.usage
+    }
+
+    // -----------------------------------------------------------------
+    // Episodes (ADR 0001 §2.2)
+    // -----------------------------------------------------------------
+
+    /// Get a reference to the episode store.
+    pub fn episodes(&self) -> &EpisodeStore {
+        &self.episodes
+    }
+
+    /// Resolve the episode this turn belongs to, opening one and closing a
+    /// timed-out predecessor as needed. See [`EpisodeStore::ensure_open`].
+    pub fn ensure_open_episode(&self, agent_id: AgentId) -> OpenFangResult<uuid::Uuid> {
+        self.episodes.ensure_open(agent_id)
+    }
+
+    /// Async wrapper for [`Self::ensure_open_episode`] — the capture path runs
+    /// inside the agent loop's async context and must not block the reactor on
+    /// a SQLite write.
+    pub async fn ensure_open_episode_async(&self, agent_id: AgentId) -> OpenFangResult<uuid::Uuid> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.ensure_open(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Close the agent's open episode. `None` when nothing was open.
+    pub fn close_episode(
+        &self,
+        agent_id: AgentId,
+        reason: CloseReason,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) -> OpenFangResult<Option<uuid::Uuid>> {
+        self.episodes
+            .close_current(agent_id, reason, title, summary)
+    }
+
+    /// Async wrapper for [`Self::close_episode`]. The tool path runs inside the
+    /// agent loop's async context, same reason as `ensure_open_episode_async`.
+    pub async fn close_episode_async(
+        &self,
+        agent_id: AgentId,
+        reason: CloseReason,
+        title: Option<String>,
+        summary: Option<String>,
+    ) -> OpenFangResult<Option<uuid::Uuid>> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || {
+            store.close_current(agent_id, reason, title.as_deref(), summary.as_deref())
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// The agent's memory status. See [`EpisodeStore::status`].
+    pub fn episode_status(
+        &self,
+        agent_id: AgentId,
+        recent_limit: usize,
+    ) -> OpenFangResult<EpisodeStatus> {
+        self.episodes.status(agent_id, recent_limit)
+    }
+
+    /// Async wrapper for [`Self::episode_status`].
+    pub async fn episode_status_async(
+        &self,
+        agent_id: AgentId,
+        recent_limit: usize,
+    ) -> OpenFangResult<EpisodeStatus> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.status(agent_id, recent_limit))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// The agent's currently open episode, if any.
+    pub fn current_episode(&self, agent_id: AgentId) -> OpenFangResult<Option<Episode>> {
+        self.episodes.current(agent_id)
     }
 
     /// Get the shared database connection (for constructing stores from outside).

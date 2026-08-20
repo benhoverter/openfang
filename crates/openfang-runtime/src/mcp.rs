@@ -375,6 +375,9 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "web_search",
     "apply_patch",
     "file_convert",
+    "memory_episode_close",
+    "memory_status",
+    "memory_note",
 ];
 
 /// True if `name` shadows an OpenFang built-in tool.

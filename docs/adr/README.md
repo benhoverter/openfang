@@ -13,3 +13,4 @@ Numbered records of decisions that constrain future work.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-memory-and-context-architecture.md) | Memory & context architecture | Proposed |
+| [0002](0002-memory-tool-surface.md) | The memory tool surface | Proposed |

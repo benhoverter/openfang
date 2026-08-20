@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -53,6 +53,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 11 {
         migrate_v11(conn)?;
+    }
+
+    if current_version < 12 {
+        migrate_v12(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -421,6 +425,83 @@ fn migrate_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 12: Episodes — the boundary object episodic capture groups into
+/// (ADR 0001 §2.2, ANAI-74 family).
+///
+/// Two changes, one migration:
+///
+/// 1. **`episodes`** — id, agent, opened/closed timestamps, a title written at
+///    close, an optional wrap-up summary, and a close reason (`topic-switch` /
+///    `explicit` / `timer` / `abandoned`). `last_activity_at` is the idle
+///    timer's clock and
+///    `turn_count` is bookkeeping for sizing consolidation input.
+///
+///    The partial unique index is the load-bearing part: **at most one open
+///    episode per agent**, enforced by the database rather than by whichever
+///    code path happens to run first. The open episode IS the row with
+///    `closed_at IS NULL`, which is what makes the lifecycle survive a daemon
+///    restart without any in-memory state to lose.
+///
+/// 2. **`memories.episode_id`** — nullable, no backfill, indexed. Written by
+///    `semantic.rs`, lifted out of the capture metadata map so the capture
+///    signatures did not have to change fleet-wide.
+///
+///    Nullable and unbackfilled ON PURPOSE. Pre-episode rows (~35k) have no
+///    defensible episode, and inventing one would be worse than admitting the
+///    gap: NULL *is* the legacy marker. It also keeps this migration a pure
+///    schema add — it rewrites no existing row, so rolling the binary back
+///    loses the column's readers, never any data.
+fn migrate_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            last_activity_at TEXT NOT NULL,
+            closed_at TEXT,
+            title TEXT,
+            summary TEXT,
+            close_reason TEXT,
+            turn_count INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- At most one OPEN episode per agent. Partial, so any number of closed
+        -- episodes coexist. This is the constraint the lifecycle relies on.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_one_open_per_agent
+            ON episodes(agent_id) WHERE closed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_episodes_agent_opened
+            ON episodes(agent_id, opened_at DESC);
+        -- Drives the idle sweep (`EpisodeStore::sweep_idle`).
+        CREATE INDEX IF NOT EXISTS idx_episodes_open_activity
+            ON episodes(last_activity_at) WHERE closed_at IS NULL;
+        ",
+    )?;
+
+    if !column_exists(conn, "memories", "episode_id") {
+        conn.execute("ALTER TABLE memories ADD COLUMN episode_id TEXT", [])?;
+    }
+    // `summary` (ANAI-194) was added to the CREATE TABLE above after v12 was
+    // first written but before it shipped anywhere, so a fresh database gets it
+    // inline. This guard covers the one case the inline column cannot: a
+    // developer tree that already applied the earlier v12 and would otherwise
+    // skip the whole migration on version number alone. Cheap, idempotent, and
+    // it means nobody has to hand-repair a local database.
+    if !column_exists(conn, "episodes", "summary") {
+        conn.execute("ALTER TABLE episodes ADD COLUMN summary TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_episode ON memories(episode_id)",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (12, datetime('now'), 'Add episodes table and memories.episode_id (ADR 0001 2.2)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +528,8 @@ mod tests {
         assert!(tables.contains(&"relations".to_string()));
         assert!(tables.contains(&"session_participants".to_string()));
         assert!(tables.contains(&"identity_bindings".to_string()));
+        assert!(tables.contains(&"episodes".to_string()));
+        assert!(column_exists(&conn, "memories", "episode_id"));
     }
 
     #[test]

@@ -186,6 +186,14 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     "web_search",
     "apply_patch",
     "file_convert",
+    // ANAI-194. Default-safe: both are scoped to the calling agent's own
+    // episodes with no cross-agent escape, and neither can delete a memory row.
+    "memory_episode_close",
+    "memory_status",
+    // ANAI-166. Default-safe on the same test: scoped to the caller's own
+    // rows, and a note is append-only — there is no agent-facing verb that
+    // removes or rewrites one (ADR 0002 §2.6).
+    "memory_note",
 ];
 
 /// Agent-lifecycle tools that are dispatchable by the daemon and advertised
@@ -458,15 +466,27 @@ pub fn built_in_tools() -> Vec<Tool> {
         ),
         // Mirrors `openfang_runtime::tool_runner` → `memory_recall`. Read-only
         // companion to memory_store.
+        //
+        // ANAI-166: `query` was added here in the SAME commit that added it to
+        // the runtime definition. ANAI-126 is the standing example of what a
+        // one-sided param addition costs — every subprocess agent goes on
+        // seeing the old schema and can never call the new shape, with no
+        // error anywhere to say so. `built_in_tools_surface` asserts names
+        // only, so `bridge_memory_recall_advertises_query` below is the guard
+        // that actually catches this.
         Tool::new(
             "memory_recall",
-            "Recall a value from YOUR OWN memory namespace by key. Prefix the key with 'shared:' to read the cross-agent namespace.",
+            "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Exactly one of the two.",
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall. Prefix with 'shared:' for cross-agent state." }
+                    "query": { "type": "string", "description": "What you are looking for, in plain words. Searches by meaning when embeddings are configured, by text match otherwise." },
+                    "key": { "type": "string", "description": "Exact storage key, for values written with memory_store. Prefix with 'shared:' for cross-agent state." },
+                    "scope": { "type": "string", "description": "Optional: restrict to one memory scope, e.g. 'episodic'." },
+                    "kind": { "type": "string", "description": "Optional: restrict to one kind of memory, e.g. 'note'." },
+                    "limit": { "type": "integer", "description": "Maximum results to return (default 5, maximum 25)." }
                 },
-                "required": ["key"]
+                "required": []
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `agent_find`. Read-only
@@ -569,6 +589,53 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
                 },
                 "required": ["format", "input"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` -> `memory_episode_close` /
+        // `memory_status` (ANAI-194). Schemas must match the runtime
+        // definitions verbatim — drift here is silent, since the bridge is
+        // what a subprocess agent actually sees.
+        Tool::new(
+            "memory_episode_close",
+            "Close the current episode - the stretch of turns your recent work \
+             is grouped into - and label it. Call this when a piece of work is \
+             finished, before you move to something unrelated. A new episode \
+             opens on your next turn. Harmless to call when nothing is open.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
+                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided" },
+                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
+                },
+                "required": ["title"]
+            })),
+        ),
+        Tool::new(
+            "memory_status",
+            "Report the state of your own memory: which episode is open, how \
+             many turns it has captured, how long it has been idle, and when it \
+             will close on its own. Use it to notice you have drifted onto \
+             unrelated work.",
+            obj(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` → `memory_note` (ANAI-166).
+        // Tail-appended, like every other bridge tool: `built_in_tools_surface`
+        // asserts an exact ordered vec, so a mid-list insert would shift every
+        // later entry and make an unrelated diff look like the cause.
+        Tool::new(
+            "memory_note",
+            "Jot something down in your own memory, in your own words - a decision, an observation, something worth keeping. Cheap and unstructured; no key needed. It is attached to your current episode.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "What to remember, in plain words." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." }
+                },
+                "required": ["text"]
             })),
         ),
     ]
@@ -815,6 +882,9 @@ mod tests {
                 "apply_patch",
                 "web_search",
                 "file_convert",
+                "memory_episode_close",
+                "memory_status",
+                "memory_note",
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"
@@ -842,6 +912,66 @@ mod tests {
              mirror the runtime tool_runner schema (ANAI-126); subprocess agents \
              cannot set a param the bridge never told them exists"
         );
+    }
+
+    /// ANAI-166, same class of guard as the `surface_to` assertion above.
+    ///
+    /// `memory_recall` grew a `query` param and dropped `key` from `required`.
+    /// Both halves are silent if they drift: a bridge still advertising
+    /// `required: ["key"]` makes every subprocess agent unable to search, and
+    /// one missing `query` entirely makes them unable to even try — with no
+    /// error at any layer, because the name-list test above still passes.
+    #[test]
+    fn bridge_memory_recall_advertises_query_and_requires_neither() {
+        let tools = built_in_tools();
+        let recall = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "memory_recall")
+            .expect("memory_recall must be advertised");
+
+        let props = recall
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("memory_recall schema must declare a `properties` object");
+        for param in ["query", "key", "scope", "kind", "limit"] {
+            assert!(
+                props.contains_key(param),
+                "schema drift — memory_recall must advertise `{param}` to mirror \
+                 the runtime tool_runner schema (ANAI-166)"
+            );
+        }
+
+        // Additive-only rule: `key` must never become required again, or the
+        // search shape becomes uncallable over the bridge.
+        let required = recall
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .expect("memory_recall schema must declare `required`");
+        assert!(
+            required.is_empty(),
+            "memory_recall takes exactly one of `query`/`key`, enforced in the \
+             handler; `required` must stay empty because provider support for \
+             anyOf/oneOf is uneven and the bridge re-serializes this schema"
+        );
+    }
+
+    /// ANAI-166: the note tool must cross the bridge with its real shape.
+    #[test]
+    fn bridge_memory_note_advertises_text_and_tags() {
+        let tools = built_in_tools();
+        let note = tools
+            .iter()
+            .find(|t| t.name.as_ref() == "memory_note")
+            .expect("memory_note must be advertised");
+        let props = note
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("memory_note schema must declare a `properties` object");
+        assert!(props.contains_key("text"));
+        assert!(props.contains_key("tags"));
     }
 
     #[test]

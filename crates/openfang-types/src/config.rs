@@ -2164,6 +2164,19 @@ pub struct MemoryConfig {
     /// Env var name holding the HTTP memory API bearer token.
     #[serde(default)]
     pub http_token_env: Option<String>,
+    /// Idle gap (minutes) after which the next captured turn starts a NEW
+    /// episode instead of resuming the open one (ADR 0001 §2.2).
+    ///
+    /// `0` or negative disables close-on-timer entirely — episodes then only
+    /// ever close explicitly. Default 120: long enough that a lunch break does
+    /// not shred one work session into three, short enough that yesterday's
+    /// context is not stapled onto this morning's.
+    #[serde(default = "default_episode_idle_timeout")]
+    pub episode_idle_timeout_minutes: i64,
+}
+
+fn default_episode_idle_timeout() -> i64 {
+    120
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -2192,6 +2205,7 @@ impl Default for MemoryConfig {
             backend: default_memory_backend(),
             http_url: None,
             http_token_env: None,
+            episode_idle_timeout_minutes: default_episode_idle_timeout(),
         }
     }
 }

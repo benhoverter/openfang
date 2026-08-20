@@ -747,7 +747,10 @@ pub async fn execute_tool(
 
         // Memory tools (agent-scoped; `shared:` prefix opts into cross-agent)
         "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
-        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id),
+        "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id).await,
+        "memory_note" => tool_memory_note(input, kernel, caller_agent_id).await,
+        "memory_episode_close" => tool_memory_episode_close(input, kernel, caller_agent_id),
+        "memory_status" => tool_memory_status(kernel, caller_agent_id),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1243,13 +1246,66 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Recall a value from YOUR OWN memory namespace by key. Prefix the key with 'shared:' to read the cross-agent namespace.".to_string(),
+            description: "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Exactly one of the two.".to_string(),
+            // ANAI-166: schema evolution is ADDITIVE ONLY. `key` is never
+            // removed and never repurposed; `required` drops to empty because
+            // `anyOf` support is uneven across providers and the MCP bridge
+            // re-serializes this schema. Exactly-one-of is therefore enforced
+            // in the handler, with an error string that tells the caller what
+            // to do. The bridge's copy of this schema
+            // (`openfang-mcp-bridge/src/lib.rs`) must change in the same
+            // commit — ANAI-126 is what happens when it does not.
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall. Prefix with 'shared:' for cross-agent state." }
+                    "query": { "type": "string", "description": "What you are looking for, in plain words. Searches by meaning when embeddings are configured, by text match otherwise." },
+                    "key": { "type": "string", "description": "Exact storage key, for values written with memory_store. Prefix with 'shared:' for cross-agent state." },
+                    "scope": { "type": "string", "description": "Optional: restrict to one memory scope, e.g. 'episodic'." },
+                    "kind": { "type": "string", "description": "Optional: restrict to one kind of memory, e.g. 'note'." },
+                    "limit": { "type": "integer", "description": "Maximum results to return (default 5, maximum 25)." }
                 },
-                "required": ["key"]
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: "memory_note".to_string(),
+            description: "Jot something down in your own memory, in your own words - a decision, an observation, something worth keeping. Cheap and unstructured; no key needed. It is attached to your current episode.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "What to remember, in plain words." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." }
+                },
+                "required": ["text"]
+            }),
+        },
+        // --- Episode tools (ANAI-194, ADR 0002 2.2) ---
+        //
+        // Grouped with the other memory tools rather than tail-appended: this
+        // list is category-ordered and its drift test asserts membership, not
+        // position. The FLAT bridge lists (`built_in_tools`, `ALLOWED_TOOLS`,
+        // `DEFAULT_ALLOWED`) are tail-appended instead, because the bridge
+        // surface test compares an exact ordered vec and a mid-list insert
+        // there skews indices silently.
+        ToolDefinition {
+            name: "memory_episode_close".to_string(),
+            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
+                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided" },
+                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_status".to_string(),
+            description: "Report the state of your own memory: which episode is open, how many turns it has captured, how long it has been idle, and when it will close on its own. Use it to notice you have drifted onto unrelated work.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
             }),
         },
         // --- Collaboration tools ---
@@ -3404,13 +3460,21 @@ fn tool_memory_store(
     }
 }
 
-fn tool_memory_recall(
-    input: &serde_json::Value,
-    kernel: Option<&Arc<dyn KernelHandle>>,
+/// Default and ceiling for `memory_recall`'s `limit`.
+///
+/// The ceiling is re-clamped kernel-side as well; this copy exists so the
+/// value reaching the handle is already sane and so a non-kernel implementor
+/// cannot be handed 10_000.
+const MEMORY_RECALL_DEFAULT_LIMIT: usize = 5;
+const MEMORY_RECALL_MAX_LIMIT: usize = 25;
+
+/// ANAI-166: exact-key lookup, unchanged from the pre-search `memory_recall`
+/// including the ANAI-165 shared-namespace fallback and its label.
+fn memory_recall_by_key(
+    kh: &Arc<dyn KernelHandle>,
     caller_agent_id: Option<&str>,
+    key: &str,
 ) -> Result<String, String> {
-    let kh = require_kernel(kernel)?;
-    let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     if let Some(val) = kh.memory_recall(caller_agent_id, key)? {
         return Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string()));
     }
@@ -3431,6 +3495,241 @@ fn tool_memory_recall(
         }
     }
     Ok(format!("No value found for key '{key}'."))
+}
+
+/// ANAI-166 (ADR 0002 §2.2/§2.3): the single read.
+///
+/// Two shapes behind one name. `key` is the pre-existing exact lookup and
+/// keeps its exact behaviour; `query` is retrieval over the caller's episodic
+/// memory. Merging them into one tool rather than adding `memory_search` is
+/// principle 2 — one door, so the scope and (in stage 3) superseded filters
+/// are enforced in exactly one place.
+///
+/// Exactly-one-of is enforced here rather than in the JSON schema because the
+/// schema crosses the MCP bridge and several provider tool formats, and
+/// `anyOf`/`oneOf` survive that trip unevenly. A handler-side check with a
+/// usable error message is worth more than a constraint that silently
+/// evaporates in re-serialization.
+async fn tool_memory_recall(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let key = input["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let query = input["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|q| !q.is_empty());
+
+    match (key, query) {
+        (Some(key), None) => memory_recall_by_key(kh, caller_agent_id, key),
+        (None, Some(query)) => {
+            let limit = input["limit"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(MEMORY_RECALL_DEFAULT_LIMIT)
+                .clamp(1, MEMORY_RECALL_MAX_LIMIT);
+            let scope = input["scope"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let kind = input["kind"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let found = kh
+                .memory_search(caller_agent_id, query, scope, kind, limit)
+                .await?;
+            Ok(format_recall_hits(query, &found))
+        }
+        (Some(_), Some(_)) => Err(
+            "Pass either 'query' (to search by meaning) or 'key' (to look up an exact stored \
+             key), not both. If you want a keyed value, use 'key'; otherwise describe what you \
+             are looking for in 'query'."
+                .to_string(),
+        ),
+        (None, None) => Err(
+            "Missing parameter: pass 'query' to search your memory, or 'key' to look up an exact \
+             stored key."
+                .to_string(),
+        ),
+    }
+}
+
+/// Render search hits for a model to read.
+///
+/// Plain text rather than raw JSON: this is prompt content, and a pretty
+/// JSON array of fragments spends context on punctuation. The empty case says
+/// which search mode ran, because "nothing found" from a degraded text search
+/// means something different from "nothing found" from a semantic one.
+fn format_recall_hits(query: &str, found: &serde_json::Value) -> String {
+    let mode = found.get("mode").and_then(|m| m.as_str()).unwrap_or("text");
+    let results = found
+        .get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if results.is_empty() {
+        return match mode {
+            "semantic" => format!("No memories found for '{query}'."),
+            _ => format!(
+                "No memories found for '{query}'. (Text matching only — no embedding provider is \
+                 configured, so this searched for the literal words, not the meaning.)"
+            ),
+        };
+    }
+
+    let mut out = format!(
+        "{} memor{} for '{query}' ({mode} search):\n",
+        results.len(),
+        if results.len() == 1 { "y" } else { "ies" }
+    );
+    for hit in &results {
+        let content = hit.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let created = hit
+            .get("created_at")
+            .and_then(|c| c.as_str())
+            .unwrap_or("?");
+        let kind = hit.get("kind").and_then(|k| k.as_str()).unwrap_or("turn");
+        out.push_str(&format!("\n[{created} · {kind}]\n{content}\n"));
+    }
+    out
+}
+
+/// ANAI-166 (ADR 0002 §2.2): the cheap write.
+async fn tool_memory_note(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let text = input["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("Missing 'text' parameter — a note with no content is not a note")?;
+    let tags: Vec<String> = input["tags"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    kh.memory_note(caller_agent_id, text, &tags).await?;
+    Ok(
+        "Noted. It is attached to your current episode and will surface in memory_recall."
+            .to_string(),
+    )
+}
+
+/// Close reasons an AGENT may name (ANAI-194, ADR 0002 §2.2).
+///
+/// Deliberately narrower than the schema. `timer` is the system's to write —
+/// an agent claiming a timer close would date the boundary wrong and make the
+/// idle gap unfalsifiable. `topic-switch` and `abandoned` are accepted by the
+/// DDL so the later agent-judgment work is a caller change rather than a
+/// migration, but nothing has approved an agent emitting them yet (§2.6), and
+/// advertising them now would get them used before the judgment they depend on
+/// exists.
+const AGENT_CLOSE_REASONS: &[&str] = &["explicit"];
+
+fn tool_memory_episode_close(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let title = input["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("Missing 'title' parameter — an episode closed without a label is a boundary nobody can find again")?;
+    let summary = input["summary"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let reason = input["reason"].as_str().unwrap_or("explicit");
+    if !AGENT_CLOSE_REASONS.contains(&reason) {
+        return Err(format!(
+            "Close reason '{reason}' is not available to agents. Use one of: {}",
+            AGENT_CLOSE_REASONS.join(", ")
+        ));
+    }
+
+    match kh.memory_episode_close(caller_agent_id, reason, Some(title), summary)? {
+        Some(id) => Ok(format!(
+            "Closed episode {id} as '{title}'. The next captured turn starts a new one."
+        )),
+        // Not an error: the agent cannot see the episode table, so a double
+        // wrap-up is a reasonable thing to do and a failure here would read as
+        // "your memory is broken" when nothing is.
+        None => Ok("No episode was open, so nothing was closed.".to_string()),
+    }
+}
+
+fn tool_memory_status(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let status = kh.memory_status(caller_agent_id)?;
+
+    let mut out = String::new();
+    match status.get("episode").and_then(|e| e.as_object()) {
+        Some(ep) => {
+            let id = ep.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+            let turns = ep.get("turn_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let opened = ep.get("opened_at").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!(
+                "Open episode {id}\n  opened: {opened}\n  turns captured: {turns}\n"
+            ));
+            let idle = status.get("idle_minutes").and_then(|v| v.as_i64());
+            if let Some(m) = idle {
+                out.push_str(&format!("  idle: {m} min\n"));
+            }
+            match status
+                .get("minutes_until_timer_close")
+                .and_then(|v| v.as_i64())
+            {
+                Some(m) => out.push_str(&format!("  closes on timer in: {m} min\n")),
+                None => out.push_str("  closes on timer in: never (timer disabled)\n"),
+            }
+        }
+        // An agent with no open episode is the normal state before its first
+        // captured turn, not a fault. Say so plainly rather than printing an
+        // empty panel the agent has to interpret.
+        None => out.push_str("No episode is open. The next captured turn opens one.\n"),
+    }
+
+    if let Some(recent) = status.get("recent_episodes").and_then(|v| v.as_array()) {
+        if !recent.is_empty() {
+            out.push_str("Recently closed:\n");
+            for ep in recent {
+                let title = ep
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(untitled)");
+                let reason = ep
+                    .get("close_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let turns = ep.get("turn_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!("  - {title} ({turns} turns, closed: {reason})\n"));
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -6800,6 +7099,31 @@ mod tests {
         // identity at all and labels a shared-namespace hit.
         memory: std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>,
         memory_calls: std::sync::Mutex<Vec<(Option<String>, String)>>,
+        // ANAI-194: (caller, reason, title, summary) per episode-close call.
+        #[allow(clippy::type_complexity)]
+        episode_closes:
+            std::sync::Mutex<Vec<(Option<String>, String, Option<String>, Option<String>)>>,
+        // The id the next close returns. `None` models "nothing was open".
+        open_episode: std::sync::Mutex<Option<String>>,
+        status: std::sync::Mutex<serde_json::Value>,
+        // ANAI-166: every (caller, query, scope, kind, limit) handed to
+        // `memory_search`, and the canned payload it returns. The tool layer's
+        // job is to route and to render; the ranking is the kernel's, so what
+        // these prove is that the right shape reached the handle.
+        #[allow(clippy::type_complexity)]
+        searches: std::sync::Mutex<
+            Vec<(
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                usize,
+            )>,
+        >,
+        search_result: std::sync::Mutex<serde_json::Value>,
+        // (caller, text, tags) per `memory_note`.
+        #[allow(clippy::type_complexity)]
+        notes: std::sync::Mutex<Vec<(Option<String>, String, Vec<String>)>>,
     }
 
     impl FakeKernelHandle {
@@ -6823,7 +7147,33 @@ mod tests {
                 gate_shadow: std::sync::atomic::AtomicBool::new(false),
                 memory: std::sync::Mutex::new(std::collections::HashMap::new()),
                 memory_calls: std::sync::Mutex::new(Vec::new()),
+                episode_closes: std::sync::Mutex::new(Vec::new()),
+                open_episode: std::sync::Mutex::new(None),
+                status: std::sync::Mutex::new(serde_json::json!({})),
+                searches: std::sync::Mutex::new(Vec::new()),
+                search_result: std::sync::Mutex::new(
+                    serde_json::json!({"mode": "semantic", "count": 0, "results": []}),
+                ),
+                notes: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        // ANAI-166: canned search payload, in the kernel's wire shape.
+        fn with_search_result(self, result: serde_json::Value) -> Self {
+            *self.search_result.lock().unwrap() = result;
+            self
+        }
+
+        // ANAI-194: pretend an episode is open, so `memory_episode_close`
+        // returns an id instead of the nothing-was-open path.
+        fn with_open_episode(self, id: &str) -> Self {
+            *self.open_episode.lock().unwrap() = Some(id.to_string());
+            self
+        }
+
+        fn with_status(self, status: serde_json::Value) -> Self {
+            *self.status.lock().unwrap() = status;
+            self
         }
 
         // ANAI-154: stand in for a judge that returns a fixed verdict.
@@ -6899,8 +7249,8 @@ mod tests {
         assert!(out.contains("SHARED"), "a shared write must say so: {out}");
     }
 
-    #[test]
-    fn memory_recall_prefers_the_agents_own_namespace() {
+    #[tokio::test]
+    async fn memory_recall_prefers_the_agents_own_namespace() {
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
         tool_memory_store(
             &serde_json::json!({"key": "note", "value": "mine"}),
@@ -6919,14 +7269,141 @@ mod tests {
             Some(&kh),
             Some("agent-x"),
         )
+        .await
         .unwrap();
         assert!(out.contains("mine"), "own value must win: {out}");
         assert!(!out.contains("theirs"));
         assert!(!out.contains("SHARED namespace"));
     }
 
+    // --- ANAI-194: episode tools -------------------------------------------
+
     #[test]
-    fn memory_recall_falls_back_to_shared_but_says_so() {
+    fn episode_close_passes_title_and_summary_through() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "git trunk cutover", "summary": "retired the octopus"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("ep-1"), "{out}");
+        let calls = fake.episode_closes.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "explicit", "reason defaults to explicit");
+        assert_eq!(calls[0].2.as_deref(), Some("git trunk cutover"));
+        assert_eq!(calls[0].3.as_deref(), Some("retired the octopus"));
+    }
+
+    /// The agent cannot see the episodes table, so asking twice is reasonable.
+    /// A hard error would read as "your memory is broken" when nothing is.
+    #[test]
+    fn episode_close_with_nothing_open_is_not_an_error() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "whatever"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("No episode was open"), "{out}");
+    }
+
+    /// `timer` is the system's to write and `topic-switch` is deferred until
+    /// the judgment it depends on exists (ADR 0002 §2.6). Neither may be
+    /// claimed by an agent, or the close reason stops being evidence.
+    #[test]
+    fn episode_close_refuses_system_and_deferred_reasons() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        for reason in ["timer", "topic-switch", "abandoned", "nonsense"] {
+            let err = tool_memory_episode_close(
+                &serde_json::json!({"title": "t", "reason": reason}),
+                Some(&kh),
+                Some("agent-x"),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("not available to agents") || err.contains(reason),
+                "{err}"
+            );
+        }
+        assert!(
+            fake.episode_closes.lock().unwrap().is_empty(),
+            "a refused reason must never reach the kernel"
+        );
+    }
+
+    #[test]
+    fn episode_close_requires_a_usable_title() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        for input in [serde_json::json!({}), serde_json::json!({"title": "   "})] {
+            assert!(tool_memory_episode_close(&input, Some(&kh), Some("agent-x")).is_err());
+        }
+    }
+
+    #[test]
+    fn status_renders_the_open_episode_and_countdown() {
+        let fake = Arc::new(FakeKernelHandle::new().with_status(serde_json::json!({
+            "episode": {
+                "id": "ep-1",
+                "opened_at": "2026-08-19T10:00:00+00:00",
+                "turn_count": 7,
+                "title": null,
+                "close_reason": null,
+            },
+            "idle_minutes": 12,
+            "idle_timeout_minutes": 120,
+            "minutes_until_timer_close": 108,
+            "recent_episodes": [
+                {"id": "ep-0", "title": "ADR 0002", "turn_count": 4, "close_reason": "explicit"}
+            ],
+        })));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake;
+        let out = tool_memory_status(Some(&kh), Some("agent-x")).unwrap();
+        assert!(out.contains("Open episode ep-1"), "{out}");
+        assert!(out.contains("turns captured: 7"), "{out}");
+        assert!(out.contains("closes on timer in: 108 min"), "{out}");
+        assert!(out.contains("ADR 0002"), "{out}");
+    }
+
+    /// No open episode is the normal pre-first-turn state, not a fault.
+    #[test]
+    fn status_says_plainly_when_nothing_is_open() {
+        let fake = Arc::new(FakeKernelHandle::new().with_status(serde_json::json!({
+            "episode": null,
+            "idle_timeout_minutes": 120,
+            "recent_episodes": [],
+        })));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake;
+        let out = tool_memory_status(Some(&kh), Some("agent-x")).unwrap();
+        assert!(out.contains("No episode is open"), "{out}");
+    }
+
+    #[test]
+    fn status_reports_a_disabled_timer_rather_than_omitting_it() {
+        let fake = Arc::new(FakeKernelHandle::new().with_status(serde_json::json!({
+            "episode": {"id": "ep-1", "opened_at": "2026-08-19T10:00:00+00:00", "turn_count": 1},
+            "idle_timeout_minutes": 0,
+            "minutes_until_timer_close": null,
+            "recent_episodes": [],
+        })));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake;
+        let out = tool_memory_status(Some(&kh), Some("agent-x")).unwrap();
+        assert!(out.contains("never (timer disabled)"), "{out}");
+    }
+
+    #[test]
+    fn episode_tools_are_advertised() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"memory_episode_close"));
+        assert!(names.contains(&"memory_status"));
+    }
+
+    #[tokio::test]
+    async fn memory_recall_falls_back_to_shared_but_says_so() {
         // Pre-ANAI-165 rows all live in the shared namespace. Recall may serve
         // them, but it must never present another agent's value as this
         // agent's own memory.
@@ -6942,6 +7419,7 @@ mod tests {
             Some(&kh),
             Some("agent-x"),
         )
+        .await
         .unwrap();
         assert!(
             out.contains("old"),
@@ -6953,18 +7431,230 @@ mod tests {
         );
     }
 
-    #[test]
-    fn memory_recall_misses_cleanly_when_nothing_exists() {
+    #[tokio::test]
+    async fn memory_recall_misses_cleanly_when_nothing_exists() {
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
         let out = tool_memory_recall(
             &serde_json::json!({"key": "nope"}),
             Some(&kh),
             Some("agent-x"),
         )
+        .await
         .unwrap();
         assert!(out.contains("No value found"), "unexpected result: {out}");
     }
 
+    // --- ANAI-166: retrieval + notes ---------------------------------------
+
+    #[tokio::test]
+    async fn memory_recall_routes_a_query_to_search_not_the_kv_store() {
+        // The whole point of stage 2. Before this, `query` had nowhere to go
+        // and the tool answered every question with an exact-key miss.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(
+            FakeKernelHandle::new().with_search_result(serde_json::json!({
+                "mode": "semantic",
+                "count": 1,
+                "results": [{
+                    "id": "m1",
+                    "content": "we cut over to the trunk model on 2026-06-22",
+                    "kind": "note",
+                    "created_at": "2026-06-22T10:00:00Z",
+                }],
+            })),
+        );
+
+        let out = tool_memory_recall(
+            &serde_json::json!({"query": "when did we change the git model", "kind": "note", "limit": 3}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("trunk model"), "hit not rendered: {out}");
+        assert!(out.contains("semantic"), "search mode not reported: {out}");
+
+        // The KV path must NOT have been consulted — a query is not a key.
+        assert!(
+            !out.contains("No value found"),
+            "query fell through to exact-key lookup: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_recall_threads_caller_scope_kind_and_a_clamped_limit() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_memory_recall(
+            &serde_json::json!({
+                "query": "episodes",
+                "scope": "episodic",
+                "kind": "note",
+                // Absurd on purpose: an unclamped limit is a context-window
+                // exhaustion primitive aimed at the caller's own turn.
+                "limit": 10_000,
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        let calls = fake.searches.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (caller, query, scope, kind, limit) = calls[0].clone();
+        assert_eq!(caller.as_deref(), Some("agent-x"));
+        assert_eq!(query, "episodes");
+        assert_eq!(scope.as_deref(), Some("episodic"));
+        assert_eq!(kind.as_deref(), Some("note"));
+        assert_eq!(limit, MEMORY_RECALL_MAX_LIMIT, "limit must be clamped");
+    }
+
+    #[tokio::test]
+    async fn memory_recall_refuses_both_query_and_key() {
+        // Enforced in the handler because the JSON schema cannot carry it —
+        // `required: []` is all that survives the bridge's re-serialization.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let err = tool_memory_recall(
+            &serde_json::json!({"query": "anything", "key": "note"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not both"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn memory_recall_refuses_neither_query_nor_key() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let err = tool_memory_recall(&serde_json::json!({}), Some(&kh), Some("agent-x"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("'query'"), "unhelpful error: {err}");
+        assert!(err.contains("'key'"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn memory_recall_keeps_the_exact_key_path_intact() {
+        // Additive-only: the pre-stage-2 shape must behave exactly as before,
+        // shared-namespace label included.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        tool_memory_store(
+            &serde_json::json!({"key": "shared:legacy", "value": "old"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        let out = tool_memory_recall(
+            &serde_json::json!({"key": "legacy"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("old"));
+        assert!(out.contains("SHARED namespace"));
+    }
+
+    #[tokio::test]
+    async fn empty_search_says_when_it_was_only_text_matching() {
+        // "Nothing found" from a degraded text search means something very
+        // different from "nothing found" from a semantic one, and an agent
+        // that cannot tell them apart will conclude its memory is empty.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(
+            FakeKernelHandle::new().with_search_result(serde_json::json!({
+                "mode": "text",
+                "count": 0,
+                "results": [],
+            })),
+        );
+        let out = tool_memory_recall(
+            &serde_json::json!({"query": "anything at all"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("No memories found"));
+        assert!(
+            out.contains("Text matching only"),
+            "degraded mode must be disclosed: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_note_threads_text_tags_and_caller() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_note(
+            &serde_json::json!({
+                "text": "  the partial unique index is what makes this safe  ",
+                "tags": ["episodes", "  ", "ddl"],
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Noted"));
+
+        let notes = fake.notes.lock().unwrap();
+        assert_eq!(notes.len(), 1);
+        let (caller, text, tags) = notes[0].clone();
+        assert_eq!(caller.as_deref(), Some("agent-x"));
+        assert_eq!(text, "the partial unique index is what makes this safe");
+        assert_eq!(
+            tags,
+            vec!["episodes".to_string(), "ddl".to_string()],
+            "blank tags must be dropped, not stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_note_refuses_an_empty_note() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        for input in [serde_json::json!({}), serde_json::json!({"text": "   "})] {
+            assert!(
+                tool_memory_note(&input, Some(&kh), Some("agent-x"))
+                    .await
+                    .is_err(),
+                "empty note should be refused: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_note_is_declared_and_recall_advertises_query() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"memory_note"));
+
+        // Runtime half of the ANAI-126-style guard; the bridge half lives in
+        // `openfang-mcp-bridge`. Both must move together or subprocess agents
+        // see a different tool than in-process ones.
+        let recall = defs
+            .iter()
+            .find(|d| d.name == "memory_recall")
+            .expect("memory_recall must be declared");
+        let props = recall
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("memory_recall must declare properties");
+        for param in ["query", "key", "scope", "kind", "limit"] {
+            assert!(props.contains_key(param), "missing param: {param}");
+        }
+        assert!(
+            recall
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .expect("required must be present")
+                .is_empty(),
+            "`key` must not be required again — exactly-one-of is a handler rule"
+        );
+    }
     #[async_trait::async_trait]
     impl crate::kernel_handle::KernelHandle for FakeKernelHandle {
         async fn spawn_agent(
@@ -7006,6 +7696,54 @@ mod tests {
                 .unwrap()
                 .push((caller.map(|c| c.to_string()), key.to_string()));
             Ok(self.memory.lock().unwrap().get(key).cloned())
+        }
+        fn memory_episode_close(
+            &self,
+            caller: Option<&str>,
+            reason: &str,
+            title: Option<&str>,
+            summary: Option<&str>,
+        ) -> Result<Option<String>, String> {
+            self.episode_closes.lock().unwrap().push((
+                caller.map(|c| c.to_string()),
+                reason.to_string(),
+                title.map(|t| t.to_string()),
+                summary.map(|s| s.to_string()),
+            ));
+            Ok(self.open_episode.lock().unwrap().take())
+        }
+        fn memory_status(&self, _caller: Option<&str>) -> Result<serde_json::Value, String> {
+            Ok(self.status.lock().unwrap().clone())
+        }
+        async fn memory_search(
+            &self,
+            caller: Option<&str>,
+            query: &str,
+            scope: Option<&str>,
+            kind: Option<&str>,
+            limit: usize,
+        ) -> Result<serde_json::Value, String> {
+            self.searches.lock().unwrap().push((
+                caller.map(|c| c.to_string()),
+                query.to_string(),
+                scope.map(|s| s.to_string()),
+                kind.map(|k| k.to_string()),
+                limit,
+            ));
+            Ok(self.search_result.lock().unwrap().clone())
+        }
+        async fn memory_note(
+            &self,
+            caller: Option<&str>,
+            text: &str,
+            tags: &[String],
+        ) -> Result<String, String> {
+            self.notes.lock().unwrap().push((
+                caller.map(|c| c.to_string()),
+                text.to_string(),
+                tags.to_vec(),
+            ));
+            Ok("note-1".to_string())
         }
         fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
             vec![]

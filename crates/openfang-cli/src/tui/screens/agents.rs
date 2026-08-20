@@ -17,13 +17,48 @@ const TOOL_OPTIONS: &[(&str, &str)] = &[
     ("file_list", "List directory contents"),
     ("memory_store", "Store data in agent memory"),
     ("memory_recall", "Recall data from memory"),
+    (
+        "memory_episode_close",
+        "Close and label the current episode",
+    ),
+    ("memory_status", "Inspect open episode and idle countdown"),
+    ("memory_note", "Jot an unstructured note into memory"),
     ("web_fetch", "Fetch web pages"),
     ("shell_exec", "Execute shell commands"),
     ("agent_send", "Send messages to other agents"),
     ("agent_list", "List running agents"),
 ];
 
-const DEFAULT_TOOLS: &[bool] = &[true, false, true, true, true, true, false, false, false];
+/// Which of [`TOOL_OPTIONS`] start checked, **positionally**. This is a
+/// parallel array, not a map: entry N here is the default for entry N there.
+///
+/// The render `.zip()`s the two, so a short `DEFAULT_TOOLS` silently truncates
+/// the visible list while the cursor keeps moving past it — invisible rows,
+/// unselectable tools, and an out-of-bounds index on Space. The `const` assert
+/// below turns that into a compile error, because this pair is the one tool
+/// registry in the tree with no runtime drift test behind it (ANAI-194).
+const DEFAULT_TOOLS: &[bool] = &[
+    true,  // file_read
+    false, // file_write
+    true,  // file_list
+    true,  // memory_store
+    true,  // memory_recall
+    // Off by default. Landing the tools grants nothing; which agents get the
+    // episode surface is a rollout decision, not a side effect of the builder.
+    false, // memory_episode_close
+    false, // memory_status
+    // Off by default for the same reason: a write tool nobody asked for.
+    false, // memory_note
+    true,  // web_fetch
+    false, // shell_exec
+    false, // agent_send
+    false, // agent_list
+];
+
+const _: () = assert!(
+    TOOL_OPTIONS.len() == DEFAULT_TOOLS.len(),
+    "TOOL_OPTIONS and DEFAULT_TOOLS are positional parallel arrays and must stay the same length"
+);
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum AgentSubScreen {

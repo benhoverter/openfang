@@ -661,7 +661,11 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
+        "memory_store"
+        | "memory_recall"
+        | "memory_note"
+        | "memory_episode_close"
+        | "memory_status" => "Memory",
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" | "agent_activate" => "Agents",
 
@@ -716,9 +720,13 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Memory
         "memory_store" => "save a key-value pair to memory",
+        // ANAI-166: this line was already here and was a lie — the tool was
+        // exact-key lookup. It is true as of stage 2; the fix was to make the
+        // implementation match the description, not to downgrade the wording.
+        "memory_note" => "jot an unstructured note into memory",
         "memory_recall" => "search memory for relevant context",
-        "memory_delete" => "delete a memory entry",
-        "memory_list" => "list stored memory keys",
+        "memory_episode_close" => "close and label the current episode",
+        "memory_status" => "check your open episode and idle countdown",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -856,6 +864,29 @@ mod tests {
         assert!(prompt.contains("## User Profile"));
         assert!(prompt.contains("## Safety"));
         assert!(prompt.contains("## Operational Guidelines"));
+    }
+
+    /// ANAI-195: these lookup tables described two tools that have never had an
+    /// agent-side implementation. Nothing dispatched `memory_delete` or
+    /// `memory_list`, and no manifest granted either, so every agent carrying
+    /// them in its granted list was told about a tool that would have failed on
+    /// call. `memory_delete` remains a real CLI subcommand — a human deleting a
+    /// row with full context is a different actor from an agent mid-task
+    /// (ADR 0002 §4.3) — so this removes the agent-facing description only.
+    ///
+    /// Asserted rather than merely deleted so the strings cannot drift back in
+    /// as "obviously reasonable" entries in a future table edit.
+    #[test]
+    fn phantom_memory_tools_are_not_described() {
+        for phantom in ["memory_delete", "memory_list"] {
+            assert_eq!(
+                tool_category(phantom),
+                "Other",
+                "{phantom} has no agent-side implementation; describing it \
+                 advertises a tool that cannot be called"
+            );
+            assert_eq!(tool_hint(phantom), "");
+        }
     }
 
     #[test]

@@ -111,8 +111,8 @@ impl SemanticStore {
         let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
 
         conn.execute(
-            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8)",
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding, episode_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8, ?9)",
             rusqlite::params![
                 id.0.to_string(),
                 agent_id.0.to_string(),
@@ -122,6 +122,7 @@ impl SemanticStore {
                 meta_str,
                 now,
                 embedding_bytes,
+                episode_id_from_metadata(&metadata),
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -250,8 +251,59 @@ impl SemanticStore {
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
                 sql.push_str(&format!(" AND source = ?{param_idx}"));
                 params.push(Box::new(source_str));
-                let _ = param_idx;
+                param_idx += 1;
             }
+
+            // ANAI-166: honour `MemoryFilter::metadata`.
+            //
+            // This field has existed on the filter since the type was written
+            // and was silently ignored here — a filter that quietly matches
+            // everything is worse than one that does not exist, because the
+            // caller reads the result as "nothing else matched". No caller
+            // populated it before now, so implementing it changes no existing
+            // behaviour.
+            //
+            // Applied in SQL rather than post-filtered in the caller on
+            // purpose: the vector path truncates to `limit` AFTER re-ranking,
+            // so a caller-side filter would first discard candidates and then
+            // return fewer than `limit` rows that did match.
+            //
+            // Keys are sorted so the generated SQL is deterministic (a
+            // HashMap's iteration order is not), which keeps the statement
+            // cacheable and the tests stable.
+            let mut meta_keys: Vec<&String> = f.metadata.keys().collect();
+            meta_keys.sort();
+            for key in meta_keys {
+                // The key lands inside a JSON path literal, which cannot be
+                // parameterised. Restrict it to an identifier charset rather
+                // than trusting callers: this is the one place in this query
+                // builder where a string is interpolated instead of bound.
+                if key.is_empty()
+                    || !key
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(OpenFangError::Memory(format!(
+                        "Invalid metadata filter key '{key}': only ASCII alphanumerics, \
+                         '_' and '-' are allowed"
+                    )));
+                }
+                // json_extract returns SQL NULL for an absent key, so a row
+                // missing the key never matches — which is what "filter by
+                // kind" has to mean for the 46k pre-`kind` rows.
+                sql.push_str(&format!(
+                    " AND json_extract(metadata, '$.{key}') = ?{param_idx}"
+                ));
+                // Compare as text for strings; JSON-encode anything else so a
+                // number or bool round-trips instead of arriving quoted.
+                let bound = match &f.metadata[key] {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                params.push(Box::new(bound));
+                param_idx += 1;
+            }
+            let _ = param_idx;
         }
 
         sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
@@ -488,6 +540,26 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Lift the episode id out of the capture metadata into its own column
+/// (ADR 0001 §2.2).
+///
+/// The agent loop already threads `episode_id` through the metadata map, so
+/// lifting it here keeps every `remember*` signature — and its four call sites
+/// across two loops, the HTTP path, and the `Memory` trait — untouched, while
+/// still giving consolidation a real indexed column to group by instead of a
+/// `json_extract` over 35k rows.
+///
+/// Anything that is not a string is treated as absent rather than coerced: a
+/// malformed episode id must degrade to "legacy row", never to a fabricated
+/// grouping key.
+fn episode_id_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Option<String> {
+    metadata
+        .get(crate::episode::EPISODE_ID_KEY)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// Serialize embedding to bytes for SQLite BLOB storage.
 fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(embedding.len() * 4);
@@ -560,6 +632,97 @@ mod tests {
         let results = store.recall("Memory", 10, Some(filter)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Memory A");
+    }
+
+    /// ANAI-166: `MemoryFilter::metadata` used to be accepted and silently
+    /// ignored, so a `kind`-filtered search returned everything and the caller
+    /// read it as "these are all the notes."
+    #[test]
+    fn metadata_filter_selects_only_matching_rows() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        let mut note_meta = HashMap::new();
+        note_meta.insert("kind".to_string(), serde_json::json!("note"));
+        store
+            .remember(
+                agent_id,
+                "a deliberate note",
+                MemorySource::Observation,
+                "episodic",
+                note_meta,
+            )
+            .unwrap();
+
+        let mut turn_meta = HashMap::new();
+        turn_meta.insert("kind".to_string(), serde_json::json!("turn"));
+        store
+            .remember(
+                agent_id,
+                "a captured turn",
+                MemorySource::Conversation,
+                "episodic",
+                turn_meta,
+            )
+            .unwrap();
+
+        // The 46k pre-`kind` rows: no discriminator at all.
+        store
+            .remember(
+                agent_id,
+                "a legacy row",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let filter = MemoryFilter {
+            agent_id: Some(agent_id),
+            metadata: HashMap::from([("kind".to_string(), serde_json::json!("note"))]),
+            ..Default::default()
+        };
+        let results = store.recall("", 10, Some(filter)).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].content, "a deliberate note");
+    }
+
+    /// A row missing the key must not match — `json_extract` returns SQL NULL
+    /// and NULL never equals a bound value. Asserted explicitly because the
+    /// alternative (legacy rows matching every filter) would make `kind`
+    /// filtering useless on the corpus that actually exists.
+    #[test]
+    fn metadata_filter_excludes_rows_without_the_key() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .remember(
+                agent_id,
+                "a legacy row",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+        let filter = MemoryFilter {
+            agent_id: Some(agent_id),
+            metadata: HashMap::from([("kind".to_string(), serde_json::json!("note"))]),
+            ..Default::default()
+        };
+        assert!(store.recall("", 10, Some(filter)).unwrap().is_empty());
+    }
+
+    /// The metadata key is interpolated into a JSON path literal, which cannot
+    /// be parameterised. It is the one string in this query builder that is not
+    /// bound, so it is charset-restricted rather than trusted.
+    #[test]
+    fn metadata_filter_rejects_a_key_that_could_escape_the_json_path() {
+        let store = setup();
+        let filter = MemoryFilter {
+            metadata: HashMap::from([("kind') OR 1=1 --".to_string(), serde_json::json!("x"))]),
+            ..Default::default()
+        };
+        assert!(store.recall("", 10, Some(filter)).is_err());
     }
 
     #[test]

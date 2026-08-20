@@ -9,6 +9,7 @@
 
 pub mod capture;
 pub mod consolidation;
+pub mod episode;
 #[cfg(feature = "http-memory")]
 pub mod http_client;
 pub mod knowledge;

@@ -121,6 +121,86 @@ pub trait KernelHandle: Send + Sync {
         key: &str,
     ) -> Result<Option<serde_json::Value>, String>;
 
+    /// ANAI-194: close the CALLER's open episode (ADR 0001 §2.2, ADR 0002 §2.2).
+    ///
+    /// `reason` is the wire spelling of a `CloseReason`. Returns the closed
+    /// episode's id, or `None` when the caller had nothing open — a second
+    /// "wrap this up" is a no-op, not a failure, because the agent cannot see
+    /// the episode table and should not be punished for asking twice.
+    ///
+    /// Scoped to the caller with no `shared:` escape. Episodes are strictly
+    /// per-agent: there is no coherent meaning to closing someone else's, and
+    /// a cross-agent close would silently truncate another agent's
+    /// consolidation input.
+    fn memory_episode_close(
+        &self,
+        caller_agent_id: Option<&str>,
+        reason: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, String>;
+
+    /// ANAI-194: the CALLER's memory status — open episode, turns captured
+    /// into it, and the idle countdown.
+    ///
+    /// Returned as JSON rather than a struct so the trait does not drag the
+    /// `openfang-memory` episode types across the handle boundary, which every
+    /// other method on here deliberately avoids.
+    fn memory_status(&self, caller_agent_id: Option<&str>) -> Result<serde_json::Value, String>;
+
+    /// ANAI-166 (ADR 0002 §2.2/§2.3): retrieval over the CALLER's episodic
+    /// memory — semantic when an embedding driver is configured, LIKE matching
+    /// when it is not.
+    ///
+    /// Named `memory_search` rather than `memory_recall` because the existing
+    /// `memory_recall` on this trait is the exact-key KV read and keeps that
+    /// contract; the *tool* named `memory_recall` fans out to both. Note that
+    /// `tool_compat` already maps a `memory_search` tool name onto
+    /// `memory_recall`, so this name must never be advertised as a tool.
+    ///
+    /// Async because embedding the query is a network call on most providers.
+    /// Returns JSON for the same reason [`Self::memory_status`] does: the trait
+    /// must not drag `openfang-memory`'s fragment types across the boundary.
+    ///
+    /// Defaulted so non-kernel implementors (test doubles, the WASM host shim,
+    /// whose `host_functions.rs` recall stays key-only by design) need no
+    /// change. A default that errors is correct here: silently returning zero
+    /// hits would be indistinguishable from "you have no such memory", which is
+    /// exactly the failure mode §1.1 of the ADR is about.
+    async fn memory_search(
+        &self,
+        caller_agent_id: Option<&str>,
+        query: &str,
+        scope: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (caller_agent_id, query, scope, kind, limit);
+        Err("Memory search is not available on this kernel handle".to_string())
+    }
+
+    /// ANAI-166 (ADR 0002 §2.2): append an unstructured note to the CALLER's
+    /// memory, attributed to the caller's currently open episode.
+    ///
+    /// The cheap write. It takes no key and no controlled vocabulary on
+    /// purpose — a note the agent had to classify before writing is a note it
+    /// will not write. Keyed, expensive writes are `memory_fact` (stage 3).
+    ///
+    /// Scoped to the caller with no `shared:` escape: a note is by definition
+    /// unreviewed material, and cross-agent unreviewed writes are how the
+    /// pre-ANAI-165 shared bucket became unattributable.
+    ///
+    /// Returns the new fragment's id.
+    async fn memory_note(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+    ) -> Result<String, String> {
+        let _ = (caller_agent_id, text, tags);
+        Err("Memory notes are not available on this kernel handle".to_string())
+    }
+
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
 

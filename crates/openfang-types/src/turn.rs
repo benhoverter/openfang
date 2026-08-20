@@ -143,6 +143,13 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "file_read",
     "file_list",
     "memory_recall",
+    // ANAI-194 shipped this tool but missed this list, which is the single
+    // source of truth for BOTH the ANAI-76/77 drop predicate and
+    // `AgentMode::Assist` tool filtering (`agent.rs`). The omission made an
+    // introspection-only call read as side-effecting, and left Assist-mode
+    // agents — the ones most likely to want it — unable to call it at all.
+    // `memory_note` is a write and stays out of here deliberately.
+    "memory_status",
     "web_fetch",
     "web_search",
     "agent_list",
@@ -288,6 +295,7 @@ mod tests {
         // Side-effecting / outbound tools are not read-only.
         for t in [
             "memory_store",
+            "memory_note",
             "agent_send",
             "channel_send",
             "file_write",
@@ -298,6 +306,22 @@ mod tests {
         }
         // Conservative bias: an unknown tool is treated as side-effecting.
         assert!(!tool_is_read_only("some_future_tool"));
+    }
+
+    /// ANAI-166. Named explicitly rather than left to the loop above, because
+    /// the omission this fixes was silent in both directions: the drop
+    /// predicate over-kept heartbeat turns whose only call was a status read,
+    /// and `AgentMode::Assist` filtering — which uses this same list as its
+    /// single source of truth — made the tool uncallable for exactly the mode
+    /// most likely to want it.
+    #[test]
+    fn memory_read_tools_are_classified_read_only() {
+        assert!(tool_is_read_only("memory_status"));
+        assert!(tool_is_read_only("memory_recall"));
+        assert!(
+            !tool_is_read_only("memory_note"),
+            "a note is a durable write and must keep its turn"
+        );
     }
 
     #[test]

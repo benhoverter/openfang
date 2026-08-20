@@ -291,6 +291,38 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
     }
 }
 
+/// ADR 0001 §2.2: resolve the episode this turn is captured into.
+///
+/// Returns `None` — no episode — for a turn the ANAI-76 predicate would drop.
+/// That exclusion is load-bearing, not tidiness: heartbeats fire on a timer
+/// forever, so letting an inert one touch the episode clock would keep every
+/// idle agent's episode open indefinitely and make close-on-timer unreachable.
+/// A quiet agent must be *seen* as quiet. Shadow-dropped rows (ANAI-77) are
+/// already marked as not-really-wanted evidence, so leaving them unassigned
+/// also keeps them out of consolidation's input set for free.
+///
+/// Failure is non-fatal: an episode-store error degrades this turn to a legacy
+/// (episode-less) row rather than losing the capture. Memory bookkeeping must
+/// never be able to fail a turn.
+async fn resolve_episode(
+    memory: &MemorySubstrate,
+    agent_id: openfang_types::agent::AgentId,
+    trigger: TurnTrigger,
+    effects: &TurnEffects,
+    observer_live: bool,
+) -> Option<uuid::Uuid> {
+    if should_capture_turn(trigger, effects, observer_live).is_drop() {
+        return None;
+    }
+    match memory.ensure_open_episode_async(agent_id).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(error = %e, "Episode resolution failed; capturing turn without an episode");
+            None
+        }
+    }
+}
+
 /// ANAI-77: build the episodic capture metadata for a completed turn,
 /// stamping the **shadow** would-drop verdict when the conservative predicate
 /// (ANAI-76) would drop this turn (an inert heartbeat). Observe-only: callers
@@ -301,13 +333,23 @@ fn build_user_turn_message(user_message: &str, blocks: Option<Vec<ContentBlock>>
 /// content-free `side_effecting_tools` / `tools_observed` counts that let the
 /// shadow window prove the drop classifier partitions correctly before the
 /// enforce flip.
+///
+/// ADR 0001 §2.2: also stamps `episode_id` when the turn belongs to one (see
+/// [`resolve_episode`]). `semantic.rs` lifts that key into a real column.
 fn capture_metadata(
     base: &HashMap<String, serde_json::Value>,
     trigger: TurnTrigger,
     effects: &TurnEffects,
     observer_live: bool,
+    episode_id: Option<uuid::Uuid>,
 ) -> HashMap<String, serde_json::Value> {
     let mut meta = base.clone();
+    if let Some(ep) = episode_id {
+        meta.insert(
+            openfang_memory::episode::EPISODE_ID_KEY.to_string(),
+            serde_json::json!(ep.to_string()),
+        );
+    }
     if should_capture_turn(trigger, effects, observer_live).is_drop() {
         meta.insert("would_drop".to_string(), serde_json::json!(true));
         meta.insert(
@@ -1006,8 +1048,21 @@ pub async fn run_agent_loop(
                 // binary reports `false` → pure keep-mode until a deployed observe
                 // binary reports `true`; cannot over-delete pre-deploy.
                 let observer_live = response.observer_live;
-                let capture_meta =
-                    capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
+                let episode_id = resolve_episode(
+                    memory,
+                    session.agent_id,
+                    trigger,
+                    &turn_effects,
+                    observer_live,
+                )
+                .await;
+                let capture_meta = capture_metadata(
+                    &trigger_meta,
+                    trigger,
+                    &turn_effects,
+                    observer_live,
+                    episode_id,
+                );
 
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
@@ -2674,8 +2729,21 @@ pub async fn run_agent_loop_streaming(
                 // binary reports `false` → pure keep-mode until a deployed observe
                 // binary reports `true`; cannot over-delete pre-deploy.
                 let observer_live = response.observer_live;
-                let capture_meta =
-                    capture_metadata(&trigger_meta, trigger, &turn_effects, observer_live);
+                let episode_id = resolve_episode(
+                    memory,
+                    session.agent_id,
+                    trigger,
+                    &turn_effects,
+                    observer_live,
+                )
+                .await;
+                let capture_meta = capture_metadata(
+                    &trigger_meta,
+                    trigger,
+                    &turn_effects,
+                    observer_live,
+                    episode_id,
+                );
 
                 // Remember this interaction (with embedding if available)
                 let interaction_text = format!(
@@ -4366,7 +4434,7 @@ mod tests {
 
         // Inert heartbeat: dropped, and the notch records zero side-effects.
         let inert = TurnEffects::new();
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true);
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true, None);
         assert_eq!(m.get("would_drop"), Some(&serde_json::json!(true)));
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
@@ -4376,13 +4444,13 @@ mod tests {
         let mut active = TurnEffects::new();
         active.observe_tool("memory_recall"); // read-only
         active.observe_tool("agent_send"); // side-effecting
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active, true);
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &active, true, None);
         assert!(!m.contains_key("would_drop"), "active heartbeat is kept");
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(1)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(2)));
 
         // Non-heartbeat turn: no notch keys, no would_drop.
-        let m = capture_metadata(&base, TurnTrigger::User, &inert, true);
+        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, None);
         assert!(!m.contains_key("side_effecting_tools"));
         assert!(!m.contains_key("tools_observed"));
         assert!(!m.contains_key("would_drop"));
@@ -4397,7 +4465,7 @@ mod tests {
         use openfang_types::turn::{TurnEffects, TurnTrigger};
         let base = HashMap::new();
         let inert = TurnEffects::new();
-        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, false);
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, false, None);
         assert!(
             !m.contains_key("would_drop"),
             "blind-observer inert heartbeat must not be marked would_drop"
@@ -4405,6 +4473,27 @@ mod tests {
         assert_eq!(m.get("observer_live"), Some(&serde_json::json!(false)));
         assert_eq!(m.get("side_effecting_tools"), Some(&serde_json::json!(0)));
         assert_eq!(m.get("tools_observed"), Some(&serde_json::json!(0)));
+    }
+
+    /// ADR 0001 §2.2: the episode id reaches the capture metadata under the
+    /// key `semantic.rs` lifts into the `memories.episode_id` column, and an
+    /// episode-less turn stamps nothing (absence is the legacy marker, so a
+    /// present-but-empty value would be worse than no key at all).
+    #[test]
+    fn capture_metadata_stamps_episode_id() {
+        use openfang_types::turn::{TurnEffects, TurnTrigger};
+        let base = HashMap::new();
+        let inert = TurnEffects::new();
+        let ep = uuid::Uuid::new_v4();
+
+        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, Some(ep));
+        assert_eq!(
+            m.get(openfang_memory::episode::EPISODE_ID_KEY),
+            Some(&serde_json::json!(ep.to_string()))
+        );
+
+        let m = capture_metadata(&base, TurnTrigger::User, &inert, true, None);
+        assert!(!m.contains_key(openfang_memory::episode::EPISODE_ID_KEY));
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted

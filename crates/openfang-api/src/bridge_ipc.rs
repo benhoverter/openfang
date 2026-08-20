@@ -88,6 +88,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "web_search",
     "apply_patch",
     "file_convert",
+    "memory_episode_close",
+    "memory_status",
+    "memory_note",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -1591,10 +1594,11 @@ mod tests {
     #[test]
     fn allowlist_cardinality_pin() {
         use openfang_mcp_bridge::{built_in_tools, DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
-        assert_eq!(ALLOWED_TOOLS.len(), 20, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-166: 22 -> 23 (`memory_note`).
+        assert_eq!(ALLOWED_TOOLS.len(), 23, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            20,
+            23,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -1604,8 +1608,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            16,
-            "DEFAULT_ALLOWED bridge-default cardinality (19 − 4 privileged)"
+            19,
+            "DEFAULT_ALLOWED bridge-default cardinality (23 − 4 privileged)"
         );
     }
 

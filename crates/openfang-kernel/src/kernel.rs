@@ -13,6 +13,7 @@ use crate::supervisor::Supervisor;
 use crate::triggers::{TriggerEngine, TriggerId, TriggerPattern};
 use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowRunId};
 
+use openfang_memory::episode::{CloseReason, EPISODE_ID_KEY};
 use openfang_memory::MemorySubstrate;
 use openfang_runtime::agent_loop::{
     run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
@@ -33,7 +34,7 @@ use openfang_types::capability::Capability;
 use openfang_types::config::{KernelConfig, OutputFormat};
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
-use openfang_types::memory::Memory;
+use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::tool::ToolDefinition;
 use openfang_types::turn::{TurnPolicy, TurnTrigger};
 
@@ -8661,20 +8662,122 @@ fn resolve_memory_scope<'k>(
         return Ok((shared_memory_agent_id(), bare));
     }
 
+    Ok((resolve_memory_caller(registry, caller_agent_id)?, key))
+}
+
+/// Resolve a memory tool's caller to an [`AgentId`], accepting a UUID or a
+/// registered name.
+///
+/// Split out of [`resolve_memory_scope`] for the episode tools (ANAI-194),
+/// which have no key and therefore no `shared:` escape hatch. That asymmetry is
+/// the point: a key can legitimately name cross-agent state, an episode never
+/// can. Keeping the fail-closed treatment of an unattributed caller in one
+/// place means the ANAI-165 rule cannot be half-applied to a new tool.
+fn resolve_memory_caller(
+    registry: &AgentRegistry,
+    caller_agent_id: Option<&str>,
+) -> Result<AgentId, String> {
     let caller = caller_agent_id.ok_or_else(|| {
         "Memory tools require a caller identity; this call arrived unattributed and was refused \
          rather than written to the shared namespace (ANAI-165)"
             .to_string()
     })?;
 
-    let id: AgentId = match caller.parse() {
-        Ok(id) => id,
+    match caller.parse() {
+        Ok(id) => Ok(id),
         Err(_) => registry
             .find_by_name(caller)
             .map(|e| e.id)
-            .ok_or_else(|| format!("Memory caller not found: {caller}"))?,
-    };
-    Ok((id, key))
+            .ok_or_else(|| format!("Memory caller not found: {caller}")),
+    }
+}
+
+/// How many closed episodes `memory_status` reports. Enough to orient, few
+/// enough that the tool result stays a status line rather than a log dump.
+const MEMORY_STATUS_RECENT_LIMIT: usize = 3;
+
+/// ANAI-166 (ADR 0002 §2.1, principle 1): the `kind` discriminator lives in
+/// capture metadata, NOT in `MemorySource`.
+///
+/// `MemorySource` is a storage-era vocabulary (`Conversation`, `Observation`,
+/// `Inference`…) shared with the HTTP memory-api and with 46k existing rows.
+/// Redefining one of its variants to mean "note" would make the concept the
+/// tool surface exposes depend on a column we do not own — exactly the
+/// tools-model-tables coupling the ADR forbids. A metadata key is ours, is
+/// filterable, and can grow `fact`/`summary` in stage 3 without touching an
+/// enum that crosses a service boundary.
+const MEMORY_KIND_KEY: &str = "kind";
+
+/// `kind` value for an agent-authored note (ADR 0002 §2.2, `memory_note`).
+const MEMORY_KIND_NOTE: &str = "note";
+
+/// Scope notes are written under.
+///
+/// The same scope episodic capture uses, deliberately: a note is raw material
+/// for consolidation on exactly the same footing as a captured turn, and
+/// giving it its own scope would hide it from every consolidation query that
+/// already filters on `episodic`.
+const MEMORY_NOTE_SCOPE: &str = "episodic";
+
+/// Ceiling on `memory_recall`'s `limit`.
+///
+/// A retrieval tool that can be asked for 500 rows is a context-window
+/// exhaustion primitive pointed at the caller's own turn. Twenty-five is well
+/// past what any prompt can use and far short of what would hurt.
+const MEMORY_SEARCH_MAX_LIMIT: usize = 25;
+
+/// Capture metadata for an agent-authored note (ANAI-166).
+///
+/// Split out of the `memory_note` handler so the durable shape of a note —
+/// which keys land on the row — is testable without standing up a kernel. It
+/// is the shape, not the write, that later stages and consolidation depend on:
+/// `kind` is what `memory_recall`'s filter matches, and `episode_id` is what
+/// groups the note with the turns around it.
+fn note_metadata(
+    episode_id: uuid::Uuid,
+    tags: &[String],
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        MEMORY_KIND_KEY.to_string(),
+        serde_json::Value::String(MEMORY_KIND_NOTE.to_string()),
+    );
+    metadata.insert(
+        EPISODE_ID_KEY.to_string(),
+        serde_json::Value::String(episode_id.to_string()),
+    );
+    // Absent rather than empty when there are no tags: an empty array in the
+    // metadata JSON would make every untagged note match a future
+    // `tags IS NOT NULL` style filter.
+    if !tags.is_empty() {
+        metadata.insert(
+            "tags".to_string(),
+            serde_json::Value::Array(
+                tags.iter()
+                    .map(|t| serde_json::Value::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    metadata
+}
+
+/// Metadata filter for `memory_recall`'s optional `kind` (ANAI-166).
+///
+/// A blank or whitespace-only `kind` yields an EMPTY filter, not a filter for
+/// the empty string. The difference matters: the latter matches nothing at all
+/// and would read to the caller as an empty memory.
+fn kind_filter_metadata(
+    kind: Option<&str>,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(kind) = kind.map(str::trim).filter(|k| !k.is_empty()) {
+        metadata.insert(
+            MEMORY_KIND_KEY.to_string(),
+            serde_json::Value::String(kind.to_string()),
+        );
+    }
+    metadata
 }
 
 /// ANAI-165: read `user_name` for the prompt builder's `## User Profile`.
@@ -9637,6 +9740,191 @@ impl KernelHandle for OpenFangKernel {
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    fn memory_episode_close(
+        &self,
+        caller_agent_id: Option<&str>,
+        reason: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let reason = CloseReason::parse(reason)
+            .ok_or_else(|| format!("Unknown episode close reason: {reason}"))?;
+        self.memory
+            .close_episode(agent_id, reason, title, summary)
+            .map(|id| id.map(|i| i.to_string()))
+            .map_err(|e| format!("Episode close failed: {e}"))
+    }
+
+    fn memory_status(&self, caller_agent_id: Option<&str>) -> Result<serde_json::Value, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let status = self
+            .memory
+            .episode_status(agent_id, MEMORY_STATUS_RECENT_LIMIT)
+            .map_err(|e| format!("Memory status failed: {e}"))?;
+
+        let episode_json = |ep: &openfang_memory::episode::Episode| {
+            serde_json::json!({
+                "id": ep.id.to_string(),
+                "opened_at": ep.opened_at.to_rfc3339(),
+                "closed_at": ep.closed_at.map(|t| t.to_rfc3339()),
+                "turn_count": ep.turn_count,
+                "title": ep.title,
+                "close_reason": ep.close_reason.map(|r| r.as_str()),
+            })
+        };
+
+        Ok(serde_json::json!({
+            "episode": status.current.as_ref().map(episode_json),
+            "idle_minutes": status.idle_minutes,
+            "idle_timeout_minutes": status.idle_timeout_minutes,
+            "minutes_until_timer_close": status.minutes_until_timer_close,
+            "recent_episodes": status.recent.iter().map(episode_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn memory_search(
+        &self,
+        caller_agent_id: Option<&str>,
+        query: &str,
+        scope: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let limit = limit.clamp(1, MEMORY_SEARCH_MAX_LIMIT);
+
+        let metadata = kind_filter_metadata(kind);
+
+        let filter = MemoryFilter {
+            // Always the caller's own rows. `memory_recall`'s `shared:` escape
+            // is a property of the KV path only: a semantic search that could
+            // reach across agents would let any agent read any other's
+            // episodic history by guessing at topic, which is a far larger
+            // door than guessing at a key.
+            agent_id: Some(agent_id),
+            scope: scope
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            metadata,
+            ..Default::default()
+        };
+
+        // Embed the query when a driver is configured. A failure here is
+        // degraded, not fatal: LIKE matching over the caller's own rows is a
+        // worse search but an honest one, and returning an error instead would
+        // take memory offline every time an embedding endpoint hiccups.
+        let query_embedding = match self.embedding_driver {
+            Some(ref driver) => match driver.embed_one(query).await {
+                Ok(vec) => Some(vec),
+                Err(e) => {
+                    warn!(error = %e, "Query embedding failed; falling back to text search");
+                    None
+                }
+            },
+            None => None,
+        };
+        let mode = if query_embedding.is_some() {
+            "semantic"
+        } else {
+            "text"
+        };
+
+        let hits = self
+            .memory
+            .recall_with_embedding_async(query, limit, Some(filter), query_embedding.as_deref())
+            .await
+            .map_err(|e| format!("Memory search failed: {e}"))?;
+
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|frag| {
+                serde_json::json!({
+                    "id": frag.id.0.to_string(),
+                    "content": frag.content,
+                    "scope": frag.scope,
+                    "kind": frag
+                        .metadata
+                        .get(MEMORY_KIND_KEY)
+                        .and_then(|v| v.as_str()),
+                    "episode_id": frag
+                        .metadata
+                        .get(EPISODE_ID_KEY)
+                        .and_then(|v| v.as_str()),
+                    "tags": frag.metadata.get("tags"),
+                    "created_at": frag.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            // Reported so a caller can tell a genuinely empty memory from a
+            // degraded search. Without it, an embedding outage is
+            // indistinguishable from "you never knew that".
+            "mode": mode,
+            "count": results.len(),
+            "results": results,
+        }))
+    }
+
+    async fn memory_note(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+    ) -> Result<String, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("Note text is empty".to_string());
+        }
+
+        // A note is activity, so it opens an episode if none is open and
+        // extends one that is. This is why ADR 0002 §2.6 refuses an
+        // `episode_open` tool: the write already establishes the state.
+        let episode_id = self
+            .memory
+            .ensure_open_episode_async(agent_id)
+            .await
+            .map_err(|e| format!("Note failed to resolve an episode: {e}"))?;
+
+        let metadata = note_metadata(episode_id, tags);
+
+        let embedding = match self.embedding_driver {
+            Some(ref driver) => match driver.embed_one(text).await {
+                Ok(vec) => Some(vec),
+                Err(e) => {
+                    // Store unembedded rather than lose the note. It stays
+                    // findable by text search, and `update_embedding` can
+                    // backfill it later; refusing the write would throw away
+                    // the one thing the agent actually asked to keep.
+                    warn!(error = %e, "Note embedding failed; storing without a vector");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let id = self
+            .memory
+            .remember_with_embedding_async(
+                agent_id,
+                text,
+                // Observation, not Inference: the agent is recording something
+                // it saw or decided, and `kind` — not `source` — is the
+                // discriminator this surface reads (see MEMORY_KIND_KEY).
+                MemorySource::Observation,
+                MEMORY_NOTE_SCOPE,
+                metadata,
+                embedding.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Note failed: {e}"))?;
+
+        Ok(id.0.to_string())
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
@@ -10605,6 +10893,62 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    // -----------------------------------------------------------------------
+    // ANAI-166: note shape and kind filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_note_carries_its_kind_and_episode() {
+        // These two keys are the whole contract. `kind` is what
+        // `memory_recall`'s filter matches on; `episode_id` is what groups the
+        // note with the turns around it and what consolidation will later use
+        // as its input set. A note missing either is stored but unfindable in
+        // the ways that matter.
+        let episode = uuid::Uuid::new_v4();
+        let meta = note_metadata(episode, &[]);
+        assert_eq!(
+            meta.get(MEMORY_KIND_KEY),
+            Some(&serde_json::Value::String(MEMORY_KIND_NOTE.to_string()))
+        );
+        assert_eq!(
+            meta.get(EPISODE_ID_KEY),
+            Some(&serde_json::Value::String(episode.to_string()))
+        );
+        assert!(
+            !meta.contains_key("tags"),
+            "an untagged note must omit `tags`, not store an empty array"
+        );
+    }
+
+    #[test]
+    fn note_tags_round_trip_as_json_strings() {
+        let meta = note_metadata(
+            uuid::Uuid::new_v4(),
+            &["episodes".to_string(), "ddl".to_string()],
+        );
+        assert_eq!(
+            meta.get("tags"),
+            Some(&serde_json::json!(["episodes", "ddl"]))
+        );
+    }
+
+    #[test]
+    fn a_blank_kind_filters_on_nothing_rather_than_on_the_empty_string() {
+        // The failure this guards is silent: filtering on "" matches no row at
+        // all, and the caller cannot distinguish that from an empty memory.
+        for blank in [None, Some(""), Some("   ")] {
+            assert!(
+                kind_filter_metadata(blank).is_empty(),
+                "blank kind must produce no filter: {blank:?}"
+            );
+        }
+        assert_eq!(
+            kind_filter_metadata(Some("  note  ")).get(MEMORY_KIND_KEY),
+            Some(&serde_json::Value::String("note".to_string())),
+            "a kind must be trimmed before it becomes a filter"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // ANAI-165: memory scope resolution
