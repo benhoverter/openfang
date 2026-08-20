@@ -3205,6 +3205,8 @@ async fn tool_agent_send_async(
         // token inherits it (minted in `run_woken_agent_loop`). None on the
         // wire when unset.
         surface_to: surface_to.clone(),
+        // Not a reply at all, so the kind is inert here (ANAI-199).
+        reply_kind: openfang_types::wake::ReplyKind::Explicit,
     };
 
     if let Some(route) = surface_to.as_deref() {
@@ -3350,6 +3352,10 @@ async fn tool_agent_reply_async(
         is_reply: true,
         // ANAI-123: carry the surfacing route back to origin (leg 3->4).
         surface_to: surface_to.clone(),
+        // ANAI-199: an agent authored this body. Every other kind is minted by
+        // the daemon on the callee's behalf, and only the daemon may set them —
+        // this is the one construction site that is allowed to say `Explicit`.
+        reply_kind: openfang_types::wake::ReplyKind::Explicit,
     };
 
     debug!(

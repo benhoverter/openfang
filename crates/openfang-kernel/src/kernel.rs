@@ -5996,6 +5996,29 @@ impl OpenFangKernel {
                         &task_id,
                         "target not found",
                     );
+                    // ANAI-199 leg 1: the sender is owed a reply and the target
+                    // will never run to give one. Before this, an
+                    // `agent_send_async` at an inactive or misnamed agent
+                    // returned "queued" and then produced nothing, forever —
+                    // the single most common silent failure, because "not
+                    // found" also fires for any agent that simply is not
+                    // active.
+                    self.emit_synthetic_reply(
+                        &envelope,
+                        &task_id,
+                        openfang_types::wake::ReplyKind::Error,
+                        format!(
+                            "[kernel] Your async request to '{}' was NOT delivered: no agent \
+                             with that name or id is registered (correlation {task_id}).\n\n\
+                             The target never ran, so NO side effects from this request exist. \
+                             This is a delivery failure, not a refusal by the target.\n\n\
+                             Check the name, or the agent may be inactive, never spawned, or \
+                             killed. Re-sending the same request unchanged will fail \
+                             identically.",
+                            envelope.target
+                        ),
+                    )
+                    .await;
                     let _ = self
                         .memory
                         .task_complete(
@@ -6028,6 +6051,27 @@ impl OpenFangKernel {
                 &task_id,
                 "refused: chain depth exceeds bound",
             );
+            // ANAI-199 leg 2: refused before dispatch. The sender's debt is
+            // still outstanding — a refusal the sender never hears about is
+            // indistinguishable from a hang.
+            self.emit_synthetic_reply(
+                &envelope,
+                &task_id,
+                openfang_types::wake::ReplyKind::Error,
+                format!(
+                    "[kernel] Your async request to '{}' was REFUSED before dispatch: the \
+                     wake-chain depth ({}) is at or beyond the bound ({}) (correlation \
+                     {task_id}).\n\n\
+                     The target never ran, so NO side effects from this request exist.\n\n\
+                     The delegation chain is too long. Re-sending unchanged will be refused \
+                     identically; shorten the chain or dispatch the work from closer to its \
+                     root.",
+                    envelope.target,
+                    envelope.lineage.depth(),
+                    openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH,
+                ),
+            )
+            .await;
             let _ = self
                 .memory
                 .task_complete(&task_id, "wake refused: chain depth exceeds bound")
@@ -6140,7 +6184,13 @@ impl OpenFangKernel {
         // reply-woken/terminal turn for the same agent. Consume-on-read already
         // removes a USED right; this covers the never-replied path. Safe under
         // `agent_msg_locks` (one woken turn per agent at a time).
-        self.reply_rights.remove(&target_id);
+        //
+        // ANAI-199: the return value is now load-bearing, not incidental. `Some`
+        // means the token was NEVER consumed — the turn ran (or failed) without
+        // the callee ever calling `agent_reply_async`, so the sender's debt is
+        // still outstanding and the daemon must pay it. `None` means the callee
+        // already answered; synthesizing anything here would double-reply.
+        let debt_outstanding = self.reply_rights.remove(&target_id).is_some();
 
         match result {
             Ok(loop_result) => {
@@ -6169,6 +6219,28 @@ impl OpenFangKernel {
             }
             Err(e) => {
                 warn!(target = %envelope.target, error = %e, "Woken agent loop failed");
+                // ANAI-199 leg 3: the turn STARTED and then failed. Unlike legs
+                // 1 and 2, side effects may exist — say so explicitly rather
+                // than let the sender assume a clean no-op.
+                if debt_outstanding {
+                    self.emit_synthetic_reply(
+                        &envelope,
+                        &task_id,
+                        openfang_types::wake::ReplyKind::Error,
+                        format!(
+                            "[kernel] Your async request to '{}' FAILED mid-turn (correlation \
+                             {task_id}).\n\nError: {e}\n\n\
+                             The target's turn STARTED, so side effects up to the point of \
+                             failure MAY exist and are NOT enumerated here. The target did not \
+                             reply; this message is the kernel closing the correlation on its \
+                             behalf.\n\n\
+                             Recovery is investigation-led: inspect what the target did before \
+                             deciding what to re-send. Do not blind-retry.",
+                            envelope.target
+                        ),
+                    )
+                    .await;
+                }
                 self.audit_wake_completion(
                     &envelope.sender,
                     &envelope.target,
@@ -6181,6 +6253,164 @@ impl OpenFangKernel {
                     .await;
             }
         }
+    }
+
+    /// ANAI-199: pay the sender's outstanding reply debt when the callee never
+    /// did — the daemon answering on the callee's behalf.
+    ///
+    /// A reply-right is a **debt the kernel owes**, not a courtesy the callee
+    /// may extend. Every path in [`Self::run_woken_agent_loop`] that ends a wake
+    /// without an `agent_reply_async` must route through here, so that
+    /// `agent_send_async` has a reply *guarantee* rather than a reply *hope*.
+    ///
+    /// The synthesized envelope is shaped exactly like the one
+    /// `tool_agent_reply_async` builds — `is_reply = true`, a fresh lineage
+    /// rooted at the callee, the inbound `surface_to` inherited — with one bit
+    /// added: [`ReplyKind`](openfang_types::wake::ReplyKind) marks it as
+    /// daemon-minted, so the initiator's leg-4 turn can tell "no answer exists"
+    /// from "here is the answer".
+    ///
+    /// **Ceiling (ANAI-200).** This path deliberately does not consult
+    /// `wake_emit_admit`: the aggregate emission ceiling lives in the runtime's
+    /// producer, and the kernel's privileged `wake_post` never called it. That
+    /// is the correct behaviour here rather than an oversight to fix — a
+    /// synthesized reply is 1:1 bounded by wakes ALREADY admitted, so it cannot
+    /// amplify; and gating it would punch a hole in the guarantee exactly when
+    /// the fleet is busy, i.e. during the fan-out that needs it most.
+    ///
+    /// **Termination.** Every reply this mints carries `is_reply = true`, and
+    /// the guard below refuses to synthesize for a wake that is itself a reply.
+    /// So a synthesized reply that ITSELF fails to dispatch is dropped with a
+    /// log and cannot recurse: depth-1 by construction, not by convention.
+    async fn emit_synthetic_reply(
+        &self,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        task_id: &str,
+        kind: openfang_types::wake::ReplyKind,
+        body: String,
+    ) {
+        // Terminal edge: nobody is owed a reply to a reply. This is the
+        // recursion base case (see the doc comment), so it is an early return
+        // rather than a caller-side precondition.
+        if envelope.is_reply {
+            debug!(
+                correlation = %task_id,
+                kind = kind.label(),
+                "ANAI-199: not synthesizing — the failed wake was itself a terminal reply, \
+                 so no reply debt is outstanding"
+            );
+            return;
+        }
+
+        // Don't enqueue a wake nobody can claim. A sender that no longer
+        // resolves (killed agent, or a non-agent originator such as cron or the
+        // API) has no woken turn to receive this, and the wake would just cycle
+        // through the consumer to be dropped. Visible non-drop: logged, never
+        // silent.
+        if self.resolve_agent_ref(&envelope.sender).is_none() {
+            warn!(
+                correlation = %task_id,
+                sender = %envelope.sender,
+                kind = kind.label(),
+                "ANAI-199: reply debt cannot be paid — sender does not resolve to a live \
+                 agent; the failure is recorded in the audit log only"
+            );
+            return;
+        }
+
+        let reply = openfang_types::wake::WakeEnvelope {
+            target: envelope.sender.clone(),
+            // Attributed to the callee, not to "kernel": the initiator asked a
+            // specific agent and should see the answer come back from it. The
+            // `reply_kind` carries the "who actually wrote this" bit.
+            sender: envelope.target.clone(),
+            message: body.clone(),
+            // Fresh single-element chain, mirroring `agent_reply_async`: a reply
+            // completes a correlation, it does not extend the inbound chain
+            // (extending would form the [origin,...,callee,origin] cycle that
+            // `would_cycle` rightly refuses).
+            lineage: openfang_types::wake::WakeLineage::root_at(&envelope.target),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: true,
+            // Inherit the inbound surfacing route so a failure reaches the same
+            // human channel a success would have (ANAI-123/124). A delegated
+            // request that dies must not die more quietly than one that works.
+            surface_to: envelope.surface_to.clone(),
+            reply_kind: kind,
+        };
+
+        let payload = match reply.to_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    correlation = %task_id,
+                    error = %e,
+                    "ANAI-199: failed to serialize synthesized reply; debt unpaid"
+                );
+                return;
+            }
+        };
+
+        let title = format!(
+            "{}{}",
+            openfang_types::wake::WAKE_TASK_PREFIX,
+            envelope.sender
+        );
+        match self
+            .wake_post(
+                &title,
+                &body,
+                Some(&envelope.sender),
+                Some(&envelope.target),
+                &payload,
+            )
+            .await
+        {
+            Ok(reply_task_id) => {
+                info!(
+                    correlation = %task_id,
+                    reply_task = %reply_task_id,
+                    initiator = %envelope.sender,
+                    kind = kind.label(),
+                    "ANAI-199: kernel synthesized a terminal reply on the callee's behalf"
+                );
+                self.audit_wake_completion(
+                    &envelope.sender,
+                    &envelope.target,
+                    task_id,
+                    format!("synthesized {} reply", kind.label()),
+                );
+            }
+            Err(e) => {
+                // Last resort: the debt is unpayable through the wake queue.
+                // Loud, because this is the guarantee failing.
+                warn!(
+                    correlation = %task_id,
+                    error = %e,
+                    initiator = %envelope.sender,
+                    kind = kind.label(),
+                    "ANAI-199: could not enqueue synthesized reply — the sender will not be \
+                     told this correlation closed"
+                );
+            }
+        }
+    }
+
+    /// Resolve an agent reference (uuid or name) to a REGISTERED agent id.
+    ///
+    /// Stricter than the inline resolution in
+    /// [`Self::run_woken_agent_loop`], which accepts any well-formed uuid: this
+    /// requires the agent to actually be in the registry, because its callers
+    /// ask "is there someone here to receive this?" rather than "does this parse
+    /// as an id?".
+    fn resolve_agent_ref(&self, who: &str) -> Option<AgentId> {
+        if let Ok(id) = who.parse::<AgentId>() {
+            if self.registry.get(id).is_some() {
+                return Some(id);
+            }
+        }
+        self.registry.find_by_name(who).map(|e| e.id)
     }
 
     /// ANAI-124: emit exactly one channel post of origin's shaped reply text on
@@ -13417,6 +13647,246 @@ system_prompt = "You are a test agent."
         assert!(
             kernel.reply_rights.is_empty(),
             "no reply-right may survive turn end"
+        );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-199: every silent early return must pay the sender's reply debt
+    // -----------------------------------------------------------------------
+
+    /// Boot a throwaway kernel with one registered agent, returned as
+    /// `(tmp, kernel, agent_name)`. The tempdir is returned so the caller keeps
+    /// it alive for the duration of the test.
+    fn anai199_kernel(agent_name: &str) -> (tempfile::TempDir, std::sync::Arc<OpenFangKernel>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-anai199");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+        register_test_agent(&kernel, agent_name);
+        // A second agent, for the cases that need the wake TARGET to resolve:
+        // the depth re-check sits downstream of target resolution, so a bogus
+        // target name would trip the not-found leg first.
+        register_test_agent(&kernel, "deep-target");
+        (tmp, kernel)
+    }
+
+    /// An `agent_send_async` at a name that does not resolve used to return
+    /// "queued" and then produce NOTHING — the sender waited forever on a wake
+    /// that was dropped with a `warn!` it never saw. Since "target not found"
+    /// also fires for any agent that is merely inactive, this is the most common
+    /// shape of the observed failure-to-respond.
+    ///
+    /// The kernel must now close the correlation itself: a terminal reply back
+    /// to the sender, marked `Error` so the sender cannot mistake it for the
+    /// target's own answer, and explicit that no side effects exist.
+    #[tokio::test]
+    async fn undeliverable_wake_pays_the_sender_an_error_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-x");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "initiator-x".into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("initiator-x"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: Default::default(),
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-undeliverable".into(), envelope)
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "the kernel must enqueue a terminal reply for the sender — without it the \
+                 sender waits forever on an undeliverable wake (ANAI-199)",
+            );
+
+        assert_eq!(reply.target, "initiator-x", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "no-such-agent",
+            "the reply is attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "a synthesized reply is terminal");
+        assert_eq!(
+            reply.reply_kind,
+            openfang_types::wake::ReplyKind::Error,
+            "the sender must be able to tell this from a real answer"
+        );
+        assert!(
+            reply.reply_kind.is_synthetic(),
+            "no agent authored this body"
+        );
+        // The body has to SAY what it means: an orchestrator reading a bare
+        // "timeout"/"error" pattern-matches to blind retry.
+        assert!(
+            reply.message.contains("NOT delivered"),
+            "the body must state the request was never delivered: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("NO side effects"),
+            "the body must state that no side effects exist: {}",
+            reply.message
+        );
+        // A failure must reach the same human channel a success would have.
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510"),
+            "the synthesized reply inherits the inbound surfacing route"
+        );
+        // The reply roots a fresh chain, so origin's leg-4 turn is a clean leaf.
+        assert_eq!(reply.lineage.depth(), 1);
+
+        kernel.shutdown();
+    }
+
+    /// A wake refused for chain depth is still a wake the sender is owed an
+    /// answer to. Before ANAI-199 the refusal was audit-only: the sender could
+    /// not distinguish "refused" from "still working".
+    #[tokio::test]
+    async fn depth_refused_wake_pays_the_sender_an_error_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-y");
+
+        // Build a chain already at the bound, so the pre-dispatch re-check trips.
+        let mut lineage = openfang_types::wake::WakeLineage::root_at("initiator-y");
+        while !lineage.exceeds_depth(openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH) {
+            lineage = lineage.extended(format!("hop-{}", lineage.depth()));
+        }
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            // The target RESOLVES here on purpose: the depth re-check sits
+            // downstream of target resolution, so a bogus name would trip the
+            // not-found leg and this test would pass for the wrong reason.
+            target: "deep-target".into(),
+            sender: "initiator-y".into(),
+            message: "one hop too far".into(),
+            lineage,
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: Default::default(),
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-too-deep".into(), envelope)
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect("a refused wake must still close the sender's correlation (ANAI-199)");
+
+        assert_eq!(reply.target, "initiator-y");
+        assert_eq!(reply.reply_kind, openfang_types::wake::ReplyKind::Error);
+        assert!(
+            reply.message.contains("REFUSED"),
+            "the body must state the request was refused, not merely failed: {}",
+            reply.message
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Termination, checked rather than assumed: a synthesized reply carries
+    /// `is_reply = true`, so if IT fails to dispatch the kernel must NOT
+    /// synthesize a reply-to-the-reply. Otherwise an undeliverable pair of
+    /// agents would pump the wake queue forever.
+    #[tokio::test]
+    async fn a_failed_reply_leg_does_not_synthesize_another_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-z");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "initiator-z".into(),
+            // This IS the terminal leg — nobody is owed anything downstream.
+            message: "here is your answer".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("no-such-agent"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: true,
+            surface_to: None,
+            reply_kind: openfang_types::wake::ReplyKind::Explicit,
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-terminal".into(), envelope)
+            .await;
+
+        assert!(
+            kernel
+                .memory
+                .claim_wake_for_dispatch(8)
+                .await
+                .expect("wake queue readable")
+                .is_none(),
+            "an undeliverable REPLY must be dropped, not answered — synthesizing here would \
+             recurse without bound (ANAI-199)"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// The debt is only payable to someone who can receive it. A sender that no
+    /// longer resolves (killed agent, or a non-agent originator like cron)
+    /// leaves the failure in the audit log rather than parking an unclaimable
+    /// wake in the queue.
+    #[tokio::test]
+    async fn unresolvable_sender_gets_no_unclaimable_wake() {
+        let (_tmp, kernel) = anai199_kernel("someone-else");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "a-ghost".into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("a-ghost"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: Default::default(),
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-ghost".into(), envelope)
+            .await;
+
+        // Counting EVERY pending task, not claiming and not filtering:
+        // `claim_wake_for_dispatch` resolves the envelope target against the
+        // registry, so a row addressed to a ghost is invisible to it — a
+        // claim-based assertion would pass even with the guard removed while the
+        // row sat in the queue forever.
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "no wake may be enqueued for a sender that can never claim it — it would park \
+             in the queue unclaimable and unseen; found {pending:?}"
         );
 
         kernel.shutdown();

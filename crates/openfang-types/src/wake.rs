@@ -223,6 +223,71 @@ pub struct WakeEnvelope {
     /// no-surfacing unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_to: Option<String>,
+    /// ANAI-199: *how* this reply came to exist. Meaningful only when
+    /// [`Self::is_reply`] is set; ignored (and omitted on the wire) otherwise.
+    ///
+    /// The initiator's leg-4 turn must be able to tell a real answer from a
+    /// kernel-synthesized stand-in, because the two demand different behaviour:
+    /// an [`ReplyKind::Explicit`] reply is the callee's considered answer, while
+    /// a synthetic one reports that the correlation was closed WITHOUT one. An
+    /// orchestrator that cannot distinguish them treats "the target never ran"
+    /// as a contract-satisfying result — precisely the silent-failure class this
+    /// stack exists to close.
+    ///
+    /// Defaults to [`ReplyKind::Explicit`] and is skipped on the wire in that
+    /// case, so every pre-ANAI-199 payload decodes back unchanged.
+    #[serde(default, skip_serializing_if = "ReplyKind::is_explicit")]
+    pub reply_kind: ReplyKind,
+}
+
+/// Provenance of a terminal reply (ANAI-199): who produced it, and therefore
+/// how much it can be trusted to mean.
+///
+/// Only [`ReplyKind::Explicit`] is produced by an agent. Every other variant is
+/// minted by the daemon to discharge an outstanding reply debt the callee did
+/// not (or could not) pay itself, so that `agent_send_async` has a reply
+/// guarantee rather than a reply *hope*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyKind {
+    /// The callee called `agent_reply_async` itself. The body is its answer.
+    #[default]
+    Explicit,
+    /// The callee's turn ended without ever calling `agent_reply_async`; the
+    /// daemon closed the correlation using the turn's final text (ANAI-198).
+    AutoClose,
+    /// The wake never produced an answer — undeliverable, refused before
+    /// dispatch, or the agent loop errored mid-turn (ANAI-199). The body says
+    /// which, and whether side effects may exist.
+    Error,
+    /// The sender's deadline elapsed and the callee's turn was aborted
+    /// (ANAI-201). Side effects up to the abort point may exist.
+    Timeout,
+}
+
+impl ReplyKind {
+    /// serde `skip_serializing_if` predicate — see [`WakeEnvelope::reply_kind`].
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+
+    /// True for every daemon-minted kind, i.e. "no agent authored this body".
+    /// The bit an initiator should branch on before treating a reply as work
+    /// product.
+    pub fn is_synthetic(&self) -> bool {
+        !self.is_explicit()
+    }
+
+    /// Stable lowercase label for logs, audit lines, and the prompt-visible
+    /// header on a synthesized reply.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::AutoClose => "auto_close",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+        }
+    }
 }
 
 /// serde `skip_serializing_if` predicate: skip a `bool` field when it is false,
@@ -330,6 +395,7 @@ mod tests {
             origin: Some("channel:1086446153098342510".into()),
             is_reply: false,
             surface_to: None,
+            reply_kind: ReplyKind::default(),
         };
         let payload = env.to_payload().unwrap();
         let back = WakeEnvelope::from_payload(&payload).unwrap();
@@ -351,6 +417,7 @@ mod tests {
             origin: None,
             is_reply: false,
             surface_to: None,
+            reply_kind: ReplyKind::default(),
         };
         let json = serde_json::to_string(&env).unwrap();
         // origin is skipped on the wire when absent...
@@ -377,6 +444,17 @@ mod tests {
             back.surface_to, None,
             "absent surface_to must decode to None"
         );
+        // ANAI-199: the default reply-kind is likewise absent on the wire, so a
+        // pre-ANAI-199 payload is byte-identical to a post-ANAI-199 one.
+        assert!(
+            !json.contains("reply_kind"),
+            "explicit reply_kind must be omitted: {json}"
+        );
+        assert_eq!(
+            back.reply_kind,
+            ReplyKind::Explicit,
+            "absent reply_kind must decode to Explicit"
+        );
     }
 
     #[test]
@@ -393,6 +471,7 @@ mod tests {
             origin: None,
             is_reply: true,
             surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: ReplyKind::default(),
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(
@@ -412,5 +491,38 @@ mod tests {
         // leg-4 turn starts clean and cannot be over-deep.
         assert_eq!(back.lineage.depth(), 1);
         assert_eq!(back.lineage.root(), Some("worker-b"));
+    }
+
+    /// ANAI-199: a daemon-synthesized reply must be distinguishable on the wire.
+    /// If `reply_kind` did not round-trip, an initiator would read "the target
+    /// was never reachable" as the target's considered answer.
+    #[test]
+    fn synthetic_reply_kind_round_trips_and_is_distinguishable() {
+        for kind in [ReplyKind::AutoClose, ReplyKind::Error, ReplyKind::Timeout] {
+            let env = WakeEnvelope {
+                target: "orchestrator".into(),
+                sender: "worker-b".into(),
+                message: "the kernel is answering on the callee's behalf".into(),
+                lineage: WakeLineage::root_at("worker-b"),
+                trigger: TurnTrigger::AgentCall,
+                origin: None,
+                is_reply: true,
+                surface_to: None,
+                reply_kind: kind,
+            };
+            let json = serde_json::to_string(&env).unwrap();
+            assert!(
+                json.contains(kind.label()),
+                "{kind:?} must serialize as its snake_case label: {json}"
+            );
+            let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
+            assert_eq!(env, back);
+            assert!(
+                back.reply_kind.is_synthetic(),
+                "{kind:?} must report as synthetic so an initiator does not \
+                 mistake it for the callee's own answer"
+            );
+        }
+        assert!(!ReplyKind::Explicit.is_synthetic());
     }
 }

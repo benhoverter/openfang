@@ -1354,6 +1354,7 @@ mod tests {
             origin: None,
             is_reply: false,
             surface_to: None,
+            reply_kind: Default::default(),
         }
     }
 
@@ -1729,6 +1730,7 @@ mod tests {
             origin: Some("channel:1086446153098342510".to_string()),
             is_reply: false,
             surface_to: None,
+            reply_kind: Default::default(),
         };
 
         // --- Producer half: post the wake into a file-backed WAL substrate. ---
