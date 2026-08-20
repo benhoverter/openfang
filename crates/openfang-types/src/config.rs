@@ -2175,8 +2175,14 @@ pub struct MemoryConfig {
     pub episode_idle_timeout_minutes: i64,
 }
 
+/// Episodes end when they end, not on a clock.
+///
+/// Zero disables close-on-timer: the only close path is an explicit
+/// `memory_episode_close`. See `openfang_memory::episode::
+/// DEFAULT_IDLE_TIMEOUT_MINUTES` for why silence is not evidence that a work
+/// session ended. Set a positive number of minutes to arm the timer.
 fn default_episode_idle_timeout() -> i64 {
-    120
+    0
 }
 
 fn default_consolidation_interval() -> u64 {

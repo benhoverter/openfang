@@ -42,12 +42,22 @@ use uuid::Uuid;
 
 /// Default idle gap after which the next turn starts a fresh episode.
 ///
-/// Two hours: long enough that a lunch break does not shred one work session
-/// into three, short enough that yesterday's context is not stapled onto this
-/// morning's. Deliberately conservative — over-long episodes only cost
-/// consolidation some extra input, while over-short ones destroy the boundary
-/// the tier exists to provide.
-pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 120;
+/// **Zero: close-on-timer is off by default.** Episodes end when they end.
+///
+/// The original two-hour default assumed an episode is a sitting. It is not —
+/// in field use a session goes quiet for days and then resumes on exactly the
+/// same topic, and a timer would have shredded that one thread into a dozen
+/// fragments, each too small for consolidation to say anything useful about.
+/// Wall-clock silence is not evidence that the work ended; only the agent
+/// saying so is. So the sole close path is explicit `memory_episode_close`.
+///
+/// A positive value re-enables the timer for deployments that want it — the
+/// mechanism is intact, just not armed. The cost of leaving it off is that a
+/// long-lived agent's episode grows without bound if it never closes one
+/// (ANAI-87's blob-growth concern, arriving through a second door). That is a
+/// close-discipline problem, and the honest place to fix it is close
+/// discipline, not a clock that guesses.
+pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 0;
 
 /// Metadata key under which the active episode is stamped onto each captured
 /// `memories` row. Also the name of the lifted column (see `semantic.rs`).
@@ -254,20 +264,23 @@ impl EpisodeStore {
                 ep.id
             }
             Some(ep) => {
-                // Timed out. Close at last activity, NOT at `now`: the episode
-                // ended when the work did, and dating it to the moment someone
-                // happened to come back would silently absorb the whole idle
-                // gap into its duration.
+                // Timed out. `closed_at` is stamped at `now` — it means "when
+                // the close happened", which is the only question it can answer
+                // that nothing else already does.
+                //
+                // It used to be back-dated to `last_activity_at` on the theory
+                // that the episode ended when the work did. That reading is
+                // fine, but it makes the field redundant: the content span is
+                // already recoverable as `opened_at..last_activity_at`, so
+                // back-dating spent the one column that could tell you when the
+                // lifecycle actually ran, and left closed episodes looking like
+                // they closed themselves the instant they went quiet. Duration
+                // of the *work* is unchanged and still exact; duration of the
+                // *episode row* now includes the idle tail, which is the truth.
+                //
                 // No title and no summary: a timer close has no author. See
                 // `Episode::summary`.
-                close_row(
-                    &tx,
-                    ep.id,
-                    ep.last_activity_at,
-                    CloseReason::Timer,
-                    None,
-                    None,
-                )?;
+                close_row(&tx, ep.id, now, CloseReason::Timer, None, None)?;
                 insert_open(&tx, agent_id, now)?
             }
             None => insert_open(&tx, agent_id, now)?,
@@ -343,8 +356,14 @@ impl EpisodeStore {
     ///
     /// Lazy timer-close ([`Self::ensure_open`]) only fires when an agent speaks
     /// again; this is the sweep for agents that went quiet. Safe to call from
-    /// the consolidation tick. Nothing calls it yet — wiring it is a scheduler
-    /// change, deliberately out of this commit.
+    /// the consolidation tick.
+    ///
+    /// **Nothing calls it, and nothing is going to.** With the idle timer off
+    /// by default ([`DEFAULT_IDLE_TIMEOUT_MINUTES`]) there is no reaping to do:
+    /// it returns 0 immediately. Kept, not deleted, because it is the working
+    /// half of the mechanism a deployment that sets a positive timeout would
+    /// need, and it is covered by tests. If you are here because episodes are
+    /// staying open, that is the design — see the const.
     pub fn sweep_idle(&self) -> OpenFangResult<usize> {
         if self.idle_timeout_minutes <= 0 {
             return Ok(0);
@@ -354,12 +373,13 @@ impl EpisodeStore {
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        // Same "close at last activity" rule as the lazy path.
+        // Same "closed_at is when the close ran" rule as the lazy path.
+        let now = Utc::now().to_rfc3339();
         let n = conn
             .execute(
-                "UPDATE episodes SET closed_at = last_activity_at, close_reason = ?1 \
+                "UPDATE episodes SET closed_at = ?3, close_reason = ?1 \
                  WHERE closed_at IS NULL AND last_activity_at < ?2",
-                rusqlite::params![CloseReason::Timer.as_str(), cutoff.to_rfc3339()],
+                rusqlite::params![CloseReason::Timer.as_str(), cutoff.to_rfc3339(), now],
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(n)
@@ -535,10 +555,20 @@ mod tests {
         let closed = s.get(first).unwrap().unwrap();
         assert!(!closed.is_open());
         assert_eq!(closed.close_reason, Some(CloseReason::Timer));
-        // Closed at last activity, not at the moment the agent came back.
+        // `closed_at` is when the close RAN, so it is ~now, not the backdated
+        // last activity. The work's span is still exact and still recoverable
+        // as opened_at..last_activity_at, which the next two asserts pin.
         assert!(
-            (Utc::now() - closed.closed_at.unwrap()) > Duration::minutes(120),
-            "timer close must be dated to the end of the work, not the return"
+            (Utc::now() - closed.closed_at.unwrap()) < Duration::minutes(1),
+            "closed_at must record when the close happened"
+        );
+        assert!(
+            closed.closed_at.unwrap() > closed.last_activity_at,
+            "a close cannot precede the activity it closes"
+        );
+        assert!(
+            (Utc::now() - closed.last_activity_at) > Duration::minutes(120),
+            "the work's end is still recorded, on last_activity_at"
         );
     }
 
@@ -635,6 +665,32 @@ mod tests {
             Some(CloseReason::Timer)
         );
         assert!(s.get(fresh).unwrap().unwrap().is_open());
+    }
+
+    /// Episodes end when they end. The default store has no timer at all, so a
+    /// long silence resumes the same episode rather than fragmenting a thread
+    /// that went quiet for a day into a thread per sitting.
+    ///
+    /// Pinned as a test because it is a product decision living in a constant:
+    /// anyone who "restores" the two-hour default has to delete this to do it.
+    #[test]
+    fn the_idle_timer_is_off_by_default() {
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_MINUTES, 0);
+
+        let conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        crate::migration::run_migrations(&conn.lock().unwrap()).unwrap();
+        let s = EpisodeStore::new(Arc::clone(&conn));
+        assert_eq!(s.idle_timeout_minutes(), 0);
+
+        let a = AgentId::new();
+        let first = s.ensure_open(a).unwrap();
+        backdate(&conn, first, 60 * 24 * 7); // a week of silence
+        assert_eq!(
+            s.ensure_open(a).unwrap(),
+            first,
+            "a week of silence must not split the episode"
+        );
+        assert_eq!(s.sweep_idle().unwrap(), 0, "nothing to reap with no timer");
     }
 
     #[test]
