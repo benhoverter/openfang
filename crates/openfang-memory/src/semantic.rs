@@ -19,6 +19,22 @@ use tracing::{debug, warn};
 #[cfg(feature = "http-memory")]
 use crate::http_client::MemoryApiClient;
 
+/// Metadata key carrying the row-type discriminator, promoted to a real column
+/// in schema v13.
+///
+/// Canonical home for the string so the kernel's tool surface, the capture
+/// path, and this store cannot drift on spelling. The vocabulary is a CLOSED
+/// set — `turn`, `note`, `store`, `summary`, and `fact` (reserved for stage 3)
+/// — and variation belongs in sibling keys, not in new `kind` values:
+/// supersession keys off `kind` + claim-key, and a fuzzy vocabulary poisons
+/// both the filter and the chain.
+///
+/// Not enforced here. The store lifts whatever well-formed string it is given,
+/// because a storage layer that silently refused a value would make a
+/// `kind = ?` filter report "no rows" for data that exists — a wrong answer is
+/// worse than an unfashionable one. Vocabulary is enforced at the writers.
+pub const KIND_KEY: &str = "kind";
+
 /// Semantic store backed by SQLite with optional vector search.
 ///
 /// Supports two backends:
@@ -121,13 +137,19 @@ impl SemanticStore {
         if episode_id.is_some() {
             metadata.remove(crate::episode::EPISODE_ID_KEY);
         }
+        // Same inversion for `kind` (schema v13): the column is the store of
+        // record, the metadata JSON is a projection hydrated back on read.
+        let kind = kind_from_metadata(&metadata);
+        if kind.is_some() {
+            metadata.remove(KIND_KEY);
+        }
         let meta_str = serde_json::to_string(&metadata)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let embedding_bytes: Option<Vec<u8>> = embedding.map(embedding_to_bytes);
 
         conn.execute(
-            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding, episode_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8, ?9)",
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, embedding, episode_id, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1.0, ?6, ?7, ?7, 0, 0, ?8, ?9, ?10)",
             rusqlite::params![
                 id.0.to_string(),
                 agent_id.0.to_string(),
@@ -138,6 +160,7 @@ impl SemanticStore {
                 now,
                 embedding_bytes,
                 episode_id,
+                kind,
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -231,7 +254,7 @@ impl SemanticStore {
         };
 
         let mut sql = String::from(
-            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding, episode_id
+            "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding, episode_id, kind
              FROM memories WHERE deleted = 0",
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -317,6 +340,20 @@ impl SemanticStore {
                     // they are excluded either way — the semantics are
                     // unchanged, only the plan is.
                     sql.push_str(&format!(" AND episode_id = ?{param_idx}"));
+                } else if key == KIND_KEY {
+                    // Same promotion (v13): filter the column, hit
+                    // `idx_memories_kind`, do not `json_extract` over the
+                    // corpus. `kind` is the discriminator stage 3 filters on
+                    // constantly, so this is the hot path, not a micro-opt.
+                    //
+                    // Unlike `episode_id`, rows written BEFORE the promotion
+                    // do carry `kind` in their JSON, so a column-only filter
+                    // would silently lose them. That is why `migrate_v13`
+                    // lifts the existing key into the column for every such
+                    // row — a copy of a fact already present, not a guess —
+                    // leaving no population that has the key but not the
+                    // column. Without that lift this branch would be wrong.
+                    sql.push_str(&format!(" AND kind = ?{param_idx}"));
                 } else {
                     sql.push_str(&format!(
                         " AND json_extract(metadata, '$.{key}') = ?{param_idx}"
@@ -357,6 +394,7 @@ impl SemanticStore {
                 let access_count: i64 = row.get(9)?;
                 let embedding_bytes: Option<Vec<u8>> = row.get(10)?;
                 let episode_id: Option<String> = row.get(11)?;
+                let kind: Option<String> = row.get(12)?;
                 Ok((
                     id_str,
                     agent_str,
@@ -370,6 +408,7 @@ impl SemanticStore {
                     access_count,
                     embedding_bytes,
                     episode_id,
+                    kind,
                 ))
             })
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -389,6 +428,7 @@ impl SemanticStore {
                 access_count,
                 embedding_bytes,
                 episode_id,
+                kind,
             ) = row_result.map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
             let id = uuid::Uuid::parse_str(&id_str)
@@ -412,6 +452,15 @@ impl SemanticStore {
                 metadata
                     .entry(crate::episode::EPISODE_ID_KEY.to_string())
                     .or_insert(serde_json::Value::String(ep));
+            }
+            // Same hydration for `kind` (v13). `or_insert` for the same
+            // reason: pre-v13 rows still carry the key in their JSON and the
+            // column is NULL for them, so the JSON is the only copy; rows
+            // written after the inversion have only the column.
+            if let Some(k) = kind {
+                metadata
+                    .entry(KIND_KEY.to_string())
+                    .or_insert(serde_json::Value::String(k));
             }
             let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -598,6 +647,20 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 fn episode_id_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Option<String> {
     metadata
         .get(crate::episode::EPISODE_ID_KEY)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Lift the row-type discriminator out of the capture metadata into its own
+/// column (schema v13). Sibling of [`episode_id_from_metadata`], same contract.
+///
+/// Anything that is not a non-empty string is treated as absent and left in the
+/// JSON untouched: the column must not claim a value that is not a kind, and
+/// silently destroying a caller's key on the way past would be worse.
+fn kind_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Option<String> {
+    metadata
+        .get(KIND_KEY)?
         .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -883,6 +946,169 @@ mod tests {
         let (column, in_json): (Option<String>, Option<i64>) = conn
             .query_row(
                 "SELECT episode_id, json_extract(metadata, '$.episode_id') FROM memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column, None);
+        assert_eq!(in_json, Some(42));
+    }
+
+    fn kind_meta(kind: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        HashMap::from([(KIND_KEY.to_string(), kind)])
+    }
+
+    /// v13: the column is the store of record for `kind` too. Asserted at the
+    /// storage layer, not through `recall`, because `recall` hydrates the key
+    /// back and would hide a double-write.
+    #[test]
+    fn kind_is_written_to_the_column_and_not_mirrored_in_metadata() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "an agent-authored note",
+                MemorySource::Conversation,
+                "episodic",
+                kind_meta(serde_json::json!("note")),
+            )
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let (column, in_json): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT kind, json_extract(metadata, '$.kind') FROM memories",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(column.as_deref(), Some("note"));
+        assert_eq!(
+            in_json, None,
+            "kind must not be mirrored into the metadata JSON"
+        );
+    }
+
+    /// The kernel's recall payload reads `kind` out of
+    /// `MemoryFragment::metadata`. Moving the fact to a column is only safe
+    /// because the read path puts it back.
+    #[test]
+    fn recall_hydrates_kind_back_into_metadata() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "an agent-authored note",
+                MemorySource::Conversation,
+                "episodic",
+                kind_meta(serde_json::json!("note")),
+            )
+            .unwrap();
+
+        let results = store.recall("note", 10, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].metadata.get(KIND_KEY),
+            Some(&serde_json::json!("note"))
+        );
+    }
+
+    /// `memory_recall(kind = ...)` compiles to `kind = ?` against the index.
+    /// The observable contract is unchanged, which is the point: this fails if
+    /// the special case selects the wrong rows.
+    #[test]
+    fn kind_filter_selects_only_that_kind() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        for (content, kind) in [("a note", "note"), ("a turn", "turn")] {
+            store
+                .remember(
+                    agent_id,
+                    content,
+                    MemorySource::Conversation,
+                    "episodic",
+                    kind_meta(serde_json::json!(kind)),
+                )
+                .unwrap();
+        }
+        // A row with no kind at all. Must not match any kind filter -- that is
+        // what "filter by kind" has to mean for the unbackfilled corpus.
+        store
+            .remember(
+                agent_id,
+                "an unclassified row",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        let filter = MemoryFilter {
+            agent_id: Some(agent_id),
+            metadata: kind_meta(serde_json::json!("note")),
+            ..Default::default()
+        };
+        let results = store.recall("", 10, Some(filter)).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].content, "a note");
+    }
+
+    /// A row written BEFORE the promotion carries `kind` in its JSON and has a
+    /// NULL column. The column-only filter would silently lose it, so
+    /// `migrate_v13` lifts the key across. This test stands in for that
+    /// population: hand-write the legacy shape, then prove the filter still
+    /// finds it after the lift.
+    #[test]
+    fn a_pre_v13_row_is_still_found_by_a_kind_filter_after_the_lift() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, kind)
+                 VALUES (?1, ?2, 'a legacy note', '\"conversation\"', 'episodic', 1.0, '{\"kind\":\"note\"}', ?3, ?3, 0, 0, NULL)",
+                rusqlite::params![
+                    MemoryId::new().0.to_string(),
+                    agent_id.0.to_string(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+            // Re-run the lift the way a v12 -> v13 upgrade would.
+            conn.pragma_update(None, "user_version", 12).unwrap();
+            crate::migration::run_migrations(&conn).unwrap();
+        }
+
+        let filter = MemoryFilter {
+            agent_id: Some(agent_id),
+            metadata: kind_meta(serde_json::json!("note")),
+            ..Default::default()
+        };
+        let results = store.recall("", 10, Some(filter)).unwrap();
+        assert_eq!(results.len(), 1, "got: {results:?}");
+        assert_eq!(results[0].content, "a legacy note");
+    }
+
+    /// A non-string kind is not a kind. It must not be promoted to the column
+    /// (the column feeds an equality filter callers trust) and it must not be
+    /// silently discarded either -- it stays in the JSON as the caller wrote it.
+    #[test]
+    fn a_malformed_kind_is_left_in_metadata_and_leaves_the_column_null() {
+        let store = setup();
+        store
+            .remember(
+                AgentId::new(),
+                "a malformed row",
+                MemorySource::Conversation,
+                "episodic",
+                kind_meta(serde_json::json!(42)),
+            )
+            .unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let (column, in_json): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, json_extract(metadata, '$.kind') FROM memories",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

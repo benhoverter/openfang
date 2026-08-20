@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -57,6 +57,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 12 {
         migrate_v12(conn)?;
+    }
+
+    if current_version < 13 {
+        migrate_v13(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -502,9 +506,104 @@ fn migrate_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// v13: promote `kind` from a metadata key to a real column on `memories`.
+///
+/// `kind` is the row-type discriminator the tool surface already writes into
+/// the metadata JSON (`turn` / `note` / `store` / `summary`, with `fact`
+/// reserved for stage 3). Filtering on it meant `json_extract` over every
+/// undeleted row; stage 3 will filter on it constantly, and supersession keys
+/// off `kind` + claim-key, so it earns storage.
+///
+/// Same shape as the v12 `episode_id` add and for the same reasons: a trailing
+/// `ALTER` plus an index, nullable, no rewrite of existing rows. Rows written
+/// before this migration keep `kind` in their JSON and have a NULL column;
+/// `semantic.rs` hydrates the column back into the metadata map on read, so
+/// old and new rows are indistinguishable to consumers. Backfill is a separate,
+/// deliberate operation — a migration that guesses at 46k historical rows is a
+/// migration that cannot be rolled back.
+fn migrate_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "kind") {
+        conn.execute("ALTER TABLE memories ADD COLUMN kind TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
+        [],
+    )?;
+
+    // Lift the key that already exists into the column it now belongs in.
+    //
+    // This is NOT the backfill: it invents nothing. `memory_note` and
+    // `memory_store` have been writing `kind` into the metadata JSON since the
+    // tool surface landed, and once `semantic.rs` filters on the column alone
+    // those rows would silently stop matching. Copying the value across is what
+    // makes "has the key" and "has the column" the same population, which is
+    // the precondition the column-only filter relies on.
+    //
+    // Idempotent (`WHERE kind IS NULL`), lossless (the JSON copy is left in
+    // place, and the read path prefers the column), and reversible: dropping
+    // back to v12 loses nothing, because nothing was removed.
+    //
+    // Guessing a `kind` for the rows that never had one is a separate,
+    // deliberate operation run by hand. A migration that infers row types from
+    // `source` is a migration you cannot undo.
+    conn.execute(
+        "UPDATE memories SET kind = json_extract(metadata, '$.kind')
+         WHERE kind IS NULL AND json_valid(metadata)
+           AND json_type(metadata, '$.kind') = 'text'",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (13, datetime('now'), 'Add memories.kind column and index (ADR 0002 2.2)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v13 must move `kind` from the metadata JSON into the column for rows
+    /// that already had it. Without this lift, `semantic.rs`'s column-only
+    /// `kind` filter would silently stop matching every note and store written
+    /// before the promotion.
+    #[test]
+    fn v13_lifts_an_existing_metadata_kind_into_the_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Two legacy shapes plus one that must be left alone.
+        conn.execute_batch(
+            "UPDATE memories SET kind = NULL;
+             INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, kind)
+             VALUES ('a', 'ag', 'note row', '\"conversation\"', 'episodic', 1.0, '{\"kind\":\"note\"}', 'now', 'now', 0, 0, NULL),
+                    ('b', 'ag', 'malformed row', '\"conversation\"', 'episodic', 1.0, '{\"kind\":42}', 'now', 'now', 0, 0, NULL),
+                    ('c', 'ag', 'no kind row', '\"conversation\"', 'episodic', 1.0, '{}', 'now', 'now', 0, 0, NULL);",
+        )
+        .unwrap();
+
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let kind_of = |id: &str| -> Option<String> {
+            conn.query_row("SELECT kind FROM memories WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(kind_of("a").as_deref(), Some("note"), "string kind lifts");
+        assert_eq!(kind_of("b"), None, "a non-string kind is not a kind");
+        assert_eq!(kind_of("c"), None, "absent stays absent");
+
+        // The JSON copy is left in place: the lift is additive and reversible.
+        let still_json: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(metadata, '$.kind') FROM memories WHERE id = 'a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_json.as_deref(), Some("note"));
+    }
 
     #[test]
     fn test_migration_creates_tables() {
