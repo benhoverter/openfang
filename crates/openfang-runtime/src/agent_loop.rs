@@ -336,6 +336,13 @@ async fn resolve_episode(
 ///
 /// ADR 0001 §2.2: also stamps `episode_id` when the turn belongs to one (see
 /// [`resolve_episode`]). `semantic.rs` lifts that key into a real column.
+///
+/// ADR 0002 §2.2: also stamps `kind = "turn"`. Every captured turn funnels
+/// through here, so this one line is what gives the row-type discriminator a
+/// value on the ~100% of the corpus the capture path writes — without it,
+/// `memory_recall(kind = ...)` filters over almost nothing and stage 3 cannot
+/// tell a fact from a transcript by anything better than an embedding's
+/// opinion. `semantic.rs` lifts the key into the `memories.kind` column (v13).
 fn capture_metadata(
     base: &HashMap<String, serde_json::Value>,
     trigger: TurnTrigger,
@@ -344,6 +351,10 @@ fn capture_metadata(
     episode_id: Option<uuid::Uuid>,
 ) -> HashMap<String, serde_json::Value> {
     let mut meta = base.clone();
+    // `or_insert`, not `insert`: if a caller ever builds capture metadata that
+    // already declares its row type, that caller knows better than this default.
+    meta.entry(openfang_memory::semantic::KIND_KEY.to_string())
+        .or_insert_with(|| serde_json::json!(openfang_memory::semantic::KIND_TURN));
     if let Some(ep) = episode_id {
         meta.insert(
             openfang_memory::episode::EPISODE_ID_KEY.to_string(),
@@ -4494,6 +4505,45 @@ mod tests {
 
         let m = capture_metadata(&base, TurnTrigger::User, &inert, true, None);
         assert!(!m.contains_key(openfang_memory::episode::EPISODE_ID_KEY));
+    }
+
+    /// ADR 0002 §2.2: every captured turn carries `kind = "turn"`, whatever the
+    /// trigger and whether or not it belongs to an episode. This is the line
+    /// that stops `memory_recall(kind = ...)` from filtering over an empty set,
+    /// so it is worth pinning explicitly rather than trusting the one-liner.
+    #[test]
+    fn capture_metadata_stamps_kind_turn() {
+        use openfang_types::turn::{TurnEffects, TurnTrigger};
+        let base = HashMap::new();
+        let inert = TurnEffects::new();
+
+        for trigger in [TurnTrigger::User, TurnTrigger::Heartbeat] {
+            let m = capture_metadata(&base, trigger, &inert, true, None);
+            assert_eq!(
+                m.get(openfang_memory::semantic::KIND_KEY),
+                Some(&serde_json::json!("turn")),
+                "{trigger:?} turn must be stamped"
+            );
+        }
+
+        // `kind` is a row type, not a trigger: a heartbeat is still a `turn`,
+        // and the trigger stays in its own key.
+        let m = capture_metadata(&base, TurnTrigger::Heartbeat, &inert, true, None);
+        assert_ne!(
+            m.get(openfang_memory::semantic::KIND_KEY),
+            Some(&serde_json::json!("heartbeat"))
+        );
+
+        // A caller that already declared a row type wins.
+        let declared = HashMap::from([(
+            openfang_memory::semantic::KIND_KEY.to_string(),
+            serde_json::json!("summary"),
+        )]);
+        let m = capture_metadata(&declared, TurnTrigger::User, &inert, true, None);
+        assert_eq!(
+            m.get(openfang_memory::semantic::KIND_KEY),
+            Some(&serde_json::json!("summary"))
+        );
     }
 
     /// Issue #1098: when a response carries Thinking blocks, the persisted

@@ -35,6 +35,16 @@ use crate::http_client::MemoryApiClient;
 /// worse than an unfashionable one. Vocabulary is enforced at the writers.
 pub const KIND_KEY: &str = "kind";
 
+/// `kind` value for a captured conversational turn — the capture path's row
+/// type, and by volume nearly all of the corpus.
+///
+/// Deliberately NOT folded together with `TurnTrigger` (`user` / `heartbeat` /
+/// `agent`), which is stamped separately: trigger is *why the turn happened*,
+/// `kind` is *what kind of row this is*. Collapsing them would make `fact` and
+/// `heartbeat` members of the same vocabulary, which is how a discriminator
+/// stops discriminating.
+pub const KIND_TURN: &str = "turn";
+
 /// Semantic store backed by SQLite with optional vector search.
 ///
 /// Supports two backends:
