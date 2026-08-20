@@ -587,8 +587,10 @@ mod tests {
         run_migrations(&conn).unwrap();
 
         let kind_of = |id: &str| -> Option<String> {
-            conn.query_row("SELECT kind FROM memories WHERE id = ?1", [id], |r| r.get(0))
-                .unwrap()
+            conn.query_row("SELECT kind FROM memories WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
         assert_eq!(kind_of("a").as_deref(), Some("note"), "string kind lifts");
         assert_eq!(kind_of("b"), None, "a non-string kind is not a kind");
