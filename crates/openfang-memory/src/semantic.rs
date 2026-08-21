@@ -7,6 +7,7 @@
 //! When a query embedding is provided, recall uses cosine similarity ranking.
 //! When no embeddings are available, falls back to LIKE matching.
 
+use crate::fact::KIND_FACT;
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -381,7 +382,38 @@ impl SemanticStore {
             let _ = param_idx;
         }
 
-        sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
+        // Candidate-window ordering (ANAI-204 step 3).
+        //
+        // On the vector path this ORDER BY does not decide the answer — the
+        // cosine sort below does. It decides which `fetch_limit` rows are
+        // allowed to be re-ranked at all, and `accessed_at DESC` on its own
+        // silently starves tier 3: the live corpus is ~13.5k rows against a
+        // 5000-row window, so a fact nobody has read lately falls out of the
+        // window and is invisible to recall no matter how well it matches.
+        // A claim store whose claims lose to transcript sediment on recency
+        // is not a claim store.
+        //
+        // Pulling facts in costs approximately nothing and cannot flood the
+        // window: the v14 partial unique index bounds the live population at
+        // one row per `(agent_id, scope, claim_key)`.
+        //
+        // `COALESCE`, not a bare comparison: `kind = 'fact'` evaluates to
+        // NULL for the pre-v13 rows that carry no `kind` at all, and SQLite
+        // sorts NULL below 0, which under DESC would push every legacy row to
+        // the back of the window — a real behaviour change to a population
+        // this fix has no business touching.
+        //
+        // Deliberately NOT applied on the LIKE path: there `fetch_limit ==
+        // limit`, so this ordering *is* the returned order, and promoting
+        // facts would be a ranking-policy change rather than a
+        // candidate-selection fix.
+        if query_embedding.is_some() {
+            sql.push_str(&format!(
+                " ORDER BY COALESCE(kind = '{KIND_FACT}', 0) DESC, accessed_at DESC, access_count DESC"
+            ));
+        } else {
+            sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
+        }
         sql.push_str(&format!(" LIMIT {fetch_limit}"));
 
         let mut stmt = conn
@@ -1291,5 +1323,183 @@ mod tests {
         assert_eq!(results.len(), 2);
         // Embedded memory should rank first
         assert_eq!(results[0].content, "Has embedding");
+    }
+
+    // --- Tier-3 facts on the recall path (ANAI-204 step 3) ---
+    //
+    // ADR 0002 §2.3: recall is the only tool permitted to read tier-3 facts,
+    // and the superseded filter lives inside it rather than in the caller.
+    // In this design that "filter" is not a WHERE clause — supersession moves
+    // the outgoing claim into `fact_history`, so recall cannot see it because
+    // it is not in the table recall queries (ADR 0001 §2.3.2). These tests
+    // pin that property end-to-end through the public read path, because the
+    // cheapest way to break §2.3.1 later is for someone to "helpfully" union
+    // history back in.
+
+    fn fact_store(store: &SemanticStore) -> crate::fact::FactStore {
+        crate::fact::FactStore::new(store.conn.clone())
+    }
+
+    /// The invariant, through the public API: after supersession the old
+    /// claim is unreachable by keyword AND by vector, not merely ranked last.
+    #[test]
+    fn a_superseded_claim_is_unreachable_through_recall() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let facts = fact_store(&store);
+
+        facts
+            .upsert(
+                crate::fact::FactWrite::new(
+                    agent_id,
+                    "agent",
+                    "git.trunk_model",
+                    "local-main is the trunk of record",
+                )
+                .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+        facts
+            .upsert(
+                crate::fact::FactWrite::new(
+                    agent_id,
+                    "agent",
+                    "git.trunk_model",
+                    "main is the trunk of record",
+                )
+                .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+
+        // Keyword path: the old claim's distinguishing token is gone.
+        assert!(
+            store.recall("local-main", 10, None).unwrap().is_empty(),
+            "superseded claim reachable by keyword"
+        );
+
+        // Vector path: the old claim's own embedding is the query, which is
+        // the most favourable case a stale row could possibly get.
+        let hits = store
+            .recall_with_embedding("", 10, None, Some(&[1.0, 0.0]))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "got: {hits:?}");
+        assert_eq!(hits[0].content, "main is the trunk of record");
+    }
+
+    /// `fact_history` is the audit path and nothing else (ADR 0001 §2.3.2).
+    /// Asserted with a populated history table so the test would notice a
+    /// join being added, not just an empty-table coincidence.
+    #[test]
+    fn recall_never_reads_fact_history() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let facts = fact_store(&store);
+
+        for claim in ["first claim", "second claim", "third claim"] {
+            facts
+                .upsert(crate::fact::FactWrite::new(
+                    agent_id,
+                    "agent",
+                    "memory.sweep_status",
+                    claim,
+                ))
+                .unwrap();
+        }
+
+        let history_rows: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM fact_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(history_rows, 2, "precondition: two supersessions recorded");
+
+        let hits = store.recall("claim", 100, None).unwrap();
+        assert_eq!(hits.len(), 1, "got: {hits:?}");
+        assert_eq!(hits[0].content, "third claim");
+    }
+
+    /// A soft-deleted fact leaves recall like any other row. Pinned because
+    /// the v14 slot index treats `deleted = 1` as vacating the slot, so the
+    /// read path and the constraint have to agree on what "gone" means.
+    #[test]
+    fn a_soft_deleted_fact_is_not_recalled() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        let id = fact_store(&store)
+            .upsert(crate::fact::FactWrite::new(
+                agent_id,
+                "agent",
+                "project.openfang.owner",
+                "Ben owns the fork",
+            ))
+            .unwrap()
+            .id();
+
+        store.forget(id).unwrap();
+        assert!(store.recall("Ben", 10, None).unwrap().is_empty());
+    }
+
+    /// The starvation regression this step fixes: a fact older than the
+    /// candidate window's worth of transcript must still be re-ranked.
+    ///
+    /// Sized just past the 5000-row floor, with every turn touched more
+    /// recently than the fact — which is exactly the live corpus's shape, not
+    /// a contrived one. Under the previous `accessed_at DESC` ordering the
+    /// fact is row 6001 of a 5000-row window and never reaches the cosine
+    /// sort at all, so this test fails without the ORDER BY change above.
+    #[test]
+    fn a_live_fact_is_not_starved_by_the_candidate_window() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        fact_store(&store)
+            .upsert(
+                crate::fact::FactWrite::new(
+                    agent_id,
+                    "agent",
+                    "git.trunk_model",
+                    "main is the trunk of record",
+                )
+                .with_embedding(vec![1.0, 0.0]),
+            )
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let source = serde_json::to_string(&MemorySource::Conversation).unwrap();
+            let sediment = embedding_to_bytes(&[0.0, 1.0]);
+            for i in 0..6000 {
+                let now = Utc::now().to_rfc3339();
+                tx.execute(
+                    "INSERT INTO memories (id, agent_id, content, source, scope, confidence,
+                                           metadata, created_at, accessed_at, access_count,
+                                           deleted, embedding, episode_id, kind)
+                     VALUES (?1, ?2, ?3, ?4, 'episodic', 0.5, '{}', ?5, ?5, 0, 0, ?6, NULL, ?7)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        agent_id.0.to_string(),
+                        format!("sediment {i}"),
+                        source,
+                        now,
+                        sediment,
+                        KIND_TURN,
+                    ],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        let hits = store
+            .recall_with_embedding("", 5, None, Some(&[1.0, 0.0]))
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|f| f.content == "main is the trunk of record"),
+            "the fact fell out of the candidate window; got: {:?}",
+            hits.iter().map(|f| &f.content).collect::<Vec<_>>()
+        );
     }
 }
