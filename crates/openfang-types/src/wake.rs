@@ -41,6 +41,12 @@
 //!   fleet-wide aggregate backstop. Both are tunable via the `[agent_wake]`
 //!   config section (see [`crate::agent_wake`]).
 //!
+//! Both gates apply to **originations only**. Terminal replies — whether an
+//! agent's `agent_reply_async` or a daemon-synthesized close (ANAI-198/199) —
+//! are ungated by design (ANAI-200): each is 1:1 with a wake already charged
+//! and grants no further reply-right, so it cannot amplify, while gating it
+//! would break the reply guarantee precisely when the fleet is busy.
+//!
 //! Origin turns (channel / cron / API — no inbound lineage) root the chain at
 //! the sender, so only self-wake is a cycle for them; that is correct, not a
 //! gap — such a turn has no ancestry to inherit.
@@ -223,6 +229,128 @@ pub struct WakeEnvelope {
     /// no-surfacing unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_to: Option<String>,
+    /// ANAI-199: *how* this reply came to exist. Meaningful only when
+    /// [`Self::is_reply`] is set; ignored (and omitted on the wire) otherwise.
+    ///
+    /// The initiator's leg-4 turn must be able to tell a real answer from a
+    /// kernel-synthesized stand-in, because the two demand different behaviour:
+    /// an [`ReplyKind::Explicit`] reply is the callee's considered answer, while
+    /// a synthetic one reports that the correlation was closed WITHOUT one. An
+    /// orchestrator that cannot distinguish them treats "the target never ran"
+    /// as a contract-satisfying result — precisely the silent-failure class this
+    /// stack exists to close.
+    ///
+    /// Defaults to [`ReplyKind::Explicit`] and is skipped on the wire in that
+    /// case, so every pre-ANAI-199 payload decodes back unchanged.
+    #[serde(default, skip_serializing_if = "ReplyKind::is_explicit")]
+    pub reply_kind: ReplyKind,
+    /// ANAI-201: the sender's deadline for this correlation, in seconds,
+    /// already clamped into the operator's configured band at
+    /// `agent_send_async` time.
+    ///
+    /// This is what upgrades the reply *debt* (ANAI-196) from an eventual
+    /// guarantee to a bounded one. ANAI-198/199/200 discharge the debt on every
+    /// path where kernel code still runs at the end of the callee's turn; a
+    /// wedged subprocess or a hung model call runs no such code, so without a
+    /// deadline the debt is simply never paid. The wake-consumer races the
+    /// callee's whole turn against this value and, on elapse, ABORTS the turn
+    /// and mints a [`ReplyKind::Timeout`] reply.
+    ///
+    /// ## Why the value is stamped here rather than resolved at enforcement
+    ///
+    /// Clamping happens once, at send, and the result is written into this
+    /// durable payload — so the queue row is the single source of truth for
+    /// this correlation's deadline. Re-deriving the clamp at enforcement time
+    /// would let an operator's `config.toml` edit silently move the deadline of
+    /// an already-dispatched send, changing a contract out from under the
+    /// orchestrator that set it, with no signal.
+    ///
+    /// `None` means "this payload predates ANAI-201" — a wake enqueued by an
+    /// older daemon and still in the queue across the upgrade. Such a wake
+    /// falls back to the configured default at dispatch (see
+    /// [`Self::timeout`]), so the guarantee covers it too rather than leaving
+    /// a cohort of unbounded stragglers. Omitted on the wire when absent, so
+    /// every pre-ANAI-201 payload round-trips byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// ANAI-201: what the sender actually ASKED for, before clamping — recorded
+    /// only when the clamp changed the value, so the common (in-band) case
+    /// stays absent on the wire.
+    ///
+    /// Two jobs. First, the `Timeout` reply can tell an orchestrator that its
+    /// 30-second estimate was raised to the 60-second floor, instead of leaving
+    /// it to conclude the deadline it set was the deadline enforced. Second,
+    /// requested-vs-enforced accumulates across the fleet as the empirical
+    /// distribution we currently lack — the very data the `[async_reply]` knobs
+    /// exist to be tuned from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_timeout_secs: Option<u64>,
+}
+
+impl WakeEnvelope {
+    /// The enforced deadline for this correlation.
+    ///
+    /// Falls back to the configured default when [`Self::timeout_secs`] is
+    /// absent, which happens only for a payload enqueued before ANAI-201 and
+    /// claimed after the upgrade. Falling back (rather than treating `None` as
+    /// "unbounded") means the guarantee applies to that cohort too; an
+    /// unbounded straggler is exactly the failure this leg exists to remove.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.timeout_secs
+                .unwrap_or_else(crate::async_reply::default_timeout_secs),
+        )
+    }
+}
+
+/// Provenance of a terminal reply (ANAI-199): who produced it, and therefore
+/// how much it can be trusted to mean.
+///
+/// Only [`ReplyKind::Explicit`] is produced by an agent. Every other variant is
+/// minted by the daemon to discharge an outstanding reply debt the callee did
+/// not (or could not) pay itself, so that `agent_send_async` has a reply
+/// guarantee rather than a reply *hope*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplyKind {
+    /// The callee called `agent_reply_async` itself. The body is its answer.
+    #[default]
+    Explicit,
+    /// The callee's turn ended without ever calling `agent_reply_async`; the
+    /// daemon closed the correlation using the turn's final text (ANAI-198).
+    AutoClose,
+    /// The wake never produced an answer — undeliverable, refused before
+    /// dispatch, or the agent loop errored mid-turn (ANAI-199). The body says
+    /// which, and whether side effects may exist.
+    Error,
+    /// The sender's deadline elapsed and the callee's turn was aborted
+    /// (ANAI-201). Side effects up to the abort point may exist.
+    Timeout,
+}
+
+impl ReplyKind {
+    /// serde `skip_serializing_if` predicate — see [`WakeEnvelope::reply_kind`].
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit)
+    }
+
+    /// True for every daemon-minted kind, i.e. "no agent authored this body".
+    /// The bit an initiator should branch on before treating a reply as work
+    /// product.
+    pub fn is_synthetic(&self) -> bool {
+        !self.is_explicit()
+    }
+
+    /// Stable lowercase label for logs, audit lines, and the prompt-visible
+    /// header on a synthesized reply.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::AutoClose => "auto_close",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+        }
+    }
 }
 
 /// serde `skip_serializing_if` predicate: skip a `bool` field when it is false,
@@ -330,6 +458,9 @@ mod tests {
             origin: Some("channel:1086446153098342510".into()),
             is_reply: false,
             surface_to: None,
+            reply_kind: ReplyKind::default(),
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
         };
         let payload = env.to_payload().unwrap();
         let back = WakeEnvelope::from_payload(&payload).unwrap();
@@ -338,6 +469,11 @@ mod tests {
         assert_eq!(back.trigger, TurnTrigger::AgentCall);
         assert_eq!(back.lineage.root(), Some("orchestrator"));
         assert_eq!(back.lineage.current(), Some("worker-a"));
+        // ANAI-201: the deadline survives the payload round trip. It has to —
+        // the queue row is the single source of truth for this correlation's
+        // deadline, and a value that did not survive serialization would be
+        // silently replaced by the configured default at dispatch.
+        assert_eq!(back.timeout(), std::time::Duration::from_secs(600));
     }
 
     #[test]
@@ -351,6 +487,9 @@ mod tests {
             origin: None,
             is_reply: false,
             surface_to: None,
+            reply_kind: ReplyKind::default(),
+            timeout_secs: None,
+            requested_timeout_secs: None,
         };
         let json = serde_json::to_string(&env).unwrap();
         // origin is skipped on the wire when absent...
@@ -377,6 +516,26 @@ mod tests {
             back.surface_to, None,
             "absent surface_to must decode to None"
         );
+        // ANAI-199: the default reply-kind is likewise absent on the wire, so a
+        // pre-ANAI-199 payload is byte-identical to a post-ANAI-199 one.
+        assert!(
+            !json.contains("reply_kind"),
+            "explicit reply_kind must be omitted: {json}"
+        );
+        assert_eq!(
+            back.reply_kind,
+            ReplyKind::Explicit,
+            "absent reply_kind must decode to Explicit"
+        );
+        // ANAI-201: both deadline fields are absent on the wire when unset, so
+        // a payload enqueued by a pre-ANAI-201 daemon is byte-identical to this
+        // one and decodes without error.
+        assert!(
+            !json.contains("timeout_secs"),
+            "unset timeout fields must be omitted: {json}"
+        );
+        assert_eq!(back.timeout_secs, None);
+        assert_eq!(back.requested_timeout_secs, None);
     }
 
     #[test]
@@ -393,6 +552,9 @@ mod tests {
             origin: None,
             is_reply: true,
             surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: ReplyKind::default(),
+            timeout_secs: None,
+            requested_timeout_secs: None,
         };
         let json = serde_json::to_string(&env).unwrap();
         assert!(
@@ -412,5 +574,92 @@ mod tests {
         // leg-4 turn starts clean and cannot be over-deep.
         assert_eq!(back.lineage.depth(), 1);
         assert_eq!(back.lineage.root(), Some("worker-b"));
+    }
+
+    /// ANAI-199: a daemon-synthesized reply must be distinguishable on the wire.
+    /// If `reply_kind` did not round-trip, an initiator would read "the target
+    /// was never reachable" as the target's considered answer.
+    #[test]
+    fn synthetic_reply_kind_round_trips_and_is_distinguishable() {
+        for kind in [ReplyKind::AutoClose, ReplyKind::Error, ReplyKind::Timeout] {
+            let env = WakeEnvelope {
+                target: "orchestrator".into(),
+                sender: "worker-b".into(),
+                message: "the kernel is answering on the callee's behalf".into(),
+                lineage: WakeLineage::root_at("worker-b"),
+                trigger: TurnTrigger::AgentCall,
+                origin: None,
+                is_reply: true,
+                surface_to: None,
+                reply_kind: kind,
+                timeout_secs: None,
+                requested_timeout_secs: None,
+            };
+            let json = serde_json::to_string(&env).unwrap();
+            assert!(
+                json.contains(kind.label()),
+                "{kind:?} must serialize as its snake_case label: {json}"
+            );
+            let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
+            assert_eq!(env, back);
+            assert!(
+                back.reply_kind.is_synthetic(),
+                "{kind:?} must report as synthetic so an initiator does not \
+                 mistake it for the callee's own answer"
+            );
+        }
+        assert!(!ReplyKind::Explicit.is_synthetic());
+    }
+
+    /// ANAI-201: a wake enqueued before this leg shipped, and claimed after the
+    /// daemon restarts into it, has no `timeout_secs` at all. It must fall back
+    /// to the CONFIGURED DEFAULT rather than be treated as unbounded — an
+    /// upgrade that left a cohort of in-queue wakes permanently exempt from the
+    /// deadline would reintroduce exactly the silent-hang class this closes,
+    /// for the wakes most likely to already be stuck.
+    #[test]
+    fn pre_anai201_payload_decodes_to_the_configured_default_deadline() {
+        // Hand-written payload in the pre-ANAI-201 shape: no timeout fields.
+        let json = r#"{
+            "target": "worker-b",
+            "sender": "orchestrator",
+            "message": "enqueued by an older daemon",
+            "lineage": {"agents": ["orchestrator"]},
+            "trigger": "agent_call"
+        }"#;
+        let back = WakeEnvelope::from_payload(json.as_bytes()).unwrap();
+        assert_eq!(back.timeout_secs, None, "the field is genuinely absent");
+        assert_eq!(
+            back.timeout(),
+            std::time::Duration::from_secs(crate::async_reply::DEFAULT_TIMEOUT_SECS),
+            "an absent deadline must resolve to the configured default, not to unbounded"
+        );
+    }
+
+    /// The stamped deadline WINS over the configured default. This is the
+    /// clamp-at-send contract: an operator editing `config.toml` mid-flight must
+    /// not move the deadline of a correlation already on the queue.
+    #[test]
+    fn a_stamped_deadline_is_not_overridden_by_configuration() {
+        let env = WakeEnvelope {
+            target: "worker-b".into(),
+            sender: "orchestrator".into(),
+            message: "bounded".into(),
+            lineage: WakeLineage::root_at("orchestrator"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: ReplyKind::default(),
+            timeout_secs: Some(123),
+            requested_timeout_secs: Some(7),
+        };
+        assert_ne!(123, crate::async_reply::DEFAULT_TIMEOUT_SECS);
+        assert_eq!(env.timeout(), std::time::Duration::from_secs(123));
+        // The pre-clamp request is preserved so the Timeout body can disclose
+        // that the enforced deadline was not the one the sender set.
+        assert_eq!(env.requested_timeout_secs, Some(7));
+        let back = WakeEnvelope::from_payload(&env.to_payload().unwrap()).unwrap();
+        assert_eq!(back, env);
     }
 }

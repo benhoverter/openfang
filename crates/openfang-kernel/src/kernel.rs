@@ -234,6 +234,24 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// ANAI-197: per-agent **wake-turn** lock. Serializes the whole woken-turn
+    /// critical section — mint reply-right -> run turn -> cleanup — so the
+    /// mint cannot be clobbered by a second wake for the same target.
+    ///
+    /// `agent_msg_locks` alone was NOT sufficient: it is acquired inside
+    /// `send_message_with_handle_and_blocks`, i.e. strictly *downstream* of the
+    /// mint in `run_woken_agent_loop`. Two senders waking the same target both
+    /// minted before either reached the lock, so the second mint overwrote the
+    /// first and the target's single `agent_reply_async` paid the WRONG debt:
+    /// sender A's answer was delivered to sender B, labelled as a reply to B's
+    /// request, and A got nothing. This lock is acquired *before* the mint, so
+    /// the mint/consume pair is inside one critical section.
+    ///
+    /// Costs no concurrency: woken turns for the same agent already serialized
+    /// on `agent_msg_locks`. This only moves the wait earlier. Always acquired
+    /// OUTSIDE `agent_msg_locks` (never the reverse), so no lock-order
+    /// inversion is possible.
+    wake_turn_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// ANAI-122: kernel-held one-shot reply-right registry. Replaces the
     /// `WAKE_REPLY_RIGHT` task-local, which could not cross the process/IPC
     /// boundary to a subprocess-driven agent (Claude Code driver): the tool
@@ -243,10 +261,15 @@ pub struct OpenFangKernel {
     /// `agent_reply_async` already holds via `require_kernel` — so the native
     /// (in-process) and subprocess (IPC) drivers read it identically.
     ///
-    /// Keyed by `AgentId`, which is race-free ONLY because `agent_msg_locks`
-    /// serializes an agent to one woken turn in flight. TODO(ANAI-125): re-key
-    /// by turn_id/correlation-id before the team-collaboration epic lets an
-    /// agent hold >1 concurrent right and breaks the single-turn invariant.
+    /// Keyed by `AgentId`. Race-free because `wake_turn_locks` (ANAI-197) holds
+    /// the mint -> turn -> cleanup span in one per-agent critical section, so an
+    /// agent has at most one live right at any instant and a concurrent wake for
+    /// the same target blocks *before* minting rather than clobbering.
+    /// (Superseded the ANAI-125 TODO, which relied on `agent_msg_locks` — a lock
+    /// acquired downstream of the mint, and therefore too late to protect it.)
+    ///
+    /// The correlation the right carries is the inbound wake's task id; that is
+    /// the durable id ANAI-201's outstanding-correlation rows key on.
     ///
     /// Lifecycle: inserted at wake-dispatch for an origination turn; removed on
     /// first read (consume-on-read keeps the reply one-shot) OR at turn end
@@ -1471,6 +1494,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             model_override: std::sync::RwLock::new(boot_model_override),
             agent_msg_locks: dashmap::DashMap::new(),
+            wake_turn_locks: dashmap::DashMap::new(),
             reply_rights: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
             approval_prompt_coords: dashmap::DashMap::new(),
@@ -5358,6 +5382,19 @@ impl OpenFangKernel {
             stale_wake_secs: self.config.agent_wake.stale_wake_secs,
         });
 
+        // Install operator-configured async-reply deadline bounds ([async_reply]
+        // config, ANAI-201) so the producer's clamp resolves them. Idempotent.
+        // Must precede any wake dispatch: the clamp runs on the SEND path, and a
+        // send that beats this install would stamp a compiled-default deadline
+        // into a durable row that then outlives the correction.
+        openfang_types::async_reply::install_limits(
+            openfang_types::async_reply::AsyncReplyLimits {
+                default_timeout_secs: self.config.async_reply.default_timeout_secs,
+                min_timeout_secs: self.config.async_reply.min_timeout_secs,
+                max_timeout_secs: self.config.async_reply.max_timeout_secs,
+            },
+        );
+
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
 
@@ -5972,6 +6009,29 @@ impl OpenFangKernel {
                         &task_id,
                         "target not found",
                     );
+                    // ANAI-199 leg 1: the sender is owed a reply and the target
+                    // will never run to give one. Before this, an
+                    // `agent_send_async` at an inactive or misnamed agent
+                    // returned "queued" and then produced nothing, forever —
+                    // the single most common silent failure, because "not
+                    // found" also fires for any agent that simply is not
+                    // active.
+                    self.emit_synthetic_reply(
+                        &envelope,
+                        &task_id,
+                        openfang_types::wake::ReplyKind::Error,
+                        format!(
+                            "[kernel] Your async request to '{}' was NOT delivered: no agent \
+                             with that name or id is registered (correlation {task_id}).\n\n\
+                             The target never ran, so NO side effects from this request exist. \
+                             This is a delivery failure, not a refusal by the target.\n\n\
+                             Check the name, or the agent may be inactive, never spawned, or \
+                             killed. Re-sending the same request unchanged will fail \
+                             identically.",
+                            envelope.target
+                        ),
+                    )
+                    .await;
                     let _ = self
                         .memory
                         .task_complete(
@@ -6004,6 +6064,27 @@ impl OpenFangKernel {
                 &task_id,
                 "refused: chain depth exceeds bound",
             );
+            // ANAI-199 leg 2: refused before dispatch. The sender's debt is
+            // still outstanding — a refusal the sender never hears about is
+            // indistinguishable from a hang.
+            self.emit_synthetic_reply(
+                &envelope,
+                &task_id,
+                openfang_types::wake::ReplyKind::Error,
+                format!(
+                    "[kernel] Your async request to '{}' was REFUSED before dispatch: the \
+                     wake-chain depth ({}) is at or beyond the bound ({}) (correlation \
+                     {task_id}).\n\n\
+                     The target never ran, so NO side effects from this request exist.\n\n\
+                     The delegation chain is too long. Re-sending unchanged will be refused \
+                     identically; shorten the chain or dispatch the work from closer to its \
+                     root.",
+                    envelope.target,
+                    envelope.lineage.depth(),
+                    openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH,
+                ),
+            )
+            .await;
             let _ = self
                 .memory
                 .task_complete(&task_id, "wake refused: chain depth exceeds bound")
@@ -6016,6 +6097,31 @@ impl OpenFangKernel {
             .get()
             .and_then(|w| w.upgrade())
             .map(|arc| arc as Arc<dyn KernelHandle>);
+
+        // ANAI-197: enter the per-agent wake-turn critical section BEFORE
+        // minting the reply-right. Everything from here to the cleanup below —
+        // mint, run, consume, cleanup — is serialized per target agent, which is
+        // what makes the agent-id keying of `reply_rights` sound.
+        //
+        // Why this is not redundant with `agent_msg_locks`: that lock is taken
+        // inside `send_message_with_handle_and_blocks`, i.e. DOWNSTREAM of the
+        // mint below. Two wakes for the same target therefore both minted before
+        // either serialized; the second clobbered the first, and the target's one
+        // `agent_reply_async` answered the WRONG initiator — sender A's answer
+        // delivered to sender B, labelled as a reply to B's request, with A left
+        // waiting forever. Cross-talk, not just silence. Acquiring here closes
+        // that window.
+        //
+        // Costs no parallelism: same-target woken turns already serialized one
+        // frame deeper, so this only moves the wait earlier. Distinct targets are
+        // unaffected. Always acquired OUTSIDE `agent_msg_locks`, never the
+        // reverse, so the lock order is total and no inversion is possible.
+        let wake_lock = self
+            .wake_turn_locks
+            .entry(target_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _wake_guard = wake_lock.lock().await;
 
         // origin threading (audit finding #3) is a documented follow-up: a wake
         // that raises an approval prompt has no inbound route yet, so pass None.
@@ -6059,10 +6165,10 @@ impl OpenFangKernel {
         // `envelope.sender`) and is consumed by the first `agent_reply_async`
         // call; a second reply this turn finds nothing.
         //
-        // Keying by agent_id is race-free ONLY because `agent_msg_locks`
-        // serializes an agent to one woken turn in flight. TODO(ANAI-125):
-        // re-key by turn_id/correlation before fan-out lets an agent hold >1
-        // concurrent right.
+        // Keying by agent_id is race-free because `_wake_guard` above holds the
+        // mint/consume/cleanup span in one per-agent critical section (ANAI-197).
+        // The pre-ANAI-197 comment credited `agent_msg_locks` for this; that lock
+        // is acquired downstream of this mint and so never protected it.
         if envelope.is_reply {
             self.reply_rights.remove(&target_id);
         } else {
@@ -6082,34 +6188,81 @@ impl OpenFangKernel {
         // read only by in-process `resolve_wake_base_lineage`, never across the
         // IPC boundary, so it correctly stays a task-local. The reply-right no
         // longer does — it lives in the registry above and crosses both drivers.
-        let result = openfang_runtime::tool_runner::WAKE_LINEAGE
-            .scope(envelope.lineage.clone(), send_fut)
-            .await;
+        // ANAI-201: race the ENTIRE woken turn against the sender's deadline.
+        //
+        // This is the leg that makes the reply guarantee *bounded* instead of
+        // merely eventual. ANAI-198/199/200 discharge the reply debt on every
+        // path where kernel code still runs at the end of the turn — but a
+        // wedged subprocess or a hung model call runs no turn-end code at all,
+        // so the debt is never discharged and the initiator waits forever. That
+        // is the original symptom, relocated inside its own fix.
+        //
+        // On elapse the future is DROPPED, which is the abort. Dropping is a
+        // real cancellation here, not a leak, and both halves already exist:
+        //   * the per-agent `agent_msg_locks` guard inside
+        //     `send_message_with_handle_and_blocks` is an RAII guard held across
+        //     the loop, so it releases and leaves no wedged agent — the sender's
+        //     follow-up is deliverable immediately rather than queueing behind a
+        //     zombie;
+        //   * the subprocess driver sets `kill_on_drop(true)`, so the child is
+        //     reaped rather than orphaned.
+        //
+        // We kill rather than renew the lease deliberately (Ben's call, recorded
+        // on ANAI-201): renewal would require the target to *signal* progress,
+        // which is the same discretionary-model-behaviour problem that produced
+        // the silence in the first place. A liveness heartbeat the model has to
+        // emit is `agent_reply_async` with extra steps.
+        //
+        // Killing also removes the "late explicit reply" question entirely: no
+        // live turn means no late reply to arbitrate.
+        let deadline = envelope.timeout();
+        let timed = tokio::time::timeout(
+            deadline,
+            openfang_runtime::tool_runner::WAKE_LINEAGE.scope(envelope.lineage.clone(), send_fut),
+        )
+        .await;
 
         // Cleanup (belt-and-suspenders): drop any reply-right that survived the
         // turn UNUSED, so a stale token cannot leak into a later
         // reply-woken/terminal turn for the same agent. Consume-on-read already
         // removes a USED right; this covers the never-replied path. Safe under
         // `agent_msg_locks` (one woken turn per agent at a time).
-        self.reply_rights.remove(&target_id);
+        //
+        // ANAI-199: the return value is now load-bearing, not incidental. `Some`
+        // means the token was NEVER consumed — the turn ran (or failed) without
+        // the callee ever calling `agent_reply_async`, so the sender's debt is
+        // still outstanding and the daemon must pay it. `None` means the callee
+        // already answered; synthesizing anything here would double-reply.
+        //
+        // ANAI-201: read BEFORE the timeout branch below, so an ABORT obeys the
+        // same rule. A callee that replied and then hung has no outstanding
+        // debt, and must not be sent a `Timeout` stacked on top of its own
+        // answer. Reading here also means the token is dropped on the abort
+        // path too — the aborted turn is over, and a surviving token would be a
+        // live grant to answer a correlation the kernel has already closed.
+        let debt_outstanding = self.reply_rights.remove(&target_id).is_some();
+
+        let result = match timed {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                // The future has already been dropped by `tokio::time::timeout`
+                // at this point, so the turn is aborted before anything below
+                // runs. Everything from here is bookkeeping and notification.
+                self.close_timed_out_woken_turn(&envelope, &task_id, debt_outstanding, deadline)
+                    .await;
+                return;
+            }
+        };
 
         match result {
             Ok(loop_result) => {
-                // ANAI-124: terminal-reply surfacing. Origin's leg-4 turn was
-                // woken by a reply (`is_reply`); if the round-trip carried a
-                // surfacing route (`surface_to`), the DAEMON — not origin's own
-                // turn — guarantees exactly one channel post of origin's shaped
-                // answer. This closes the 2026-07-04 failure: a woken turn runs
-                // under `TurnPolicy::woken()` (non-delivery), so its text never
-                // auto-routes and the delegated answer otherwise dies in the
-                // loop. We shape-in-origin, emit-in-daemon: `loop_result` IS
-                // origin's reply text, and the daemon guarantees the emit.
-                if envelope.is_reply {
-                    if let Some(route) = envelope.surface_to.as_deref() {
-                        self.surface_reply_to_channel(&task_id, &envelope, route, &loop_result)
-                            .await;
-                    }
-                }
+                self.close_completed_woken_turn(
+                    &envelope,
+                    &task_id,
+                    debt_outstanding,
+                    &loop_result,
+                )
+                .await;
                 self.audit_wake_completion(
                     &envelope.sender,
                     &envelope.target,
@@ -6120,6 +6273,28 @@ impl OpenFangKernel {
             }
             Err(e) => {
                 warn!(target = %envelope.target, error = %e, "Woken agent loop failed");
+                // ANAI-199 leg 3: the turn STARTED and then failed. Unlike legs
+                // 1 and 2, side effects may exist — say so explicitly rather
+                // than let the sender assume a clean no-op.
+                if debt_outstanding {
+                    self.emit_synthetic_reply(
+                        &envelope,
+                        &task_id,
+                        openfang_types::wake::ReplyKind::Error,
+                        format!(
+                            "[kernel] Your async request to '{}' FAILED mid-turn (correlation \
+                             {task_id}).\n\nError: {e}\n\n\
+                             The target's turn STARTED, so side effects up to the point of \
+                             failure MAY exist and are NOT enumerated here. The target did not \
+                             reply; this message is the kernel closing the correlation on its \
+                             behalf.\n\n\
+                             Recovery is investigation-led: inspect what the target did before \
+                             deciding what to re-send. Do not blind-retry.",
+                            envelope.target
+                        ),
+                    )
+                    .await;
+                }
                 self.audit_wake_completion(
                     &envelope.sender,
                     &envelope.target,
@@ -6132,6 +6307,322 @@ impl OpenFangKernel {
                     .await;
             }
         }
+    }
+
+    /// Close out a woken turn the kernel ABORTED for exceeding the sender's
+    /// deadline (ANAI-201): pay the outstanding reply debt with a `Timeout`
+    /// reply, audit the abort, and complete the queue row.
+    ///
+    /// Split out of [`Self::run_woken_agent_loop`]'s timeout arm for the same
+    /// reason [`Self::close_completed_woken_turn`] was: reaching that arm in
+    /// place requires a live model driver that hangs past a real deadline, and
+    /// a leg of the reply *guarantee* that can only ever be checked by hand is
+    /// not a guarantee. Everything here takes the outcome as data.
+    ///
+    /// The caller has already dropped the turn future by the time this runs, so
+    /// "aborted" is a statement of completed fact, not an intention.
+    async fn close_timed_out_woken_turn(
+        &self,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        task_id: &str,
+        debt_outstanding: bool,
+        deadline: std::time::Duration,
+    ) {
+        let secs = deadline.as_secs();
+        warn!(
+            target = %envelope.target,
+            correlation = %task_id,
+            timeout_secs = secs,
+            debt_outstanding,
+            "ANAI-201: woken turn exceeded the sender's deadline; turn aborted"
+        );
+
+        // Not `debt_outstanding` means the callee already answered and then ran
+        // long. Its answer stands; stacking a `Timeout` on top would tell the
+        // initiator its request failed when it did not.
+        if debt_outstanding {
+            // The body IS the deliverable here, not decoration. The reader is a
+            // model, and a model handed a bare "timeout" pattern-matches
+            // straight to "retry" — which in this case means re-running a
+            // request whose first attempt may already have written files, posted
+            // messages, or spawned agents. Four clauses, each load-bearing:
+            // what happened, what state the target is in NOW, what may exist on
+            // disk, and what to do about it.
+            let clamp_note = match envelope.requested_timeout_secs {
+                Some(asked) => format!(
+                    " (you requested {asked}s; it was CLAMPED to {secs}s by operator \
+                     configuration, so the deadline enforced was not the one you set)"
+                ),
+                None => String::new(),
+            };
+            self.emit_synthetic_reply(
+                envelope,
+                task_id,
+                openfang_types::wake::ReplyKind::Timeout,
+                format!(
+                    "[kernel] Your async request to '{}' TIMED OUT after {secs}s{clamp_note} \
+                     (correlation {task_id}).\n\n\
+                     The deadline elapsed and the target's turn was ABORTED. It is NOT still \
+                     running and it will NOT answer later — this is the only reply you will \
+                     receive for this correlation.\n\n\
+                     '{}' is no longer executing this request and is free to take new work \
+                     immediately.\n\n\
+                     The turn STARTED, so side effects up to the abort point MAY exist and are \
+                     NOT enumerated here: files written, messages sent, agents spawned, memory \
+                     rows stored. Whatever the turn had accumulated in memory is gone; only \
+                     durable artifacts survive.\n\n\
+                     Recovery is investigation-led, NOT a retry. Inspect what the target \
+                     actually did before deciding anything. Re-sending this request unchanged \
+                     will duplicate any side effects the aborted turn already produced, and \
+                     will likely time out identically.",
+                    envelope.target, envelope.target,
+                ),
+            )
+            .await;
+        }
+
+        self.audit_wake_completion(
+            &envelope.sender,
+            &envelope.target,
+            task_id,
+            format!("aborted: deadline exceeded ({secs}s)"),
+        );
+        let _ = self
+            .memory
+            .task_complete(
+                task_id,
+                &format!("wake aborted: deadline exceeded ({secs}s)"),
+            )
+            .await;
+    }
+
+    /// Close out a woken turn that ran to completion: surface a terminal reply
+    /// to its channel (ANAI-124), or auto-close the sender's outstanding reply
+    /// debt (ANAI-198).
+    ///
+    /// Split out of [`Self::run_woken_agent_loop`]'s `Ok` arm so the branch is
+    /// reachable in tests: exercising it in place would need a live LLM driver,
+    /// and a leg of the reply *guarantee* that is only ever checked by hand is
+    /// not a guarantee. Everything here takes the turn's result as data, so a
+    /// test supplies an [`AgentLoopResult`] directly.
+    ///
+    /// The two arms are mutually exclusive by construction, not by luck: a
+    /// reply-woken turn mints no reply-right (see the mint above), so
+    /// `debt_outstanding` is always false when `is_reply` is set. The `else` is
+    /// belt-and-braces on top of that.
+    async fn close_completed_woken_turn(
+        &self,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        task_id: &str,
+        debt_outstanding: bool,
+        loop_result: &AgentLoopResult,
+    ) {
+        // ANAI-124: terminal-reply surfacing. Origin's leg-4 turn was woken by
+        // a reply (`is_reply`); if the round-trip carried a surfacing route
+        // (`surface_to`), the DAEMON — not origin's own turn — guarantees
+        // exactly one channel post of origin's shaped answer. This closes the
+        // 2026-07-04 failure: a woken turn runs under `TurnPolicy::woken()`
+        // (non-delivery), so its text never auto-routes and the delegated
+        // answer otherwise dies in the loop. We shape-in-origin,
+        // emit-in-daemon: `loop_result` IS origin's reply text, and the daemon
+        // guarantees the emit.
+        if envelope.is_reply {
+            if let Some(route) = envelope.surface_to.as_deref() {
+                self.surface_reply_to_channel(task_id, envelope, route, loop_result)
+                    .await;
+            }
+            return;
+        }
+
+        // ANAI-198 (L1): turn-end auto-close. The turn ran to completion and
+        // the callee never called `agent_reply_async`, so the debt is still
+        // open. Before this, the turn-end `remove()` silently discarded the
+        // token and the sender waited forever on an agent that had already
+        // finished and gone idle — the worst shape of the failure, because
+        // nothing anywhere reports it: no error, no warn, no audit line, just a
+        // successful dispatch and a sender that never hears back.
+        //
+        // The turn's final text becomes the answer BY DEFAULT, marked
+        // `AutoClose` and never `Explicit`: the callee did not address it to the
+        // sender, so it may be a summary written for nobody, or empty.
+        // `is_synthetic()` is the bit an initiator branches on; the body says so
+        // in words too, for the model that reads prose rather than flags.
+        //
+        // `debt_outstanding` false means the callee already replied explicitly —
+        // synthesizing here would double-answer one correlation.
+        if debt_outstanding {
+            self.emit_synthetic_reply(
+                envelope,
+                task_id,
+                openfang_types::wake::ReplyKind::AutoClose,
+                auto_close_body(&envelope.target, task_id, loop_result),
+            )
+            .await;
+        }
+    }
+
+    /// ANAI-199: pay the sender's outstanding reply debt when the callee never
+    /// did — the daemon answering on the callee's behalf.
+    ///
+    /// A reply-right is a **debt the kernel owes**, not a courtesy the callee
+    /// may extend. Every path in [`Self::run_woken_agent_loop`] that ends a wake
+    /// without an `agent_reply_async` must route through here, so that
+    /// `agent_send_async` has a reply *guarantee* rather than a reply *hope*.
+    ///
+    /// The synthesized envelope is shaped exactly like the one
+    /// `tool_agent_reply_async` builds — `is_reply = true`, a fresh lineage
+    /// rooted at the callee, the inbound `surface_to` inherited — with one bit
+    /// added: [`ReplyKind`](openfang_types::wake::ReplyKind) marks it as
+    /// daemon-minted, so the initiator's leg-4 turn can tell "no answer exists"
+    /// from "here is the answer".
+    ///
+    /// **Ceiling (ANAI-200).** This path deliberately does not consult
+    /// `wake_emit_admit`: the aggregate emission ceiling lives in the runtime's
+    /// producer, and the kernel's privileged `wake_post` never called it. That
+    /// is the correct behaviour here rather than an oversight to fix — a
+    /// synthesized reply is 1:1 bounded by wakes ALREADY admitted, so it cannot
+    /// amplify; and gating it would punch a hole in the guarantee exactly when
+    /// the fleet is busy, i.e. during the fan-out that needs it most.
+    ///
+    /// **Termination.** Every reply this mints carries `is_reply = true`, and
+    /// the guard below refuses to synthesize for a wake that is itself a reply.
+    /// So a synthesized reply that ITSELF fails to dispatch is dropped with a
+    /// log and cannot recurse: depth-1 by construction, not by convention.
+    async fn emit_synthetic_reply(
+        &self,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        task_id: &str,
+        kind: openfang_types::wake::ReplyKind,
+        body: String,
+    ) {
+        // Terminal edge: nobody is owed a reply to a reply. This is the
+        // recursion base case (see the doc comment), so it is an early return
+        // rather than a caller-side precondition.
+        if envelope.is_reply {
+            debug!(
+                correlation = %task_id,
+                kind = kind.label(),
+                "ANAI-199: not synthesizing — the failed wake was itself a terminal reply, \
+                 so no reply debt is outstanding"
+            );
+            return;
+        }
+
+        // Don't enqueue a wake nobody can claim. A sender that no longer
+        // resolves (killed agent, or a non-agent originator such as cron or the
+        // API) has no woken turn to receive this, and the wake would just cycle
+        // through the consumer to be dropped. Visible non-drop: logged, never
+        // silent.
+        if self.resolve_agent_ref(&envelope.sender).is_none() {
+            warn!(
+                correlation = %task_id,
+                sender = %envelope.sender,
+                kind = kind.label(),
+                "ANAI-199: reply debt cannot be paid — sender does not resolve to a live \
+                 agent; the failure is recorded in the audit log only"
+            );
+            return;
+        }
+
+        let reply = openfang_types::wake::WakeEnvelope {
+            target: envelope.sender.clone(),
+            // Attributed to the callee, not to "kernel": the initiator asked a
+            // specific agent and should see the answer come back from it. The
+            // `reply_kind` carries the "who actually wrote this" bit.
+            sender: envelope.target.clone(),
+            message: body.clone(),
+            // Fresh single-element chain, mirroring `agent_reply_async`: a reply
+            // completes a correlation, it does not extend the inbound chain
+            // (extending would form the [origin,...,callee,origin] cycle that
+            // `would_cycle` rightly refuses).
+            lineage: openfang_types::wake::WakeLineage::root_at(&envelope.target),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: true,
+            // Inherit the inbound surfacing route so a failure reaches the same
+            // human channel a success would have (ANAI-123/124). A delegated
+            // request that dies must not die more quietly than one that works.
+            surface_to: envelope.surface_to.clone(),
+            reply_kind: kind,
+            // ANAI-201: the reply carries no deadline of its own. It mints no
+            // reply-right on leg 4, so there is no debt for a deadline to
+            // bound; dispatch applies the configured default to bound the
+            // leg-4 turn itself.
+            timeout_secs: None,
+            requested_timeout_secs: None,
+        };
+
+        let payload = match reply.to_payload() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    correlation = %task_id,
+                    error = %e,
+                    "ANAI-199: failed to serialize synthesized reply; debt unpaid"
+                );
+                return;
+            }
+        };
+
+        let title = format!(
+            "{}{}",
+            openfang_types::wake::WAKE_TASK_PREFIX,
+            envelope.sender
+        );
+        match self
+            .wake_post(
+                &title,
+                &body,
+                Some(&envelope.sender),
+                Some(&envelope.target),
+                &payload,
+            )
+            .await
+        {
+            Ok(reply_task_id) => {
+                info!(
+                    correlation = %task_id,
+                    reply_task = %reply_task_id,
+                    initiator = %envelope.sender,
+                    kind = kind.label(),
+                    "ANAI-199: kernel synthesized a terminal reply on the callee's behalf"
+                );
+                self.audit_wake_completion(
+                    &envelope.sender,
+                    &envelope.target,
+                    task_id,
+                    format!("synthesized {} reply", kind.label()),
+                );
+            }
+            Err(e) => {
+                // Last resort: the debt is unpayable through the wake queue.
+                // Loud, because this is the guarantee failing.
+                warn!(
+                    correlation = %task_id,
+                    error = %e,
+                    initiator = %envelope.sender,
+                    kind = kind.label(),
+                    "ANAI-199: could not enqueue synthesized reply — the sender will not be \
+                     told this correlation closed"
+                );
+            }
+        }
+    }
+
+    /// Resolve an agent reference (uuid or name) to a REGISTERED agent id.
+    ///
+    /// Stricter than the inline resolution in
+    /// [`Self::run_woken_agent_loop`], which accepts any well-formed uuid: this
+    /// requires the agent to actually be in the registry, because its callers
+    /// ask "is there someone here to receive this?" rather than "does this parse
+    /// as an id?".
+    fn resolve_agent_ref(&self, who: &str) -> Option<AgentId> {
+        if let Ok(id) = who.parse::<AgentId>() {
+            if self.registry.get(id).is_some() {
+                return Some(id);
+            }
+        }
+        self.registry.find_by_name(who).map(|e| e.id)
     }
 
     /// ANAI-124: emit exactly one channel post of origin's shaped reply text on
@@ -8415,6 +8906,75 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
         disk.file_policy = entry.file_policy.clone();
     }
     disk
+}
+
+/// ANAI-198: upper bound on the callee's final text carried into an auto-close
+/// reply.
+///
+/// The initiator is woken with this body as its prompt, so an unbounded paste
+/// of a long turn's final text would blow a hole in the orchestrator's context
+/// window on a path it never asked for. Truncation is announced in the body —
+/// a silently clipped answer would be worse than a loud one.
+const AUTO_CLOSE_MAX_BODY_CHARS: usize = 8_000;
+
+/// ANAI-198: compose the body of a turn-end auto-close reply.
+///
+/// Pure, and free rather than associated, so the wording — which is the entire
+/// deliverable of this leg — is unit-testable without booting a kernel.
+///
+/// The wording carries real weight: the reader is a model, and the difference
+/// between "here is the answer" and "the target finished without answering you"
+/// determines whether it proceeds on a non-answer. So the body states, in
+/// prose and not only in [`ReplyKind`](openfang_types::wake::ReplyKind):
+/// the turn COMPLETED (this is neither an error nor a timeout), no reply was
+/// addressed to the sender, and the text below — if any — is the callee's final
+/// turn text, evidence rather than a considered reply.
+fn auto_close_body(target: &str, correlation: &str, loop_result: &AgentLoopResult) -> String {
+    let header = format!(
+        "[kernel] '{target}' COMPLETED its turn for your async request but never called \
+         `agent_reply_async`, so nothing was addressed to you (correlation {correlation}).\n\n\
+         The kernel is closing this correlation on the target's behalf. The turn ran to \
+         completion — this is NOT a delivery failure, NOT an error, and NOT a timeout. Any text \
+         below was written by the target for its own turn, not as an answer to your request: \
+         treat it as evidence, not as a considered reply.\n\n"
+    );
+
+    // A declined turn and an empty one are reported identically on purpose: in
+    // both cases the sender has no text, and the actionable fact is the same —
+    // look at side effects, not at this message.
+    let text = if loop_result.silent {
+        ""
+    } else {
+        loop_result.response.trim()
+    };
+    if text.is_empty() {
+        return format!(
+            "{header}--- no final text ---\n\
+             The target produced no final text{}. Whatever it accomplished is in its side \
+             effects, which are NOT enumerated here.",
+            if loop_result.silent {
+                " (it explicitly declined to respond)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    if text.chars().count() > AUTO_CLOSE_MAX_BODY_CHARS {
+        let cut = text
+            .char_indices()
+            .nth(AUTO_CLOSE_MAX_BODY_CHARS)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        return format!(
+            "{header}--- final turn text from '{target}' (TRUNCATED to the first \
+             {AUTO_CLOSE_MAX_BODY_CHARS} characters) ---\n{}\n\n[kernel] …truncated. The full \
+             text is in the target's transcript.",
+            &text[..cut]
+        );
+    }
+
+    format!("{header}--- final turn text from '{target}' ---\n{text}")
 }
 
 fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
@@ -13256,5 +13816,835 @@ system_prompt = "You are a test agent."
             .contains("gone_soon"));
 
         kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-197: the reply-right mint must be inside the wake-turn lock
+    // -----------------------------------------------------------------------
+
+    /// Two senders wake the SAME target concurrently. Each woken dispatch mints
+    /// a one-shot reply-right naming its own initiator, then (after an await
+    /// point, standing in for the agent turn) consumes it and answers.
+    ///
+    /// Before ANAI-197 the mint happened OUTSIDE any lock — `agent_msg_locks` is
+    /// acquired one frame deeper, inside `send_message_with_handle_and_blocks`,
+    /// so both dispatches minted before either serialized. The second mint
+    /// clobbered the first and the target's single `agent_reply_async` answered
+    /// the WRONG initiator: A's answer delivered to B, A left waiting forever.
+    /// That is cross-talk, not silence, and it is why fan-out onto a shared
+    /// target scrambled the interagent web.
+    ///
+    /// The fix is ordering, not re-keying: `wake_turn_locks` wraps
+    /// mint -> turn -> consume in one per-agent critical section, so a second
+    /// wake for the same target BLOCKS BEFORE MINTING. This test fails (one task
+    /// reads the other's initiator) if that guard is removed.
+    #[tokio::test]
+    async fn concurrent_wakes_on_one_target_do_not_clobber_each_others_reply_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-anai197");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+
+        // One shared target, two distinct initiators — the fan-out shape.
+        let target: AgentId = AgentId(uuid::Uuid::new_v4());
+
+        // Mirrors `run_woken_agent_loop`'s critical section exactly: take the
+        // wake-turn lock, mint, run the turn (the await), consume, clean up.
+        async fn one_woken_dispatch(
+            kernel: std::sync::Arc<OpenFangKernel>,
+            target: AgentId,
+            initiator: &str,
+            correlation: &str,
+            turn_millis: u64,
+        ) -> String {
+            let wake_lock = kernel
+                .wake_turn_locks
+                .entry(target)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            let _wake_guard = wake_lock.lock().await;
+
+            kernel.reply_rights.insert(
+                target,
+                openfang_runtime::tool_runner::ReplyRight::new(initiator, correlation, None),
+            );
+
+            // Stand-in for the agent turn. Any await here is enough: it is the
+            // yield point the clobbering wake used to slip through.
+            tokio::time::sleep(std::time::Duration::from_millis(turn_millis)).await;
+
+            // The turn calls `agent_reply_async`, which consumes the right and
+            // is told who to answer by the token — nothing else.
+            let answered = kernel
+                .reply_rights
+                .remove(&target)
+                .map(|(_, right)| right.reply_to().to_string())
+                .expect("a woken origination turn must find its reply-right");
+
+            // Turn-end cleanup (idempotent; the consume above already removed it).
+            kernel.reply_rights.remove(&target);
+            answered
+        }
+
+        let a = tokio::spawn(one_woken_dispatch(
+            kernel.clone(),
+            target,
+            "initiator-a",
+            "corr-a",
+            120,
+        ));
+        // Start B while A's turn is mid-flight — the exact interleaving that
+        // used to clobber.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let b = tokio::spawn(one_woken_dispatch(
+            kernel.clone(),
+            target,
+            "initiator-b",
+            "corr-b",
+            10,
+        ));
+
+        let answered_a = a.await.expect("dispatch A completes");
+        let answered_b = b.await.expect("dispatch B completes");
+
+        assert_eq!(
+            answered_a, "initiator-a",
+            "A's woken turn answered the wrong initiator — its reply-right was \
+             clobbered by a concurrent wake for the same target (ANAI-197)"
+        );
+        assert_eq!(
+            answered_b, "initiator-b",
+            "B's woken turn answered the wrong initiator — its reply-right was \
+             clobbered by a concurrent wake for the same target (ANAI-197)"
+        );
+
+        // And no token outlives the turns that minted them.
+        assert!(
+            kernel.reply_rights.is_empty(),
+            "no reply-right may survive turn end"
+        );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-199: every silent early return must pay the sender's reply debt
+    // -----------------------------------------------------------------------
+
+    /// Boot a throwaway kernel with one registered agent, returned as
+    /// `(tmp, kernel, agent_name)`. The tempdir is returned so the caller keeps
+    /// it alive for the duration of the test.
+    fn anai199_kernel(agent_name: &str) -> (tempfile::TempDir, std::sync::Arc<OpenFangKernel>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-anai199");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+        register_test_agent(&kernel, agent_name);
+        // A second agent, for the cases that need the wake TARGET to resolve:
+        // the depth re-check sits downstream of target resolution, so a bogus
+        // target name would trip the not-found leg first.
+        register_test_agent(&kernel, "deep-target");
+        (tmp, kernel)
+    }
+
+    /// An `agent_send_async` at a name that does not resolve used to return
+    /// "queued" and then produce NOTHING — the sender waited forever on a wake
+    /// that was dropped with a `warn!` it never saw. Since "target not found"
+    /// also fires for any agent that is merely inactive, this is the most common
+    /// shape of the observed failure-to-respond.
+    ///
+    /// The kernel must now close the correlation itself: a terminal reply back
+    /// to the sender, marked `Error` so the sender cannot mistake it for the
+    /// target's own answer, and explicit that no side effects exist.
+    #[tokio::test]
+    async fn undeliverable_wake_pays_the_sender_an_error_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-x");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "initiator-x".into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("initiator-x"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: Default::default(),
+            // ANAI-201: an explicit, generous deadline so these ANAI-199
+            // assertions exercise the error legs rather than racing the
+            // abort path this same dispatcher now enforces.
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-undeliverable".into(), envelope)
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "the kernel must enqueue a terminal reply for the sender — without it the \
+                 sender waits forever on an undeliverable wake (ANAI-199)",
+            );
+
+        assert_eq!(reply.target, "initiator-x", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "no-such-agent",
+            "the reply is attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "a synthesized reply is terminal");
+        assert_eq!(
+            reply.reply_kind,
+            openfang_types::wake::ReplyKind::Error,
+            "the sender must be able to tell this from a real answer"
+        );
+        assert!(
+            reply.reply_kind.is_synthetic(),
+            "no agent authored this body"
+        );
+        // The body has to SAY what it means: an orchestrator reading a bare
+        // "timeout"/"error" pattern-matches to blind retry.
+        assert!(
+            reply.message.contains("NOT delivered"),
+            "the body must state the request was never delivered: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("NO side effects"),
+            "the body must state that no side effects exist: {}",
+            reply.message
+        );
+        // A failure must reach the same human channel a success would have.
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510"),
+            "the synthesized reply inherits the inbound surfacing route"
+        );
+        // The reply roots a fresh chain, so origin's leg-4 turn is a clean leaf.
+        assert_eq!(reply.lineage.depth(), 1);
+
+        kernel.shutdown();
+    }
+
+    /// A wake refused for chain depth is still a wake the sender is owed an
+    /// answer to. Before ANAI-199 the refusal was audit-only: the sender could
+    /// not distinguish "refused" from "still working".
+    #[tokio::test]
+    async fn depth_refused_wake_pays_the_sender_an_error_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-y");
+
+        // Build a chain already at the bound, so the pre-dispatch re-check trips.
+        let mut lineage = openfang_types::wake::WakeLineage::root_at("initiator-y");
+        while !lineage.exceeds_depth(openfang_types::wake::DEFAULT_MAX_WAKE_DEPTH) {
+            lineage = lineage.extended(format!("hop-{}", lineage.depth()));
+        }
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            // The target RESOLVES here on purpose: the depth re-check sits
+            // downstream of target resolution, so a bogus name would trip the
+            // not-found leg and this test would pass for the wrong reason.
+            target: "deep-target".into(),
+            sender: "initiator-y".into(),
+            message: "one hop too far".into(),
+            lineage,
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: Default::default(),
+            // ANAI-201: an explicit, generous deadline so these ANAI-199
+            // assertions exercise the error legs rather than racing the
+            // abort path this same dispatcher now enforces.
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-too-deep".into(), envelope)
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect("a refused wake must still close the sender's correlation (ANAI-199)");
+
+        assert_eq!(reply.target, "initiator-y");
+        assert_eq!(reply.reply_kind, openfang_types::wake::ReplyKind::Error);
+        assert!(
+            reply.message.contains("REFUSED"),
+            "the body must state the request was refused, not merely failed: {}",
+            reply.message
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Termination, checked rather than assumed: a synthesized reply carries
+    /// `is_reply = true`, so if IT fails to dispatch the kernel must NOT
+    /// synthesize a reply-to-the-reply. Otherwise an undeliverable pair of
+    /// agents would pump the wake queue forever.
+    #[tokio::test]
+    async fn a_failed_reply_leg_does_not_synthesize_another_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-z");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "initiator-z".into(),
+            // This IS the terminal leg — nobody is owed anything downstream.
+            message: "here is your answer".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("no-such-agent"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: true,
+            surface_to: None,
+            reply_kind: openfang_types::wake::ReplyKind::Explicit,
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-terminal".into(), envelope)
+            .await;
+
+        assert!(
+            kernel
+                .memory
+                .claim_wake_for_dispatch(8)
+                .await
+                .expect("wake queue readable")
+                .is_none(),
+            "an undeliverable REPLY must be dropped, not answered — synthesizing here would \
+             recurse without bound (ANAI-199)"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// The debt is only payable to someone who can receive it. A sender that no
+    /// longer resolves (killed agent, or a non-agent originator like cron)
+    /// leaves the failure in the audit log rather than parking an unclaimable
+    /// wake in the queue.
+    #[tokio::test]
+    async fn unresolvable_sender_gets_no_unclaimable_wake() {
+        let (_tmp, kernel) = anai199_kernel("someone-else");
+
+        let envelope = openfang_types::wake::WakeEnvelope {
+            target: "no-such-agent".into(),
+            sender: "a-ghost".into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at("a-ghost"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: Default::default(),
+            // ANAI-201: an explicit, generous deadline so these ANAI-199
+            // assertions exercise the error legs rather than racing the
+            // abort path this same dispatcher now enforces.
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        };
+
+        kernel
+            .clone()
+            .run_woken_agent_loop("corr-ghost".into(), envelope)
+            .await;
+
+        // Counting EVERY pending task, not claiming and not filtering:
+        // `claim_wake_for_dispatch` resolves the envelope target against the
+        // registry, so a row addressed to a ghost is invisible to it — a
+        // claim-based assertion would pass even with the guard removed while the
+        // row sat in the queue forever.
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "no wake may be enqueued for a sender that can never claim it — it would park \
+             in the queue unclaimable and unseen; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-198: a completed turn that never replied still closes the
+    // correlation
+    // -----------------------------------------------------------------------
+
+    /// A finished turn's result, as `run_woken_agent_loop` would receive it.
+    fn test_turn_result(response: &str, silent: bool) -> AgentLoopResult {
+        AgentLoopResult {
+            response: response.to_string(),
+            total_usage: Default::default(),
+            iterations: 1,
+            cost_usd: None,
+            silent,
+            directives: Default::default(),
+        }
+    }
+
+    fn anai198_envelope(sender: &str, target: &str) -> openfang_types::wake::WakeEnvelope {
+        openfang_types::wake::WakeEnvelope {
+            target: target.into(),
+            sender: sender.into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at(sender),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: Default::default(),
+            // ANAI-201: an explicit, generous deadline so these ANAI-199
+            // assertions exercise the error legs rather than racing the
+            // abort path this same dispatcher now enforces.
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        }
+    }
+
+    /// THE failure mode this stack exists for: the target woke, ran a full
+    /// turn, and simply never called `agent_reply_async`. Nothing errored, so
+    /// no error leg fires; the turn-end cleanup used to drop the unused token on
+    /// the floor and the sender waited forever on an agent that had already
+    /// finished and gone idle.
+    ///
+    /// The kernel must now close the correlation with the turn's own final text,
+    /// marked `AutoClose` so the initiator cannot mistake an unaddressed summary
+    /// for a considered answer.
+    #[tokio::test]
+    async fn completed_turn_that_never_replied_is_auto_closed_with_its_final_text() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ac");
+
+        let envelope = anai198_envelope("initiator-ac", "deep-target");
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-autoclose",
+                true, // the token survived the turn: the callee never replied
+                &test_turn_result("I refactored the parser and ran the suite.", false),
+            )
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "a turn that completed without replying must still close the sender's \
+                 correlation — otherwise the sender waits forever on an idle agent (ANAI-198)",
+            );
+
+        assert_eq!(reply.target, "initiator-ac", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "deep-target",
+            "attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "an auto-close is terminal");
+        assert_eq!(
+            reply.reply_kind,
+            openfang_types::wake::ReplyKind::AutoClose,
+            "an unaddressed final text is NOT an explicit answer and must not claim to be"
+        );
+        assert!(reply.reply_kind.is_synthetic());
+        // The turn's own words are the payload — that is the whole point of
+        // auto-close over a bare "no reply" notice.
+        assert!(
+            reply.message.contains("I refactored the parser"),
+            "the turn's final text must be carried to the sender: {}",
+            reply.message
+        );
+        // ...but framed, so a model does not read it as an answer to its request.
+        assert!(
+            reply.message.contains("never called"),
+            "the body must say the target never replied: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("NOT a delivery failure"),
+            "the body must distinguish itself from the error/timeout kinds: {}",
+            reply.message
+        );
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510"),
+            "an auto-close inherits the inbound surfacing route"
+        );
+        assert_eq!(reply.lineage.depth(), 1);
+
+        kernel.shutdown();
+    }
+
+    /// The other half of the contract: a callee that DID call
+    /// `agent_reply_async` has already answered, and its reply-right was
+    /// consumed on read. Auto-closing anyway would deliver two terminal replies
+    /// for one correlation — the initiator would wake twice and could act twice
+    /// on the same request.
+    #[tokio::test]
+    async fn an_explicitly_answered_turn_is_not_auto_closed_twice() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ad");
+
+        let envelope = anai198_envelope("initiator-ad", "deep-target");
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-already-answered",
+                false, // the token was consumed: `agent_reply_async` already ran
+                &test_turn_result("done, see my reply", false),
+            )
+            .await;
+
+        // Count rows rather than claim: a claim resolves the target against the
+        // registry and would hide a misaddressed row (the ANAI-199 trap).
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "a correlation the callee already answered must not be answered again by the \
+             kernel — one request, one terminal reply; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A reply-woken turn (leg 4) owes nobody anything: it is the end of the
+    /// chain. Auto-closing here would bounce a reply back at the callee forever.
+    ///
+    /// Note this asserts the BEHAVIOUR, which is guarded twice: by the
+    /// `is_reply` early return in `close_completed_woken_turn` and again inside
+    /// `emit_synthetic_reply`. Removing either one alone leaves this green —
+    /// checked, not assumed. That redundancy is deliberate: termination is the
+    /// one property whose failure mode is an unbounded queue.
+    #[tokio::test]
+    async fn a_reply_woken_turn_is_never_auto_closed() {
+        let (_tmp, kernel) = anai199_kernel("initiator-ae");
+
+        let mut envelope = anai198_envelope("initiator-ae", "deep-target");
+        envelope.is_reply = true;
+        envelope.surface_to = None; // keep the ANAI-124 channel emit out of this
+
+        kernel
+            .close_completed_woken_turn(
+                &envelope,
+                "corr-terminal-leg",
+                // Deliberately the "debt outstanding" value: the `is_reply`
+                // guard must win on its own, not because this happens to be
+                // false in production.
+                true,
+                &test_turn_result("thanks, noted", false),
+            )
+            .await;
+
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "a terminal reply leg must not be auto-closed — that is a reply-to-a-reply and \
+             recurses without bound; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-201: the sender's deadline bounds the guarantee
+    // -----------------------------------------------------------------------
+
+    /// The leg that makes the reply guarantee *bounded*. Every earlier leg
+    /// (L1/L2/L3) only fires if kernel code still runs at the end of the
+    /// callee's turn; a wedged subprocess or a hung model call runs none, so
+    /// without this the debt is simply never discharged.
+    ///
+    /// The abort itself is `tokio::time::timeout` dropping the turn future — a
+    /// mechanism worth no test of its own. What IS worth pinning is the
+    /// contract the sender receives afterwards, because an orchestrator plans
+    /// its next move entirely from this body.
+    #[tokio::test]
+    async fn a_timed_out_turn_pays_the_sender_a_timeout_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-t1");
+
+        let envelope = anai198_envelope("initiator-t1", "deep-target");
+        kernel
+            .close_timed_out_woken_turn(
+                &envelope,
+                "corr-timeout",
+                true, // the callee never replied before the deadline elapsed
+                std::time::Duration::from_secs(600),
+            )
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "an aborted turn must still close the sender's correlation — a deadline that \
+                 kills the work and then says nothing is strictly worse than no deadline \
+                 (ANAI-201)",
+            );
+
+        assert_eq!(reply.target, "initiator-t1", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "deep-target",
+            "attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "a timeout close is terminal");
+        assert_eq!(
+            reply.reply_kind,
+            openfang_types::wake::ReplyKind::Timeout,
+            "a timeout must be distinguishable from an answer, an auto-close, and an error — \
+             the four demand different recovery"
+        );
+        assert!(reply.reply_kind.is_synthetic());
+        // ANAI-123/124: a request that dies must not die more quietly than one
+        // that works.
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510"),
+            "the surfacing route must be inherited so the failure reaches the same channel"
+        );
+
+        // The four load-bearing clauses. Ben's acceptance criteria, asserted
+        // rather than left as prose someone can quietly reword away.
+        let body = &reply.message;
+        assert!(
+            body.contains("TIMED OUT after 600s"),
+            "clause 0 — the deadline that was actually enforced: {body}"
+        );
+        assert!(
+            body.contains("ABORTED"),
+            "clause 1 — the turn was killed, not merely observed to be late: {body}"
+        );
+        assert!(
+            body.contains("NOT still running"),
+            "clause 2 — the target is takeable; an orchestrator must not wait on it: {body}"
+        );
+        assert!(
+            body.contains("side effects") && body.contains("NOT enumerated"),
+            "clause 3 — partial work may exist and the kernel cannot list it: {body}"
+        );
+        assert!(
+            body.contains("NOT a retry"),
+            "clause 4 — a model reading a bare 'timeout' will refire; say the opposite \
+             explicitly: {body}"
+        );
+        assert!(
+            !body.contains("CLAMPED"),
+            "an unclamped deadline must not claim to have been rewritten: {body}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// The clamp is policy, but hiding it is a bug: an orchestrator that asked
+    /// for 30s and was silently given 60s would mis-plan every downstream step
+    /// on a deadline it never agreed to.
+    #[tokio::test]
+    async fn a_clamped_deadline_is_disclosed_in_the_timeout_body() {
+        let (_tmp, kernel) = anai199_kernel("initiator-t2");
+
+        let mut envelope = anai198_envelope("initiator-t2", "deep-target");
+        envelope.timeout_secs = Some(60);
+        envelope.requested_timeout_secs = Some(5); // clamped up off the floor
+
+        kernel
+            .close_timed_out_woken_turn(
+                &envelope,
+                "corr-clamped",
+                true,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect("a clamped correlation is still a correlation the kernel owes a reply");
+
+        let body = &reply.message;
+        assert!(
+            body.contains("you requested 5s") && body.contains("CLAMPED to 60s"),
+            "the sender must be told BOTH numbers, or it will assume the deadline it set was \
+             the deadline enforced: {body}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A callee that answered and THEN ran long has already discharged its
+    /// debt. Stacking a `Timeout` on top would tell the initiator its request
+    /// failed when it demonstrably did not — and would break the one-reply-per-
+    /// correlation invariant every other leg is built on.
+    #[tokio::test]
+    async fn a_timed_out_turn_that_already_replied_is_not_double_answered() {
+        let (_tmp, kernel) = anai199_kernel("initiator-t3");
+
+        let envelope = anai198_envelope("initiator-t3", "deep-target");
+        kernel
+            .close_timed_out_woken_turn(
+                &envelope,
+                "corr-already-answered",
+                false, // the reply-right was consumed: the callee already answered
+                std::time::Duration::from_secs(600),
+            )
+            .await;
+
+        // Count rows; do NOT try to claim. A claim resolves the target against
+        // the registry, so a row addressed to a ghost is invisible to it while
+        // still sitting in the queue forever — the trap that made an earlier
+        // ANAI-199 assertion pass with its guard removed.
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "a correlation the callee already answered must not also receive a Timeout; \
+             found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Termination, again: a synthesized `Timeout` carries `is_reply = true`,
+    /// so an aborted REPLY leg must not produce a reply-to-a-reply. Depth-1 by
+    /// construction — the failure mode is an unbounded queue, so it is checked
+    /// on every synthesized kind rather than assumed from the shared helper.
+    ///
+    /// Honest coverage note: this stays green if you remove EITHER the
+    /// `debt_outstanding` guard here or the `is_reply` guard inside
+    /// [`Self::emit_synthetic_reply`] — it asserts the behaviour, and the
+    /// behaviour is double-guarded. Verified by mutation rather than assumed.
+    /// The redundancy is deliberate for exactly the reason above.
+    #[tokio::test]
+    async fn an_aborted_reply_leg_is_never_timed_out_into_another_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-t4");
+
+        let mut envelope = anai198_envelope("initiator-t4", "deep-target");
+        envelope.is_reply = true;
+
+        kernel
+            .close_timed_out_woken_turn(
+                &envelope,
+                "corr-terminal-timeout",
+                // Deliberately "debt outstanding": the `is_reply` guard must win
+                // on its own, not because this happens to be false in practice.
+                true,
+                std::time::Duration::from_secs(600),
+            )
+            .await;
+
+        let pending = kernel
+            .memory
+            .task_list(Some("pending"))
+            .await
+            .expect("task queue readable");
+        assert!(
+            pending.is_empty(),
+            "an aborted terminal reply leg must not be answered — that recurses without \
+             bound; found {pending:?}"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// Wording is the deliverable: the reader is a model deciding what to do
+    /// next. "No text" must not look like "empty answer", and a declined turn
+    /// must say so.
+    #[test]
+    fn auto_close_body_reports_a_textless_turn_as_such() {
+        let silent = auto_close_body("worker", "corr-1", &test_turn_result("", true));
+        assert!(silent.contains("no final text"), "{silent}");
+        assert!(
+            silent.contains("explicitly declined"),
+            "a NO_REPLY turn must be reported as a choice, not as an absence: {silent}"
+        );
+        assert!(
+            silent.contains("side effects"),
+            "the sender must be pointed at where the work actually is: {silent}"
+        );
+
+        // A turn whose text is only whitespace is textless, not an answer.
+        let empty = auto_close_body("worker", "corr-2", &test_turn_result("   \n  ", false));
+        assert!(empty.contains("no final text"), "{empty}");
+        assert!(
+            !empty.contains("explicitly declined"),
+            "an empty turn did not decline — do not put words in its mouth: {empty}"
+        );
+
+        // A silent turn that nonetheless carries text: `silent` wins, because
+        // the agent asked for its text not to be delivered.
+        let silent_with_text = auto_close_body(
+            "worker",
+            "corr-3",
+            &test_turn_result("internal notes", true),
+        );
+        assert!(
+            !silent_with_text.contains("internal notes"),
+            "a NO_REPLY turn's text must not be surfaced against its wishes: {silent_with_text}"
+        );
+    }
+
+    /// The body becomes the initiator's prompt, so an unbounded paste of a long
+    /// turn would eat the orchestrator's context on a path it never asked for.
+    /// Truncation is fine; SILENT truncation is not.
+    #[test]
+    fn auto_close_body_truncates_a_long_turn_loudly() {
+        let long = "x".repeat(AUTO_CLOSE_MAX_BODY_CHARS * 2);
+        let body = auto_close_body("worker", "corr-4", &test_turn_result(&long, false));
+
+        assert!(
+            body.contains("TRUNCATED"),
+            "a clipped body must announce it, or the sender reasons over a half-sentence"
+        );
+        assert!(
+            body.contains("transcript"),
+            "say where the full text lives: {}",
+            &body[..200.min(body.len())]
+        );
+        assert!(
+            body.chars().count() < long.chars().count(),
+            "the cap must actually bound the body"
+        );
+
+        // And a body just under the cap is passed through untouched.
+        let short = "y".repeat(AUTO_CLOSE_MAX_BODY_CHARS - 1);
+        let body = auto_close_body("worker", "corr-5", &test_turn_result(&short, false));
+        assert!(!body.contains("TRUNCATED"));
+        assert!(body.contains(&short));
     }
 }

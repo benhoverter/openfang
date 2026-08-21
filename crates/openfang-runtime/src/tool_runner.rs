@@ -1150,13 +1150,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                           Accepts UUID or agent name."
                 .to_string()
                 + " Optionally pass surface_to (\"<channel>:<recipient>\") to have the target's \
-                   eventual agent_reply_async answer auto-posted to that channel.",
+                   eventual agent_reply_async answer auto-posted to that channel."
+                + " You are GUARANTEED exactly one reply per call: if the target answers, you \
+                   get its answer; if it cannot or does not, the daemon closes the correlation \
+                   itself and tells you why. Pass timeout_secs to bound how long that takes.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" },
-                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." }
+                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." },
+                    "timeout_secs": { "type": "integer", "description": "Optional deadline in seconds. You are guaranteed a reply within roughly this long: if the target has not answered by then, its turn is ABORTED and the daemon sends you a timeout reply instead. Set it to how long you actually expect the work to take, with headroom — an over-tight value kills legitimate work, and partial side effects from the aborted turn may persist. Clamped into the operator's configured band; omit to accept the configured default." }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -3099,6 +3103,28 @@ async fn tool_agent_send_async(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
+    // ANAI-201: the sender's deadline for this correlation. This is what makes
+    // the reply guarantee *bounded* rather than merely eventual — the
+    // wake-consumer races the callee's whole turn against it and, on elapse,
+    // aborts the turn and mints a `Timeout` reply.
+    //
+    // Clamped HERE, once, and the result stamped into the durable envelope, so
+    // the queue row is the single source of truth for this correlation's
+    // deadline. Deriving it at enforcement time instead would let a config edit
+    // silently move the deadline of an already-dispatched send.
+    //
+    // A non-integer / negative value is treated as "omitted" rather than
+    // rejected: refusing the whole send over a malformed optional knob would
+    // trade a bounded reply for no reply at all, which is backwards.
+    let requested_timeout = input["timeout_secs"].as_u64();
+    let timeout_secs = openfang_types::async_reply::clamp_timeout_secs(requested_timeout);
+    // Recorded only when the clamp actually rewrote the request, so the common
+    // in-band case stays absent on the wire. Two consumers: the `Timeout` body
+    // (so an orchestrator is told its deadline was moved rather than inferring
+    // it was honored) and the requested-vs-enforced distribution these knobs
+    // are meant to be tuned from once real data exists.
+    let requested_timeout_secs = requested_timeout.filter(|r| *r != timeout_secs);
+
     // Canonicalize the target to a stable agent-id BEFORE the cycle check.
     // `sender` is always a UUID (the caller's agent id); a caller may address
     // `target` by NAME. would_cycle is a plain string compare, so without
@@ -3205,6 +3231,11 @@ async fn tool_agent_send_async(
         // token inherits it (minted in `run_woken_agent_loop`). None on the
         // wire when unset.
         surface_to: surface_to.clone(),
+        // Not a reply at all, so the kind is inert here (ANAI-199).
+        reply_kind: openfang_types::wake::ReplyKind::Explicit,
+        // ANAI-201: the clamped deadline rides the durable payload; see above.
+        timeout_secs: Some(timeout_secs),
+        requested_timeout_secs,
     };
 
     if let Some(route) = surface_to.as_deref() {
@@ -3242,9 +3273,26 @@ async fn tool_agent_send_async(
         Err(_) => String::new(),
     };
 
+    // ANAI-201: state the enforced deadline, and say so explicitly when it is
+    // NOT the number the caller passed. An orchestrator that asked for 30s and
+    // silently got 60s would mis-plan every downstream step on a deadline it
+    // never agreed to; the clamp is policy, but hiding it is a bug.
+    let deadline_note = match requested_timeout_secs {
+        Some(asked) => format!(
+            " You will receive exactly one reply for this correlation. Deadline: {timeout_secs}s \
+             (you requested {asked}s; CLAMPED into the operator's configured band). If the \
+             target has not replied by then its turn is aborted and you get a timeout reply."
+        ),
+        None => format!(
+            " You will receive exactly one reply for this correlation. Deadline: {timeout_secs}s; \
+             if the target has not replied by then its turn is aborted and you get a timeout \
+             reply."
+        ),
+    };
+
     Ok(format!(
         "Async wake queued for '{target}' (task {task_id}). \
-         The target runs on its own; no reply is returned inline.{depth_note}"
+         The target runs on its own; no reply is returned inline.{deadline_note}{depth_note}"
     ))
 }
 
@@ -3271,8 +3319,14 @@ async fn tool_agent_send_async(
 ///   initiator's root, which the initiator's own fan-out may have exhausted;
 ///   gagging a legitimate terminal answer for the initiator's spending buys no
 ///   safety, since the reply is one-shot and cannot itself fan out.
-/// * **Aggregate ceiling:** still enforced — a reply is a real emission, and
-///   the fleet-wide backstop only ever refuses, never permits.
+/// * **Aggregate ceiling:** deliberately NOT enforced either, as of ANAI-200.
+///   It guards amplification, and a reply cannot amplify — it is 1:1 with a
+///   wake the ceiling already charged, and terminal. Worse, the gate used to
+///   sit AFTER the token was consumed, so a trip destroyed the debt without
+///   emitting anything and the kernel's turn-end auto-close (ANAI-198) saw
+///   nothing owed: a ceiling trip turned a real answer into permanent silence,
+///   exactly under the load that makes the guarantee matter. See the inline
+///   note at the former gate site and `Kernel::emit_synthetic_reply`.
 async fn tool_agent_reply_async(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -3320,19 +3374,24 @@ async fn tool_agent_reply_async(
     // auto-post. `None` when the origin dispatched without `surface_to`.
     let surface_to = right.surface_to().map(str::to_string);
 
-    // Aggregate cross-tree ceiling still applies (defense-in-depth): a reply is
-    // a real wake emission. The per-tree budget is intentionally skipped (see
-    // the doc comment) — it would gag a legitimate answer for the initiator's
-    // own fan-out spending, and the reply cannot itself fan out.
-    if !wake_emit_admit() {
-        return Err(format!(
-            "Refusing async reply: aggregate wake-emission ceiling exceeded \
-             ({} wakes / {}s window across all trees). It clears once emissions \
-             go quiet.",
-            openfang_types::agent_wake::emit_max(),
-            openfang_types::agent_wake::window_secs()
-        ));
-    }
+    // ANAI-200: NO rate gate on this path — neither the per-tree budget nor the
+    // aggregate ceiling. Both guard *amplification*, and a reply cannot amplify:
+    // the one-shot right was minted by an already-admitted wake and consumed
+    // above, so this emission is 1:1 bounded by a wake the gates already
+    // charged, and `is_reply = true` makes it terminal (the consumer mints no
+    // further right, so it cannot bounce).
+    //
+    // The ceiling used to be checked HERE, after `take_reply_right` — which
+    // meant a refusal ate the token and emitted nothing, so the turn-end
+    // sweep in `run_woken_agent_loop` saw the debt already settled and never
+    // auto-closed (ANAI-198). A ceiling trip converted a real answer into
+    // permanent silence for that correlation: precisely the failure this stack
+    // exists to kill, firing exactly when the fleet is busy enough to need the
+    // guarantee. Reordering the check ahead of the take would only downgrade
+    // answers to `AutoClose` fallbacks — and the daemon's synthesized replies
+    // are ungated anyway, so the ceiling would suppress the good message while
+    // admitting the worse one. Dropping it is the correct fix, and it matches
+    // the reasoning already documented on `Kernel::emit_synthetic_reply`.
 
     // Terminal edge: root a FRESH single-element lineage at the replier. This is
     // the *completion* of a correlation, not an extension of the inbound chain;
@@ -3350,6 +3409,17 @@ async fn tool_agent_reply_async(
         is_reply: true,
         // ANAI-123: carry the surfacing route back to origin (leg 3->4).
         surface_to: surface_to.clone(),
+        // ANAI-199: an agent authored this body. Every other kind is minted by
+        // the daemon on the callee's behalf, and only the daemon may set them —
+        // this is the one construction site that is allowed to say `Explicit`.
+        reply_kind: openfang_types::wake::ReplyKind::Explicit,
+        // ANAI-201: a reply-woken turn mints no reply-right, so there is no
+        // debt on leg 4 for a deadline to bound the payment of. Leave it unset
+        // and let dispatch apply the configured default: leg 4 is still a real
+        // turn that can hang, and bounding it keeps the queue row from sitting
+        // `in_progress` until the far coarser stale-wake reaper notices.
+        timeout_secs: None,
+        requested_timeout_secs: None,
     };
 
     debug!(
@@ -5791,25 +5861,12 @@ mod tests {
             ));
         let input = serde_json::json!({ "message": "here is my answer" });
 
-        // ANAI-122: the first call reaches the real emit path (`wake_emit_admit`),
-        // which stamps the process-global ceiling window. Serialize behind the
-        // shared guard and drain first so this test neither pollutes nor is
-        // polluted by the ceiling test — the two are the only emit-touching tests.
-        let _guard = WAKE_EMIT_TEST_GUARD
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        reset_wake_emit_window();
-
-        // First call: the seeded right MUST clear the token gate. Whatever the
-        // downstream outcome (the aggregate ceiling is process-global and may be
-        // exhausted by a parallel test), it must NOT be the reply-right refusal.
+        // ANAI-200: the reply path no longer touches the process-global emit
+        // window at all, so this test needs neither the shared guard nor a
+        // window drain — it cannot pollute the ceiling test, nor be polluted by
+        // it. (Pre-ANAI-200 it stamped the window and had to serialize.)
         let first = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent")).await;
-        if let Err(e) = &first {
-            assert!(
-                !e.contains("reply-right"),
-                "a seeded right must pass the token gate; got refusal: {e}"
-            );
-        }
+        first.expect("a seeded right must produce a queued reply");
 
         // Second call, same turn: the right was consumed on first read, so the
         // registry is empty and the tool refuses. This is the one-shot property,
@@ -5819,6 +5876,46 @@ mod tests {
         assert!(
             err.contains("reply-right"),
             "second call must refuse at the reply-right gate; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_reply_survives_an_exhausted_aggregate_ceiling() {
+        // ANAI-200 regression. The aggregate ceiling used to be checked AFTER
+        // `take_reply_right` consumed the one-shot token: a ceiling trip ate the
+        // debt and emitted nothing, so the kernel's turn-end sweep saw the
+        // correlation as already settled and never auto-closed it (ANAI-198).
+        // Net effect: under fleet-wide load — the one condition where the reply
+        // guarantee earns its keep — a real answer became permanent silence.
+        //
+        // A reply cannot amplify (1:1 with an already-admitted wake, terminal by
+        // `is_reply`), so the correct fix was to drop the gate, not reorder it.
+        // Saturate the window and assert the reply still goes out.
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        for _ in 0..openfang_types::agent_wake::emit_max() {
+            assert!(wake_emit_admit(), "priming the window must admit");
+        }
+        assert!(
+            !wake_emit_admit(),
+            "precondition: the aggregate ceiling must now be refusing"
+        );
+
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> =
+            Arc::new(FakeKernelHandle::new().with_reply_right(
+                "callee-agent",
+                ReplyRight::new("origin-agent", "corr-ceiling", None),
+            ));
+        let input = serde_json::json!({ "message": "answer under load" });
+
+        let out = tool_agent_reply_async(&input, Some(&handle), Some("callee-agent"))
+            .await
+            .expect("a reply must not be refused by the aggregate ceiling");
+        assert!(
+            out.contains("corr-ceiling"),
+            "the queued reply must name its correlation; got: {out}"
         );
     }
 
