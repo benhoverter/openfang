@@ -20,6 +20,7 @@ pub mod semantic;
 pub mod session;
 pub mod structured;
 pub mod usage;
+pub mod vocabulary;
 
 mod substrate;
 pub use substrate::MemorySubstrate;
