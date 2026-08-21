@@ -2,8 +2,32 @@
 //! (ADR 0001 §2.3, schema v14).
 //!
 //! A **fact** is a `memories` row with `kind = 'fact'` that occupies a *slot*
-//! named by `(agent_id, scope, claim_key)`. The slot holds at most one live
+//! named by `(scope, scope_ref, claim_key)`. The slot holds at most one live
 //! row, enforced by the v14 partial unique index — not by convention.
+//!
+//! # The slot belongs to its subject, not to its author
+//!
+//! `scope_ref` is *what the claim is about* — the agent's own id for an
+//! `agent`-scoped claim, the project slug for a `project` one. Who wrote it is
+//! recorded separately, as `authored_by`, and is deliberately not part of the
+//! address.
+//!
+//! That split is the 2026-08-21 amendment to v14, and it is load-bearing
+//! rather than tidy. Keying the slot on its author meant two agents writing
+//! the same project claim produced two live rows that disagreed and neither
+//! superseded the other — supersession, the entire feature, was off for every
+//! scope but `agent`. `kimiya-alpha`'s framing is the one to keep: a
+//! disposable worker writes a fact and is then deleted, and its row is left
+//! holding the live value for a claim nobody can overwrite. Make the row
+//! belong to the project, not the corpse.
+//!
+//! One consequence to be explicit about: `memories.agent_id` still carries the
+//! author and the recall path still filters on it (ANAI-165). So a
+//! project-scoped fact is *addressed* correctly today but is not yet
+//! *readable* by the writer's siblings. Closing that needs declared project
+//! membership, which is ANAI-208 and not this module's to fix. What this
+//! module guarantees now is that when membership lands the rows are already
+//! keyed the right way, and no migration is owed.
 //!
 //! # What this module is for
 //!
@@ -57,7 +81,7 @@
 //!
 //! # Vocabulary is enforced here, and that is not a silent refusal
 //!
-//! `upsert` validates `scope` and `claim_key` against
+//! `upsert` validates `scope`, `scope_ref` and `claim_key` against
 //! [`crate::vocabulary`] before it opens a transaction, and returns
 //! [`OpenFangError::InvalidInput`] if either is outside the space (§2.3.3
 //! mitigation 1). The earlier worry — that a storage layer refusing a key
@@ -70,7 +94,7 @@
 //! This layer is the backstop that makes the vocabulary a property of the
 //! store rather than a habit of its callers.
 
-use crate::vocabulary::{ClaimKey, FactScope};
+use crate::vocabulary::{check_scope_ref, nearest_keys, ClaimKey, FactScope};
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -89,9 +113,20 @@ pub const KIND_FACT: &str = "fact";
 
 /// How many existing keys a rejection lists back to the caller.
 ///
-/// Enough to be a usable menu, few enough that it does not swamp the reason
-/// for the rejection in a model's context.
-const MAX_SUGGESTED_KEYS: i64 = 25;
+/// Three, not the twenty-five this shipped with. `openfang-security`'s catch,
+/// and it is a real one: rejection text lands in the transcript, and the
+/// transcript is memory-captured — so a twenty-five-key echo seeded tier-1
+/// memory with a tier-3 key-space enumeration every time a model fat-fingered
+/// a key. The caller is trying to *select* an existing slot and a near miss is
+/// the one they meant, so three nearest by edit distance keeps all of the
+/// utility and drops the enumeration to nothing.
+const SUGGESTED_KEYS: usize = 3;
+
+/// Upper bound on the candidate list a suggestion is drawn from.
+///
+/// Bounds the edit-distance scan on a path that has already failed. This is
+/// not a disclosure limit — only [`SUGGESTED_KEYS`] of these are ever shown.
+const SUGGESTION_CANDIDATES: i64 = 500;
 
 /// Lifecycle of a claim: unfinished versus stable (ADR 0001 §2.3.2).
 ///
@@ -148,12 +183,21 @@ impl std::fmt::Display for FactStatus {
 /// adding a field later is not a breaking change at every call site.
 #[derive(Debug, Clone)]
 pub struct FactWrite {
-    /// Owning agent — first component of the slot key.
+    /// Who is writing. Recorded as `authored_by`, and **not** part of the
+    /// slot address — see the module docs.
     pub agent_id: AgentId,
-    /// `agent` / `project` / `user` / `global` (§2.3.2). Second component of
+    /// `agent` / `project` / `user` / `global` (§2.3.2). First component of
     /// the slot key: the same claim key under two scopes is two slots.
     pub scope: String,
-    /// Slot name from the controlled vocabulary, e.g. `git.trunk_model`.
+    /// What the claim is *about*: the project slug, the user slug. Second
+    /// component of the slot key.
+    ///
+    /// `None` is legal only for `agent` scope, where it is derived from
+    /// `agent_id`. Honouring a caller-chosen agent ref would let one agent
+    /// write into another's slot space, which is the ANAI-165 boundary
+    /// reopened from inside tier 3.
+    pub scope_ref: Option<String>,
+    /// Slot name from the controlled vocabulary, e.g. `repo.trunk_model`.
     pub claim_key: String,
     /// The claim itself, in prose. Compared verbatim to decide affirm versus
     /// supersede.
@@ -185,6 +229,7 @@ impl FactWrite {
         Self {
             agent_id,
             scope: scope.into(),
+            scope_ref: None,
             claim_key: claim_key.into(),
             claim: claim.into(),
             status: FactStatus::Settled,
@@ -194,6 +239,14 @@ impl FactWrite {
             metadata: HashMap::new(),
             embedding: None,
         }
+    }
+
+    /// Name what this claim is about.
+    ///
+    /// Required for every scope except `agent`, which derives its own.
+    pub fn with_scope_ref(mut self, scope_ref: impl Into<String>) -> Self {
+        self.scope_ref = Some(scope_ref.into());
+        self
     }
 
     /// Mark this claim open or settled.
@@ -273,10 +326,12 @@ impl FactOutcome {
 pub struct Fact {
     /// Row id — stable for the life of the slot.
     pub id: MemoryId,
-    /// Owning agent.
-    pub agent_id: String,
+    /// Who wrote the current claim. Metadata, not address.
+    pub authored_by: Option<String>,
     /// Slot scope.
     pub scope: String,
+    /// What the claim is about — the other half of the slot address.
+    pub scope_ref: String,
     /// Slot name.
     pub claim_key: String,
     /// The current claim.
@@ -306,8 +361,12 @@ pub struct FactHistoryEntry {
     pub id: Uuid,
     /// The slot row this claim used to be.
     pub memory_id: MemoryId,
+    /// Who believed the superseded claim. Not necessarily who ended it.
+    pub authored_by: Option<String>,
     /// Slot scope.
     pub scope: String,
+    /// What the claim was about.
+    pub scope_ref: String,
     /// Slot name.
     pub claim_key: String,
     /// The superseded claim.
@@ -335,6 +394,9 @@ pub struct FactStore {
 /// The subset of a live row `upsert` needs to decide what to do.
 struct LiveRow {
     id: String,
+    /// The *outgoing* row's author. History answers "who believed this",
+    /// which is a different question from "who replaced it".
+    authored_by: Option<String>,
     claim: String,
     status: Option<String>,
     confidence: f64,
@@ -349,7 +411,7 @@ impl FactStore {
         Self { conn }
     }
 
-    /// Append the keys already in use under this `(agent, scope)` to a
+    /// Append the nearest existing keys under this `(scope, scope_ref)` to a
     /// claim-key rejection.
     ///
     /// ADR 0001 §2.3.3 names "consolidation *selects* a key from the existing
@@ -357,7 +419,8 @@ impl FactStore {
     /// that is only told *no* will invent a second legal name for a slot that
     /// already exists — which is the exact failure the vocabulary is meant to
     /// prevent, arrived at by a different road. So the rejection carries the
-    /// space.
+    /// part of the space the caller was reaching for — see [`SUGGESTED_KEYS`]
+    /// for why it is a short menu rather than the space itself.
     ///
     /// Best-effort by construction: if the lookup itself fails we return the
     /// original validation error untouched. The caller's key is wrong either
@@ -365,24 +428,21 @@ impl FactStore {
     /// the only part they can act on.
     fn with_existing_keys(
         conn: &Connection,
-        write: &FactWrite,
+        scope: FactScope,
+        scope_ref: &str,
+        attempted: &str,
         err: OpenFangError,
     ) -> OpenFangError {
         let lookup = (|| -> rusqlite::Result<Vec<String>> {
             let mut stmt = conn.prepare(
-                "SELECT claim_key FROM memories
-                 WHERE agent_id = ?1 AND scope = ?2 AND kind = ?3
+                "SELECT DISTINCT claim_key FROM memories
+                 WHERE scope = ?1 AND scope_ref = ?2 AND kind = ?3
                    AND deleted = 0 AND claim_key IS NOT NULL
                  ORDER BY claim_key
                  LIMIT ?4",
             )?;
             let rows = stmt.query_map(
-                rusqlite::params![
-                    write.agent_id.0.to_string(),
-                    write.scope,
-                    KIND_FACT,
-                    MAX_SUGGESTED_KEYS,
-                ],
+                rusqlite::params![scope.as_str(), scope_ref, KIND_FACT, SUGGESTION_CANDIDATES],
                 |r| r.get::<_, String>(0),
             )?;
             rows.collect()
@@ -390,22 +450,23 @@ impl FactStore {
 
         match lookup {
             Ok(keys) if !keys.is_empty() => {
-                let more = if keys.len() as i64 == MAX_SUGGESTED_KEYS {
-                    " (first 25)"
+                // "at least" when the candidate scan hit its bound: reporting
+                // a truncated count as exact would be a quiet lie about the
+                // size of the space.
+                let count = if keys.len() as i64 == SUGGESTION_CANDIDATES {
+                    format!("at least {}", keys.len())
                 } else {
-                    ""
+                    keys.len().to_string()
                 };
                 OpenFangError::InvalidInput(format!(
-                    "{err} Keys already in use for scope {:?}{more}: {}. \
-                     Prefer one of these if it fits the claim.",
-                    write.scope,
-                    keys.join(", ")
+                    "{err} {count} keys are already in use for {scope} {scope_ref:?}; \
+                     the closest are: {}. Prefer one of these if it fits the claim.",
+                    nearest_keys(&keys, attempted, SUGGESTED_KEYS).join(", ")
                 ))
             }
             Ok(_) => OpenFangError::InvalidInput(format!(
-                "{err} No facts exist yet under scope {:?}, so this would mint the \
-                 first key in that space.",
-                write.scope
+                "{err} No facts exist yet for {scope} {scope_ref:?}, so this would mint \
+                 the first key in that space."
             )),
             Err(_) => err,
         }
@@ -428,10 +489,11 @@ impl FactStore {
     /// # Rejections
     ///
     /// Returns [`OpenFangError::InvalidInput`] — before opening the
-    /// transaction, so nothing is written — when `scope` or `claim_key` is
-    /// outside the controlled vocabulary, or when `scope` is `global` (ADR
-    /// 0001 §5.2, unanswered). A claim-key rejection carries the keys already
-    /// in use under that scope, because §2.3.3's first mitigation is that a
+    /// transaction, so nothing is written — when `scope`, `scope_ref` or
+    /// `claim_key` is outside the controlled vocabulary, when a subject-scoped
+    /// write carries no `scope_ref`, or when `scope` is `global` (out of scope
+    /// for this epic). A claim-key rejection carries the nearest keys already
+    /// in use for that subject, because §2.3.3's first mitigation is that a
     /// caller *selects* from the existing key space rather than inventing a
     /// name, and it cannot select from a space it has not been shown.
     pub fn upsert(&self, write: FactWrite) -> OpenFangResult<FactOutcome> {
@@ -444,20 +506,42 @@ impl FactStore {
         let scope = FactScope::parse(&write.scope)?;
         if !scope.is_shipped() {
             return Err(OpenFangError::InvalidInput(format!(
-                "fact scope {scope} is not available: ADR 0001 §5.2 leaves cross-agent \
-                 global facts an open question (who may write one, and whether it renders \
-                 into every agent's prompt). Use agent, project or user scope."
+                "fact scope {scope} is not available: fleet-wide claims are out of scope \
+                 for this epic (Ben, 2026-08-21). A global fact renders into every agent's \
+                 prompt forever, and the only control that survives a single well-chosen \
+                 row is human promotion, which nothing has built yet. Use agent, project \
+                 or user scope."
             )));
         }
+
+        let agent = write.agent_id.0.to_string();
+        // The subject half of the slot address. Derived for `agent` scope so
+        // no caller can address another agent's slots; demanded for the rest,
+        // because SQLite treats NULLs as distinct inside a unique index and an
+        // absent ref would silently switch off the constraint it is part of.
+        let scope_ref = match (scope.takes_caller_ref(), write.scope_ref.as_deref()) {
+            (false, _) => agent.clone(),
+            (true, Some(given)) => {
+                check_scope_ref(scope, given)?;
+                given.to_string()
+            }
+            (true, None) => {
+                return Err(OpenFangError::InvalidInput(format!(
+                    "a {scope}-scoped fact needs a scope_ref naming what it is about \
+                     (the project or user slug). Without one the slot has no subject, so \
+                     the claim would be filed under whoever happened to write it."
+                )));
+            }
+        };
+
         let claim_key = ClaimKey::parse(&write.claim_key)
-            .map_err(|e| Self::with_existing_keys(&conn, &write, e))?;
+            .map_err(|e| Self::with_existing_keys(&conn, scope, &scope_ref, &write.claim_key, e))?;
         let claim_key = claim_key.as_str().to_string();
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
         let now = Utc::now().to_rfc3339();
-        let agent = write.agent_id.0.to_string();
         let meta_str = serde_json::to_string(&write.metadata)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         let source_str = serde_json::to_string(&write.source)
@@ -469,20 +553,22 @@ impl FactStore {
 
         let live = tx
             .query_row(
-                "SELECT id, content, status, confidence, metadata, episode_id, created_at
+                "SELECT id, authored_by, content, status, confidence, metadata, episode_id,
+                        created_at
                  FROM memories
-                 WHERE agent_id = ?1 AND scope = ?2 AND claim_key = ?3
+                 WHERE scope = ?1 AND scope_ref = ?2 AND claim_key = ?3
                    AND kind = ?4 AND deleted = 0",
-                rusqlite::params![agent, scope.as_str(), claim_key, KIND_FACT],
+                rusqlite::params![scope.as_str(), scope_ref, claim_key, KIND_FACT],
                 |r| {
                     Ok(LiveRow {
                         id: r.get(0)?,
-                        claim: r.get(1)?,
-                        status: r.get(2)?,
-                        confidence: r.get(3)?,
-                        metadata: r.get(4)?,
-                        episode_id: r.get(5)?,
-                        created_at: r.get(6)?,
+                        authored_by: r.get(1)?,
+                        claim: r.get(2)?,
+                        status: r.get(3)?,
+                        confidence: r.get(4)?,
+                        metadata: r.get(5)?,
+                        episode_id: r.get(6)?,
+                        created_at: r.get(7)?,
                     })
                 },
             )
@@ -499,8 +585,9 @@ impl FactStore {
                     "INSERT INTO memories (id, agent_id, content, source, scope, confidence,
                                            metadata, created_at, accessed_at, access_count,
                                            deleted, embedding, episode_id, kind, claim_key,
-                                           status, last_affirmed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 0, ?9, ?10, ?11, ?12, ?13, ?8)",
+                                           status, last_affirmed_at, scope_ref, authored_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 0, ?9, ?10, ?11, ?12, ?13,
+                             ?8, ?14, ?2)",
                     rusqlite::params![
                         id.0.to_string(),
                         agent,
@@ -515,6 +602,7 @@ impl FactStore {
                         KIND_FACT,
                         claim_key,
                         write.status.as_str(),
+                        scope_ref,
                     ],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -527,6 +615,11 @@ impl FactStore {
             // the *current* belief in an unchanged claim, and freezing them
             // would leave a caller no way to correct a confidence short of
             // faking a claim edit.
+            //
+            // `authored_by` is the exception, and deliberately: it names who
+            // believed *this claim*, and an affirmation is by definition the
+            // same claim. Refreshing it would quietly re-attribute a belief to
+            // whoever last re-derived it.
             Some(row)
                 if row.claim == write.claim
                     && row.status.as_deref() == Some(write.status.as_str()) =>
@@ -548,15 +641,18 @@ impl FactStore {
                 let id = parse_memory_id(&row.id)?;
                 let history_id = Uuid::new_v4();
                 tx.execute(
-                    "INSERT INTO fact_history (id, memory_id, agent_id, scope, claim_key, claim,
-                                               status, confidence, metadata, episode_id,
-                                               created_at, superseded_at, superseded_by_episode)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    "INSERT INTO fact_history (id, memory_id, authored_by, scope, scope_ref,
+                                               claim_key, claim, status, confidence, metadata,
+                                               episode_id, created_at, superseded_at,
+                                               superseded_by_episode)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     rusqlite::params![
                         history_id.to_string(),
                         row.id,
-                        agent,
+                        // The OUTGOING row's author.
+                        row.authored_by,
                         scope.as_str(),
+                        scope_ref,
                         claim_key,
                         row.claim,
                         row.status,
@@ -585,7 +681,8 @@ impl FactStore {
                     "UPDATE memories
                      SET content = ?2, source = ?3, confidence = ?4, metadata = ?5,
                          embedding = ?6, episode_id = ?7, status = ?8,
-                         created_at = ?9, accessed_at = ?9, last_affirmed_at = ?9
+                         created_at = ?9, accessed_at = ?9, last_affirmed_at = ?9,
+                         agent_id = ?10, authored_by = ?10
                      WHERE id = ?1",
                     rusqlite::params![
                         row.id,
@@ -597,6 +694,7 @@ impl FactStore {
                         write.episode_id,
                         write.status.as_str(),
                         now,
+                        agent,
                     ],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -610,10 +708,13 @@ impl FactStore {
     }
 
     /// The live claim in a slot, if any. Exact-key lookup, no ranking.
+    ///
+    /// Addressed by subject rather than by author: whoever wrote the claim,
+    /// the slot is found the same way.
     pub fn get(
         &self,
-        agent_id: AgentId,
         scope: &str,
+        scope_ref: &str,
         claim_key: &str,
     ) -> OpenFangResult<Option<Fact>> {
         let conn = self
@@ -621,12 +722,12 @@ impl FactStore {
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.query_row(
-            "SELECT id, agent_id, scope, claim_key, content, status, confidence, episode_id,
-                    created_at, last_affirmed_at, metadata
+            "SELECT id, authored_by, scope, scope_ref, claim_key, content, status, confidence,
+                    episode_id, created_at, last_affirmed_at, metadata
              FROM memories
-             WHERE agent_id = ?1 AND scope = ?2 AND claim_key = ?3
+             WHERE scope = ?1 AND scope_ref = ?2 AND claim_key = ?3
                AND kind = ?4 AND deleted = 0",
-            rusqlite::params![agent_id.0.to_string(), scope, claim_key, KIND_FACT],
+            rusqlite::params![scope, scope_ref, claim_key, KIND_FACT],
             row_to_fact,
         )
         .optional()
@@ -641,8 +742,8 @@ impl FactStore {
     /// call, which is the only time the history is wanted.
     pub fn history(
         &self,
-        agent_id: AgentId,
         scope: &str,
+        scope_ref: &str,
         claim_key: &str,
         limit: usize,
     ) -> OpenFangResult<Vec<FactHistoryEntry>> {
@@ -652,17 +753,17 @@ impl FactStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, memory_id, scope, claim_key, claim, status, confidence, episode_id,
-                        created_at, superseded_at, superseded_by_episode
+                "SELECT id, memory_id, authored_by, scope, scope_ref, claim_key, claim, status,
+                        confidence, episode_id, created_at, superseded_at, superseded_by_episode
                  FROM fact_history
-                 WHERE agent_id = ?1 AND scope = ?2 AND claim_key = ?3
+                 WHERE scope = ?1 AND scope_ref = ?2 AND claim_key = ?3
                  ORDER BY superseded_at DESC
                  LIMIT ?4",
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         let rows = stmt
             .query_map(
-                rusqlite::params![agent_id.0.to_string(), scope, claim_key, limit as i64],
+                rusqlite::params![scope, scope_ref, claim_key, limit as i64],
                 row_to_history,
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -691,23 +792,24 @@ fn parse_memory_id(s: &str) -> OpenFangResult<MemoryId> {
 #[allow(clippy::type_complexity)]
 fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenFangResult<Fact>> {
     let id: String = row.get(0)?;
-    let status: Option<String> = row.get(5)?;
-    let metadata: String = row.get(10)?;
+    let status: Option<String> = row.get(6)?;
+    let metadata: String = row.get(11)?;
     Ok((|| {
         Ok(Fact {
             id: parse_memory_id(&id)?,
-            agent_id: row.get::<_, String>(1).unwrap_or_default(),
+            authored_by: row.get::<_, Option<String>>(1).unwrap_or_default(),
             scope: row.get::<_, String>(2).unwrap_or_default(),
-            claim_key: row.get::<_, String>(3).unwrap_or_default(),
-            claim: row.get::<_, String>(4).unwrap_or_default(),
+            scope_ref: row.get::<_, String>(3).unwrap_or_default(),
+            claim_key: row.get::<_, String>(4).unwrap_or_default(),
+            claim: row.get::<_, String>(5).unwrap_or_default(),
             status: match status.as_deref() {
                 Some(s) => FactStatus::parse(s)?,
                 None => FactStatus::Settled,
             },
-            confidence: row.get::<_, f64>(6).unwrap_or(1.0),
-            episode_id: row.get::<_, Option<String>>(7).unwrap_or_default(),
-            created_at: row.get::<_, String>(8).unwrap_or_default(),
-            last_affirmed_at: row.get::<_, Option<String>>(9).unwrap_or_default(),
+            confidence: row.get::<_, f64>(7).unwrap_or(1.0),
+            episode_id: row.get::<_, Option<String>>(8).unwrap_or_default(),
+            created_at: row.get::<_, String>(9).unwrap_or_default(),
+            last_affirmed_at: row.get::<_, Option<String>>(10).unwrap_or_default(),
             metadata: serde_json::from_str(&metadata).unwrap_or_default(),
         })
     })())
@@ -718,24 +820,26 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenFangResult<Fact>
 fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenFangResult<FactHistoryEntry>> {
     let id: String = row.get(0)?;
     let memory_id: String = row.get(1)?;
-    let status: Option<String> = row.get(5)?;
+    let status: Option<String> = row.get(7)?;
     Ok((|| {
         Ok(FactHistoryEntry {
             id: Uuid::parse_str(&id)
                 .map_err(|e| OpenFangError::Memory(format!("malformed history id {id:?}: {e}")))?,
             memory_id: parse_memory_id(&memory_id)?,
-            scope: row.get::<_, String>(2).unwrap_or_default(),
-            claim_key: row.get::<_, String>(3).unwrap_or_default(),
-            claim: row.get::<_, String>(4).unwrap_or_default(),
+            authored_by: row.get::<_, Option<String>>(2).unwrap_or_default(),
+            scope: row.get::<_, String>(3).unwrap_or_default(),
+            scope_ref: row.get::<_, String>(4).unwrap_or_default(),
+            claim_key: row.get::<_, String>(5).unwrap_or_default(),
+            claim: row.get::<_, String>(6).unwrap_or_default(),
             status: match status.as_deref() {
                 Some(s) => Some(FactStatus::parse(s)?),
                 None => None,
             },
-            confidence: row.get::<_, f64>(6).unwrap_or(1.0),
-            episode_id: row.get::<_, Option<String>>(7).unwrap_or_default(),
-            created_at: row.get::<_, String>(8).unwrap_or_default(),
-            superseded_at: row.get::<_, String>(9).unwrap_or_default(),
-            superseded_by_episode: row.get::<_, Option<String>>(10).unwrap_or_default(),
+            confidence: row.get::<_, f64>(8).unwrap_or(1.0),
+            episode_id: row.get::<_, Option<String>>(9).unwrap_or_default(),
+            created_at: row.get::<_, String>(10).unwrap_or_default(),
+            superseded_at: row.get::<_, String>(11).unwrap_or_default(),
+            superseded_by_episode: row.get::<_, Option<String>>(12).unwrap_or_default(),
         })
     })())
 }
@@ -756,6 +860,12 @@ mod tests {
         AgentId::new()
     }
 
+    /// The `scope_ref` an `agent`-scoped write derives for itself. Tests read
+    /// a slot the same way the writer addressed it.
+    fn aref(a: AgentId) -> String {
+        a.0.to_string()
+    }
+
     fn write(a: AgentId, key: &str, claim: &str) -> FactWrite {
         FactWrite::new(a, "agent", key, claim)
     }
@@ -766,14 +876,19 @@ mod tests {
         let a = agent();
 
         let out = facts
-            .upsert(write(a, "git.trunk_model", "main is trunk"))
+            .upsert(write(a, "repo.trunk_model", "main is trunk"))
             .unwrap();
         assert!(matches!(out, FactOutcome::Created { .. }));
 
-        let fact = facts.get(a, "agent", "git.trunk_model").unwrap().unwrap();
+        let fact = facts
+            .get("agent", &aref(a), "repo.trunk_model")
+            .unwrap()
+            .unwrap();
         assert_eq!(fact.claim, "main is trunk");
         assert_eq!(fact.status, FactStatus::Settled);
         assert_eq!(fact.id, out.id());
+        assert_eq!(fact.scope_ref, aref(a), "agent scope derives its own ref");
+        assert_eq!(fact.authored_by.as_deref(), Some(aref(a).as_str()));
         assert!(
             fact.last_affirmed_at.is_some(),
             "a fresh claim counts as affirmed at write time"
@@ -788,10 +903,10 @@ mod tests {
         let a = agent();
 
         let first = facts
-            .upsert(write(a, "git.trunk_model", "local-main is trunk").with_episode("ep-1"))
+            .upsert(write(a, "repo.trunk_model", "local-main is trunk").with_episode("ep-1"))
             .unwrap();
         let second = facts
-            .upsert(write(a, "git.trunk_model", "main is trunk").with_episode("ep-2"))
+            .upsert(write(a, "repo.trunk_model", "main is trunk").with_episode("ep-2"))
             .unwrap();
 
         assert_eq!(
@@ -801,16 +916,22 @@ mod tests {
         );
         assert!(second.superseded());
 
-        let live = facts.get(a, "agent", "git.trunk_model").unwrap().unwrap();
+        let live = facts
+            .get("agent", &aref(a), "repo.trunk_model")
+            .unwrap()
+            .unwrap();
         assert_eq!(live.claim, "main is trunk");
         assert_eq!(live.episode_id.as_deref(), Some("ep-2"));
 
-        let hist = facts.history(a, "agent", "git.trunk_model", 10).unwrap();
+        let hist = facts
+            .history("agent", &aref(a), "repo.trunk_model", 10)
+            .unwrap();
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].claim, "local-main is trunk");
         assert_eq!(hist[0].episode_id.as_deref(), Some("ep-1"));
         assert_eq!(hist[0].superseded_by_episode.as_deref(), Some("ep-2"));
         assert_eq!(hist[0].memory_id, first.id());
+        assert_eq!(hist[0].scope_ref, aref(a));
     }
 
     /// §2.3.1, the property the whole tier exists for: after any number of
@@ -821,7 +942,7 @@ mod tests {
         let a = agent();
 
         for claim in ["v1", "v2", "v3"] {
-            facts.upsert(write(a, "git.trunk_model", claim)).unwrap();
+            facts.upsert(write(a, "repo.trunk_model", claim)).unwrap();
         }
 
         let live: i64 = conn
@@ -835,13 +956,154 @@ mod tests {
             .unwrap();
         assert_eq!(live, 1, "superseded claims must not remain in `memories`");
 
-        let hist = facts.history(a, "agent", "git.trunk_model", 10).unwrap();
+        let hist = facts
+            .history("agent", &aref(a), "repo.trunk_model", 10)
+            .unwrap();
         assert_eq!(hist.len(), 2, "two supersessions, two history rows");
         assert_eq!(
             hist.iter().map(|h| h.claim.as_str()).collect::<Vec<_>>(),
             vec!["v2", "v1"],
             "history is newest-superseded first"
         );
+    }
+
+    /// The 2026-08-21 amendment, at the writer rather than at the index: a
+    /// project slot belongs to the project, so a second agent writing it
+    /// *supersedes* instead of forking a private duplicate. Under the original
+    /// author-keyed address both rows stayed live and disagreed.
+    #[test]
+    fn a_second_author_supersedes_rather_than_forks() {
+        let (facts, _c) = store();
+        let alpha = agent();
+        let tools = agent();
+
+        facts
+            .upsert(
+                FactWrite::new(alpha, "project", "project.hot_file_owner", "alpha holds it")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        let out = facts
+            .upsert(
+                FactWrite::new(tools, "project", "project.hot_file_owner", "tools holds it")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        assert!(out.superseded(), "same subject, same key: one slot");
+
+        let live = facts
+            .get("project", "openfang", "project.hot_file_owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.claim, "tools holds it");
+        assert_eq!(
+            live.authored_by.as_deref(),
+            Some(aref(tools).as_str()),
+            "the live row names its current author"
+        );
+
+        let hist = facts
+            .history("project", "openfang", "project.hot_file_owner", 10)
+            .unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(
+            hist[0].authored_by.as_deref(),
+            Some(aref(alpha).as_str()),
+            "history records who believed the superseded claim, not who ended it"
+        );
+    }
+
+    /// The counterpart: subject is what separates two slots now, and it is
+    /// enough on its own.
+    #[test]
+    fn different_subjects_are_different_slots() {
+        let (facts, _c) = store();
+        let a = agent();
+
+        facts
+            .upsert(FactWrite::new(a, "project", "project.owner", "Ben").with_scope_ref("openfang"))
+            .unwrap();
+        facts
+            .upsert(FactWrite::new(a, "project", "project.owner", "Erik").with_scope_ref("tttb"))
+            .unwrap();
+
+        assert_eq!(
+            facts
+                .get("project", "openfang", "project.owner")
+                .unwrap()
+                .unwrap()
+                .claim,
+            "Ben"
+        );
+        assert_eq!(
+            facts
+                .get("project", "tttb", "project.owner")
+                .unwrap()
+                .unwrap()
+                .claim,
+            "Erik"
+        );
+    }
+
+    /// An `agent`-scoped write must land in the writer's own slot space. A
+    /// caller-supplied ref here would be the ANAI-165 boundary reopened from
+    /// inside tier 3 — one agent writing beliefs into another's prompt.
+    #[test]
+    fn agent_scope_ignores_a_caller_supplied_ref() {
+        let (facts, _c) = store();
+        let a = agent();
+        let victim = agent();
+
+        facts
+            .upsert(write(a, "repo.trunk_model", "mine").with_scope_ref(aref(victim)))
+            .unwrap();
+
+        assert!(
+            facts
+                .get("agent", &aref(victim), "repo.trunk_model")
+                .unwrap()
+                .is_none(),
+            "an agent may not address another agent's slot"
+        );
+        assert!(facts
+            .get("agent", &aref(a), "repo.trunk_model")
+            .unwrap()
+            .is_some());
+    }
+
+    /// A subject-scoped fact with no subject would be filed under whoever
+    /// wrote it, which is precisely the defect the amendment removed. Refused
+    /// before the transaction opens.
+    #[test]
+    fn a_subject_scope_demands_a_scope_ref() {
+        let (facts, conn) = store();
+        let err = facts
+            .upsert(FactWrite::new(agent(), "project", "project.owner", "Ben"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("needs a scope_ref"), "{err}");
+
+        let rows: i64 = conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// The ref is half the slot address, so the same subject spelled two ways
+    /// is two slots holding contradictory claims.
+    #[test]
+    fn a_malformed_scope_ref_is_refused() {
+        let (facts, _c) = store();
+        let err = facts
+            .upsert(
+                FactWrite::new(agent(), "project", "project.owner", "Ben")
+                    .with_scope_ref("OpenFang Fork"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("scope_ref"), "{err}");
     }
 
     /// Re-deriving the same claim must not spam the audit trail.
@@ -851,25 +1113,61 @@ mod tests {
         let a = agent();
 
         facts
-            .upsert(write(a, "git.trunk_model", "main is trunk").with_confidence(0.5))
+            .upsert(write(a, "repo.trunk_model", "main is trunk").with_confidence(0.5))
             .unwrap();
         let out = facts
-            .upsert(write(a, "git.trunk_model", "main is trunk").with_confidence(0.9))
+            .upsert(write(a, "repo.trunk_model", "main is trunk").with_confidence(0.9))
             .unwrap();
 
         assert!(matches!(out, FactOutcome::Affirmed { .. }));
         assert!(
             facts
-                .history(a, "agent", "git.trunk_model", 10)
+                .history("agent", &aref(a), "repo.trunk_model", 10)
                 .unwrap()
                 .is_empty(),
             "nothing was superseded, so nothing belongs in history"
         );
 
-        let live = facts.get(a, "agent", "git.trunk_model").unwrap().unwrap();
+        let live = facts
+            .get("agent", &aref(a), "repo.trunk_model")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             live.confidence, 0.9,
             "an affirmation refreshes current-state attributes"
+        );
+    }
+
+    /// An affirmation is the same claim, so it must not re-attribute the
+    /// belief to whoever last re-derived it.
+    #[test]
+    fn an_affirmation_does_not_re_attribute_the_claim() {
+        let (facts, _c) = store();
+        let author = agent();
+        let affirmer = agent();
+
+        facts
+            .upsert(
+                FactWrite::new(author, "project", "project.owner", "Ben")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        let out = facts
+            .upsert(
+                FactWrite::new(affirmer, "project", "project.owner", "Ben")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        assert!(matches!(out, FactOutcome::Affirmed { .. }));
+
+        assert_eq!(
+            facts
+                .get("project", "openfang", "project.owner")
+                .unwrap()
+                .unwrap()
+                .authored_by
+                .as_deref(),
+            Some(aref(author).as_str())
         );
     }
 
@@ -893,13 +1191,13 @@ mod tests {
 
         assert!(out.superseded());
         let hist = facts
-            .history(a, "agent", "memory.sweep_status", 10)
+            .history("agent", &aref(a), "memory.sweep_status", 10)
             .unwrap();
         assert_eq!(hist.len(), 1);
         assert_eq!(hist[0].status, Some(FactStatus::Open));
         assert_eq!(
             facts
-                .get(a, "agent", "memory.sweep_status")
+                .get("agent", &aref(a), "memory.sweep_status")
                 .unwrap()
                 .unwrap()
                 .status,
@@ -915,7 +1213,7 @@ mod tests {
         let a = agent();
 
         facts
-            .upsert(write(a, "git.trunk_model", "old").with_embedding(vec![1.0, 2.0, 3.0]))
+            .upsert(write(a, "repo.trunk_model", "old").with_embedding(vec![1.0, 2.0, 3.0]))
             .unwrap();
         let embedded: Option<Vec<u8>> = conn
             .lock()
@@ -928,7 +1226,7 @@ mod tests {
             .unwrap();
         assert!(embedded.is_some(), "precondition: the first claim had one");
 
-        facts.upsert(write(a, "git.trunk_model", "new")).unwrap();
+        facts.upsert(write(a, "repo.trunk_model", "new")).unwrap();
         let after: Option<Vec<u8>> = conn
             .lock()
             .unwrap()
@@ -944,7 +1242,7 @@ mod tests {
         );
     }
 
-    /// Scope, agent and key are all part of the slot identity.
+    /// Scope, subject and key are all part of the slot identity.
     #[test]
     fn distinct_slots_do_not_collide() {
         let (facts, _c) = store();
@@ -952,18 +1250,16 @@ mod tests {
         let b = agent();
 
         facts
-            .upsert(write(a, "git.trunk_model", "agent scope"))
+            .upsert(write(a, "repo.trunk_model", "agent scope"))
             .unwrap();
         facts
-            .upsert(FactWrite::new(
-                a,
-                "project",
-                "git.trunk_model",
-                "project scope",
-            ))
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "project scope")
+                    .with_scope_ref("openfang"),
+            )
             .unwrap();
         facts
-            .upsert(write(b, "git.trunk_model", "other agent"))
+            .upsert(write(b, "repo.trunk_model", "other agent"))
             .unwrap();
         facts
             .upsert(write(a, "memory.sweep_status", "other key"))
@@ -971,7 +1267,7 @@ mod tests {
 
         assert_eq!(
             facts
-                .get(a, "agent", "git.trunk_model")
+                .get("agent", &aref(a), "repo.trunk_model")
                 .unwrap()
                 .unwrap()
                 .claim,
@@ -979,7 +1275,7 @@ mod tests {
         );
         assert_eq!(
             facts
-                .get(a, "project", "git.trunk_model")
+                .get("project", "openfang", "repo.trunk_model")
                 .unwrap()
                 .unwrap()
                 .claim,
@@ -987,7 +1283,7 @@ mod tests {
         );
         assert_eq!(
             facts
-                .get(b, "agent", "git.trunk_model")
+                .get("agent", &aref(b), "repo.trunk_model")
                 .unwrap()
                 .unwrap()
                 .claim,
@@ -1002,7 +1298,7 @@ mod tests {
         let (facts, conn) = store();
         let a = agent();
 
-        let first = facts.upsert(write(a, "git.trunk_model", "old")).unwrap();
+        let first = facts.upsert(write(a, "repo.trunk_model", "old")).unwrap();
         conn.lock()
             .unwrap()
             .execute(
@@ -1011,7 +1307,7 @@ mod tests {
             )
             .unwrap();
 
-        let second = facts.upsert(write(a, "git.trunk_model", "new")).unwrap();
+        let second = facts.upsert(write(a, "repo.trunk_model", "new")).unwrap();
         assert!(
             matches!(second, FactOutcome::Created { .. }),
             "a released slot is empty, not occupied by a tombstone"
@@ -1019,7 +1315,7 @@ mod tests {
         assert_ne!(first.id(), second.id());
         assert_eq!(
             facts
-                .get(a, "agent", "git.trunk_model")
+                .get("agent", &aref(a), "repo.trunk_model")
                 .unwrap()
                 .unwrap()
                 .claim,
@@ -1034,7 +1330,7 @@ mod tests {
         let (facts, conn) = store();
         let a = agent();
         facts
-            .upsert(write(a, "git.trunk_model", "main is trunk"))
+            .upsert(write(a, "repo.trunk_model", "main is trunk"))
             .unwrap();
 
         let kind: String = conn
@@ -1073,26 +1369,49 @@ mod tests {
         assert_eq!((rows, hist), (0, 0));
     }
 
-    /// The rejection has to show the caller the space it should have selected
+    /// The rejection points the caller at the space it should have selected
     /// from (ADR 0001 2.3.3 mitigation 1) — otherwise the next attempt is
-    /// another invented name.
+    /// another invented name. But a *short* menu, not the space: rejection
+    /// text is memory-captured, so a dump would seed tier 1 with the tier-3
+    /// key space on every typo.
     #[test]
-    fn a_rejection_lists_the_keys_already_in_use() {
+    fn a_rejection_offers_the_nearest_keys_without_dumping_the_space() {
         let (facts, _c) = store();
         let a = agent();
-        facts
-            .upsert(write(a, "git.trunk_model", "main is trunk"))
-            .unwrap();
-        facts
-            .upsert(write(a, "memory.sweep_status", "clean"))
-            .unwrap();
+        for key in [
+            "repo.trunk_model",
+            "memory.sweep_status",
+            "delivery.last_channel",
+            "deploy.supervisor",
+            "build.running_sha",
+        ] {
+            facts.upsert(write(a, key, "...")).unwrap();
+        }
 
         let err = facts
-            .upsert(write(a, "2026-08-21-trunk-note", "..."))
+            .upsert(write(a, "repo.trunk-model-2026", "..."))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("git.trunk_model"), "{err}");
-        assert!(err.contains("memory.sweep_status"), "{err}");
+
+        assert!(err.contains("5 keys are already in use"), "{err}");
+        assert!(
+            err.contains("repo.trunk_model"),
+            "the near miss is the key they meant: {err}"
+        );
+
+        let listed = err
+            .split("the closest are: ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("rejection names the closest keys: {err}"))
+            .split(". Prefer")
+            .next()
+            .unwrap()
+            .split(", ")
+            .count();
+        assert_eq!(
+            listed, 3,
+            "a rejection lists three keys, not the space: {err}"
+        );
     }
 
     /// Empty key space is its own message: "there is nothing to select from"
@@ -1107,8 +1426,8 @@ mod tests {
         assert!(err.contains("No facts exist yet"), "{err}");
     }
 
-    /// ADR 0001 5.2 is unanswered, so the writer refuses rather than letting
-    /// a cross-agent fact ship because nobody said no.
+    /// Global is out for this epic (Ben, 2026-08-21). The writer refuses
+    /// rather than letting a fleet-wide fact ship because nobody said no.
     #[test]
     fn global_scope_is_refused_at_the_writer() {
         let (facts, conn) = store();
@@ -1116,12 +1435,13 @@ mod tests {
             .upsert(FactWrite::new(
                 agent(),
                 "global",
-                "git.trunk_model",
+                "repo.trunk_model",
                 "true for everyone",
             ))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("5.2"), "{err}");
+        assert!(err.contains("out of scope for this epic"), "{err}");
+        assert!(err.contains("Use agent, project or user scope"), "{err}");
 
         let rows: i64 = conn
             .lock()
@@ -1131,7 +1451,7 @@ mod tests {
         assert_eq!(rows, 0);
     }
 
-    /// Scope is half of the slot key, so a free-text scope would silently open
+    /// Scope is part of the slot key, so a free-text scope would silently open
     /// a second slot for the same claim — the 2.3.3 dedup miss by another
     /// route. `episodic` is the scope every pre-v14 row carries, which makes
     /// it the most likely typo to arrive here.
@@ -1142,7 +1462,7 @@ mod tests {
             .upsert(FactWrite::new(
                 agent(),
                 "episodic",
-                "git.trunk_model",
+                "repo.trunk_model",
                 "main is trunk",
             ))
             .unwrap_err()

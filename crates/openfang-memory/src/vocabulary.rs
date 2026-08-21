@@ -36,55 +36,102 @@
 //! a date or a ticket id cannot be a namespace, because a claim about *state*
 //! does not belong to the moment it was written.
 //!
-//! # The namespace list is closed on purpose
+//! # A grammar that only refuses pushes callers back to event keys
 //!
-//! Slot names are open within a namespace — a new claim about git can name
-//! itself. Namespaces are a hardcoded list, so minting one is a code change
-//! and therefore a review, which is the "periodic key-space review" of §2.3.3
-//! mitigation 3 paid for up front instead of deferred to a curation job that
-//! may never run. Six is a starting point, not a ceiling; growing it is meant
-//! to be easy but *visible*.
+//! The empirical finding above has a catch, and `tttb-ben` supplied it while
+//! reviewing this module: the key he would have minted unprompted
+//! (`feature-extract-v2-25row-batch-state`) is an episode label, and refusing
+//! it is correct — but the *thing he wanted to store* was real durable state,
+//! "where am I in a multi-step promotion". If nothing legal holds in-flight
+//! process state, a refusal just sends the caller back to inventing an event
+//! key with a different spelling.
+//!
+//! So [`GRAMMAR_HINT`] offers the shape rather than only naming the rule:
+//! one slot per process, overwritten as it advances
+//! (`project.tttb.promotion_status = "blocked-on-zod"`), not one key per
+//! attempt.
+//!
+//! # The namespace list is closed; depth is not
+//!
+//! Slot names are open within a namespace, and a key may carry up to five
+//! qualifier segments between the namespace and the slot. Namespaces are a
+//! hardcoded list, so minting one is a code change and therefore a review —
+//! the "periodic key-space review" of §2.3.3 mitigation 3 paid for up front
+//! instead of deferred to a curation job that may never run.
+//!
+//! Depth is what makes a *short* namespace list survivable. `kimiya-alpha`'s
+//! argument, which is why the two-or-three-segment cap was lifted: her claims
+//! all want `project.<project>.<subject>.<slot>`, and squashing the subject
+//! into the qualifier (`project.kimiya-spike13.corpus_size`) loses the ability
+//! to ask "everything believed about Kimiya". One deep subtree beats four
+//! shallow trees, because with four trees a caller has to remember which tree
+//! a fact lives in and will guess wrong.
+//!
+//! The nine namespaces below were reviewed by five agents against work they
+//! actually had in flight (2026-08-21):
+//!
+//! - `git` became **`repo.<name>.<slot>`** — there are three repos, so
+//!   `git.default_branch` is ambiguous the moment a second one exists.
+//! - **`build`**, **`deploy`** and **`tool`** are separate because they churn
+//!   on different clocks: which commit the fleet is running, how it is
+//!   supervised, and what a given tool does are three different re-read
+//!   cadences.
+//! - `policy`, `hazard`, `decision` and `security` were **considered and
+//!   cut** (Ben, 2026-08-21). Policies live in `RULES.md` and are injected;
+//!   hazards are Linear tickets; a reversed decision is context rather than a
+//!   correction, so it is append-shaped and belongs in tier 1, not a slot;
+//!   `security.*` needs a daemon-side writer that does not exist yet, and a
+//!   security namespace an agent can self-author reads authoritative while
+//!   being a lie about its own guardrails.
 
 use openfang_types::error::{OpenFangError, OpenFangResult};
 
 /// The closed namespace list — the first segment of every claim key.
 ///
-/// Grounded, not invented: `git`, `memory` and `project` are the ADR's own
-/// worked examples (§2.3.2); `delivery` is the one durable dotted key the
-/// system already mints; `agent` and `user` mirror the scope tiers and the
-/// `users/` workspace subdir that curated memory already organises around.
+/// Grounded, not invented. `memory` and `project` are the ADR's own worked
+/// examples (§2.3.2); `delivery` is the one durable dotted key the system
+/// already mints; `agent` and `user` mirror the scope tiers and the `users/`
+/// workspace subdir that curated memory already organises around; `repo`,
+/// `build`, `deploy` and `tool` each came from an agent naming a claim it had
+/// re-derived by hand more than once.
 ///
 /// Adding an entry is a deliberate, reviewable act. See the module docs.
-pub const NAMESPACES: &[&str] = &["agent", "delivery", "git", "memory", "project", "user"];
-
-/// Namespaces that take a middle qualifier segment, e.g.
-/// `project.<slug>.owner`.
-///
-/// Three-segment keys are allowed only here. Left open to every namespace,
-/// `git.<anything>.status` would reintroduce the free-text key space this
-/// module exists to close.
-pub const QUALIFIED_NAMESPACES: &[&str] = &["project", "user"];
+pub const NAMESPACES: &[&str] = &[
+    "agent", "build", "deploy", "delivery", "memory", "project", "repo", "tool", "user",
+];
 
 /// Longest a single segment may be.
 const MAX_SEGMENT: usize = 48;
 
 /// Longest a whole key may be.
-const MAX_KEY: usize = 96;
+///
+/// 128 bytes, matching the key cap `openfang-security` asked for: long enough
+/// for a full-depth key, short enough that a key cannot smuggle prose into the
+/// render path.
+const MAX_KEY: usize = 128;
+
+/// Most segments a key may have, namespace and slot included.
+///
+/// Seven, not five. `tttb-ben`'s real keys are already four deep and
+/// `project.tttb.feature_parsed.segments.role_set` is a legitimate five — a
+/// cap his second-shallowest example already touches is not a cap, it is a
+/// tripwire.
+const MAX_SEGMENTS: usize = 7;
 
 /// Which tier of the world a fact is about (ADR 0001 §2.3.2).
 ///
-/// This is the second component of the slot key, so it is *load-bearing for
-/// uniqueness*: the same claim key under two scopes is two live rows. A typo'd
-/// free-text scope would therefore silently open a second slot for the same
-/// claim — precisely the §2.3.3 dedup miss — which is why this is a closed
-/// enum and not a `String`.
+/// Load-bearing for uniqueness together with `scope_ref`: the same claim key
+/// under two scopes is two slots. A typo'd free-text scope would silently open
+/// a second slot for the same claim — precisely the §2.3.3 dedup miss — which
+/// is why this is a closed enum and not a `String`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactScope {
-    /// About the agent itself.
+    /// About the agent itself. `scope_ref` is the agent's own id.
     Agent,
-    /// About a project. Usually paired with a qualified key.
+    /// About a project. `scope_ref` is the project slug, and the row belongs
+    /// to the project rather than to whoever wrote it.
     Project,
-    /// About a human.
+    /// About a human. `scope_ref` is the user slug.
     User,
     /// True for everyone, everywhere. See [`FactScope::is_shipped`].
     Global,
@@ -113,17 +160,28 @@ impl FactScope {
 
     /// Whether writing this scope is actually in scope for the shipped system.
     ///
-    /// `global` is **not**. ADR 0001 §5.2 leaves it an open question — "does a
-    /// `scope = global` fact render into every agent's prompt, and who is
-    /// allowed to write one?" — and notes it is the same threat surface
-    /// ANAI-165 closed and should not be reopened casually.
+    /// `global` is **not**, by Ben's call of 2026-08-21: "global gets ignored
+    /// for this epic." The reasoning survived a five-agent review — a
+    /// fleet-wide claim renders into ~70 prompts forever, and every cap
+    /// proposed to bound that (rate, count, provenance) is satisfied by the
+    /// single well-chosen row that is the actual attack. The control is human
+    /// promotion, which is a mechanism nobody has built yet.
     ///
-    /// The variant exists so the stored form is parseable and so the open
+    /// The variant exists so the stored form stays parseable and so the open
     /// question is represented in the type rather than forgotten. The writer
     /// refuses it, which turns an unanswered design question into a loud
     /// failure instead of a capability that shipped because nobody said no.
     pub fn is_shipped(self) -> bool {
         !matches!(self, FactScope::Global)
+    }
+
+    /// Whether this scope's `scope_ref` is supplied by the caller.
+    ///
+    /// `agent` derives it from the writer's own id — accepting a caller-chosen
+    /// agent ref would let one agent write facts into another's slot space,
+    /// which is the ANAI-165 boundary reopened from inside tier 3.
+    pub fn takes_caller_ref(self) -> bool {
+        !matches!(self, FactScope::Agent)
     }
 
     /// Parse a scope, rejecting anything outside the vocabulary.
@@ -151,6 +209,47 @@ impl std::fmt::Display for FactScope {
     }
 }
 
+/// Validate the `scope_ref` half of a slot address.
+///
+/// `scope_ref` is who or what the fact is *about* — an agent id, a project
+/// slug, a user slug. It is half the uniqueness key, so the same slug spelled
+/// two ways is two slots holding contradictory claims, which is the §2.3.3
+/// dedup miss arriving through the address rather than through the key. Same
+/// slug rules as a qualifier segment, and never empty: SQLite treats NULLs as
+/// distinct in a unique index, so an absent ref would silently disable the
+/// constraint it is part of.
+pub fn check_scope_ref(scope: FactScope, raw: &str) -> OpenFangResult<()> {
+    if raw.is_empty() {
+        return Err(OpenFangError::InvalidInput(format!(
+            "a {scope} fact needs a scope_ref naming what it is about \
+             (the project slug, e.g. \"openfang-fork\"); without one the slot has no owner \
+             and the uniqueness constraint cannot hold"
+        )));
+    }
+    if raw.len() > MAX_SEGMENT {
+        return Err(OpenFangError::InvalidInput(format!(
+            "scope_ref {raw:?} exceeds {MAX_SEGMENT} characters"
+        )));
+    }
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => {
+            return Err(OpenFangError::InvalidInput(format!(
+                "scope_ref {raw:?} must start with a lowercase letter or digit"
+            )));
+        }
+    }
+    if let Some(bad) =
+        chars.find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-'))
+    {
+        return Err(OpenFangError::InvalidInput(format!(
+            "scope_ref {raw:?} contains {bad:?}; allowed: a-z, 0-9, '_' and '-'"
+        )));
+    }
+    Ok(())
+}
+
 /// A validated claim key.
 ///
 /// Constructing one is the only way to assert a key is in the vocabulary, so
@@ -172,8 +271,7 @@ impl ClaimKey {
     /// Validate a key against the grammar.
     ///
     /// ```text
-    /// key       := namespace "." slot
-    ///            | qualified_namespace "." qualifier "." slot
+    /// key       := namespace ("." qualifier)* "." slot     (2..=7 segments)
     /// namespace := one of NAMESPACES
     /// qualifier := [a-z0-9][a-z0-9_-]*      (slugs may hyphenate)
     /// slot      := [a-z][a-z0-9_]*          (slots may not)
@@ -208,24 +306,20 @@ impl ClaimKey {
                 "a claim key may not have an empty segment (no leading, trailing or doubled '.')",
             ));
         }
+        if segments.len() < 2 {
+            return Err(reject(
+                raw,
+                "a claim key needs a namespace: write 'namespace.slot', e.g. 'repo.trunk_model'",
+            ));
+        }
+        if segments.len() > MAX_SEGMENTS {
+            return Err(reject(
+                raw,
+                &format!("a claim key may have at most {MAX_SEGMENTS} segments"),
+            ));
+        }
 
-        let (namespace, qualifier, slot) = match segments.as_slice() {
-            [ns, slot] => (*ns, None, *slot),
-            [ns, qual, slot] => (*ns, Some(*qual), *slot),
-            [_] => {
-                return Err(reject(
-                    raw,
-                    "a claim key needs a namespace: write 'namespace.slot', e.g. 'git.trunk_model'",
-                ));
-            }
-            _ => {
-                return Err(reject(
-                    raw,
-                    "a claim key may have at most three segments (namespace.qualifier.slot)",
-                ));
-            }
-        };
-
+        let namespace = segments[0];
         if !NAMESPACES.contains(&namespace) {
             return Err(reject(
                 raw,
@@ -236,21 +330,11 @@ impl ClaimKey {
             ));
         }
 
-        if let Some(qual) = qualifier {
-            if !QUALIFIED_NAMESPACES.contains(&namespace) {
-                return Err(reject(
-                    raw,
-                    &format!(
-                        "the {namespace:?} namespace does not take a middle qualifier; \
-                         write '{namespace}.slot'. Qualifiers are for: {}",
-                        QUALIFIED_NAMESPACES.join(", ")
-                    ),
-                ));
-            }
+        let last = segments.len() - 1;
+        for qual in &segments[1..last] {
             check_qualifier(raw, qual)?;
         }
-
-        check_slot(raw, slot)?;
+        check_slot(raw, segments[last])?;
 
         Ok(ClaimKey(key.to_string()))
     }
@@ -263,15 +347,72 @@ impl std::fmt::Display for ClaimKey {
 }
 
 /// The grammar, quoted back to whoever got it wrong.
-const GRAMMAR_HINT: &str = "Claim keys name a durable slot, not an event: \
-'namespace.slot' (e.g. 'git.trunk_model', 'memory.sweep_status') or \
-'project.<slug>.slot' for project- and user-qualified claims. Lowercase, \
-words joined by '_'. A key must not encode a date or a ticket id — those \
-describe when something was written, not what is true.";
+///
+/// The last sentence is doing work the rest of the module cannot: it names the
+/// shape a caller should reach for when what they actually have is in-flight
+/// process state. Refusal alone sends them back to minting event keys.
+pub const GRAMMAR_HINT: &str = "Claim keys name a durable slot, not an event: \
+'namespace.slot' (e.g. 'repo.trunk_model', 'memory.sweep_status'), with up to five \
+qualifier segments in between for project- and repo-scoped claims \
+('project.openfang-fork.memory.owner'). Lowercase, words joined by '_'; qualifiers may \
+hyphenate, slots may not. A key must not encode a date or a ticket id — those describe \
+when something was written, not what is true. If what you have is progress through a \
+multi-step task, that IS a durable slot: name the process once and overwrite it as it \
+advances ('project.<slug>.promotion_status' = \"blocked-on-zod\"), rather than minting a \
+new key per attempt.";
 
 /// Build a rejection that a model can act on.
 fn reject(raw: &str, why: &str) -> OpenFangError {
     OpenFangError::InvalidInput(format!("rejected claim key {raw:?}: {why}. {GRAMMAR_HINT}"))
+}
+
+/// The `n` existing keys closest to `target` by edit distance.
+///
+/// Used to shape a rejection into a short menu instead of a dump of the key
+/// space. `openfang-security`'s catch, and it is a real one: rejection text
+/// lands in the transcript, and the transcript is memory-captured — so an
+/// error that echoes 25 keys seeds tier-1 memory with a tier-3 enumeration
+/// every time a model fat-fingers a key. Three near misses keep all of the
+/// utility (the caller is trying to *select*, and a near miss is what they
+/// meant) while dropping the enumeration to nothing.
+pub fn nearest_keys(candidates: &[String], target: &str, n: usize) -> Vec<String> {
+    let mut scored: Vec<(usize, &String)> = candidates
+        .iter()
+        .map(|c| (edit_distance(c, target), c))
+        .collect();
+    // Distance first, then lexical, so the suggestion list is deterministic —
+    // a rejection that reorders between identical calls reads as nondeterminism
+    // to whoever is debugging it.
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(n).map(|(_, c)| c.clone()).collect()
+}
+
+/// Levenshtein distance, two-row form.
+///
+/// Local rather than a dependency: it runs on a bounded candidate list in a
+/// path that has already failed, and a new crate in the memory subsystem costs
+/// more review than forty lines of textbook DP.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Slot names are strict: they are the part a model most wants to improvise.
@@ -342,10 +483,29 @@ mod tests {
     #[test]
     fn adr_examples_are_legal() {
         for key in [
-            "git.trunk_model",
+            "repo.trunk_model",
             "memory.sweep_status",
             "project.openfang-fork.owner",
             "delivery.last_channel",
+        ] {
+            ClaimKey::parse(key).unwrap_or_else(|e| panic!("{key} should parse: {e}"));
+        }
+    }
+
+    /// The keys five agents named as things they had re-derived by hand. If
+    /// the namespace list ever stops covering these, it has drifted from the
+    /// review that produced it.
+    #[test]
+    fn reviewed_agent_keys_are_legal() {
+        for key in [
+            "repo.openfang.trunk_model",
+            "deploy.supervisor",
+            "deploy.cron-eviction.last_run",
+            "build.fleet.running_sha",
+            "tool.memory_fact.status",
+            "project.tttb.feature_parsed.promotion_status",
+            "project.tttb.feature_parsed.segments.role_set",
+            "user.ben.timezone",
         ] {
             ClaimKey::parse(key).unwrap_or_else(|e| panic!("{key} should parse: {e}"));
         }
@@ -376,48 +536,86 @@ mod tests {
         assert!(err.contains("not a known namespace"), "{err}");
         // The rejection names the legal space, so the caller can retry once
         // rather than guessing.
-        assert!(err.contains("git"), "{err}");
+        assert!(err.contains("repo"), "{err}");
+    }
+
+    /// `git` was renamed to `repo` in the 2026-08-21 review: three repos exist,
+    /// so `git.default_branch` is ambiguous the moment a second one does.
+    #[test]
+    fn git_namespace_was_replaced_by_repo() {
+        assert!(ClaimKey::parse("git.trunk_model").is_err());
+        assert!(ClaimKey::parse("repo.trunk_model").is_ok());
+    }
+
+    /// The four namespaces cut on 2026-08-21 must stay cut, or the tier
+    /// quietly grows a push surface nobody built the render rules for.
+    #[test]
+    fn cut_namespaces_stay_cut() {
+        for key in [
+            "policy.no_force_push",
+            "hazard.bridge_timeout",
+            "decision.dice_union",
+            "security.gatekeeper_enabled",
+        ] {
+            assert!(
+                ClaimKey::parse(key).is_err(),
+                "{key} names a namespace that was considered and cut"
+            );
+        }
     }
 
     #[test]
     fn bare_slot_is_rejected_with_a_worked_example() {
         let err = ClaimKey::parse("trunk_model").unwrap_err().to_string();
         assert!(err.contains("needs a namespace"), "{err}");
-        assert!(err.contains("git.trunk_model"), "{err}");
+        assert!(err.contains("repo.trunk_model"), "{err}");
     }
 
+    /// A refusal has to offer the shape for in-flight state, or the caller
+    /// goes back to minting an event key with a different spelling.
     #[test]
-    fn qualifier_only_where_allowed() {
-        assert!(ClaimKey::parse("user.ben.timezone").is_ok());
-        let err = ClaimKey::parse("git.openfang.trunk_model")
+    fn rejection_offers_the_process_state_shape() {
+        let err = ClaimKey::parse("feature-extract-v2-25row-batch-state")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("does not take a middle qualifier"), "{err}");
+        assert!(err.contains("promotion_status"), "{err}");
+        assert!(err.contains("overwrite it as it advances"), "{err}");
+    }
+
+    /// Depth is what lets a nine-namespace list absorb categories nobody
+    /// anticipated — one deep subtree beats four shallow trees.
+    #[test]
+    fn qualifiers_are_allowed_in_any_namespace_and_at_depth() {
+        assert!(ClaimKey::parse("repo.openfang.trunk_model").is_ok());
+        assert!(ClaimKey::parse("project.a.b.c").is_ok());
+        assert!(ClaimKey::parse("project.a.b.c.d.e.f").is_ok(), "seven deep");
     }
 
     #[test]
-    fn four_segments_rejected() {
-        let err = ClaimKey::parse("project.a.b.c").unwrap_err().to_string();
-        assert!(err.contains("at most three segments"), "{err}");
+    fn depth_is_capped() {
+        let err = ClaimKey::parse("project.a.b.c.d.e.f.g")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most 7 segments"), "{err}");
     }
 
     #[test]
     fn slot_may_not_hyphenate_but_qualifier_may() {
         assert!(ClaimKey::parse("project.of-mem-fact.owner").is_ok());
-        assert!(ClaimKey::parse("git.trunk-model").is_err());
+        assert!(ClaimKey::parse("repo.trunk-model").is_err());
     }
 
     #[test]
     fn case_and_whitespace_rejected() {
-        assert!(ClaimKey::parse("git.Trunk_Model").is_err());
-        assert!(ClaimKey::parse("Git.trunk_model").is_err());
-        assert!(ClaimKey::parse(" git.trunk_model").is_err());
-        assert!(ClaimKey::parse("git.trunk model").is_err());
+        assert!(ClaimKey::parse("repo.Trunk_Model").is_err());
+        assert!(ClaimKey::parse("Repo.trunk_model").is_err());
+        assert!(ClaimKey::parse(" repo.trunk_model").is_err());
+        assert!(ClaimKey::parse("repo.trunk model").is_err());
     }
 
     #[test]
     fn empty_segments_rejected() {
-        for key in ["", ".", "git.", ".trunk_model", "git..trunk_model"] {
+        for key in ["", ".", "repo.", ".trunk_model", "repo..trunk_model"] {
             assert!(ClaimKey::parse(key).is_err(), "{key:?} should be rejected");
         }
     }
@@ -434,9 +632,9 @@ mod tests {
     #[test]
     fn length_bounded() {
         let long_slot = "a".repeat(MAX_SEGMENT + 1);
-        assert!(ClaimKey::parse(&format!("git.{long_slot}")).is_err());
+        assert!(ClaimKey::parse(&format!("repo.{long_slot}")).is_err());
         let long_key = "a".repeat(MAX_KEY);
-        assert!(ClaimKey::parse(&format!("git.{long_key}")).is_err());
+        assert!(ClaimKey::parse(&format!("repo.{long_key}")).is_err());
     }
 
     #[test]
@@ -468,12 +666,62 @@ mod tests {
 
     #[test]
     fn global_scope_is_parseable_but_not_shipped() {
-        // ADR 0001 §5.2 is unanswered. Parse it so stored data is readable;
-        // refuse to write it so the question cannot be settled by accident.
+        // Ben, 2026-08-21: global is out for this epic. Parse it so stored
+        // data stays readable; refuse to write it so the question cannot be
+        // settled by accident.
         assert_eq!(FactScope::parse("global").unwrap(), FactScope::Global);
         assert!(!FactScope::Global.is_shipped());
         for scope in [FactScope::Agent, FactScope::Project, FactScope::User] {
             assert!(scope.is_shipped());
         }
+    }
+
+    /// An agent may not choose the `scope_ref` of an `agent`-scoped fact:
+    /// that would be one agent writing into another's slot space, which is the
+    /// ANAI-165 boundary reopened from inside tier 3.
+    #[test]
+    fn only_agent_scope_derives_its_own_ref() {
+        assert!(!FactScope::Agent.takes_caller_ref());
+        for scope in [FactScope::Project, FactScope::User, FactScope::Global] {
+            assert!(scope.takes_caller_ref());
+        }
+    }
+
+    #[test]
+    fn scope_ref_rules_match_qualifier_rules() {
+        assert!(check_scope_ref(FactScope::Project, "openfang-fork").is_ok());
+        assert!(check_scope_ref(FactScope::Project, "tttb").is_ok());
+        // Empty is the dangerous one: SQLite treats NULLs and would treat an
+        // absent ref as distinct, silently disabling the constraint.
+        assert!(check_scope_ref(FactScope::Project, "").is_err());
+        assert!(check_scope_ref(FactScope::Project, "OpenFang").is_err());
+        assert!(check_scope_ref(FactScope::Project, "of fork").is_err());
+    }
+
+    #[test]
+    fn nearest_keys_ranks_by_edit_distance_and_is_deterministic() {
+        let keys: Vec<String> = [
+            "repo.trunk_model",
+            "memory.sweep_status",
+            "delivery.last_channel",
+            "repo.trunk_mode",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let near = nearest_keys(&keys, "repo.trunk_modl", 3);
+        assert_eq!(near.len(), 3);
+        assert_eq!(near[0], "repo.trunk_mode");
+        assert_eq!(near[1], "repo.trunk_model");
+        assert_eq!(near, nearest_keys(&keys, "repo.trunk_modl", 3));
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("abc", "abc"), 0);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
     }
 }

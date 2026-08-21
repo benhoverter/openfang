@@ -567,28 +567,54 @@ fn migrate_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// v14: the tier-3 claim store — keyed fact slots on `memories`, plus the
 /// append-only `fact_history` audit table (ADR 0001 §2.3.2, ADR 0002 §2.5).
 ///
-/// Three changes, one migration, all additive:
+/// Five changes, one migration, all additive:
 ///
 /// 1. **`memories.claim_key`** — the slot name a tier-3 row occupies, drawn
-///    from a controlled vocabulary (`git.trunk_model`, `memory.sweep_status`,
+///    from a controlled vocabulary (`repo.trunk_model`, `memory.sweep_status`,
 ///    …). NULL for every non-fact row, which is every row that exists today.
 ///
 /// 2. **`memories.status`** — `open` | `settled` per §2.3.2. Deliberately no
 ///    `superseded` value: a superseded fact is not a flagged row, it is a row
-///    that has left this table (see 3). `last_affirmed_at` records the last
+///    that has left this table (see 4). `last_affirmed_at` records the last
 ///    time a write re-asserted the same claim without changing it.
 ///
-/// 3. **The uniqueness constraint is the whole design.** The partial unique
-///    index holds **at most one live fact per `(agent_id, scope, claim_key)`**.
+/// 3. **`memories.scope_ref`** — *what the fact is about*: the agent id for an
+///    `agent`-scoped claim, the project slug for a `project` one, the user
+///    slug for a `user` one. **`memories.authored_by`** records who wrote it,
+///    which is a different question and is now metadata rather than address.
+///
+/// 4. **The uniqueness constraint is the whole design.** The partial unique
+///    index holds **at most one live fact per `(scope, scope_ref, claim_key)`**.
 ///    Partial on `kind = 'fact' AND deleted = 0`, so it constrains nothing
 ///    outside tier 3 and a soft-deleted fact frees its slot. This is §2.3.1's
 ///    invariant enforced by DDL rather than by whichever reader remembers to
 ///    filter — a superseded fact cannot reach the prompt because it is not in
 ///    the table the recall path queries.
 ///
-/// 4. **`fact_history`** — append-only, written by the upsert inside the same
+///    **Amended in place on 2026-08-21, before any fact row existed.** The
+///    first cut keyed the slot on `(agent_id, scope, claim_key)`, which put
+///    *the author* in the address. Three agents found the same defect
+///    independently from three different use cases: two agents writing the
+///    same project claim produce two live rows that disagree and neither
+///    supersedes the other, so supersession — the entire feature — was off for
+///    every scope except `agent`. `kimiya-alpha`'s framing is the one to keep:
+///    a disposable worker that writes a fact and is then deleted leaves an
+///    orphan row holding the live value for a claim nobody can overwrite, so
+///    *make the row belong to the project, not the corpse*. `alpha`'s hot-file
+///    ledger is the same shape — a ledger row is owned by the file, not by
+///    whoever claimed it. Rewriting the migration rather than stacking a v15
+///    is honest here precisely because no binary carrying v14 has ever booted:
+///    there is no deployed schema to be inconsistent with.
+///
+///    `scope_ref` is never NULL on a fact row, and that is load-bearing rather
+///    than tidy: SQLite treats NULLs as distinct inside a unique index, so a
+///    NULL ref would silently switch off the constraint it is part of. The
+///    writer derives or demands it before opening a transaction.
+///
+/// 5. **`fact_history`** — append-only, written by the upsert inside the same
 ///    transaction that replaces the live row. It carries the superseded
-///    claim's text, provenance, and the episode that replaced it.
+///    claim's text, its `authored_by`, and the episode that replaced it, so
+///    "who believed this, and when did we stop" survives the overwrite.
 ///
 ///    **It has no `embedding` column, on purpose.** The only reader is
 ///    `memory_history`, an exact-`claim_key` lookup; it never needs vector
@@ -605,6 +631,8 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
         ("claim_key", "TEXT"),
         ("status", "TEXT"),
         ("last_affirmed_at", "TEXT"),
+        ("scope_ref", "TEXT"),
+        ("authored_by", "TEXT"),
     ];
     for (name, typedef) in &cols {
         if !column_exists(conn, "memories", name) {
@@ -615,13 +643,26 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
         }
     }
 
+    // A development database that ran the pre-amendment v14 carries the old
+    // author-keyed table. `CREATE TABLE IF NOT EXISTS` would silently leave it
+    // in place with the wrong columns, which is the worst of the three
+    // outcomes: no error, wrong schema. Dropping is safe here and only here —
+    // no shipped binary has ever written a `fact_history` row.
+    if !column_exists(conn, "fact_history", "scope_ref") {
+        conn.execute("DROP TABLE IF EXISTS fact_history", [])?;
+    }
+
     conn.execute_batch(
         "
-        -- At most one LIVE fact per (agent, scope, claim key). Partial on both
-        -- `kind` and `deleted`, so: non-fact rows are unconstrained, and a
+        -- Superseded by the 2026-08-21 amendment: the author was in the slot
+        -- address, so two agents could hold two live claims for one key.
+        DROP INDEX IF EXISTS idx_memories_one_live_fact_per_key;
+
+        -- At most one LIVE fact per (scope, subject, claim key). Partial on
+        -- both `kind` and `deleted`, so: non-fact rows are unconstrained, and a
         -- soft-deleted fact releases its slot for a future write.
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_one_live_fact_per_key
-            ON memories(agent_id, scope, claim_key)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_one_live_fact_per_slot
+            ON memories(scope, scope_ref, claim_key)
             WHERE kind = 'fact' AND deleted = 0;
 
         -- Drives fact lookup by slot (the read side of the upsert).
@@ -629,11 +670,14 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
             ON memories(claim_key) WHERE kind = 'fact';
 
         -- Append-only supersession audit. NO embedding column: see doc comment.
+        -- `authored_by` rather than `agent_id`: the history row records who
+        -- believed the superseded claim, which is metadata, not address.
         CREATE TABLE IF NOT EXISTS fact_history (
             id TEXT PRIMARY KEY,
             memory_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
+            authored_by TEXT,
             scope TEXT NOT NULL,
+            scope_ref TEXT NOT NULL,
             claim_key TEXT NOT NULL,
             claim TEXT NOT NULL,
             status TEXT,
@@ -645,12 +689,12 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
             superseded_by_episode TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_fact_history_key
-            ON fact_history(agent_id, scope, claim_key, superseded_at DESC);
+            ON fact_history(scope, scope_ref, claim_key, superseded_at DESC);
         ",
     )?;
 
     conn.execute(
-        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (14, datetime('now'), 'Add tier-3 fact slots and fact_history (ADR 0001 2.3.2)')",
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (14, datetime('now'), 'Add tier-3 fact slots keyed on (scope, scope_ref, claim_key) and fact_history (ADR 0001 2.3.2)')",
         [],
     )?;
     Ok(())
@@ -741,18 +785,19 @@ mod tests {
     fn insert_fact(
         conn: &Connection,
         id: &str,
-        agent: &str,
+        author: &str,
         scope: &str,
+        scope_ref: &str,
         key: &str,
         deleted: i64,
     ) -> Result<usize, rusqlite::Error> {
         conn.execute(
             "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata,
                                    created_at, accessed_at, access_count, deleted, kind,
-                                   claim_key, status)
-             VALUES (?1, ?2, 'claim text', '\"tool\"', ?3, 1.0, '{}', 'now', 'now', 0, ?5,
-                     'fact', ?4, 'settled')",
-            rusqlite::params![id, agent, scope, key, deleted],
+                                   claim_key, status, scope_ref, authored_by)
+             VALUES (?1, ?2, 'claim text', '\"tool\"', ?3, 1.0, '{}', 'now', 'now', 0, ?6,
+                     'fact', ?4, 'settled', ?5, ?2)",
+            rusqlite::params![id, author, scope, key, scope_ref, deleted],
         )
     }
 
@@ -764,17 +809,53 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        insert_fact(&conn, "f1", "ag", "agent", "git.trunk_model", 0).unwrap();
-        let dup = insert_fact(&conn, "f2", "ag", "agent", "git.trunk_model", 0);
+        insert_fact(&conn, "f1", "ag", "agent", "ag", "repo.trunk_model", 0).unwrap();
+        let dup = insert_fact(&conn, "f2", "ag", "agent", "ag", "repo.trunk_model", 0);
         assert!(
             dup.is_err(),
             "a second live fact in one slot must be rejected"
         );
 
-        // Different scope, different agent, and different key are all distinct slots.
-        insert_fact(&conn, "f3", "ag", "global", "git.trunk_model", 0).unwrap();
-        insert_fact(&conn, "f4", "other", "agent", "git.trunk_model", 0).unwrap();
-        insert_fact(&conn, "f5", "ag", "agent", "memory.sweep_status", 0).unwrap();
+        // Different scope, different subject, and different key are all
+        // distinct slots.
+        insert_fact(&conn, "f3", "ag", "project", "tttb", "repo.trunk_model", 0).unwrap();
+        insert_fact(&conn, "f4", "ag", "agent", "other", "repo.trunk_model", 0).unwrap();
+        insert_fact(&conn, "f5", "ag", "agent", "ag", "memory.sweep_status", 0).unwrap();
+    }
+
+    /// The 2026-08-21 amendment, pinned: the slot belongs to its subject, so a
+    /// second agent writing the same project claim collides instead of opening
+    /// a private duplicate. Under the original `(agent_id, scope, claim_key)`
+    /// index this insert succeeded and left two live rows disagreeing with each
+    /// other — supersession switched off for every scope but `agent`.
+    #[test]
+    fn v14_slot_is_owned_by_its_subject_not_its_author() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        insert_fact(
+            &conn,
+            "f1",
+            "alpha",
+            "project",
+            "openfang",
+            "project.hot_file_owner",
+            0,
+        )
+        .unwrap();
+        let other_author = insert_fact(
+            &conn,
+            "f2",
+            "tools",
+            "project",
+            "openfang",
+            "project.hot_file_owner",
+            0,
+        );
+        assert!(
+            other_author.is_err(),
+            "two authors, one project slot: the second write must collide, not fork"
+        );
     }
 
     /// A soft-deleted fact frees its slot — otherwise `forget` would poison a
@@ -784,9 +865,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        insert_fact(&conn, "f1", "ag", "agent", "git.trunk_model", 1).unwrap();
-        insert_fact(&conn, "f2", "ag", "agent", "git.trunk_model", 1).unwrap();
-        insert_fact(&conn, "f3", "ag", "agent", "git.trunk_model", 0).unwrap();
+        insert_fact(&conn, "f1", "ag", "agent", "ag", "repo.trunk_model", 1).unwrap();
+        insert_fact(&conn, "f2", "ag", "agent", "ag", "repo.trunk_model", 1).unwrap();
+        insert_fact(&conn, "f3", "ag", "agent", "ag", "repo.trunk_model", 0).unwrap();
     }
 
     /// The partial index must not constrain the 13k non-fact rows, which all
@@ -818,5 +899,54 @@ mod tests {
         assert!(column_exists(&conn, "memories", "claim_key"));
         assert!(column_exists(&conn, "memories", "status"));
         assert!(column_exists(&conn, "memories", "last_affirmed_at"));
+        assert!(column_exists(&conn, "memories", "scope_ref"));
+        assert!(column_exists(&conn, "memories", "authored_by"));
+        assert!(column_exists(&conn, "fact_history", "scope_ref"));
+        assert!(column_exists(&conn, "fact_history", "authored_by"));
+    }
+
+    /// A database that ran the pre-amendment v14 must end up with the amended
+    /// schema, not with the old table quietly surviving a
+    /// `CREATE TABLE IF NOT EXISTS`. This is the only failure mode of amending
+    /// a migration in place, so it gets a test rather than a comment.
+    #[test]
+    fn v14_amendment_replaces_a_pre_amendment_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Rebuild the shape the first cut produced.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_memories_one_live_fact_per_slot;
+             DROP TABLE fact_history;
+             CREATE UNIQUE INDEX idx_memories_one_live_fact_per_key
+                 ON memories(agent_id, scope, claim_key)
+                 WHERE kind = 'fact' AND deleted = 0;
+             CREATE TABLE fact_history (
+                 id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                 scope TEXT NOT NULL, claim_key TEXT NOT NULL, claim TEXT NOT NULL,
+                 status TEXT, confidence REAL NOT NULL DEFAULT 1.0,
+                 metadata TEXT NOT NULL DEFAULT '{}', episode_id TEXT,
+                 created_at TEXT NOT NULL, superseded_at TEXT NOT NULL,
+                 superseded_by_episode TEXT);",
+        )
+        .unwrap();
+
+        migrate_v14(&conn).unwrap();
+
+        assert!(column_exists(&conn, "fact_history", "scope_ref"));
+        assert!(!column_exists(&conn, "fact_history", "agent_id"));
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_memories_one_live_fact_per_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "the author-keyed index must not survive");
+
+        // And the amended constraint is actually the live one.
+        insert_fact(&conn, "f1", "a", "project", "p", "project.owner", 0).unwrap();
+        assert!(insert_fact(&conn, "f2", "b", "project", "p", "project.owner", 0).is_err());
     }
 }

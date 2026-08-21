@@ -1353,7 +1353,7 @@ mod tests {
                 crate::fact::FactWrite::new(
                     agent_id,
                     "agent",
-                    "git.trunk_model",
+                    "repo.trunk_model",
                     "local-main is the trunk of record",
                 )
                 .with_embedding(vec![1.0, 0.0]),
@@ -1364,7 +1364,7 @@ mod tests {
                 crate::fact::FactWrite::new(
                     agent_id,
                     "agent",
-                    "git.trunk_model",
+                    "repo.trunk_model",
                     "main is the trunk of record",
                 )
                 .with_embedding(vec![1.0, 0.0]),
@@ -1458,7 +1458,7 @@ mod tests {
                 crate::fact::FactWrite::new(
                     agent_id,
                     "agent",
-                    "git.trunk_model",
+                    "repo.trunk_model",
                     "main is the trunk of record",
                 )
                 .with_embedding(vec![1.0, 0.0]),
