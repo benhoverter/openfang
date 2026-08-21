@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -61,6 +61,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 13 {
         migrate_v13(conn)?;
+    }
+
+    if current_version < 14 {
+        migrate_v14(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -560,6 +564,98 @@ fn migrate_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// v14: the tier-3 claim store — keyed fact slots on `memories`, plus the
+/// append-only `fact_history` audit table (ADR 0001 §2.3.2, ADR 0002 §2.5).
+///
+/// Three changes, one migration, all additive:
+///
+/// 1. **`memories.claim_key`** — the slot name a tier-3 row occupies, drawn
+///    from a controlled vocabulary (`git.trunk_model`, `memory.sweep_status`,
+///    …). NULL for every non-fact row, which is every row that exists today.
+///
+/// 2. **`memories.status`** — `open` | `settled` per §2.3.2. Deliberately no
+///    `superseded` value: a superseded fact is not a flagged row, it is a row
+///    that has left this table (see 3). `last_affirmed_at` records the last
+///    time a write re-asserted the same claim without changing it.
+///
+/// 3. **The uniqueness constraint is the whole design.** The partial unique
+///    index holds **at most one live fact per `(agent_id, scope, claim_key)`**.
+///    Partial on `kind = 'fact' AND deleted = 0`, so it constrains nothing
+///    outside tier 3 and a soft-deleted fact frees its slot. This is §2.3.1's
+///    invariant enforced by DDL rather than by whichever reader remembers to
+///    filter — a superseded fact cannot reach the prompt because it is not in
+///    the table the recall path queries.
+///
+/// 4. **`fact_history`** — append-only, written by the upsert inside the same
+///    transaction that replaces the live row. It carries the superseded
+///    claim's text, provenance, and the episode that replaced it.
+///
+///    **It has no `embedding` column, on purpose.** The only reader is
+///    `memory_history`, an exact-`claim_key` lookup; it never needs vector
+///    search. An embedded history row would be one forgotten `WHERE` away from
+///    a superseded claim surfacing in semantic recall, which is precisely the
+///    failure §2.3.1 exists to make structurally impossible. Decision ratified
+///    by Ben 2026-08-21.
+///
+/// House style, same as v12/v13: guarded `ALTER`s and `CREATE ... IF NOT
+/// EXISTS`, no existing row rewritten, no backfill. Rolling the binary back to
+/// v13 loses this migration's readers and never any data.
+fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let cols = [
+        ("claim_key", "TEXT"),
+        ("status", "TEXT"),
+        ("last_affirmed_at", "TEXT"),
+    ];
+    for (name, typedef) in &cols {
+        if !column_exists(conn, "memories", name) {
+            conn.execute(
+                &format!("ALTER TABLE memories ADD COLUMN {} {}", name, typedef),
+                [],
+            )?;
+        }
+    }
+
+    conn.execute_batch(
+        "
+        -- At most one LIVE fact per (agent, scope, claim key). Partial on both
+        -- `kind` and `deleted`, so: non-fact rows are unconstrained, and a
+        -- soft-deleted fact releases its slot for a future write.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_one_live_fact_per_key
+            ON memories(agent_id, scope, claim_key)
+            WHERE kind = 'fact' AND deleted = 0;
+
+        -- Drives fact lookup by slot (the read side of the upsert).
+        CREATE INDEX IF NOT EXISTS idx_memories_claim_key
+            ON memories(claim_key) WHERE kind = 'fact';
+
+        -- Append-only supersession audit. NO embedding column: see doc comment.
+        CREATE TABLE IF NOT EXISTS fact_history (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            claim_key TEXT NOT NULL,
+            claim TEXT NOT NULL,
+            status TEXT,
+            confidence REAL NOT NULL DEFAULT 1.0,
+            metadata TEXT NOT NULL DEFAULT '{}',
+            episode_id TEXT,
+            created_at TEXT NOT NULL,
+            superseded_at TEXT NOT NULL,
+            superseded_by_episode TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_fact_history_key
+            ON fact_history(agent_id, scope, claim_key, superseded_at DESC);
+        ",
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (14, datetime('now'), 'Add tier-3 fact slots and fact_history (ADR 0001 2.3.2)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +734,89 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         run_migrations(&conn).unwrap(); // Should not error
+    }
+
+    /// Helper: insert a tier-3 fact row directly, bypassing the (not yet
+    /// written) store, so these tests pin the DDL and nothing else.
+    fn insert_fact(
+        conn: &Connection,
+        id: &str,
+        agent: &str,
+        scope: &str,
+        key: &str,
+        deleted: i64,
+    ) -> Result<usize, rusqlite::Error> {
+        conn.execute(
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata,
+                                   created_at, accessed_at, access_count, deleted, kind,
+                                   claim_key, status)
+             VALUES (?1, ?2, 'claim text', '\"tool\"', ?3, 1.0, '{}', 'now', 'now', 0, ?5,
+                     'fact', ?4, 'settled')",
+            rusqlite::params![id, agent, scope, key, deleted],
+        )
+    }
+
+    /// §2.3.1 enforced by DDL: two LIVE facts cannot occupy the same slot.
+    /// If this test ever goes green-by-deletion, supersession has stopped being
+    /// a constraint and gone back to being a convention.
+    #[test]
+    fn v14_rejects_a_second_live_fact_in_the_same_slot() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        insert_fact(&conn, "f1", "ag", "agent", "git.trunk_model", 0).unwrap();
+        let dup = insert_fact(&conn, "f2", "ag", "agent", "git.trunk_model", 0);
+        assert!(
+            dup.is_err(),
+            "a second live fact in one slot must be rejected"
+        );
+
+        // Different scope, different agent, and different key are all distinct slots.
+        insert_fact(&conn, "f3", "ag", "global", "git.trunk_model", 0).unwrap();
+        insert_fact(&conn, "f4", "other", "agent", "git.trunk_model", 0).unwrap();
+        insert_fact(&conn, "f5", "ag", "agent", "memory.sweep_status", 0).unwrap();
+    }
+
+    /// A soft-deleted fact frees its slot — otherwise `forget` would poison a
+    /// claim key permanently.
+    #[test]
+    fn v14_soft_deleted_fact_frees_its_slot() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        insert_fact(&conn, "f1", "ag", "agent", "git.trunk_model", 1).unwrap();
+        insert_fact(&conn, "f2", "ag", "agent", "git.trunk_model", 1).unwrap();
+        insert_fact(&conn, "f3", "ag", "agent", "git.trunk_model", 0).unwrap();
+    }
+
+    /// The partial index must not constrain the 13k non-fact rows, which all
+    /// have a NULL claim_key.
+    #[test]
+    fn v14_leaves_non_fact_rows_unconstrained() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, deleted, kind)
+             VALUES ('t1', 'ag', 'turn one', '\"conversation\"', 'episodic', 1.0, '{}', 'now', 'now', 0, 0, 'turn'),
+                    ('t2', 'ag', 'turn two', '\"conversation\"', 'episodic', 1.0, '{}', 'now', 'now', 0, 0, 'turn');",
+        )
+        .unwrap();
+    }
+
+    /// `fact_history` is the audit path only. An embedding column here is one
+    /// forgotten WHERE away from a superseded claim reaching the prompt.
+    #[test]
+    fn v14_fact_history_carries_no_embedding() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        assert!(
+            !column_exists(&conn, "fact_history", "embedding"),
+            "fact_history must never carry an embedding (ADR 0001 2.3.1)"
+        );
+        assert!(column_exists(&conn, "memories", "claim_key"));
+        assert!(column_exists(&conn, "memories", "status"));
+        assert!(column_exists(&conn, "memories", "last_affirmed_at"));
     }
 }
