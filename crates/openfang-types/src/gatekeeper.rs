@@ -332,6 +332,164 @@ pub enum GateVerdict {
     Deny,
 }
 
+/// Overlap between adjacent [`overcap_chunks`], in characters.
+///
+/// Comfortably longer than any path or verb this floor matches, so a control
+/// path straddling a chunk boundary is whole inside one of them.
+const OVERCAP_CHUNK_OVERLAP: usize = 512;
+
+/// Split an over-cap logical line into overlapping chunks the normalizer can
+/// actually read.
+///
+/// ANAI-206 F7. [`crate::cmd_norm::deny_variants`] truncates its input at
+/// [`crate::cmd_norm::MAX_NORMALIZE_INPUT`], so a folded line longer than that
+/// cannot be deobfuscated in one pass. Chunking is what lets every predicate
+/// that reads folded lines have an above-cap branch that *evaluates* rather
+/// than degrading to raw containment or skipping outright. A script body is
+/// capped at [`crate::path_facts::MAX_SCRIPT_BODY_BYTES`], so this returns a
+/// handful of chunks at most.
+fn overcap_chunks(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let cap = crate::cmd_norm::MAX_NORMALIZE_INPUT;
+    let step = cap.saturating_sub(OVERCAP_CHUNK_OVERLAP).max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let end = (start + cap).min(chars.len());
+        out.push(chars[start..end].iter().collect());
+        if end == chars.len() {
+            break;
+        }
+        start += step;
+    }
+    out
+}
+
+/// Where a script body's working directory sits, as far as this floor can tell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cwd {
+    /// Unknown, or somewhere outside the control plane. The default, and the
+    /// assumption for everything except a `cd` we could read.
+    Elsewhere,
+    /// Under `~/.openfang/`, but not under a substrate subtree.
+    ControlPlane,
+    /// Under the control-plane root itself, or one of [`SUBSTRATE_SUBTREES`].
+    Substrate,
+}
+
+/// What a walk over a body's `cd` frames found.
+struct CwdHits {
+    /// A write to a relative operand while the working directory is inside the
+    /// control plane. Feeds [`GateFlags::script_body_control_plane`] — a fact
+    /// the judge weighs.
+    writes: bool,
+    /// A recursive removal of a relative operand while the working directory is
+    /// the substrate. Feeds [`GateFlags::substrate_destruction`] — hard, so
+    /// this half is deliberately the tighter of the two.
+    destroys: bool,
+}
+
+/// ANAI-206 F3: follow `cd` so a relative operand cannot launder its target.
+///
+/// Every other predicate in this module reads a *token* and asks what it names.
+/// That is blind to the cheapest bypass in the whole review — two lines of
+/// ordinary shell, cheaper than the continuation case commit 4 closed:
+///
+/// ```text
+///   cd ~/.openfang/agents
+///   rm -rf openfang-alpha
+/// ```
+///
+/// Line 1 names the substrate but writes nothing, so the conjunction does not
+/// fire. Line 2 writes, but `openfang-alpha` is a bare word — not path-shaped,
+/// so it does not even reach [`crate::path_facts::PathFact`] and the judge is
+/// handed an empty map of a script that ends the fleet.
+///
+/// Both halves require a **relative** operand, which is the whole point:
+/// `cd ~/.openfang/agents` followed by `rm -rf /tmp/scratch` is not laundering
+/// anything, and firing on it would spend a bypassed judge for nothing.
+///
+/// Known gaps, deliberate and fail-open: `cd` inside a subshell or a function
+/// body is treated as changing the frame for everything after it, `pushd`/`popd`
+/// is not a stack here, and a `cd` whose argument is an expansion this floor
+/// cannot evaluate leaves the frame `Elsewhere`. This closes the shape.
+fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
+    let mut cwd = Cwd::Elsewhere;
+    let mut hits = CwdHits {
+        writes: false,
+        destroys: false,
+    };
+    for line in lines {
+        let lowered = line.text.to_ascii_lowercase();
+        for segment in split_segments(&lowered) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            if let Some(next) = cd_target(&tokens, cwd) {
+                cwd = next;
+                continue;
+            }
+            if cwd == Cwd::Elsewhere {
+                continue;
+            }
+            if !tokens.iter().skip(1).any(|t| is_relative_operand(t)) {
+                continue;
+            }
+            if segment_writes(&tokens) {
+                hits.writes = true;
+            }
+            if cwd == Cwd::Substrate && segment_removes_recursively(&tokens) {
+                hits.destroys = true;
+            }
+        }
+    }
+    hits
+}
+
+/// The frame this segment moves to, or `None` if it is not a `cd`.
+fn cd_target(tokens: &[&str], current: Cwd) -> Option<Cwd> {
+    if !matches!(basename(tokens[0]).as_str(), "cd" | "pushd") {
+        return None;
+    }
+    // Bare `cd` goes home and `cd -` goes back; either way, not here.
+    let Some(arg) = tokens.iter().skip(1).find(|t| !t.starts_with('-')) else {
+        return Some(Cwd::Elsewhere);
+    };
+    let arg = arg.trim_matches(|c| c == '"' || c == '\'');
+    if names_substrate(arg) {
+        return Some(Cwd::Substrate);
+    }
+    if names_control_plane(arg) {
+        return Some(Cwd::ControlPlane);
+    }
+    // Absolute or home-anchored: we can see the whole path, and it is not the
+    // control plane.
+    if arg.starts_with('/') || arg.starts_with('~') {
+        return Some(Cwd::Elsewhere);
+    }
+    // Relative. Descending keeps whatever frame we were in; anything walking
+    // upwards leaves it, because we cannot say where it lands.
+    if arg.starts_with("..") {
+        return Some(Cwd::Elsewhere);
+    }
+    Some(current)
+}
+
+/// True when a token is an operand resolved against the current directory —
+/// the only kind a `cd` can launder.
+fn is_relative_operand(token: &str) -> bool {
+    if token.is_empty() || token.starts_with('-') {
+        return false;
+    }
+    if token.starts_with('/') || token.starts_with('~') {
+        return false;
+    }
+    // An assignment is not an operand, and a redirect target is
+    // `redirects_outside_workspace`'s question.
+    !token.contains('=') && !token.contains('>')
+}
+
 impl GateVerdict {
     /// Strictness rank. Higher is more restrictive.
     fn rank(self) -> u8 {
@@ -1219,7 +1377,13 @@ pub fn body_writes_control_plane(body: &str) -> bool {
     if lines.iter().any(line_writes_control_plane) {
         return true;
     }
-    deferred_control_plane_write(&lines)
+    if deferred_control_plane_write(&lines) {
+        return true;
+    }
+    // ANAI-206 commit 7, F3: the third splitting shape. `cd` moves the frame
+    // every later relative operand is resolved against, and nothing here was
+    // tracking it.
+    cwd_relative_hits(&lines).writes
 }
 
 /// One logical line of a script body, plus any heredoc payload it consumes.
@@ -1231,7 +1395,22 @@ struct LogicalLine {
 /// True if this one logical line writes the control plane.
 fn line_writes_control_plane(line: &LogicalLine) -> bool {
     if line.text.chars().count() > crate::cmd_norm::MAX_NORMALIZE_INPUT {
-        return names_control_plane(&line.text);
+        // ANAI-206 F7. Raw containment here is fail-closed against a plain path
+        // and fail-**open** against an obfuscated one, and inside a body the
+        // attacker controls both the padding and the spelling:
+        // `rm -rf ~/.open""fang/agents/ \` continued onto 9000 characters of
+        // flag padding folds past the cap, and then clears a containment test
+        // that never sees a literal `.openfang/`. Chunk the line so
+        // `deny_variants` runs over all of it; keep raw containment as a belt.
+        //
+        // Units match on both sides on purpose: this guard counts `chars()` and
+        // `deny_variants` truncates by `chars()` too, so a multi-byte line
+        // cannot clear the guard and then be silently byte-truncated inside the
+        // normalizer with no fallback at all.
+        return overcap_chunks(&line.text)
+            .iter()
+            .any(|chunk| touches_control_plane(chunk))
+            || names_control_plane(&line.text);
     }
     if touches_control_plane(&line.text) {
         return true;
@@ -1242,6 +1421,19 @@ fn line_writes_control_plane(line: &LogicalLine) -> bool {
     // already split away. If the payload names the control plane and anything
     // on the line writes, fail closed. Over-fires on a heredoc that merely
     // mentions the control plane in prose; that costs one Discord prompt.
+    // ANAI-206 F4, second half. Adding `OPAQUE_EXEC_VERBS` to `segment_writes`
+    // is necessary but not sufficient: an opaque executor's argv is exactly
+    // what this floor cannot read, so *attributing* it to a segment is
+    // meaningless. `python3 -c 'import shutil,sys; shutil.rmtree(...)' <path>`
+    // gets split by the semicolon **inside the quoted source**, which strands
+    // the path in a segment carrying no verb at all. On the command line
+    // `has_opaque_execution` rescues this by scanning the whole string; a body
+    // had no equivalent, because a body sets one predicate where a command line
+    // sets ten. This is that equivalent, scoped to lines naming the control
+    // plane so it costs nothing anywhere else.
+    if names_control_plane(&line.text) && runs_opaque_source(&line.text) {
+        return true;
+    }
     match &line.heredoc_payload {
         Some(payload) if names_control_plane(payload) => {
             let lowered = line.text.to_ascii_lowercase();
@@ -1281,12 +1473,12 @@ fn line_writes_control_plane(line: &LogicalLine) -> bool {
 fn logical_lines(body: &str) -> Vec<LogicalLine> {
     let mut out: Vec<LogicalLine> = Vec::new();
     let mut pending: Option<String> = None;
-    let mut heredoc: Option<(String, usize)> = None;
+    let mut heredoc: Option<(HeredocOpen, usize)> = None;
 
     for raw in body.lines() {
         let state = heredoc
             .as_ref()
-            .map(|(delim, idx)| (raw.trim() == delim.as_str(), *idx));
+            .map(|(open, idx)| (terminates_heredoc(raw, open), *idx));
         if let Some((terminates, idx)) = state {
             if terminates {
                 heredoc = None;
@@ -1320,8 +1512,8 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
             heredoc_payload: None,
         });
         let idx = out.len() - 1;
-        if let Some(delim) = heredoc_delimiter(&out[idx].text) {
-            heredoc = Some((delim, idx));
+        if let Some(open) = heredoc_delimiter(&out[idx].text) {
+            heredoc = Some((open, idx));
         }
     }
 
@@ -1349,29 +1541,99 @@ fn strip_continuation(line: &str) -> Option<&str> {
 ///
 /// Quotes around the delimiter are stripped rather than honoured: `<<'EOF'`
 /// only changes whether the payload is expanded, not where it ends.
-fn heredoc_delimiter(line: &str) -> Option<String> {
-    let idx = line.find("<<")?;
-    let rest = &line[idx + 2..];
-    // `<<<` is a here-string — its payload is on this line already.
-    if rest.starts_with('<') {
-        return None;
-    }
-    let rest = rest.strip_prefix('-').unwrap_or(rest);
-    let mut delim = String::new();
-    for c in rest.trim_start().chars() {
-        if c.is_whitespace() || matches!(c, '>' | '<' | ';' | '&' | '|' | ')' | '`') {
-            break;
-        }
-        if matches!(c, '\'' | '"' | '\\') {
+fn heredoc_delimiter(line: &str) -> Option<HeredocOpen> {
+    // ANAI-206 F6, second half. This used to take the *first* `<<` in the line
+    // unconditionally, so `x=$((1<<3))` opened a phantom heredoc with the
+    // delimiter `3` that swallowed every following line into one logical line.
+    // On its own that only over-fires, but it is also a free way to push a
+    // logical line past the normalizer's cap — the amplifier for F7. Scan every
+    // `<<` and take the first one that opens something a shell would call a
+    // heredoc.
+    let mut from = 0usize;
+    while let Some(offset) = line[from..].find("<<") {
+        let idx = from + offset;
+        let rest = &line[idx + 2..];
+        from = idx + 2;
+        // `<<<` is a here-string — its payload is on this line already.
+        if rest.starts_with('<') {
             continue;
         }
-        delim.push(c);
+        let (rest, strip_tabs) = match rest.strip_prefix('-') {
+            Some(stripped) => (stripped, true),
+            None => (rest, false),
+        };
+        let mut delim = String::new();
+        for c in rest.trim_start().chars() {
+            if c.is_whitespace() || matches!(c, '>' | '<' | ';' | '&' | '|' | ')' | '`') {
+                break;
+            }
+            if matches!(c, '\'' | '"' | '\\') {
+                continue;
+            }
+            delim.push(c);
+        }
+        if plausible_delimiter(&delim) {
+            return Some(HeredocOpen { delim, strip_tabs });
+        }
     }
-    if delim.is_empty() {
-        None
+    None
+}
+
+/// A heredoc opened by one logical line: its delimiter, and whether the `<<-`
+/// form was used.
+struct HeredocOpen {
+    delim: String,
+    /// `<<-` strips leading **tabs** — only tabs, and only from the terminator
+    /// and the payload. It does not strip spaces, and no form strips trailing
+    /// whitespace.
+    strip_tabs: bool,
+}
+
+/// True when a parsed word is shaped like a heredoc delimiter rather than the
+/// right-hand side of an arithmetic shift.
+///
+/// A shell heredoc word is a word; `1<<3` is followed by a number. Rejecting
+/// digit-led and punctuation-bearing delimiters costs us the vanishingly rare
+/// script whose heredoc delimiter starts with a digit — that script folds one
+/// line less and is scanned line by line instead, which is the safe direction.
+fn plausible_delimiter(delim: &str) -> bool {
+    match delim.chars().next() {
+        None => false,
+        Some(c) if c.is_ascii_digit() => false,
+        Some(_) => delim
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')),
+    }
+}
+
+/// True when this physical line ends the heredoc it is inside.
+///
+/// ANAI-206 F6, and the one place in [`logical_lines`] that used to lean the
+/// wrong way. Bash ends a heredoc on a line that is *exactly* the delimiter, at
+/// column 0; `<<-` strips leading tabs and nothing strips trailing whitespace.
+/// The previous test was `raw.trim() == delim`, which matched an indented
+/// terminator bash would keep consuming — so our fold ended early and the rest
+/// of the payload fell out of the logical line and was scanned as standalone
+/// physical lines, where a control path names but does not write:
+///
+/// ```text
+///   rm -rf $(cat <<EOF
+///     EOF
+///   ~/.openfang/agents/
+///   EOF
+///   )
+/// ```
+///
+/// Ending the fold *late* costs an over-fire; ending it early costs the
+/// substrate.
+fn terminates_heredoc(raw: &str, open: &HeredocOpen) -> bool {
+    let line = raw.strip_suffix('\r').unwrap_or(raw);
+    let line = if open.strip_tabs {
+        line.trim_start_matches('\t')
     } else {
-        Some(delim)
-    }
+        line
+    };
+    line == open.delim
 }
 
 /// True if the body writes through a name that earlier took a control-plane
@@ -1664,9 +1926,50 @@ fn segment_removes_recursively(tokens: &[&str]) -> bool {
 /// declines to guess.
 #[must_use]
 pub fn body_destroys_substrate(body: &str) -> bool {
-    logical_lines(body).iter().any(|line| {
-        line.text.chars().count() <= crate::cmd_norm::MAX_NORMALIZE_INPUT
-            && destroys_substrate(&line.text)
+    let lines = logical_lines(body);
+    if lines.iter().any(logical_line_destroys_substrate) {
+        return true;
+    }
+    cwd_relative_hits(&lines).destroys
+}
+
+/// [`destroys_substrate`] against one folded logical line, with an above-cap
+/// branch that evaluates instead of skipping.
+///
+/// ANAI-206 F7, and the worse half of it. The first version of this predicate
+/// required `line.text.chars().count() <= MAX_NORMALIZE_INPUT` and *skipped*
+/// anything longer — a hard flag that silently does not evaluate, which is
+/// strictly worse than a soft flag that degrades, because nothing downstream
+/// can tell the difference between "evaluated to false" and "never ran". Plain
+/// `rm -rf ~/.openfang` plus 9000 characters of padding cleared it with no
+/// obfuscation at all.
+///
+/// Above the cap the conjunction is also relaxed from per-segment to per-line:
+/// the verb and the target landing far enough apart to sit in different chunks
+/// is the attack, not a shape real scripts have, and an 8KB logical line is
+/// already anomalous. Over-firing here costs a bypassed judge on a script no
+/// human wrote by hand.
+fn logical_line_destroys_substrate(line: &LogicalLine) -> bool {
+    if line.text.chars().count() <= crate::cmd_norm::MAX_NORMALIZE_INPUT {
+        return destroys_substrate(&line.text);
+    }
+    let chunks = overcap_chunks(&line.text);
+    let names = chunks.iter().any(|chunk| {
+        crate::cmd_norm::deny_variants(chunk)
+            .iter()
+            .any(|v| names_substrate(v))
+    });
+    if !names {
+        return false;
+    }
+    chunks.iter().any(|chunk| {
+        crate::cmd_norm::deny_variants(chunk).iter().any(|v| {
+            let lowered = v.to_ascii_lowercase();
+            split_segments(&lowered).into_iter().any(|segment| {
+                let tokens: Vec<&str> = segment.split_whitespace().collect();
+                segment_removes_recursively(&tokens)
+            })
+        })
     })
 }
 
@@ -1715,7 +2018,17 @@ fn segment_writes(tokens: &[&str]) -> bool {
             return true;
         }
     }
-    tokens_match_verb_pair(tokens, MUTATION_VERBS) || tokens_match_verb_pair(tokens, EGRESS_VERBS)
+    // ANAI-206 F4. `OPAQUE_EXEC_BINS` was checked above and `OPAQUE_EXEC_VERBS`
+    // was not, so this function's own doc claim — "a segment containing an
+    // opaque executor counts as a write, because its argv is not readable
+    // here" — was only half true. `python3 -c '...' ~/.openfang/agents` is
+    // rescued on the command line by `has_opaque_execution`; inside a script
+    // body there is no such flag, because the body sets one predicate and the
+    // command line sets ten. Every command-line predicate the body cannot set
+    // is a gap of this class.
+    tokens_match_verb_pair(tokens, MUTATION_VERBS)
+        || tokens_match_verb_pair(tokens, EGRESS_VERBS)
+        || tokens_match_verb_pair(tokens, OPAQUE_EXEC_VERBS)
 }
 
 /// True if any resolved base or inner command is in [`DESTRUCTIVE_BINS`].
@@ -2999,6 +3312,10 @@ mod anai_206_f1_f2_tests {
 #[cfg(test)]
 #[path = "gatekeeper_commit6_tests.rs"]
 mod commit6_tests;
+
+#[cfg(test)]
+#[path = "gatekeeper_commit7_tests.rs"]
+mod commit7_tests;
 /// ANAI-206 commit 6: a **write** to the judge's own policy file.
 ///
 /// The second member of [`GateFlags::hard`] that is about an attack on the
@@ -3030,4 +3347,18 @@ pub fn writes_gatekeeper_policy(command: &str) -> bool {
             tokens.iter().any(|t| t.contains(GATEKEEPER_POLICY_PATH)) && segment_writes(&tokens)
         })
     })
+}
+/// True if this whole line hands text to an interpreter this floor cannot read.
+///
+/// Line-scoped rather than segment-scoped on purpose — see the call site in
+/// [`line_writes_control_plane`]. The separators `split_segments` keys on are
+/// ordinary characters inside a quoted `-c` payload, so segmenting an opaque
+/// invocation splits the very thing that makes it opaque.
+fn runs_opaque_source(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    let tokens: Vec<&str> = lowered.split_whitespace().collect();
+    tokens
+        .iter()
+        .any(|t| OPAQUE_EXEC_BINS.contains(&basename(t).as_str()))
+        || tokens_match_verb_pair(&tokens, OPAQUE_EXEC_VERBS)
 }

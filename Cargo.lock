@@ -4253,6 +4253,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "libc",
  "openfang-memory",
  "openfang-skills",
  "openfang-types",

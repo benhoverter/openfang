@@ -649,6 +649,14 @@ impl PathFactSheet {
                 || body.destroys_substrate
                 || body.body_truncated
                 || body.body_unresolved
+                // ANAI-206 F3. `all()` over an empty vec is vacuously true, so
+                // a body whose every operand is a bare word — `cd
+                // ~/.openfang/agents` then `rm -rf openfang-alpha`, where
+                // `looks_like_path` rejects the target — used to map to *zero*
+                // facts and sail through this conjunction. An empty map is not
+                // a clean map. The command's own facts are already held to
+                // exactly this bar three lines below.
+                || body.body_facts.is_empty()
                 || !body.body_facts.iter().all(PathFact::suppress_eligible)
             {
                 return false;
@@ -1280,6 +1288,25 @@ mod tests {
         }
     }
 
+    /// [`body`] with one suppress-eligible path fact in its map.
+    ///
+    /// ANAI-206 F3 made an empty `body_facts` disqualifying on its own: `all()`
+    /// over an empty vec is vacuously true, and a script whose every operand is
+    /// a bare word — `cd ~/.openfang/agents` then `rm -rf openfang-alpha` —
+    /// maps to exactly zero facts. Tests isolating some *other* axis need a
+    /// baseline that is eligible for the right reason.
+    fn mapped_body(status: ScriptBodyStatus) -> ScriptBody {
+        ScriptBody {
+            body_facts: vec![fact(
+                PathExistence::File,
+                GitFact::NoRepo,
+                true,
+                PathAuthority::Write,
+            )],
+            ..body(status)
+        }
+    }
+
     /// The motivating case: one interpreter, one script path, nothing else.
     #[test]
     fn a_bare_interpreter_invocation_names_its_script() {
@@ -1400,7 +1427,9 @@ mod tests {
             )],
             truncated: false,
             unresolved: false,
-            script_body: Some(body(ScriptBodyStatus::Included)),
+            // ANAI-206 F3: an empty body map is no longer a clean one, so the
+            // baseline this test isolates its axes against has to carry a fact.
+            script_body: Some(mapped_body(ScriptBodyStatus::Included)),
         };
         assert!(base.suppress_eligible());
 
@@ -1487,7 +1516,7 @@ mod tests {
             )],
             truncated: false,
             unresolved: false,
-            script_body: Some(body(ScriptBodyStatus::Included)),
+            script_body: Some(mapped_body(ScriptBodyStatus::Included)),
         };
         assert!(sheet.suppress_eligible());
         for status in [

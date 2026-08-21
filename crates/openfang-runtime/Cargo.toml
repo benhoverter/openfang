@@ -33,6 +33,10 @@ regex-lite = { workspace = true }
 rusqlite = { workspace = true }
 rmcp = { workspace = true }
 http = "1"
+# ANAI-206 F8: `O_NOFOLLOW`. std exposes `custom_flags` but not the constant.
+# Already in `Cargo.lock` at 0.2.x as a transitive dependency of tokio, so this
+# promotes an existing build input to a direct one rather than adding code.
+libc = "0.2"
 tokio-tungstenite = "0.24"
 shlex = "1"
 

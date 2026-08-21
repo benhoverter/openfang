@@ -15,11 +15,19 @@
 //! 2. **No symlink traversal.** Every stat is `symlink_metadata`; a link is
 //!    reported as a link with its target named, never resolved through. A
 //!    symlinked script is `Symlink`, never `File`, so it is never opened.
+//!    ANAI-206 F8: that held at `stat` time and not at `open` time, so the
+//!    single read is now `O_NOFOLLOW` and validates the handle it holds rather
+//!    than re-resolving the name. The older TOCTOU note in this module — that
+//!    stale facts are free because shadow mode acts on nothing — stopped being
+//!    true the moment item 1 started reading bytes: the bytes reach the model
+//!    provider and the audit chain whether or not the verdict is enforced.
 //! 3. **Every failure is `Unknown`, and `Unknown` is never recoverable.** A
 //!    timed-out git query, an unstattable path, an unresolvable argument — all
 //!    of them subtract confidence rather than adding it.
 
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -175,11 +183,50 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     let Some(path) = fact.resolved.as_ref() else {
         return (body, Vec::new());
     };
-    let Ok(bytes) = std::fs::read(path) else {
+    // Guardrail 4b — ANAI-206 F8, the TOCTOU the security review found.
+    //
+    // Everything above was decided against a *path*, stat'd earlier in
+    // `gather()` with a 300ms git budget in between. `std::fs::read` then
+    // re-resolved that path and followed symlinks, and the size re-check
+    // caught growth but never identity. An agent that can write the script —
+    // and it must be able to, for the script to be worth reading — can leave a
+    // background flipper swapping the file for a link and have the gate render
+    // a file outside its own `file_policy` reach into the judge prompt and the
+    // audit chain. That is exactly what guardrail 2 exists to prevent.
+    //
+    // `O_NOFOLLOW` refuses at `open`, and every check from here down is against
+    // the handle rather than the name: we validate the bytes we are holding,
+    // not a path we re-resolve.
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
         return (body, Vec::new());
     };
-    // ...and again on what we actually got, because the stat was taken earlier
-    // and a file can grow between the two.
+    let Ok(meta) = file.metadata() else {
+        return (body, Vec::new());
+    };
+    // `fstat` on the open handle. A directory or a device that replaced the
+    // file between the two is not a script.
+    if !meta.is_file() {
+        return (body, Vec::new());
+    }
+    if meta.len() > MAX_SCRIPT_BODY_BYTES {
+        body.status = ScriptBodyStatus::TooLarge;
+        return (body, Vec::new());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    if file
+        .by_ref()
+        .take(MAX_SCRIPT_BODY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (body, Vec::new());
+    }
+    // ...and again on what we actually got, because a file can grow between
+    // the `fstat` and the last byte read.
     if bytes.len() as u64 > MAX_SCRIPT_BODY_BYTES {
         body.status = ScriptBodyStatus::TooLarge;
         return (body, Vec::new());
@@ -205,13 +252,26 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     // substrate on line 40 of the file this command runs bypasses the judge for
     // exactly the same reason it does on the command line.
     body.destroys_substrate = openfang_types::gatekeeper::body_destroys_substrate(&text);
-    let (tokens, unresolved) = extract_body_path_tokens(&text);
+
+    // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
+    //
+    // `extract_body_path_tokens` used to read the unredacted text, and
+    // `PathFact::render` prints `resolved.unwrap_or(&self.raw)`. So
+    // `API_TOKEN=/Users/x/.ssh/deploy_key_abc123` was redacted *inside* the
+    // `<script-body>` fence and printed in full as a path fact *outside* it,
+    // where the facts block deliberately is not redacted. `looks_secret` cannot
+    // catch it on the way out either: it excludes any token containing `/`,
+    // which is every path.
+    //
+    // Extract twice rather than redacting the rendered block, which would eat
+    // the ordinary paths the map exists for. The two predicates above keep
+    // reading plaintext on purpose — redaction can blank a line that names a
+    // control path — and only the rendered map moves behind the redactor.
+    let (redacted, redactions) = redact_secrets(&text);
+    let (tokens, unresolved) = extract_body_path_tokens(&redacted);
     body.body_truncated = tokens.len() > MAX_BODY_PATH_FACTS;
     body.body_unresolved = unresolved;
     let tokens: Vec<String> = tokens.into_iter().take(MAX_BODY_PATH_FACTS).collect();
-
-    // Guardrail 6.
-    let (redacted, redactions) = redact_secrets(&text);
     body.content = Some(redacted);
     body.redactions = redactions;
     body.status = ScriptBodyStatus::Included;
@@ -1093,5 +1153,125 @@ mod tests {
             let sheet = gather(cmd, &[], Some(&ws), Some(&policy)).await;
             assert!(sheet.script_body.is_none(), "{cmd}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-206 commit 7: F8 (TOCTOU at the read) and F9 (the redaction leak).
+    // -----------------------------------------------------------------------
+
+    /// **F8.** Every guardrail above the read is decided against a *path*,
+    /// stat'd earlier in `gather()` with a git budget in between. `std::fs::read`
+    /// re-resolved that path and followed links, so an agent that can write the
+    /// script — and it must be able to, for the script to be worth reading — can
+    /// swap it for a symlink inside that window and have the gate render a file
+    /// outside its own `file_policy` reach into the judge prompt and the audit
+    /// chain.
+    ///
+    /// The window is not reproducible in a test without a racing thread, so this
+    /// asserts the property that closes it instead: a fact that *claims* the path
+    /// is a regular file must not be enough to read through a link. The fact here
+    /// is deliberately a lie, which is exactly what the attacker manufactures.
+    #[tokio::test]
+    async fn a_stale_fact_cannot_read_through_a_symlink() {
+        let ws = tempdir("body-toctou");
+        let link = ws.join("swapped.sh");
+        std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+
+        let lying_fact = PathFact {
+            raw: "./swapped.sh".to_string(),
+            resolved: Some(link.display().to_string()),
+            // What the stat said 300ms ago, before the flip.
+            existence: PathExistence::File,
+            size_bytes: Some(12),
+            symlink_target: None,
+            mtime_secs_ago: Some(0),
+            git: GitFact::NoRepo,
+            inside_workspace: true,
+            authority: PathAuthority::Write,
+        };
+
+        let (body, tokens) = read_script_body("./swapped.sh", &[lying_fact]);
+        assert!(
+            body.content.is_none(),
+            "O_NOFOLLOW must refuse the link even when the fact says File"
+        );
+        assert_ne!(body.status, ScriptBodyStatus::Included);
+        assert!(tokens.is_empty());
+    }
+
+    /// The ordinary path still reads, so the `O_NOFOLLOW` open is not a blanket
+    /// refusal.
+    #[tokio::test]
+    async fn a_real_file_still_reads_through_the_nofollow_open() {
+        let (ws, policy) = writable_ws("body-nofollow-ok");
+        std::fs::write(
+            ws.join("ok.sh"),
+            "echo hi
+",
+        )
+        .unwrap();
+        let sheet = gather("bash ./ok.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert_eq!(body.content.as_deref(), Some("echo hi\n"));
+    }
+
+    /// **F9.** `PathFact::render` prints the token it was built from, and the
+    /// body facts block renders *outside* the `<script-body>` fence where nothing
+    /// redacts it. Extraction therefore has to run on the redacted text, or a
+    /// secret-shaped assignment whose value is a path is blanked inside the fence
+    /// and printed in full immediately below it. `looks_secret` cannot catch it
+    /// on the way out: it excludes every token containing `/`, which is every
+    /// path.
+    #[tokio::test]
+    async fn a_redacted_secret_path_is_not_re_emitted_as_a_fact() {
+        let (ws, policy) = writable_ws("body-f9");
+        std::fs::write(
+            ws.join("deploy.sh"),
+            "#!/usr/bin/env bash\nAPI_TOKEN=/Users/x/.ssh/deploy_key_abc123\ncargo build\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./deploy.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert!(body.redactions > 0);
+
+        let content = body.content.as_deref().unwrap_or_default();
+        assert!(!content.contains("deploy_key_abc123"), "{content}");
+
+        let rendered = body.render_body_facts();
+        assert!(
+            !rendered.contains("deploy_key_abc123"),
+            "the facts block renders outside the fence: {rendered}"
+        );
+        assert!(
+            body.body_facts
+                .iter()
+                .all(|f| !f.raw.contains("deploy_key_abc123")),
+            "{:?}",
+            body.body_facts
+        );
+    }
+
+    /// ...and the paths the map exists for are still there. Redacting the
+    /// rendered block instead of extracting twice would have eaten these.
+    #[tokio::test]
+    async fn ordinary_paths_survive_the_redaction_reorder() {
+        let (ws, policy) = writable_ws("body-f9-ok");
+        std::fs::write(ws.join("data.txt"), "x").unwrap();
+        std::fs::write(
+            ws.join("run.sh"),
+            "#!/usr/bin/env bash\nAPI_TOKEN=/Users/x/.ssh/k_abc123\nrm ./data.txt\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./run.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.expect("script body");
+        assert!(
+            body.body_facts.iter().any(|f| f.raw == "./data.txt"),
+            "{:?}",
+            body.body_facts
+        );
     }
 }
