@@ -179,6 +179,8 @@ pub async fn build_gate_request(
         // ANAI-206 item 3. Set below, once the body has been read: it is the
         // one floor predicate that cannot be computed from the command text.
         script_body_control_plane: false,
+        // ANAI-206 F1. Same: it is a fact about a read that has not happened yet.
+        script_body_blind: false,
     };
 
     // ANAI-190. Gathered from the *comment-stripped* command, for the same
@@ -201,6 +203,24 @@ pub async fn build_gate_request(
         .script_body
         .as_ref()
         .is_some_and(|b| b.writes_control_plane);
+
+    // ANAI-206 F1. Item 2 let a control-plane *read* fall through to the judge
+    // on the strength of item 1 handing over the body. Where item 1 refused,
+    // that trade was never paid for — the command reached the judge with a
+    // stated refusal and a clean floor. Restores the pre-206 escalation for
+    // exactly that case and no other: the command must be an execution, must
+    // name the control plane, and the body must not have been included.
+    //
+    // Computed on `command` (comment-stripped) for the same reason the path
+    // facts are: a path behind a `#` is not a path the shell will act on.
+    flags.script_body_blind = openfang_types::path_facts::executes_script_like(&command)
+        && openfang_types::gatekeeper::names_control_plane(&command)
+        && !path_facts.script_body.as_ref().is_some_and(|b| {
+            matches!(
+                b.status,
+                openfang_types::path_facts::ScriptBodyStatus::Included
+            )
+        });
 
     GateRequest {
         agent_name: agent_id.to_string(),

@@ -122,6 +122,15 @@ pub const FENCE_MARKERS: &[&str] = &["<command", "command>", "<script-body", "sc
 /// Control-plane root, matched broadly. See [`touches_control_plane`].
 pub const CONTROL_PLANE_ROOT: &str = ".openfang/";
 
+/// The same root **without** its trailing separator.
+///
+/// ANAI-206 F2. [`CONTROL_PLANE_ROOT`] carries the slash and every
+/// [`CONTROL_PATH_FRAGMENTS`] entry carries a separator, so `rm -rf ~/.openfang`
+/// — the most complete form of substrate destruction available — did not name
+/// the control plane at all. [`names_control_plane`] scans on this form and
+/// decides what follows it.
+pub const CONTROL_PLANE_ROOT_BARE: &str = ".openfang";
+
 /// Subtrees under [`CONTROL_PLANE_ROOT`] that are *not* control plane.
 ///
 /// ANAI-184 scope item 4, the F2 generalization: enumerating the bad parts of
@@ -528,6 +537,22 @@ pub struct GateFlags {
     /// means ESCALATE.
     #[serde(default)]
     pub script_body_control_plane: bool,
+    /// ANAI-206 F1: the command **executes** a script that names the control
+    /// plane, and the body could not be read.
+    ///
+    /// Item 2's entire soundness argument is that a control-plane *read* may
+    /// fall through to the judge *because* item 1 shows the judge the body. When
+    /// item 1 refuses, that argument evaporates and nothing was putting the
+    /// floor back: `~/.openfang/scripts/deploy.sh` run directly, `bash -x`,
+    /// `bash "$SCRIPT"`, `source`, a glob — every one of them escalated by rule
+    /// before ANAI-206 and reached the judge with an empty sheet after it.
+    ///
+    /// This is item 2's precondition written down: the narrowing applies where
+    /// the body was included, and nowhere else. Reads that are not executions
+    /// (`cat ~/.openfang/config.toml`) are untouched — the judge can see the
+    /// whole command there, so item 2's win survives.
+    #[serde(default)]
+    pub script_body_blind: bool,
 }
 
 impl GateFlags {
@@ -544,6 +569,7 @@ impl GateFlags {
             || self.writes_outside_workspace
             || self.parse_failed
             || self.script_body_control_plane
+            || self.script_body_blind
     }
 
     /// Compact `k=v` rendering for the audit log.
@@ -581,6 +607,9 @@ impl GateFlags {
         }
         if self.script_body_control_plane {
             hit.push("script_control_plane");
+        }
+        if self.script_body_blind {
+            hit.push("script_blind");
         }
         if hit.is_empty() {
             "none".to_string()
@@ -1332,15 +1361,28 @@ pub fn names_control_plane(s: &str) -> bool {
         return true;
     }
     let mut rest: &str = &lowered;
-    while let Some(idx) = rest.find(CONTROL_PLANE_ROOT) {
+    while let Some(idx) = rest.find(CONTROL_PLANE_ROOT_BARE) {
         let tail = &rest[idx..];
-        if !CONTROL_PLANE_BENIGN_PREFIXES
-            .iter()
-            .any(|p| tail.starts_with(p))
-        {
+        let after = &tail[CONTROL_PLANE_ROOT_BARE.len()..];
+        let hit = if after.starts_with('/') {
+            !CONTROL_PLANE_BENIGN_PREFIXES
+                .iter()
+                .any(|p| tail.starts_with(p))
+        } else {
+            // ANAI-206 F2: the root itself. A path character after it means
+            // this is a *different* name that merely starts the same way —
+            // `.openfangx`, `.openfang.tar.gz` — and claiming those are the
+            // control plane would cost prompts for nothing. Anything else
+            // (end of string, whitespace, a quote, a separator) is the root.
+            !after
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        };
+        if hit {
             return true;
         }
-        rest = &rest[idx + CONTROL_PLANE_ROOT.len()..];
+        rest = &rest[idx + CONTROL_PLANE_ROOT_BARE.len()..];
     }
     false
 }
@@ -2593,5 +2635,57 @@ mod tests {
         ] {
             assert_eq!(neutralize_header_field(name), name);
         }
+    }
+}
+
+#[cfg(test)]
+mod anai_206_f1_f2_tests {
+    use super::*;
+
+    #[test]
+    fn bare_control_plane_root_names_control_plane() {
+        // F2. The slash in `CONTROL_PLANE_ROOT` made this match nothing.
+        assert!(names_control_plane("~/.openfang"));
+        assert!(names_control_plane("/users/rlyeh/.openfang"));
+        assert!(names_control_plane("~/.openfang/"));
+        assert!(names_control_plane("rm -rf ~/.openfang"));
+    }
+
+    #[test]
+    fn bare_root_write_fires_the_floor() {
+        assert!(touches_control_plane("rm -rf ~/.openfang"));
+        assert!(touches_control_plane("mv /tmp/x ~/.openfang"));
+    }
+
+    #[test]
+    fn bare_root_read_still_falls_through() {
+        // Item 2's narrowing is not undone by F2.
+        assert!(!touches_control_plane("ls ~/.openfang"));
+    }
+
+    #[test]
+    fn names_that_merely_start_the_same_way_are_not_the_root() {
+        assert!(!names_control_plane("~/.openfangx"));
+        assert!(!names_control_plane("~/.openfang-old"));
+        assert!(!names_control_plane("~/.openfang.tar.gz"));
+    }
+
+    #[test]
+    fn benign_subtrees_survive_the_bare_scan() {
+        assert!(!names_control_plane(
+            "~/.openfang/workspaces/alpha/notes.md"
+        ));
+        assert!(!names_control_plane("~/.openfang/logs/daemon.log"));
+        assert!(!names_control_plane("~/.openfang/tmp/files/x.diff"));
+    }
+
+    #[test]
+    fn blind_flag_is_part_of_the_floor() {
+        let flags = GateFlags {
+            script_body_blind: true,
+            ..Default::default()
+        };
+        assert!(flags.any());
+        assert!(flags.as_log_string().contains("script_blind"));
     }
 }

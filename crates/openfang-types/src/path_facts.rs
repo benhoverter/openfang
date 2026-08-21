@@ -309,7 +309,43 @@ pub const MAX_SCRIPT_BODY_BYTES: u64 = 16 * 1024;
 /// Deliberately the two-token form only — see [`script_body_target`].
 pub const SCRIPT_INTERPRETERS: &[&str] = &[
     "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "node", "ruby", "perl",
+    // ANAI-206 F1: sourcing a script runs every line of it in the caller's own
+    // shell. Strictly more powerful than `bash file`, and it was not on the
+    // list, so the judge saw nothing.
+    "source", ".",
 ];
+
+/// Suffixes that make a bare path-shaped token a script we can read.
+///
+/// ANAI-206 F1: `~/.openfang/scripts/deploy.sh` with no interpreter token is
+/// the same execution of the same file as `bash ~/.openfang/scripts/deploy.sh`,
+/// but [`script_body_target`] required an interpreter and refused it — so the
+/// most common form in this fleet was the one form the judge never saw.
+pub const SCRIPT_SUFFIXES: &[&str] = &[".sh", ".bash", ".zsh", ".py", ".rb", ".pl", ".js"];
+
+/// True if `token` is named like a script file. See [`SCRIPT_SUFFIXES`].
+#[must_use]
+pub fn looks_like_script_file(token: &str) -> bool {
+    let lowered = token.to_ascii_lowercase();
+    SCRIPT_SUFFIXES.iter().any(|s| lowered.ends_with(s))
+}
+
+/// True if the command's first token *executes* something rather than reading
+/// it — an interpreter, or a script file run directly.
+///
+/// ANAI-206 F1. This is the gate on the blind-body floor: item 2's narrowing
+/// says a control-plane *read* may fall through to the judge, and that is sound
+/// for `cat ~/.openfang/config.toml`, where the judge can see the whole story
+/// in the command text. It is not sound for `bash $SCRIPT`, where the story is
+/// in a file we could not open. This predicate separates the two.
+#[must_use]
+pub fn executes_script_like(command: &str) -> bool {
+    let Some(first) = command.split_whitespace().next() else {
+        return false;
+    };
+    let bin = first.rsplit('/').next().unwrap_or(first);
+    SCRIPT_INTERPRETERS.contains(&bin) || looks_like_script_file(bin)
+}
 
 /// Substrings in an assignment's left-hand side that make its value a secret.
 pub const SECRET_KEY_HINTS: &[&str] = &[
@@ -830,12 +866,31 @@ pub fn script_body_target(command: &str, inner: &[String]) -> Option<String> {
         return None;
     }
     let mut tokens = command.split_whitespace();
-    let bin = tokens.next()?;
-    let bin = bin.rsplit('/').next().unwrap_or(bin);
-    if !SCRIPT_INTERPRETERS.contains(&bin) {
+    let first = tokens.next()?;
+    let bin = first.rsplit('/').next().unwrap_or(first);
+    let candidate = if SCRIPT_INTERPRETERS.contains(&bin) {
+        // ANAI-206 F1: skip interpreter flags instead of refusing on them.
+        // `bash -x deploy.sh` used to return `None` here, which meant the judge
+        // was handed nothing for a command that differs from the readable form
+        // by one debugging flag. `-c` cannot reach this loop: an inline script
+        // makes `inner` non-empty and the guard at the top of this function has
+        // already returned. Any other flag carrying a `c` is refused rather
+        // than reasoned about.
+        let mut next = tokens.next()?;
+        while next.starts_with('-') {
+            if next.len() > 1 && next[1..].contains('c') {
+                return None;
+            }
+            next = tokens.next()?;
+        }
+        next
+    } else if looks_like_script_file(bin) {
+        // ANAI-206 F1: direct execution, no interpreter token.
+        first
+    } else {
         return None;
-    }
-    let candidate = tokens.next()?.trim_matches(|c| c == '"' || c == '\'');
+    };
+    let candidate = candidate.trim_matches(|c| c == '"' || c == '\'');
     if candidate.starts_with('-') {
         return None;
     }
@@ -1232,7 +1287,9 @@ mod tests {
             // inline code, not a file
             "bash -c \"rm ./x\"",
             // interpreter flags: not worth the parser
-            "bash -x ./scripts/build.sh",
+            // ANAI-206 F1 moved `bash -x <script>` out of this list: refusing
+            // on a debugging flag cost the judge the body of a script it could
+            // otherwise read. See `interpreter_flags_no_longer_refuse_the_body`.
             // separators, redirects, substitution, expansion
             "bash ./a.sh && bash ./b.sh",
             "bash ./a.sh > /tmp/out",
@@ -1470,5 +1527,59 @@ mod tests {
         let (out, n) = redact_secrets(script);
         assert_eq!(n, 0, "{out}");
         assert_eq!(out, script);
+    }
+}
+
+#[cfg(test)]
+mod anai_206_f1_tests {
+    use super::*;
+
+    #[test]
+    fn interpreter_flags_no_longer_refuse_the_body() {
+        assert_eq!(
+            script_body_target("bash -x /home/a/deploy.sh", &[]).as_deref(),
+            Some("/home/a/deploy.sh")
+        );
+    }
+
+    #[test]
+    fn direct_execution_resolves_the_same_file() {
+        assert_eq!(
+            script_body_target("/home/a/deploy.sh", &[]).as_deref(),
+            Some("/home/a/deploy.sh")
+        );
+    }
+
+    #[test]
+    fn source_is_an_interpreter() {
+        assert_eq!(
+            script_body_target("source /home/a/env.sh", &[]).as_deref(),
+            Some("/home/a/env.sh")
+        );
+    }
+
+    #[test]
+    fn inline_script_flags_are_still_refused() {
+        // `-c` never reaches the flag loop in practice (`inner` is non-empty),
+        // but the loop must not walk past one if it ever does.
+        assert_eq!(script_body_target("bash -c ls", &[]), None);
+        assert_eq!(script_body_target("bash --rcfile /home/a/x.sh", &[]), None);
+    }
+
+    #[test]
+    fn non_script_commands_are_not_executions() {
+        assert!(!executes_script_like("cat /home/a/config.toml"));
+        assert!(!executes_script_like("ls -la"));
+        assert!(!executes_script_like(""));
+    }
+
+    #[test]
+    fn executions_we_cannot_resolve_are_still_executions() {
+        // The blind-body floor exists for exactly these: `script_body_target`
+        // refuses them, so nothing else marks them as dangerous.
+        assert!(executes_script_like("bash \"$SCRIPT\""));
+        assert!(executes_script_like("bash /home/a/*.sh"));
+        assert!(executes_script_like("/home/a/deploy.sh"));
+        assert!(executes_script_like("source /home/a/env.sh"));
     }
 }
