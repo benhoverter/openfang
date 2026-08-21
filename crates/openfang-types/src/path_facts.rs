@@ -57,6 +57,15 @@ use serde::{Deserialize, Serialize};
 /// suppression rather than as a cosmetic elision.
 pub const MAX_PATH_FACTS: usize = 8;
 
+/// Hard cap on how many paths the *body* of an executed script contributes.
+///
+/// Larger than [`MAX_PATH_FACTS`] because a script legitimately names more
+/// paths than a command line does, and small enough that the block stays
+/// readable. Overflow is recorded (see [`ScriptBody::body_truncated`]) and
+/// withholds suppression, exactly as command-line truncation does: a script we
+/// have only partly mapped is a script whose effects we do not know.
+pub const MAX_BODY_PATH_FACTS: usize = 12;
+
 /// What `symlink_metadata` found. Deliberately not "safe"/"unsafe".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +107,26 @@ pub enum GitFact {
     Ignored,
     /// The query timed out, errored, or was never run. Fails closed.
     Unknown,
+}
+
+impl GitFact {
+    /// Short token for audit rows.
+    ///
+    /// Exists so the corpus can see how often the git axis is *structurally*
+    /// silent. `~/.openfang/scripts/` is not a repository, so every script
+    /// under it answers `NoRepo` and guardrail 3 never fires there — that is a
+    /// coverage fact we want to be able to count, not infer.
+    #[must_use]
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::NoRepo => "no-repo",
+            Self::TrackedClean => "tracked-clean",
+            Self::TrackedDirty => "tracked-dirty",
+            Self::Untracked => "untracked",
+            Self::Ignored => "ignored",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// The tier `file_policy` would have granted this agent for this exact path.
@@ -383,6 +412,22 @@ impl ScriptBodyStatus {
 /// 6. Secret shapes redacted on read.
 /// 7. The audit row says whether content was consulted, and why not when it
 ///    was not.
+///
+/// # ANAI-206 item 3: the body's own paths
+///
+/// Items 1 and 2 together traded a deterministic floor for a model's reading
+/// comprehension: item 2 stopped `bash ~/.openfang/scripts/foo.sh` from
+/// short-circuiting on the theory that item 1 shows the judge what `foo.sh`
+/// does — but what item 1 hands over is *prose*. The command's own paths get
+/// the full [`PathFact`] treatment; the body's paths got nothing, so a script
+/// containing `rm -rf ~/.openfang/agents/` reached a judge that had to read
+/// that line and notice.
+///
+/// So the body is now mapped as well as shown: [`body_facts`](Self::body_facts)
+/// carries the same facts for the paths named *inside* the script, and
+/// [`writes_control_plane`](Self::writes_control_plane) restores the floor item
+/// 2 removed — a control-plane **write** anywhere in the body escalates by
+/// rule, while a mere read still reaches the judge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptBody {
     /// The token as the agent wrote it. Untrusted; rendered, never executed.
@@ -394,6 +439,46 @@ pub struct ScriptBody {
     pub content: Option<String>,
     /// How many secret-shaped spans were replaced.
     pub redactions: usize,
+    /// What the git index said about the script file itself.
+    ///
+    /// Recorded for the audit row rather than for a decision: guardrail 3
+    /// already refused on `Ignored` and `Unknown`, so anything that gets this
+    /// far is one of the other four. Present so the corpus can count how much
+    /// of the population sits outside any repository, where that guardrail is
+    /// structurally inert.
+    #[serde(default = "git_unknown")]
+    pub git: GitFact,
+    /// ANAI-206 item 3: facts for every path named *inside* the script.
+    ///
+    /// Empty when the body was not read. Computed by the daemon, not parsed by
+    /// the judge — the judge is handed facts, not text to interpret.
+    #[serde(default)]
+    pub body_facts: Vec<PathFact>,
+    /// The body named more than [`MAX_BODY_PATH_FACTS`] paths; the tail was
+    /// dropped and the map is incomplete.
+    #[serde(default)]
+    pub body_truncated: bool,
+    /// The body named at least one path that is a glob or an expansion.
+    ///
+    /// Common and load-bearing: real scripts are full of `"$HOME/..."` and
+    /// `$REPO/...`, and we do not know what those name at gather time.
+    #[serde(default)]
+    pub body_unresolved: bool,
+    /// ANAI-206 item 3: some line of the body **writes** the control plane.
+    ///
+    /// Wired to a floor predicate, so this short-circuits to `Escalate` exactly
+    /// as the same write would on the command line. Scanned line by line rather
+    /// than over the whole body, because
+    /// [`cmd_norm::deny_variants`](crate::cmd_norm::deny_variants) truncates its
+    /// input at 8KB and a 16KB script would otherwise hide a write past that
+    /// boundary.
+    #[serde(default)]
+    pub writes_control_plane: bool,
+}
+
+/// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
+fn git_unknown() -> GitFact {
+    GitFact::Unknown
 }
 
 impl ScriptBody {
@@ -422,6 +507,47 @@ impl ScriptBody {
                 self.status.as_token()
             ),
         }
+    }
+
+    /// ANAI-206 item 3: the daemon's map of what the script touches.
+    ///
+    /// Rendered **outside** the `<script-body>` fence on purpose. These are
+    /// daemon-computed facts about attacker-influenced tokens; putting them
+    /// inside the untrusted fence would let the script's own text forge lines
+    /// that read as facts. The tokens themselves are still neutralised by the
+    /// caller before they reach the prompt.
+    ///
+    /// Empty string when the body was not read: the refusal is already stated
+    /// inside the fence, and a "paths: (none)" block next to it would read as a
+    /// script that touches nothing.
+    #[must_use]
+    pub fn render_body_facts(&self) -> String {
+        if !self.status.included() {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        if self.writes_control_plane {
+            lines.push("  [this script WRITES the OpenFang control plane]".to_string());
+        }
+        if self.body_facts.is_empty() {
+            lines.push("  (no resolvable paths named inside the script)".to_string());
+        } else {
+            lines.extend(self.body_facts.iter().map(|f| format!("  {}", f.render())));
+        }
+        if self.body_truncated {
+            lines.push(
+                "  [...more paths named inside the script than shown; map is incomplete]"
+                    .to_string(),
+            );
+        }
+        if self.body_unresolved {
+            lines.push(
+                "  [at least one path inside the script was a glob or expansion and was not \
+                 resolved]"
+                    .to_string(),
+            );
+        }
+        lines.join("\n")
     }
 }
 
@@ -465,6 +591,18 @@ impl PathFactSheet {
         if matches!(&self.script_body, Some(b) if !b.status.included()) {
             return false;
         }
+        // ANAI-206 item 3. The same argument one level down: a script we read
+        // but could not fully map is a script whose effects we do not know. The
+        // body's paths are held to exactly the bar the command's own paths are.
+        if let Some(body) = &self.script_body {
+            if body.writes_control_plane
+                || body.body_truncated
+                || body.body_unresolved
+                || !body.body_facts.iter().all(PathFact::suppress_eligible)
+            {
+                return false;
+            }
+        }
         !self.truncated
             && !self.unresolved
             && !self.facts.is_empty()
@@ -506,6 +644,22 @@ impl PathFactSheet {
             token.push_str(&format!(" script={}", body.status.as_token()));
             if body.redactions > 0 {
                 token.push_str(&format!(" redacted={}", body.redactions));
+            }
+            // Guardrail 3's coverage, made countable: every script under
+            // `~/.openfang/scripts/` answers `no-repo`, and there the guardrail
+            // is inert.
+            token.push_str(&format!(" script_git={}", body.git.as_token()));
+            if body.status.included() {
+                token.push_str(&format!(" body_n={}", body.body_facts.len()));
+                if body.body_truncated {
+                    token.push_str(" body_truncated");
+                }
+                if body.body_unresolved {
+                    token.push_str(" body_unresolved");
+                }
+                if body.writes_control_plane {
+                    token.push_str(" body_control_plane");
+                }
             }
         }
         token
@@ -586,6 +740,49 @@ pub fn extract_path_tokens(command: &str, inner: &[String]) -> (Vec<String>, boo
     for source in std::iter::once(command).chain(inner.iter().map(String::as_str)) {
         for token in source.split_whitespace() {
             let token = token.trim_matches(|c| c == '"' || c == '\'');
+            if !looks_like_path(token) {
+                continue;
+            }
+            if is_unresolvable(token) {
+                unresolved = true;
+                continue;
+            }
+            let owned = token.to_string();
+            if !seen.contains(&owned) {
+                seen.push(owned);
+            }
+        }
+    }
+    (seen, unresolved)
+}
+
+/// ANAI-206 item 3: pull the path-shaped tokens out of a *script body*.
+///
+/// Separate from [`extract_path_tokens`] rather than a reuse of it, for three
+/// reasons that all come from the input being a file instead of a command line:
+///
+/// - Comments are stripped per line. A path named in a comment is not a path
+///   the shell acts on, and stating it as fact would be stating something
+///   false — the same rule the command itself is held to.
+/// - Leading redirect and grouping punctuation is trimmed, so `>~/x` yields
+///   `~/x` rather than a nonsense token.
+/// - The cap is [`MAX_BODY_PATH_FACTS`], applied by the caller, and overflow is
+///   reported rather than swallowed.
+///
+/// A token carrying an expansion (`"$HOME/x"`) is *not* a fact — we do not know
+/// what it names — so it sets the unresolved flag instead. That is the common
+/// case in real scripts and it is why item 3 buys the judge a map rather than a
+/// guarantee.
+#[must_use]
+pub fn extract_body_path_tokens(body: &str) -> (Vec<String>, bool) {
+    let mut seen: Vec<String> = Vec::new();
+    let mut unresolved = false;
+    let stripped = crate::gatekeeper::strip_shell_comments(body);
+    for line in stripped.lines() {
+        for token in line.split_whitespace() {
+            let token =
+                token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | ';' | ',' | '&' | '|'));
+            let token = token.trim_start_matches(['>', '<']);
             if !looks_like_path(token) {
                 continue;
             }
@@ -1001,6 +1198,11 @@ mod tests {
             status,
             content: matches!(status, ScriptBodyStatus::Included).then(|| "set -e\n".to_string()),
             redactions: 0,
+            git: GitFact::NoRepo,
+            body_facts: Vec::new(),
+            body_truncated: false,
+            body_unresolved: false,
+            writes_control_plane: false,
         }
     }
 
@@ -1059,6 +1261,105 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // ANAI-206 item 3: the body's own paths.
+    // -----------------------------------------------------------------------
+
+    /// Comments are stripped, redirect punctuation is trimmed, and an
+    /// expansion is recorded as blindness rather than invented as a fact.
+    #[test]
+    fn body_tokens_are_extracted_per_line() {
+        let (tokens, unresolved) = extract_body_path_tokens(
+            "#!/usr/bin/env bash\n\
+             set -e\n\
+             # touches ~/.openfang/agents/decoy.toml\n\
+             cargo build >./out/log.txt\n\
+             cp ./a.txt \"./b.txt\"\n\
+             rm -rf \"$HOME/scratch\"\n",
+        );
+        assert!(tokens.contains(&"./out/log.txt".to_string()), "{tokens:?}");
+        assert!(tokens.contains(&"./a.txt".to_string()), "{tokens:?}");
+        assert!(tokens.contains(&"./b.txt".to_string()), "{tokens:?}");
+        // A path named only in a comment is not a path the shell acts on.
+        assert!(
+            !tokens.iter().any(|t| t.contains("decoy")),
+            "comment token survived: {tokens:?}"
+        );
+        // ...and `$HOME/scratch` is blindness, not a fact.
+        assert!(unresolved);
+    }
+
+    /// The regression items 1 and 2 opened: a script whose body writes the
+    /// substrate must never be suppress-eligible on the strength of tidy
+    /// command-line metadata.
+    #[test]
+    fn a_body_that_writes_the_control_plane_poisons_the_sheet() {
+        let mut hostile = body(ScriptBodyStatus::Included);
+        hostile.writes_control_plane = true;
+        let sheet = PathFactSheet {
+            facts: vec![fact(
+                PathExistence::File,
+                GitFact::NoRepo,
+                true,
+                PathAuthority::Write,
+            )],
+            truncated: false,
+            unresolved: false,
+            script_body: Some(hostile),
+        };
+        assert!(!sheet.suppress_eligible());
+        assert!(sheet.as_log_token().contains("body_control_plane"));
+    }
+
+    /// A body we mapped only partly is a body whose effects we do not know —
+    /// the same rule the command's own paths are held to, one level down.
+    #[test]
+    fn a_partly_mapped_body_poisons_the_sheet() {
+        let base = PathFactSheet {
+            facts: vec![fact(
+                PathExistence::File,
+                GitFact::NoRepo,
+                true,
+                PathAuthority::Write,
+            )],
+            truncated: false,
+            unresolved: false,
+            script_body: Some(body(ScriptBodyStatus::Included)),
+        };
+        assert!(base.suppress_eligible());
+
+        for mutate in [
+            (|b: &mut ScriptBody| b.body_truncated = true) as fn(&mut ScriptBody),
+            |b: &mut ScriptBody| b.body_unresolved = true,
+            |b: &mut ScriptBody| {
+                b.body_facts = vec![fact(
+                    PathExistence::File,
+                    GitFact::Ignored,
+                    true,
+                    PathAuthority::Write,
+                )]
+            },
+        ] {
+            let mut b = body(ScriptBodyStatus::Included);
+            mutate(&mut b);
+            let sheet = PathFactSheet {
+                script_body: Some(b),
+                ..base.clone()
+            };
+            assert!(!sheet.suppress_eligible());
+        }
+    }
+
+    /// A refusal already states itself inside the fence; a "paths: (none)"
+    /// block beside it would read as a script that touches nothing.
+    #[test]
+    fn a_refused_body_renders_no_fact_block() {
+        assert_eq!(body(ScriptBodyStatus::OutsideReach).render_body_facts(), "");
+        assert!(!body(ScriptBodyStatus::Included)
+            .render_body_facts()
+            .is_empty());
+    }
+
     /// Guardrail 7. Every row the feature touched says so, refusal included —
     /// otherwise the corpus cannot price a guardrail that is costing coverage.
     #[test]
@@ -1074,7 +1375,10 @@ mod tests {
             unresolved: false,
             script_body: Some(body(ScriptBodyStatus::Included)),
         };
-        assert_eq!(sheet.as_log_token(), "n=1 rec=1 auth=1 script=included");
+        assert_eq!(
+            sheet.as_log_token(),
+            "n=1 rec=1 auth=1 script=included script_git=no-repo body_n=0"
+        );
 
         let refused = PathFactSheet {
             script_body: Some(body(ScriptBodyStatus::OutsideReach)),
@@ -1082,7 +1386,7 @@ mod tests {
         };
         assert_eq!(
             refused.as_log_token(),
-            "n=1 rec=1 auth=1 script=outside-reach"
+            "n=1 rec=1 auth=1 script=outside-reach script_git=no-repo"
         );
 
         let mut redacted_body = body(ScriptBodyStatus::Included);

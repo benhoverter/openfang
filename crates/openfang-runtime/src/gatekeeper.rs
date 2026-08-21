@@ -149,7 +149,7 @@ pub async fn build_gate_request(
             Err(_) => (Vec::new(), Vec::new(), true),
         };
 
-    let flags = GateFlags {
+    let mut flags = GateFlags {
         touches_control_plane: openfang_types::gatekeeper::touches_control_plane(raw_command),
         destructive_verb: openfang_types::gatekeeper::has_destructive_verb(&bases, &inner),
         redirect_outside_workspace: openfang_types::gatekeeper::redirects_outside_workspace(
@@ -176,6 +176,9 @@ pub async fn build_gate_request(
         // flag is about what the agent *wrote*, not about what survives stripping.
         fence_escape: openfang_types::gatekeeper::contains_fence_marker(raw_command),
         parse_failed,
+        // ANAI-206 item 3. Set below, once the body has been read: it is the
+        // one floor predicate that cannot be computed from the command text.
+        script_body_control_plane: false,
     };
 
     // ANAI-190. Gathered from the *comment-stripped* command, for the same
@@ -187,6 +190,17 @@ pub async fn build_gate_request(
     // `file_policy` tier lookup. No file contents are read, so there is nothing
     // here that can leak a byte the requesting agent could not already see.
     let path_facts = crate::path_facts::gather(&command, &inner, workspace_root, file_policy).await;
+
+    // ANAI-206 item 3. Item 2 narrowed the control-plane floor to writes, which
+    // is what lets `bash ~/.openfang/scripts/foo.sh` reach the judge at all.
+    // This is the other half of that trade: a write to the substrate on line 40
+    // of the file that command runs fires the same floor it would fire on the
+    // command line. Without it the branch would have swapped a deterministic
+    // floor for the judge's reading comprehension.
+    flags.script_body_control_plane = path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.writes_control_plane);
 
     GateRequest {
         agent_name: agent_id.to_string(),

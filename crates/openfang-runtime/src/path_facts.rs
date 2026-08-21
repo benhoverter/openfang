@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use openfang_types::config::{FileAccessTier, FilePolicy};
 use openfang_types::path_facts::{
-    extract_path_tokens, redact_secrets, script_body_target, GitFact, PathAuthority, PathExistence,
-    PathFact, PathFactSheet, ScriptBody, ScriptBodyStatus, MAX_PATH_FACTS, MAX_SCRIPT_BODY_BYTES,
+    extract_body_path_tokens, extract_path_tokens, redact_secrets, script_body_target, GitFact,
+    PathAuthority, PathExistence, PathFact, PathFactSheet, ScriptBody, ScriptBodyStatus,
+    MAX_BODY_PATH_FACTS, MAX_PATH_FACTS, MAX_SCRIPT_BODY_BYTES,
 };
 
 /// Total wall-clock budget for *all* git queries behind one gate decision.
@@ -69,7 +70,23 @@ pub async fn gather(
     // ANAI-206 item 1. The one place in the gate that reads file bytes, and it
     // runs last on purpose: every guardrail it enforces is a fact the two
     // phases above computed.
-    let script_body = script_body_target(command, inner).map(|raw| read_script_body(&raw, &facts));
+    let mut script_body =
+        script_body_target(command, inner).map(|raw| read_script_body(&raw, &facts));
+
+    // ANAI-206 item 3, second phase: stat the paths the body named.
+    //
+    // A second git pass rather than one, because the body cannot be read until
+    // the script's own facts exist and the two phases therefore cannot be
+    // merged. It carries its own budget for the same reason the first one does:
+    // a slow repository costs a `GitFact::Unknown`, never the latency ceiling.
+    if let Some((body, tokens)) = script_body.as_mut() {
+        body.body_facts = tokens
+            .iter()
+            .map(|raw| stat_fact(raw, canon_ws.as_deref(), file_policy))
+            .collect();
+        annotate_git(&mut body.body_facts, canon_ws.as_deref()).await;
+    }
+    let script_body = script_body.map(|(body, _)| body);
 
     PathFactSheet {
         facts,
@@ -90,21 +107,32 @@ pub async fn gather(
 /// `raw` is [`script_body_target`]'s answer, so it is always a token the
 /// command itself wrote and always one the sheet already stat'd — the judge
 /// never chooses a path.
-fn read_script_body(raw: &str, facts: &[PathFact]) -> ScriptBody {
+fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) {
     let mut body = ScriptBody {
         raw: raw.to_string(),
         resolved: None,
         status: ScriptBodyStatus::Unreadable,
         content: None,
         redactions: 0,
+        git: GitFact::Unknown,
+        body_facts: Vec::new(),
+        body_truncated: false,
+        body_unresolved: false,
+        writes_control_plane: false,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
     // failed to resolve. Either way we have nothing to check reach against.
     let Some(fact) = facts.iter().find(|f| f.raw == raw) else {
-        return body;
+        return (body, Vec::new());
     };
     body.resolved = fact.resolved.clone();
+    // Recorded, not decided on: guardrail 3 refuses `Ignored` and `Unknown`
+    // below, so anything that survives is one of the other four. This exists so
+    // the audit row can say how much of the population is `NoRepo`, where that
+    // guardrail is structurally inert — `~/.openfang/scripts/` is not a
+    // repository, and it is the directory item 1 exists to serve.
+    body.git = fact.git;
 
     // Guardrail 2, first and unconditional. `Prompt` is excluded because the
     // operator already said they want to be asked about this path, and
@@ -112,7 +140,7 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> ScriptBody {
     // of — the ANAI-190 rule, unchanged.
     if !matches!(fact.authority, PathAuthority::Read | PathAuthority::Write) {
         body.status = ScriptBodyStatus::OutsideReach;
-        return body;
+        return (body, Vec::new());
     }
 
     // Guardrail 3. `Unknown` is a refusal, not a pass: the git budget expiring
@@ -120,11 +148,11 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> ScriptBody {
     match fact.git {
         GitFact::Ignored => {
             body.status = ScriptBodyStatus::Ignored;
-            return body;
+            return (body, Vec::new());
         }
         GitFact::Unknown => {
             body.status = ScriptBodyStatus::GitUnknown;
-            return body;
+            return (body, Vec::new());
         }
         _ => {}
     }
@@ -133,45 +161,55 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> ScriptBody {
     // the no-traversal invariant: a symlinked leaf is `Symlink`, never `File`,
     // and lands in `Unreadable` without being opened.
     if fact.existence != PathExistence::File {
-        return body;
+        return (body, Vec::new());
     }
 
     // Guardrail 4, on the stat first so an oversized file is never read into
     // memory at all.
     if fact.size_bytes.unwrap_or(u64::MAX) > MAX_SCRIPT_BODY_BYTES {
         body.status = ScriptBodyStatus::TooLarge;
-        return body;
+        return (body, Vec::new());
     }
 
     let Some(path) = fact.resolved.as_ref() else {
-        return body;
+        return (body, Vec::new());
     };
     let Ok(bytes) = std::fs::read(path) else {
-        return body;
+        return (body, Vec::new());
     };
     // ...and again on what we actually got, because the stat was taken earlier
     // and a file can grow between the two.
     if bytes.len() as u64 > MAX_SCRIPT_BODY_BYTES {
         body.status = ScriptBodyStatus::TooLarge;
-        return body;
+        return (body, Vec::new());
     }
 
     // Guardrail 5.
     let Ok(text) = String::from_utf8(bytes) else {
         body.status = ScriptBodyStatus::Binary;
-        return body;
+        return (body, Vec::new());
     };
     if looks_binary(&text) {
         body.status = ScriptBodyStatus::Binary;
-        return body;
+        return (body, Vec::new());
     }
+
+    // ANAI-206 item 3, first phase. Both of these read the *unredacted* text,
+    // for the reason in this function's doc comment: redaction can blank a line
+    // that names a control path, and a scan of the redacted form would then
+    // miss exactly what it is looking for.
+    body.writes_control_plane = openfang_types::gatekeeper::body_writes_control_plane(&text);
+    let (tokens, unresolved) = extract_body_path_tokens(&text);
+    body.body_truncated = tokens.len() > MAX_BODY_PATH_FACTS;
+    body.body_unresolved = unresolved;
+    let tokens: Vec<String> = tokens.into_iter().take(MAX_BODY_PATH_FACTS).collect();
 
     // Guardrail 6.
     let (redacted, redactions) = redact_secrets(&text);
     body.content = Some(redacted);
     body.redactions = redactions;
     body.status = ScriptBodyStatus::Included;
-    body
+    (body, tokens)
 }
 
 /// True when text carries control bytes in a shape no script has.
@@ -607,6 +645,129 @@ mod tests {
         let ws = tempdir("missing");
         let sheet = gather("rm ./nope.txt", &[], Some(&ws), None).await;
         assert_eq!(sheet.facts[0].existence, PathExistence::Missing);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-206 item 3, end to end against real files.
+    // -----------------------------------------------------------------------
+
+    /// A workspace whose whole tree is writable, which is the shape the item 1
+    /// guardrails require before a body is read at all.
+    fn writable_ws(name: &str) -> (PathBuf, FilePolicy) {
+        let ws = tempdir(name);
+        let policy = FilePolicy::new(
+            true,
+            FileAccessTier::Deny,
+            vec![FileRule {
+                path: ws.display().to_string(),
+                tier: FileAccessTier::Write,
+            }],
+        );
+        (ws, policy)
+    }
+
+    /// The regression items 1 and 2 opened, closed end to end: a script that
+    /// writes the substrate fires the floor even though the command line that
+    /// runs it is unremarkable.
+    #[tokio::test]
+    async fn a_script_that_writes_the_control_plane_is_flagged() {
+        let (ws, policy) = writable_ws("body-write");
+        std::fs::write(
+            ws.join("deploy.sh"),
+            "#!/usr/bin/env bash\nset -e\ncargo build\nrm -rf ~/.openfang/agents/\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./deploy.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.as_ref().expect("body read");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert!(body.writes_control_plane);
+        assert!(!sheet.suppress_eligible());
+        assert!(sheet.as_log_token().contains("body_control_plane"));
+    }
+
+    /// ...and item 2's win survives: a script that merely *reads* the control
+    /// plane still reaches the judge rather than short-circuiting.
+    #[tokio::test]
+    async fn a_script_that_only_reads_the_control_plane_is_not_flagged() {
+        let (ws, policy) = writable_ws("body-read");
+        std::fs::write(
+            ws.join("status.sh"),
+            "#!/usr/bin/env bash\ncat ~/.openfang/config.toml\nls ~/.openfang/agents\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./status.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.as_ref().expect("body read");
+        assert!(!body.writes_control_plane, "{body:?}");
+    }
+
+    /// The body's paths get the same treatment the command's do — stat, git,
+    /// containment, authority — rather than being left as prose for the judge
+    /// to parse.
+    #[tokio::test]
+    async fn the_bodys_paths_are_stat_like_any_other() {
+        let (ws, policy) = writable_ws("body-facts");
+        std::fs::write(ws.join("data.txt"), "x").unwrap();
+        std::fs::write(
+            ws.join("run.sh"),
+            "#!/usr/bin/env bash\nrm ./data.txt\nrm ./gone.txt\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./run.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.as_ref().expect("body read");
+        let by_raw = |raw: &str| {
+            body.body_facts
+                .iter()
+                .find(|f| f.raw == raw)
+                .unwrap_or_else(|| panic!("{raw} missing from {:?}", body.body_facts))
+                .clone()
+        };
+        let data = by_raw("./data.txt");
+        assert_eq!(data.existence, PathExistence::File);
+        assert!(data.inside_workspace);
+        assert_eq!(data.authority, PathAuthority::Write);
+        assert_eq!(by_raw("./gone.txt").existence, PathExistence::Missing);
+    }
+
+    /// Redaction runs *after* the scan, and that ordering is load-bearing: a
+    /// key that reads like a secret blanks its value, so scanning the redacted
+    /// form would lose the very path the map exists to record.
+    #[tokio::test]
+    async fn redaction_cannot_hide_a_path_from_the_map() {
+        // Distinct from the item 1 redaction test's directory: `tempdir` wipes
+        // the tree it is handed, and two tests sharing a name race.
+        let (ws, policy) = writable_ws("body-redact-order");
+        std::fs::write(
+            ws.join("run.sh"),
+            "#!/usr/bin/env bash\nAUTH_FILE=./creds.txt\nrm ./creds.txt\n",
+        )
+        .unwrap();
+
+        let sheet = gather("bash ./run.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.as_ref().expect("body read");
+        // The judge sees the redacted line...
+        assert!(body.content.as_ref().unwrap().contains("[redacted]"));
+        assert!(body.redactions > 0);
+        // ...and the map still knows the path.
+        assert!(
+            body.body_facts.iter().any(|f| f.raw == "./creds.txt"),
+            "{:?}",
+            body.body_facts
+        );
+    }
+
+    /// Guardrail 3 is structurally inert outside a repository, and that has to
+    /// be countable rather than inferred.
+    #[tokio::test]
+    async fn the_audit_row_records_the_scripts_git_answer() {
+        let (ws, policy) = writable_ws("body-git-token");
+        std::fs::write(ws.join("run.sh"), "echo hello\n").unwrap();
+
+        let sheet = gather("bash ./run.sh", &[], Some(&ws), Some(&policy)).await;
+        assert_eq!(sheet.script_body.as_ref().unwrap().git, GitFact::NoRepo);
+        assert!(sheet.as_log_token().contains("script_git=no-repo"));
     }
 
     /// The walk-up must not escape the workspace and adopt a parent
