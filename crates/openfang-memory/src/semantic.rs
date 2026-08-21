@@ -677,7 +677,7 @@ fn kind_from_metadata(metadata: &HashMap<String, serde_json::Value>) -> Option<S
 }
 
 /// Serialize embedding to bytes for SQLite BLOB storage.
-fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
+pub(crate) fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(embedding.len() * 4);
     for &val in embedding {
         bytes.extend_from_slice(&val.to_le_bytes());
