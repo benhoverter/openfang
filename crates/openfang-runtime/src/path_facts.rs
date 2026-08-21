@@ -119,6 +119,7 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
         body_truncated: false,
         body_unresolved: false,
         writes_control_plane: false,
+        destroys_substrate: false,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
@@ -199,6 +200,11 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     // that names a control path, and a scan of the redacted form would then
     // miss exactly what it is looking for.
     body.writes_control_plane = openfang_types::gatekeeper::body_writes_control_plane(&text);
+    // ANAI-206 commit 6. `writes_control_plane` is now a fact the judge weighs,
+    // so the hard case has to be named separately: a recursive removal of the
+    // substrate on line 40 of the file this command runs bypasses the judge for
+    // exactly the same reason it does on the command line.
+    body.destroys_substrate = openfang_types::gatekeeper::body_destroys_substrate(&text);
     let (tokens, unresolved) = extract_body_path_tokens(&text);
     body.body_truncated = tokens.len() > MAX_BODY_PATH_FACTS;
     body.body_unresolved = unresolved;

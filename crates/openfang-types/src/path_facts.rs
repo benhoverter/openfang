@@ -510,6 +510,17 @@ pub struct ScriptBody {
     /// boundary.
     #[serde(default)]
     pub writes_control_plane: bool,
+    /// ANAI-206 commit 6: some logical line of the body recursively removes the
+    /// substrate.
+    ///
+    /// Wired to [`GateFlags::substrate_destruction`](crate::gatekeeper::GateFlags::substrate_destruction),
+    /// which is one of the four predicates that bypass the judge. Without it,
+    /// commit 6 would reopen the hole commits 3 and 4 closed:
+    /// `writes_control_plane` is now a fact the judge weighs, so a body
+    /// containing `rm -rf ~/.openfang/agents` would depend on the judge reading
+    /// that line and noticing.
+    #[serde(default)]
+    pub destroys_substrate: bool,
 }
 
 /// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
@@ -562,6 +573,9 @@ impl ScriptBody {
             return String::new();
         }
         let mut lines: Vec<String> = Vec::new();
+        if self.destroys_substrate {
+            lines.push("  [this script RECURSIVELY REMOVES the OpenFang substrate]".to_string());
+        }
         if self.writes_control_plane {
             lines.push("  [this script WRITES the OpenFang control plane]".to_string());
         }
@@ -632,6 +646,7 @@ impl PathFactSheet {
         // body's paths are held to exactly the bar the command's own paths are.
         if let Some(body) = &self.script_body {
             if body.writes_control_plane
+                || body.destroys_substrate
                 || body.body_truncated
                 || body.body_unresolved
                 || !body.body_facts.iter().all(PathFact::suppress_eligible)
@@ -695,6 +710,9 @@ impl PathFactSheet {
                 }
                 if body.writes_control_plane {
                     token.push_str(" body_control_plane");
+                }
+                if body.destroys_substrate {
+                    token.push_str(" body_substrate_destruction");
                 }
             }
         }
@@ -1258,6 +1276,7 @@ mod tests {
             body_truncated: false,
             body_unresolved: false,
             writes_control_plane: false,
+            destroys_substrate: false,
         }
     }
 

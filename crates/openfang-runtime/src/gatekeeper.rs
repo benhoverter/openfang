@@ -181,6 +181,15 @@ pub async fn build_gate_request(
         script_body_control_plane: false,
         // ANAI-206 F1. Same: it is a fact about a read that has not happened yet.
         script_body_blind: false,
+        // ANAI-206 commit 6. The destructive member of the hard floor. Computed
+        // on `raw_command` like the other verb predicates: what the agent wrote
+        // is the question, not what survives comment stripping. OR'd with the
+        // script-body answer below.
+        substrate_destruction: openfang_types::gatekeeper::destroys_substrate(raw_command),
+        // ANAI-206 commit 6. Pre-existing control, kept alive across the
+        // demotion of `touches_control_plane`: a write to the judge's own
+        // instructions is not a question the judge can be asked.
+        policy_self_modification: openfang_types::gatekeeper::writes_gatekeeper_policy(raw_command),
     };
 
     // ANAI-190. Gathered from the *comment-stripped* command, for the same
@@ -203,6 +212,16 @@ pub async fn build_gate_request(
         .script_body
         .as_ref()
         .is_some_and(|b| b.writes_control_plane);
+
+    // ANAI-206 commit 6. Same trade one level down, and the reason commit 6 is
+    // not a regression against commits 3 and 4: `script_body_control_plane` is
+    // now a fact the judge weighs, so the case no judgement could excuse — a
+    // recursive removal of the substrate inside the body — is lifted out and
+    // kept hard.
+    flags.substrate_destruction |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.destroys_substrate);
 
     // ANAI-206 F1. Item 2 let a control-plane *read* fall through to the judge
     // on the strength of item 1 handing over the body. Where item 1 refused,
@@ -469,7 +488,12 @@ mod tests {
     async fn network_binary_hits_the_floor() {
         let req = build_gate_request("a", "curl https://example.com", &policy(), None, None).await;
         assert!(req.flags.network_binary);
-        assert_eq!(req.floor(), GateVerdict::Escalate);
+        // ANAI-206 commit 6: the flag still fires, but a network binary is a
+        // fact the judge weighs, not a bypass. `curl` fetching a public URL and
+        // `curl` posting a secrets file are the same flag and different
+        // commands, and telling them apart is what the judge is for.
+        assert!(!req.flags.hard(), "{}", req.flags.as_log_string());
+        assert_eq!(req.floor(), GateVerdict::Suppress);
     }
 
     #[tokio::test]
@@ -559,7 +583,12 @@ mod tests {
             "flags: {}",
             req.flags.as_log_string()
         );
-        assert_eq!(req.floor(), GateVerdict::Escalate);
+        // ANAI-206 commit 6: demoted to a fact. The judge sees `egress` on the
+        // flags line and the operator policy tells it to escalate a push — but
+        // it is now a judgement, and the corpus will say whether the judge
+        // makes it. That number is the flip decision.
+        assert!(!req.flags.hard(), "{}", req.flags.as_log_string());
+        assert_eq!(req.floor(), GateVerdict::Suppress);
     }
 
     /// The other half of verb granularity: reads must stay suppressible, or the
@@ -594,7 +623,11 @@ mod tests {
             req.flags.as_log_string()
         );
         assert!(req.flags.mutation_verb);
-        assert_eq!(req.floor(), GateVerdict::Escalate);
+        // ANAI-206 commit 6: demoted. This is the exact shape the fact sheet
+        // was built to decide — `/etc/motd` is outside the workspace and the
+        // sheet says so, which is what rule 4 tells the judge to escalate on.
+        assert!(!req.flags.hard(), "{}", req.flags.as_log_string());
+        assert_eq!(req.floor(), GateVerdict::Suppress);
     }
 
     #[tokio::test]
@@ -612,10 +645,19 @@ mod tests {
             "flags: {}",
             req.flags.as_log_string()
         );
+        // ANAI-206 commit 6: `opaque_execution` was demoted, so this command
+        // reaching Escalate is now load-bearing on `parse_failed` — an inline
+        // interpreter source does not tokenize, and unjudgeable stays hard.
+        assert!(req.flags.parse_failed, "{}", req.flags.as_log_string());
         assert_eq!(req.floor(), GateVerdict::Escalate);
     }
 
-    /// ANAI-154 F2. Rewriting the judge's own policy file is control plane.
+    /// ANAI-154 F2, carried through the ANAI-206 commit 6 inversion.
+    ///
+    /// `touches_control_plane` used to carry this, and that flag is now a fact
+    /// the judge weighs — so without an explicit predicate the inversion would
+    /// have handed "may I rewrite your instructions?" to the judge as an
+    /// ordinary question. It stays hard under its own name.
     #[tokio::test]
     async fn writing_the_gatekeeper_policy_hits_the_floor() {
         let req = build_gate_request(
@@ -631,6 +673,64 @@ mod tests {
             "flags: {}",
             req.flags.as_log_string()
         );
+        assert!(
+            req.flags.policy_self_modification,
+            "flags: {}",
+            req.flags.as_log_string()
+        );
+        assert!(req.flags.hard());
         assert_eq!(req.floor(), GateVerdict::Escalate);
+    }
+
+    /// ...and a *read* of the same file is not. The judge can see the whole
+    /// command, so reconnaissance is a judgement, not a bypass.
+    #[tokio::test]
+    async fn reading_the_gatekeeper_policy_reaches_the_judge() {
+        let req = build_gate_request(
+            "a",
+            "cat ~/.openfang/gatekeeper.md",
+            &policy(),
+            Some(std::path::Path::new("/ws")),
+            None,
+        )
+        .await;
+        assert!(req.flags.touches_control_plane);
+        assert!(!req.flags.policy_self_modification);
+        assert_eq!(req.floor(), GateVerdict::Suppress);
+    }
+
+    /// The command Ben named: routine, destructive-flagged, on the agent's own
+    /// path. Before commit 6 it short-circuited to Escalate and the judge never
+    /// saw it. Now it reaches the judge with `destructive` stated.
+    #[tokio::test]
+    async fn a_scratch_file_removal_reaches_the_judge() {
+        let req = build_gate_request(
+            "a",
+            "rm ./scratch/tmp-patch.sh",
+            &policy(),
+            Some(std::path::Path::new("/ws")),
+            None,
+        )
+        .await;
+        assert!(req.flags.destructive_verb);
+        assert!(!req.flags.hard(), "{}", req.flags.as_log_string());
+        assert_eq!(req.floor(), GateVerdict::Suppress);
+    }
+
+    /// ...and the command Ben named on the other side. Substrate, recursive,
+    /// no slash. The judge is not consulted and does not need to be.
+    #[tokio::test]
+    async fn a_bare_root_wipe_never_reaches_the_judge() {
+        for cmd in ["rm -rf ~/.openfang", "rm -rf ~/.openfang/agents"] {
+            let req =
+                build_gate_request("a", cmd, &policy(), Some(std::path::Path::new("/ws")), None)
+                    .await;
+            assert!(
+                req.flags.substrate_destruction,
+                "{cmd} → {}",
+                req.flags.as_log_string()
+            );
+            assert_eq!(req.floor(), GateVerdict::Escalate, "{cmd}");
+        }
     }
 }

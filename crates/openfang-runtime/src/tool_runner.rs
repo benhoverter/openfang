@@ -8853,9 +8853,19 @@ mod tests {
         // never billed. `--version` keeps the executed command harmless.
         let fake = Arc::new(FakeKernelHandle::new());
         let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
-        let policy = gate_policy("curl");
+        let policy = gate_policy("cp");
 
-        let _ = run_gated(&handle, &policy, "curl --version").await;
+        // ANAI-206 commit 6: `network` is a fact the judge weighs now, not a
+        // bypass, so this pins the property on a predicate that is still hard.
+        // A write to the judge's own policy file is not a question the judge
+        // can be asked. Source and destination are the same path, so the
+        // command is inert even if it were ever executed.
+        let _ = run_gated(
+            &handle,
+            &policy,
+            "cp ~/.openfang/gatekeeper.md ~/.openfang/gatekeeper.md",
+        )
+        .await;
 
         assert!(
             !fake
@@ -9076,9 +9086,19 @@ mod tests {
                 .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
         );
         let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
-        let policy = gate_policy("curl");
+        let policy = gate_policy("cp");
 
-        let result = run_gated(&handle, &policy, "curl https://example.com").await;
+        // ANAI-206 commit 6: pinned on `policy_self_modification` rather than
+        // `network`, which is now a fact the judge weighs. The property under
+        // test is unchanged — a hard floor short-circuits before the model
+        // call. Source and destination are the same path, so the command is
+        // inert regardless.
+        let result = run_gated(
+            &handle,
+            &policy,
+            "cp ~/.openfang/gatekeeper.md ~/.openfang/gatekeeper.md",
+        )
+        .await;
 
         assert!(
             !fake
