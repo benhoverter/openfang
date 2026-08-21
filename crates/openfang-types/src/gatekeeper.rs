@@ -672,8 +672,7 @@ impl GateRequest {
         // attacker-reachable, because "which of these is agent-influenced" is
         // exactly the kind of fact that quietly stops being true.
         let agent = neutralize_header_field(&self.agent_name);
-        let workspace =
-            neutralize_header_field(self.workspace_root.as_deref().unwrap_or("(none)"));
+        let workspace = neutralize_header_field(self.workspace_root.as_deref().unwrap_or("(none)"));
         let auto_tiers = neutralize_header_field(&join_or_none(
             &self
                 .safe_bins

@@ -137,6 +137,7 @@ fn classify_approver(
 ///   custom_id asks.
 /// - `"tool"`: refused for shell_exec (that blanket trust is
 ///   `exec_policy.mode = full`, not a per-prompt cache).
+///
 /// Any other token (incl. `"once"` / None / unknown) yields `None`.
 fn cache_scope_from_token(
     token: Option<&str>,

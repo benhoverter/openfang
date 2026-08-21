@@ -3253,6 +3253,13 @@ impl OpenFangKernel {
         }
     }
 
+    // 11 positional args is over clippy's 7-arg threshold. Left as-is
+    // deliberately: this is the single hot path every turn funnels through, its
+    // params are heterogeneous one-shot values (not a cohesive struct), and
+    // every one is already named at each of its call sites. Bundling them into
+    // a `LlmTurnParams` would move the argument list, not shorten it, and would
+    // churn the highest-traffic seam in the kernel for no readability win.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_llm_agent(
         &self,
         entry: &AgentEntry,
@@ -6140,7 +6147,7 @@ impl OpenFangKernel {
             // turn is autonomous, not a channel delivery). This is the flip
             // the step-1 comment promised.
             TurnPolicy::woken(),
-            envelope.trigger.clone(),
+            envelope.trigger,
         );
         // ANAI-110: scope the inbound wake lineage into task-local context for
         // the whole woken turn, so a nested `agent_send_async` extends the REAL

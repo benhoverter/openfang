@@ -25,8 +25,8 @@
 //! `allowed_commands`" — which is precisely the tier this gate is defined over.
 //! No 65-manifest migration; the gatekeeper intercepts the existing funnel.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use openfang_types::gatekeeper::{
     GateFlags, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,

@@ -420,9 +420,9 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
                 r.from, r.to
             )));
         }
-        validate_presets(r).map_err(|reason| invalid(reason))?;
-        validate_options(r).map_err(|reason| invalid(reason))?;
-        validate_argv_tokens(r).map_err(|reason| invalid(reason))?;
+        validate_presets(r).map_err(invalid)?;
+        validate_options(r).map_err(invalid)?;
+        validate_argv_tokens(r).map_err(invalid)?;
         let key = (r.from.to_ascii_lowercase(), r.to.to_ascii_lowercase());
         if !seen.insert(key) {
             return Err(invalid(format!(

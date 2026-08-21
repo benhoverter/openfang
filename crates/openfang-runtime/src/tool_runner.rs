@@ -2934,25 +2934,24 @@ async fn tool_agent_send(
         .await
 }
 
-/// Wake-emission rate backstops (ANAI-111).
-///
-/// Two sliding-window counters guard two DIFFERENT amplification modes; both
-/// are tunable via the `[agent_wake]` config section / `OPENFANG_AGENT_WAKE_*`
-/// env vars (see [`openfang_types::agent_wake`]) and both self-GC once
-/// emissions go quiet:
-///
-/// * [`wake_tree_admit`] — the **per-tree budget** (req 10), keyed on the
-///   lineage root. Since lineage threading landed (ANAI-110) the cross-hop
-///   cycle (req 4) and depth (req 9) bounds enforce for real — but neither
-///   catches *fan-out*: a tree that never repeats an agent and never exceeds
-///   the depth bound can still emit `F^k` wakes. Charging the root for its
-///   whole subtree's rate closes that hole.
-/// * [`wake_emit_admit`] — the coarse **aggregate ceiling** across ALL trees.
-///   N trees each under their own per-tree budget still sum to `N * budget` of
-///   fleet-wide load; this bounds that aggregate. It only ever refuses, never
-///   permits — harmless defense-in-depth the per-tree budget does not subsume.
+// Wake-emission rate backstops (ANAI-111).
+//
+// Two sliding-window counters guard two DIFFERENT amplification modes; both
+// are tunable via the `[agent_wake]` config section / `OPENFANG_AGENT_WAKE_*`
+// env vars (see `openfang_types::agent_wake`) and both self-GC once
+// emissions go quiet:
+//
+// * `wake_tree_admit` — the per-tree budget (req 10), keyed on the lineage
+//   root. Since lineage threading landed (ANAI-110) the cross-hop cycle
+//   (req 4) and depth (req 9) bounds enforce for real — but neither catches
+//   fan-out: a tree that never repeats an agent and never exceeds the depth
+//   bound can still emit `F^k` wakes. Charging the root for its whole
+//   subtree's rate closes that hole.
+// * `wake_emit_admit` — the coarse aggregate ceiling across ALL trees. N
+//   trees each under their own per-tree budget still sum to `N * budget` of
+//   fleet-wide load; this bounds that aggregate. It only ever refuses, never
+//   permits — harmless defense-in-depth the per-tree budget does not subsume.
 
-/// Record-and-test the process-global aggregate wake-emission window. Returns
 /// Process-global sliding window backing [`wake_emit_admit`]. Hoisted to module
 /// scope (rather than a fn-local `static`) so the test-only
 /// [`reset_wake_emit_window`] can drain it: the aggregate ceiling is a shared
@@ -2964,9 +2963,12 @@ static WAKE_EMIT_WINDOW: std::sync::OnceLock<
     std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
 > = std::sync::OnceLock::new();
 
-/// `true` if admitted (and stamps it into the window), `false` if the trailing
-/// window is already at [`emit_max`](openfang_types::agent_wake::emit_max)
-/// capacity — in which case the caller must refuse the wake.
+/// Record-and-test the process-global aggregate wake-emission window.
+///
+/// Returns `true` if admitted (and stamps it into the window), `false` if the
+/// trailing window is already at
+/// [`emit_max`](openfang_types::agent_wake::emit_max) capacity — in which case
+/// the caller must refuse the wake.
 fn wake_emit_admit() -> bool {
     use std::collections::VecDeque;
     use std::sync::Mutex;
