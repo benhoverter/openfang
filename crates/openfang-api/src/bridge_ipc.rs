@@ -1584,6 +1584,179 @@ mod tests {
         );
     }
 
+    /// **Invariant C (per-tool schema correspondence).**
+    ///
+    /// Invariant A proves the two surfaces agree on *tool names*. It says
+    /// nothing about the *shape* of each tool, and that gap has now bitten
+    /// twice: `surface_to` (ANAI-126) and `timeout_secs` (ANAI-196) were
+    /// both added to `openfang_runtime::tool_runner::builtin_tool_definitions()`
+    /// and forgotten in `openfang_mcp_bridge::built_in_tools()`, so every
+    /// bridge-backed agent was structurally unable to pass a parameter the
+    /// runtime accepts.
+    ///
+    /// Both times the response was a hand-written, field-by-field
+    /// `contains_key("surface_to")` guard living in the bridge crate. That
+    /// shape cannot work: it only catches the *one* field someone thought to
+    /// name, and the bridge crate has no dependency on the runtime, so it can
+    /// only ever compare a literal against another literal. This test lives
+    /// in `openfang-api` — the one crate that depends on both — and asserts
+    /// **set equality of `properties` keys and of `required`** for every
+    /// mirrored tool. A new field on either side fails here by construction,
+    /// with no per-field maintenance.
+    ///
+    /// If you're here because this test failed: the two schemas for the named
+    /// tool disagree. Mirror the field into
+    /// `crates/openfang-mcp-bridge/src/lib.rs` (`built_in_tools`), copying the
+    /// description verbatim from `tool_runner.rs`. Do **not** add a new
+    /// single-field assertion — this test already covers it.
+    ///
+    /// Deliberately *not* asserted: description prose and per-property
+    /// details (`type`, `enum`, `description`). Those drift benignly and
+    /// pinning them would make this test a rewrite-tax on every copy edit.
+    /// The failure mode we care about is a parameter that is *unreachable*
+    /// through the bridge, which is exactly a key-set difference.
+    ///
+    /// Known, deliberate divergences live in `MIRROR_EXCEPTIONS` below, each
+    /// with a reason. The list is self-cleaning: an exception that is no
+    /// longer divergent fails the test, so a stale waiver cannot silently
+    /// blind the check.
+    /// `(tool, property, why)` — deliberate divergences, exempt from the
+    /// equality assertion.
+    const MIRROR_EXCEPTIONS: &[(&str, &str, &str)] = &[
+        (
+            "file_convert",
+            "options",
+            "ANAI-131: the static bridge entry ships WITHOUT `options` by \
+                 design. The dispatcher injects a live projection computed \
+                 daemon-side from the recipe manifest \
+                 (`inject_convert_options`), so the advertised surface matches \
+                 the recipes actually installed. A static mirror here would be \
+                 wrong, not merely redundant. Covered by \
+                 `openfang_mcp_bridge::tests::file_convert_advertises_injected_options_schema`.",
+        ),
+        (
+            "channel_send",
+            "image_url",
+            "ANAI-196 finding: unmirrored, pending review — see below.",
+        ),
+        (
+            "channel_send",
+            "file_url",
+            "ANAI-196 finding: unmirrored, pending review — see below.",
+        ),
+        (
+            "channel_send",
+            "file_path",
+            "ANAI-196 finding: unmirrored, pending review. `file_path` \
+                 makes `tool_channel_send` read local disk \
+                 (`resolve_file_path` + `fs::read`) and ship the bytes to an \
+                 arbitrary channel recipient, yet `channel_send` is \
+                 deliberately absent from `FS_SANDBOXED_TOOLS` — whose doc \
+                 comment asserts it does not touch the filesystem. It does. \
+                 An agent with no registered workspace therefore gets the \
+                 unscoped `resolve_file_path` fallback. Mirroring these four \
+                 properties would make that path discoverable to every bridge \
+                 agent, so it waits on the sandbox decision rather than riding \
+                 along with a schema fix.",
+        ),
+        (
+            "channel_send",
+            "filename",
+            "ANAI-196 finding: unmirrored, pending review — see `file_path`.",
+        ),
+    ];
+
+    #[test]
+    fn advertised_tool_schemas_match_runtime() {
+        use openfang_mcp_bridge::built_in_tools;
+        use openfang_runtime::tool_runner::builtin_tool_definitions;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        fn key_set(schema: &serde_json::Value, field: &str) -> BTreeSet<String> {
+            match field {
+                "properties" => schema
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default(),
+                _ => schema
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }
+
+        let runtime: BTreeMap<String, serde_json::Value> = builtin_tool_definitions()
+            .into_iter()
+            .map(|d| (d.name, d.input_schema))
+            .collect();
+
+        let mut drift: Vec<String> = Vec::new();
+        // Exceptions actually exercised this run; anything declared but never
+        // hit is stale and fails below.
+        let mut waivers_used: BTreeSet<(String, String)> = BTreeSet::new();
+
+        for tool in built_in_tools() {
+            let name = tool.name.as_ref().to_string();
+            let Some(runtime_schema) = runtime.get(&name) else {
+                drift.push(format!(
+                    "{name}: advertised by the bridge but absent from \
+                     builtin_tool_definitions() — nothing to mirror against"
+                ));
+                continue;
+            };
+            let bridge_schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+
+            for field in ["properties", "required"] {
+                let bridge_keys = key_set(&bridge_schema, field);
+                let runtime_keys = key_set(runtime_schema, field);
+                let missing: Vec<&String> = runtime_keys
+                    .difference(&bridge_keys)
+                    .filter(|k| {
+                        let waived = field == "properties"
+                            && MIRROR_EXCEPTIONS
+                                .iter()
+                                .any(|(t, p, _)| *t == name && *p == k.as_str());
+                        if waived {
+                            waivers_used.insert((name.clone(), (*k).clone()));
+                        }
+                        !waived
+                    })
+                    .collect();
+                let extra: Vec<&String> = bridge_keys.difference(&runtime_keys).collect();
+                if !missing.is_empty() || !extra.is_empty() {
+                    drift.push(format!(
+                        "{name}.{field}: missing from bridge {missing:?}, \
+                         extra on bridge {extra:?}"
+                    ));
+                }
+            }
+        }
+
+        let declared: BTreeSet<(String, String)> = MIRROR_EXCEPTIONS
+            .iter()
+            .map(|(t, p, _)| ((*t).to_string(), (*p).to_string()))
+            .collect();
+        let stale: Vec<&(String, String)> = declared.difference(&waivers_used).collect();
+        assert!(
+            stale.is_empty(),
+            "stale MIRROR_EXCEPTIONS entries — these no longer diverge, so the \
+             waiver is blinding the check for nothing. Delete them: {stale:?}",
+        );
+
+        assert!(
+            drift.is_empty(),
+            "schema drift between openfang_runtime::tool_runner::builtin_tool_definitions() \
+             and openfang_mcp_bridge::built_in_tools():\n  {}",
+            drift.join("\n  "),
+        );
+    }
+
     /// Pins the tool-surface cardinality. Bumps are expected when a new
     /// bridge tool lands — update intentionally, in lockstep with the sets
     /// exercised by [`allowlist_surface_correspondence`].

@@ -365,13 +365,18 @@ pub fn built_in_tools() -> Vec<Tool> {
              or to avoid the head-of-line blocking of a synchronous A->B call. \
              Accepts UUID or agent name. Optionally pass surface_to \
              (\"<channel>:<recipient>\") to have the target's eventual \
-             agent_reply_async answer auto-posted to that channel.",
+             agent_reply_async answer auto-posted to that channel. \
+             You are GUARANTEED exactly one reply per call: if the target \
+             answers, you get its answer; if it cannot or does not, the daemon \
+             closes the correlation itself and tells you why. Pass timeout_secs \
+             to bound how long that takes.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "agent_id": { "type": "string", "description": "The target agent's UUID or name to wake" },
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" },
-                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." }
+                    "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." },
+                    "timeout_secs": { "type": "integer", "description": "Optional deadline in seconds. You are guaranteed a reply within roughly this long: if the target has not answered by then, its turn is ABORTED and the daemon sends you a timeout reply instead. Set it to how long you actually expect the work to take, with headroom — an over-tight value kills legitimate work, and partial side effects from the aborted turn may persist. Clamped into the operator's configured band; omit to accept the configured default." }
                 },
                 "required": ["agent_id", "message"]
             })),
@@ -889,58 +894,25 @@ mod tests {
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"
         );
-
-        // Property-level drift guard (ANAI-126). The name-list assertion above
-        // only checks that a tool *exists* — a field silently dropped from an
-        // existing tool's schema slides right past it. `surface_to` did exactly
-        // that: it landed in the runtime (ANAI-123) but was never mirrored here,
-        // leaving every subprocess/bridge agent blind to the param. Assert the
-        // surfacing route is advertised on agent_send_async, in lockstep with
-        // the runtime tool_runner schema.
-        let send_async = tools
-            .iter()
-            .find(|t| t.name.as_ref() == "agent_send_async")
-            .expect("agent_send_async must be advertised");
-        let props = send_async
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("agent_send_async schema must declare a `properties` object");
-        assert!(
-            props.contains_key("surface_to"),
-            "schema drift — agent_send_async must advertise `surface_to` to \
-             mirror the runtime tool_runner schema (ANAI-126); subprocess agents \
-             cannot set a param the bridge never told them exists"
-        );
     }
 
-    /// ANAI-166, same class of guard as the `surface_to` assertion above.
+    /// ANAI-196: the *field-presence* half of this guard is gone. It now lives
+    /// in `openfang_api::bridge_ipc::tests::advertised_tool_schemas_match_runtime`
+    /// (Invariant C), which asserts property-set equality against the runtime
+    /// for every mirrored tool rather than naming one field at a time. Two
+    /// escapes (`surface_to`, `timeout_secs`) proved the per-field shape does
+    /// not work; do not reintroduce it here.
     ///
-    /// `memory_recall` grew a `query` param and dropped `key` from `required`.
-    /// Both halves are silent if they drift: a bridge still advertising
-    /// `required: ["key"]` makes every subprocess agent unable to search, and
-    /// one missing `query` entirely makes them unable to even try — with no
-    /// error at any layer, because the name-list test above still passes.
+    /// What remains is the part Invariant C deliberately cannot express: an
+    /// *intentional divergence rule*. `memory_recall` takes exactly one of
+    /// `query`/`key`, enforced in the handler, so `required` must stay empty.
     #[test]
-    fn bridge_memory_recall_advertises_query_and_requires_neither() {
+    fn bridge_memory_recall_requires_neither_query_nor_key() {
         let tools = built_in_tools();
         let recall = tools
             .iter()
             .find(|t| t.name.as_ref() == "memory_recall")
             .expect("memory_recall must be advertised");
-
-        let props = recall
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("memory_recall schema must declare a `properties` object");
-        for param in ["query", "key", "scope", "kind", "limit"] {
-            assert!(
-                props.contains_key(param),
-                "schema drift — memory_recall must advertise `{param}` to mirror \
-                 the runtime tool_runner schema (ANAI-166)"
-            );
-        }
 
         // Additive-only rule: `key` must never become required again, or the
         // search shape becomes uncallable over the bridge.
@@ -955,23 +927,6 @@ mod tests {
              handler; `required` must stay empty because provider support for \
              anyOf/oneOf is uneven and the bridge re-serializes this schema"
         );
-    }
-
-    /// ANAI-166: the note tool must cross the bridge with its real shape.
-    #[test]
-    fn bridge_memory_note_advertises_text_and_tags() {
-        let tools = built_in_tools();
-        let note = tools
-            .iter()
-            .find(|t| t.name.as_ref() == "memory_note")
-            .expect("memory_note must be advertised");
-        let props = note
-            .input_schema
-            .get("properties")
-            .and_then(|p| p.as_object())
-            .expect("memory_note schema must declare a `properties` object");
-        assert!(props.contains_key("text"));
-        assert!(props.contains_key("tags"));
     }
 
     #[test]
@@ -1008,7 +963,7 @@ mod tests {
             .and_then(|p| p.get("options"))
             .and_then(|o| o.get("properties"))
             .and_then(|p| p.as_object())
-            .map_or(false, |p| p.contains_key("orientation"));
+            .is_some_and(|p| p.contains_key("orientation"));
         assert!(
             has_orientation,
             "injected options schema must carry the projected orientation property"
@@ -1037,7 +992,7 @@ mod tests {
             .input_schema
             .get("properties")
             .and_then(|p| p.as_object())
-            .map_or(false, |p| p.contains_key("options"));
+            .is_some_and(|p| p.contains_key("options"));
         assert!(
             !has_options,
             "no dispatcher options -> no injected options property"
