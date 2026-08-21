@@ -128,6 +128,20 @@ pub const CONTROL_PLANE_ROOT: &str = ".openfang/";
 pub const CONTROL_PLANE_BENIGN_PREFIXES: &[&str] =
     &[".openfang/workspaces/", ".openfang/logs/", ".openfang/tmp/"];
 
+/// The judge's own policy text. Unconditionally control plane — see
+/// [`touches_control_plane`], which makes every *other* control path
+/// write-sensitive but never this one.
+pub const GATEKEEPER_POLICY_PATH: &str = ".openfang/gatekeeper.md";
+
+/// Binaries in [`PATH_WRITING_BINS`] / [`MUTATION_VERBS`] that only write when
+/// an in-place flag is present. `sed -n 'p' f` prints; `sed -i 's/a/b/' f`
+/// rewrites. ANAI-206: the two must land on opposite sides of the write test,
+/// or half the fleet's read-only `sed` invocations keep short-circuiting.
+pub const IN_PLACE_ONLY_BINS: &[&str] = &["sed", "perl", "ruby", "awk"];
+
+/// Flags that turn an [`IN_PLACE_ONLY_BINS`] invocation into a write.
+pub const IN_PLACE_FLAGS: &[&str] = &["-i", "--in-place"];
+
 /// Binaries whose ordinary job is to move bytes off this machine or pull code
 /// onto it. Coarse by design: there is no read-only mode of `npm` or `gh` that
 /// a string predicate can tell apart from a publishing one.
@@ -250,8 +264,8 @@ pub const MUTATION_VERBS: &[(&str, &[&str])] = &[
             "apply",
         ],
     ),
-    ("sed", &["-i"]),
-    ("perl", &["-i"]),
+    ("sed", &["-i", "--in-place"]),
+    ("perl", &["-i", "--in-place"]),
     ("find", &["-delete", "-exec", "-execdir", "-ok", "-okdir"]),
     ("crontab", &["-r"]),
 ];
@@ -464,8 +478,11 @@ impl GateReview {
 /// RED floor: the model can narrow past none of them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateFlags {
-    /// Command references `~/.openfang/{agents,daemon,scripts}` or the root
-    /// config — the substrate the whole fleet runs on.
+    /// Command **writes** the substrate the whole fleet runs on —
+    /// `~/.openfang/` outside the benign subtrees. ANAI-206: a read of a
+    /// control path no longer fires this and falls through to the judge
+    /// instead; `~/.openfang/gatekeeper.md` is the one path where reading
+    /// still counts. See [`touches_control_plane`].
     pub touches_control_plane: bool,
     /// A destructive binary appears among the bases or inner commands.
     pub destructive_verb: bool,
@@ -870,36 +887,148 @@ fn strip_line_comment(line: &str) -> &str {
 // Deterministic floor predicates
 // ---------------------------------------------------------------------------
 
-/// True if any deobfuscated variant of `command` names the control plane.
+/// True if any deobfuscated variant of `command` **writes** the control plane.
 ///
 /// Matched over [`crate::cmd_norm::deny_variants`] rather than the raw string,
 /// so `~/.open""fang/agents` folds to the same hit.
+///
+/// # Why this is write-aware (ANAI-206)
+///
+/// ANAI-154 and ANAI-184 shipped this as pure string containment: a command
+/// that merely *mentioned* a control path forced `Escalate` through the floor,
+/// and the floor short-circuits before the judge is billed. In the audit corpus
+/// that put 32 of 106 short-circuits — 24 of them `bash ~/.openfang/scripts/*.sh`
+/// — permanently out of the judge's reach, so the one population the gate was
+/// built for could never be decided by it.
+///
+/// The predicate the floor actually wants is *writes the substrate*, not
+/// *names the substrate*. A read falls through to the judge, which is a
+/// narrowing of the floor's reach but not of its authority: the judge can still
+/// only `Escalate` or `Suppress`, and every other floor predicate
+/// (`destructive_verb`, `writes_outside_workspace`, `opaque_execution`, …) is
+/// unchanged and still fires on the write forms.
+///
+/// Three things keep this from being a hole:
+///
+/// 1. [`GATEKEEPER_POLICY_PATH`] is unconditional. Self-modification of the
+///    judge's own policy is not suppressible even on a read — a read of that
+///    file is reconnaissance for the write.
+/// 2. Write detection is per *segment*, not per command string, and a segment
+///    containing an opaque executor (`xargs`, `eval`, …) counts as a write,
+///    because its argv is not readable here.
+/// 3. A variant that names the control plane in a form the tokenizer cannot
+///    attribute to any segment fails closed to `true`.
+///
+/// `bash ~/.openfang/scripts/deploy-local.sh` is the motivating case: it is
+/// structurally a *read* of that script, and it is only sound to treat it as
+/// one because ANAI-206 item 1 hands the judge the script body. Without that,
+/// this would be downgrading "runs a control-plane script" to "mentions a
+/// path" and the judge would be guessing blind.
 pub fn touches_control_plane(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
         let lowered = v.to_ascii_lowercase();
-        if CONTROL_PATH_FRAGMENTS
+        if !names_control_plane(&lowered) {
+            return false;
+        }
+        // The judge's own policy file: read or write, always the operator's
+        // business. Deliberately not clever.
+        if lowered.contains(GATEKEEPER_POLICY_PATH) {
+            return true;
+        }
+        let mut attributed = false;
+        for segment in split_segments(&lowered) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if !tokens.iter().any(|t| names_control_plane(t)) {
+                continue;
+            }
+            attributed = true;
+            if segment_writes(&tokens) {
+                return true;
+            }
+        }
+        // Named somewhere, but not as a token of any segment — e.g. glued into
+        // a construct this tokenizer does not model. Fail closed.
+        !attributed
+    })
+}
+
+/// True if `s` names the control plane at all, read or write.
+///
+/// The containment half of [`touches_control_plane`], applied both to a whole
+/// variant and to individual tokens of it.
+///
+/// ANAI-184 scope item 4: inverted rule. Any reference to `.openfang/` counts
+/// unless it names a known-benign subtree. [`CONTROL_PATH_FRAGMENTS`] is kept
+/// as documentation of the cases we know about and as belt to a future edit of
+/// the benign list.
+pub fn names_control_plane(s: &str) -> bool {
+    let lowered = s.to_ascii_lowercase();
+    if CONTROL_PATH_FRAGMENTS
+        .iter()
+        .any(|frag| lowered.contains(frag))
+    {
+        return true;
+    }
+    let mut rest: &str = &lowered;
+    while let Some(idx) = rest.find(CONTROL_PLANE_ROOT) {
+        let tail = &rest[idx..];
+        if !CONTROL_PLANE_BENIGN_PREFIXES
             .iter()
-            .any(|frag| lowered.contains(frag))
+            .any(|p| tail.starts_with(p))
         {
             return true;
         }
-        // ANAI-184 scope item 4: inverted rule. Any *other* reference to
-        // `.openfang/` counts, unless it names a known-benign subtree. The
-        // explicit fragment list above is kept as documentation of the cases we
-        // know about and as belt to a future edit of the benign list.
-        let mut rest: &str = &lowered;
-        while let Some(idx) = rest.find(CONTROL_PLANE_ROOT) {
-            let tail = &rest[idx..];
-            if !CONTROL_PLANE_BENIGN_PREFIXES
+        rest = &rest[idx + CONTROL_PLANE_ROOT.len()..];
+    }
+    false
+}
+
+/// Split a command variant on shell separators, so a write in one segment is
+/// not attributed to a control path named in another.
+///
+/// `cat ~/.openfang/config.toml && cp a b` writes `b`, not the config. Command
+/// substitution delimiters are separators too: what runs inside them is its own
+/// command, and `collect_command_bases` has already surfaced it as `inner` for
+/// the other predicates.
+fn split_segments(variant: &str) -> Vec<&str> {
+    variant
+        .split([';', '&', '|', '\n', '`', '(', ')'])
+        .collect()
+}
+
+/// True if this segment writes something.
+///
+/// Coarse and fail-closed in the same register as the rest of the floor: the
+/// cost of a false positive is one Discord prompt, and the cost of a false
+/// negative is an unreviewed edit to the substrate the fleet runs on.
+fn segment_writes(tokens: &[&str]) -> bool {
+    // A redirect in the segment writes its target. Which target it is does not
+    // matter here — `redirects_outside_workspace` owns that question.
+    if tokens.iter().any(|t| t.contains('>')) {
+        return true;
+    }
+    for token in tokens {
+        let base = basename(token);
+        let base = base.as_str();
+        if IN_PLACE_ONLY_BINS.contains(&base) {
+            if tokens
                 .iter()
-                .any(|p| tail.starts_with(p))
+                .any(|t| IN_PLACE_FLAGS.iter().any(|f| token_matches_verb(t, f)))
             {
                 return true;
             }
-            rest = &rest[idx + CONTROL_PLANE_ROOT.len()..];
+            continue;
         }
-        false
-    })
+        if DESTRUCTIVE_BINS.contains(&base)
+            || MUTATION_BINS.contains(&base)
+            || PATH_WRITING_BINS.contains(&base)
+            // Unreadable argv. Cannot be shown to be a read, so it is a write.
+            || OPAQUE_EXEC_BINS.contains(&base)
+        {
+            return true;
+        }
+    }
+    tokens_match_verb_pair(tokens, MUTATION_VERBS) || tokens_match_verb_pair(tokens, EGRESS_VERBS)
 }
 
 /// True if any resolved base or inner command is in [`DESTRUCTIVE_BINS`].
@@ -995,32 +1124,60 @@ fn any_base_in(bases: &[String], inner: &[String], list: &[&str]) -> bool {
 /// asymmetry is priced correctly.
 fn has_verb_pair(command: &str, table: &[(&str, &[&str])]) -> bool {
     for variant in crate::cmd_norm::deny_variants(command) {
-        let tokens: Vec<String> = variant.split_whitespace().map(basename).collect();
-        for (bin, verbs) in table {
-            if !tokens.iter().any(|t| t == bin) {
-                continue;
-            }
-            if tokens
-                .iter()
-                .any(|t| verbs.iter().any(|v| token_matches_verb(t, v)))
-            {
-                return true;
-            }
+        let tokens: Vec<&str> = variant.split_whitespace().collect();
+        if tokens_match_verb_pair(&tokens, table) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`has_verb_pair`] for one already-tokenized segment. Shared with
+/// [`segment_writes`], which needs the same test scoped to a segment rather
+/// than to a whole variant.
+fn tokens_match_verb_pair(tokens: &[&str], table: &[(&str, &[&str])]) -> bool {
+    let bases: Vec<String> = tokens.iter().map(|t| basename(t)).collect();
+    for (bin, verbs) in table {
+        if !bases.iter().any(|t| t == bin) {
+            continue;
+        }
+        if bases
+            .iter()
+            .any(|t| verbs.iter().any(|v| token_matches_verb(t, v)))
+        {
+            return true;
         }
     }
     false
 }
 
 /// Exact token match, plus short-flag bundles: `sed -ie 's/a/b/'` carries `-i`.
+///
+/// ANAI-206: the bundle test reads the *leading* alphanumeric run rather than
+/// requiring the whole token to be alphanumeric, so `sed -i.bak` and
+/// `sed -ne -i.bak` match `-i`. The old form rejected them on the `.`, which
+/// left the commonest real in-place invocation on the read side of the write
+/// test. Long flags match an `=` suffix for the same reason.
 fn token_matches_verb(token: &str, verb: &str) -> bool {
     if token == verb {
         return true;
     }
-    // Only single-letter short flags bundle. `--eval` and `-delete` are matched
-    // by equality alone.
+    // `--in-place=.bak` is `--in-place`.
+    if verb.starts_with("--") {
+        if let Some(rest) = token.strip_prefix(verb) {
+            return rest.starts_with('=');
+        }
+        return false;
+    }
+    // Only single-letter short flags bundle. `-delete` is matched by equality
+    // alone.
     if verb.len() == 2 && verb.starts_with('-') && token.len() > 2 && !token.starts_with("--") {
         if let (Some(v), Some(t)) = (verb.strip_prefix('-'), token.strip_prefix('-')) {
-            return t.chars().all(|c| c.is_ascii_alphanumeric()) && t.contains(v);
+            let letters: String = t
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            return letters.contains(v);
         }
     }
     false
@@ -1513,8 +1670,10 @@ mod tests {
     /// control file nobody has thought of yet is escalated by default.
     #[test]
     fn control_plane_rule_is_inverted() {
-        // Not in CONTROL_PATH_FRAGMENTS, still control plane.
-        assert!(touches_control_plane("cat ~/.openfang/approvals.db"));
+        // Not in CONTROL_PATH_FRAGMENTS, still control plane. ANAI-206: the
+        // inverted rule is now tested through `names_control_plane`, which is
+        // the containment half; `touches_control_plane` adds the write test.
+        assert!(names_control_plane("cat ~/.openfang/approvals.db"));
         assert!(touches_control_plane(
             "cp x ~/.openfang/some-future-file.toml"
         ));
@@ -1525,6 +1684,84 @@ mod tests {
         assert!(!touches_control_plane("ls ~/.openfang/logs/daemon/"));
         // ...but the enumerated control paths win over a benign-looking prefix.
         assert!(touches_control_plane("tee ~/.openfang/scripts/x.sh"));
+    }
+
+    // -- ANAI-206 item 2: write-aware control plane ---------------------------
+
+    #[test]
+    fn reading_the_control_plane_falls_through_to_the_judge() {
+        // The motivating population: 24 of 106 corpus short-circuits.
+        assert!(!touches_control_plane(
+            "bash ~/.openfang/scripts/deploy-local.sh"
+        ));
+        assert!(!touches_control_plane("cat ~/.openfang/config.toml"));
+        assert!(!touches_control_plane("ls ~/.openfang/agents"));
+        assert!(!touches_control_plane(
+            "grep -rn model ~/.openfang/agents/openfang-alpha/agent.toml"
+        ));
+    }
+
+    #[test]
+    fn writing_the_control_plane_still_hits_the_floor() {
+        assert!(touches_control_plane("rm -rf ~/.openfang/agents"));
+        assert!(touches_control_plane("mv a.toml ~/.openfang/agents/b.toml"));
+        assert!(touches_control_plane("echo x > ~/.openfang/config.toml"));
+        assert!(touches_control_plane(
+            "chmod +x ~/.openfang/scripts/deploy-local.sh"
+        ));
+        // Obfuscation still folds onto the same hit.
+        assert!(touches_control_plane("rm -rf ~/.open\"\"fang/agents"));
+    }
+
+    #[test]
+    fn sed_read_and_sed_in_place_land_on_opposite_sides() {
+        // The named ANAI-206 trap: `sed` is in PATH_WRITING_BINS, but only
+        // writes with an in-place flag.
+        assert!(!touches_control_plane(
+            "sed -n '1,20p' ~/.openfang/config.toml"
+        ));
+        assert!(touches_control_plane(
+            "sed -i 's/a/b/' ~/.openfang/config.toml"
+        ));
+        assert!(touches_control_plane(
+            "sed --in-place 's/a/b/' ~/.openfang/config.toml"
+        ));
+        // Short-flag bundles carry `-i`.
+        assert!(touches_control_plane(
+            "sed -ne 'p' -i.bak ~/.openfang/config.toml"
+        ));
+    }
+
+    #[test]
+    fn the_judges_own_policy_is_unconditional() {
+        // A read of the file that instructs the judge is the operator's
+        // business too — it is reconnaissance for the write.
+        assert!(touches_control_plane("cat ~/.openfang/gatekeeper.md"));
+        assert!(touches_control_plane("tee ~/.openfang/gatekeeper.md"));
+        // ...but an unrelated file of the same name is not.
+        assert!(!touches_control_plane("cat docs/gatekeeper.md"));
+    }
+
+    #[test]
+    fn a_write_in_one_segment_is_not_attributed_to_another() {
+        // `cp` writes `b`, not the config that the first segment reads.
+        assert!(!touches_control_plane(
+            "cat ~/.openfang/config.toml && cp a b"
+        ));
+        // ...and the reverse still fires.
+        assert!(touches_control_plane(
+            "cat a && cp a ~/.openfang/config.toml"
+        ));
+    }
+
+    #[test]
+    fn unreadable_argv_over_a_control_path_fails_closed() {
+        assert!(touches_control_plane(
+            "xargs -I{} echo {} ~/.openfang/agents"
+        ));
+        assert!(touches_control_plane(
+            "eval \"cat ~/.openfang/config.toml\""
+        ));
     }
 
     // -- verdict algebra -----------------------------------------------------
