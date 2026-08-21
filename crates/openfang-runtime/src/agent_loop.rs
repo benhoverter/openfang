@@ -7351,4 +7351,296 @@ mod tests {
             result.response
         );
     }
+
+    // === ANAI-79 §1.1: session survival is the reversibility anchor ===
+    //
+    // The ANAI-85 enforce gate deletes the episodic row for an inert
+    // heartbeat. That is only safe because the raw transcript was already
+    // persisted by `save_session_async` earlier in the same turn -- the
+    // session store is the recovery path if the predicate is ever wrong.
+    //
+    // Nothing enforced that ordering. Every other test in this epic passes
+    // if someone moves the session save below the gate (or inside its `else`
+    // branch), at which point dropped turns become *unrecoverable* rather
+    // than merely un-recalled. These tests are that missing guard: they
+    // assert the observable consequence (transcript on disk, episodic row
+    // absent) rather than the call order, so they survive refactors that
+    // preserve the property and fail on any that do not.
+    //
+    // Caveat worth knowing: `prune_heartbeat_turns` later strips NO_REPLY
+    // heartbeat turns older than the 10 most recent, so survival in the
+    // transcript is bounded, not eternal. These tests use non-NO_REPLY text
+    // to assert the save itself, independent of that pruning policy.
+
+    /// Answers with plain text, no tool calls, and reports a LIVE observer --
+    /// exactly the combination `should_capture_turn` needs to return `Drop`
+    /// on a `Heartbeat` turn.
+    struct InertObservedDriver;
+
+    fn inert_observed_response() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "standing by".to_string(),
+                provider_metadata: None,
+            }],
+            stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+            },
+            observed_tools: Vec::new(),
+            observer_live: true,
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for InertObservedDriver {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+            Ok(inert_observed_response())
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    text: "standing by".to_string(),
+                })
+                .await;
+            Ok(inert_observed_response())
+        }
+    }
+
+    fn blank_session(agent_id: openfang_types::agent::AgentId) -> Session {
+        Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id,
+            messages: Vec::new(),
+            context_window_tokens: 0,
+            label: None,
+        }
+    }
+
+    /// Count every episodic row the substrate holds for `agent_id`.
+    ///
+    /// An empty query means no `LIKE` clause is emitted, so this is a full
+    /// count for the agent rather than a relevance search.
+    async fn agent_memory_rows(
+        memory: &openfang_memory::MemorySubstrate,
+        agent_id: openfang_types::agent::AgentId,
+    ) -> usize {
+        memory
+            .recall("", 1000, Some(MemoryFilter::agent(agent_id)))
+            .await
+            .expect("recall must succeed")
+            .len()
+    }
+
+    /// Assert the transcript for the turn is on disk and complete.
+    fn assert_transcript_persisted(
+        memory: &openfang_memory::MemorySubstrate,
+        session_id: openfang_types::agent::SessionId,
+        user_half: &str,
+        assistant_half: &str,
+        context: &str,
+    ) {
+        let saved = memory
+            .get_session(session_id)
+            .expect("session store must be readable")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{context}: no session was persisted -- the raw transcript is \
+                     the ONLY recovery path for a dropped turn (ANAI-79 §1.1)"
+                )
+            });
+        let rendered = format!("{:?}", saved.messages);
+        assert!(
+            rendered.contains(user_half),
+            "{context}: user half of the turn missing from the persisted \
+             transcript; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains(assistant_half),
+            "{context}: assistant half of the turn missing from the persisted \
+             transcript; got {rendered:?}"
+        );
+    }
+
+    /// Non-streaming loop: an inert heartbeat is dropped from episodic memory
+    /// AND its transcript is still persisted. Both halves matter -- the first
+    /// proves the gate fired, the second proves the drop is reversible.
+    #[tokio::test]
+    async fn dropped_heartbeat_still_persists_the_session_transcript() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = blank_session(agent_id);
+        let session_id = session.id;
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(InertObservedDriver);
+
+        run_agent_loop(
+            &manifest,
+            "heartbeat probe alpha",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::Heartbeat,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            agent_memory_rows(&memory, agent_id).await,
+            0,
+            "inert heartbeat must write no episodic row (ANAI-85 enforce); if this \
+             fails the gate regressed, not the session save"
+        );
+        assert_transcript_persisted(
+            &memory,
+            session_id,
+            "heartbeat probe alpha",
+            "standing by",
+            "dropped heartbeat (non-streaming)",
+        );
+    }
+
+    /// Streaming loop carries the same obligation. It is a near-verbatim copy
+    /// of the non-streaming path, which is exactly why it needs its own test:
+    /// a fix applied to one copy and not the other would otherwise go unseen.
+    #[tokio::test]
+    async fn dropped_heartbeat_still_persists_the_session_transcript_streaming() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = blank_session(agent_id);
+        let session_id = session.id;
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(InertObservedDriver);
+        let (tx, _rx) = mpsc::channel(64);
+
+        run_agent_loop_streaming(
+            &manifest,
+            "heartbeat probe beta",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
+            false, // suppress_phantom_guard
+            TurnTrigger::Heartbeat,
+        )
+        .await
+        .expect("streaming loop should complete");
+
+        assert_eq!(
+            agent_memory_rows(&memory, agent_id).await,
+            0,
+            "inert heartbeat must write no episodic row on the streaming path either"
+        );
+        assert_transcript_persisted(
+            &memory,
+            session_id,
+            "heartbeat probe beta",
+            "standing by",
+            "dropped heartbeat (streaming)",
+        );
+    }
+
+    /// Control: the identical driver on a `User` turn is KEPT. Without this,
+    /// the two tests above would still pass if capture broke entirely and
+    /// nothing was ever written -- "zero rows" would stop being evidence that
+    /// the *predicate* chose to drop.
+    #[tokio::test]
+    async fn kept_turn_writes_both_the_transcript_and_the_episodic_row() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = blank_session(agent_id);
+        let session_id = session.id;
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(InertObservedDriver);
+
+        run_agent_loop(
+            &manifest,
+            "a real user turn",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::User,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert_eq!(
+            agent_memory_rows(&memory, agent_id).await,
+            1,
+            "a user turn must still be captured -- the drop gate judges \
+             heartbeats only"
+        );
+        assert_transcript_persisted(
+            &memory,
+            session_id,
+            "a real user turn",
+            "standing by",
+            "kept user turn",
+        );
+    }
 }
