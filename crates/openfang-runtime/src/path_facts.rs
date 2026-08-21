@@ -7,9 +7,14 @@
 //!
 //! Three invariants hold everywhere in this module:
 //!
-//! 1. **No file contents.** Metadata only. There is nothing here to leak.
+//! 1. **Metadata by default.** The path facts themselves are stat, git and a
+//!    tier lookup — no bytes. The single exception is ANAI-206's script body
+//!    (see [`read_script_body`]), which reads exactly one file: the one the
+//!    command itself is about to execute, and only when it is inside the
+//!    requesting agent's own `file_policy` reach. The judge never names a path.
 //! 2. **No symlink traversal.** Every stat is `symlink_metadata`; a link is
-//!    reported as a link with its target named, never resolved through.
+//!    reported as a link with its target named, never resolved through. A
+//!    symlinked script is `Symlink`, never `File`, so it is never opened.
 //! 3. **Every failure is `Unknown`, and `Unknown` is never recoverable.** A
 //!    timed-out git query, an unstattable path, an unresolvable argument — all
 //!    of them subtract confidence rather than adding it.
@@ -20,8 +25,8 @@ use std::time::Duration;
 
 use openfang_types::config::{FileAccessTier, FilePolicy};
 use openfang_types::path_facts::{
-    extract_path_tokens, GitFact, PathAuthority, PathExistence, PathFact, PathFactSheet,
-    MAX_PATH_FACTS,
+    extract_path_tokens, redact_secrets, script_body_target, GitFact, PathAuthority, PathExistence,
+    PathFact, PathFactSheet, ScriptBody, ScriptBodyStatus, MAX_PATH_FACTS, MAX_SCRIPT_BODY_BYTES,
 };
 
 /// Total wall-clock budget for *all* git queries behind one gate decision.
@@ -61,11 +66,128 @@ pub async fn gather(
     // under a single budget. Anything it does not answer stays `Unknown`.
     annotate_git(&mut facts, canon_ws.as_deref()).await;
 
+    // ANAI-206 item 1. The one place in the gate that reads file bytes, and it
+    // runs last on purpose: every guardrail it enforces is a fact the two
+    // phases above computed.
+    let script_body = script_body_target(command, inner).map(|raw| read_script_body(&raw, &facts));
+
     PathFactSheet {
         facts,
         truncated,
         unresolved,
+        script_body,
     }
+}
+
+/// Read the single script a command executes, or record why we would not.
+///
+/// Ordering is the security property. Reach is checked before anything is
+/// touched, so a path outside the requesting agent's `file_policy` never
+/// reaches an `open` — the gate must not become a privilege-escalation oracle
+/// for an agent that can name a path in a command. Every later check is a
+/// refusal too, and every refusal is recorded rather than dropped.
+///
+/// `raw` is [`script_body_target`]'s answer, so it is always a token the
+/// command itself wrote and always one the sheet already stat'd — the judge
+/// never chooses a path.
+fn read_script_body(raw: &str, facts: &[PathFact]) -> ScriptBody {
+    let mut body = ScriptBody {
+        raw: raw.to_string(),
+        resolved: None,
+        status: ScriptBodyStatus::Unreadable,
+        content: None,
+        redactions: 0,
+    };
+
+    // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
+    // failed to resolve. Either way we have nothing to check reach against.
+    let Some(fact) = facts.iter().find(|f| f.raw == raw) else {
+        return body;
+    };
+    body.resolved = fact.resolved.clone();
+
+    // Guardrail 2, first and unconditional. `Prompt` is excluded because the
+    // operator already said they want to be asked about this path, and
+    // `NoPolicy` because outside `file_policy` there is no reach to be inside
+    // of — the ANAI-190 rule, unchanged.
+    if !matches!(fact.authority, PathAuthority::Read | PathAuthority::Write) {
+        body.status = ScriptBodyStatus::OutsideReach;
+        return body;
+    }
+
+    // Guardrail 3. `Unknown` is a refusal, not a pass: the git budget expiring
+    // under fleet load must not launder an ignored file into a readable one.
+    match fact.git {
+        GitFact::Ignored => {
+            body.status = ScriptBodyStatus::Ignored;
+            return body;
+        }
+        GitFact::Unknown => {
+            body.status = ScriptBodyStatus::GitUnknown;
+            return body;
+        }
+        _ => {}
+    }
+
+    // `PathExistence::File` comes from `symlink_metadata`, so this also carries
+    // the no-traversal invariant: a symlinked leaf is `Symlink`, never `File`,
+    // and lands in `Unreadable` without being opened.
+    if fact.existence != PathExistence::File {
+        return body;
+    }
+
+    // Guardrail 4, on the stat first so an oversized file is never read into
+    // memory at all.
+    if fact.size_bytes.unwrap_or(u64::MAX) > MAX_SCRIPT_BODY_BYTES {
+        body.status = ScriptBodyStatus::TooLarge;
+        return body;
+    }
+
+    let Some(path) = fact.resolved.as_ref() else {
+        return body;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return body;
+    };
+    // ...and again on what we actually got, because the stat was taken earlier
+    // and a file can grow between the two.
+    if bytes.len() as u64 > MAX_SCRIPT_BODY_BYTES {
+        body.status = ScriptBodyStatus::TooLarge;
+        return body;
+    }
+
+    // Guardrail 5.
+    let Ok(text) = String::from_utf8(bytes) else {
+        body.status = ScriptBodyStatus::Binary;
+        return body;
+    };
+    if looks_binary(&text) {
+        body.status = ScriptBodyStatus::Binary;
+        return body;
+    }
+
+    // Guardrail 6.
+    let (redacted, redactions) = redact_secrets(&text);
+    body.content = Some(redacted);
+    body.redactions = redactions;
+    body.status = ScriptBodyStatus::Included;
+    body
+}
+
+/// True when text carries control bytes in a shape no script has.
+///
+/// A NUL settles it. Beyond that a handful of stray control characters is
+/// tolerated — terminal escapes turn up in real deploy scripts — but a run of
+/// them means we are looking at a compiled artifact that happened to decode as
+/// UTF-8, and handing that to a model is noise at best.
+fn looks_binary(text: &str) -> bool {
+    if text.contains('\0') {
+        return true;
+    }
+    text.chars()
+        .filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t')
+        .count()
+        > 8
 }
 
 /// Everything computable without spawning anything: resolution, stat,
@@ -411,6 +533,7 @@ async fn run_git(root: &Path, args: &[&str], paths: &[String]) -> Option<String>
 mod tests {
     use super::*;
     use openfang_types::config::{FilePolicy, FileRule};
+    use openfang_types::path_facts::MAX_SCRIPT_BODY_BYTES;
 
     fn tempdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("openfang-anai190-{name}"));
@@ -594,5 +717,214 @@ mod tests {
     fn a_sibling_directory_is_not_inside_the_workspace() {
         assert!(!is_within(Path::new("/ws-evil/a.txt"), Path::new("/ws")));
         assert!(is_within(Path::new("/ws/a.txt"), Path::new("/ws")));
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-206 item 1: the script body. Each guardrail gets a test, and the
+    // `file_policy` one gets two — it is the assertion that keeps the gate from
+    // being a privilege-escalation oracle, and it is the one a future
+    // refactor is most likely to quietly weaken.
+    // -----------------------------------------------------------------------
+
+    /// A policy granting `tier` over the whole of `ws`.
+    fn policy_over(ws: &Path, tier: FileAccessTier) -> FilePolicy {
+        FilePolicy::new(
+            true,
+            FileAccessTier::Deny,
+            vec![FileRule {
+                path: ws.display().to_string(),
+                tier,
+            }],
+        )
+    }
+
+    /// The motivating case: 24 corpus rows are `bash ~/.openfang/scripts/*.sh`,
+    /// and until item 2 the floor short-circuited every one of them. Now they
+    /// reach the judge, and this is what the judge gets to read.
+    #[tokio::test]
+    async fn the_script_a_command_executes_is_read_and_handed_over() {
+        let ws = tempdir("body-happy");
+        std::fs::write(
+            ws.join("deploy.sh"),
+            "#!/bin/bash\nset -euo pipefail\ncargo build\n",
+        )
+        .unwrap();
+        let policy = policy_over(&ws, FileAccessTier::Write);
+
+        let sheet = gather("bash ./deploy.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.clone().expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert!(body.content.as_deref().unwrap().contains("cargo build"));
+        assert_eq!(body.redactions, 0);
+        assert!(sheet.as_log_token().contains("script=included"));
+    }
+
+    /// **The anti-oracle assertion.** The judge runs with daemon privileges. A
+    /// path the requesting agent's `file_policy` does not reach must never be
+    /// read, or any agent that can name a path in a command has an oracle for
+    /// its contents. `Read` is enough — the agent could have `cat`-ed it —
+    /// `Prompt` and `Deny` are not, and neither is an absent policy.
+    #[tokio::test]
+    async fn a_script_outside_the_agents_file_policy_reach_is_never_read() {
+        let ws = tempdir("body-reach");
+        std::fs::write(ws.join("secret.sh"), "echo the-content\n").unwrap();
+
+        for tier in [FileAccessTier::Deny, FileAccessTier::Prompt] {
+            let policy = policy_over(&ws, tier);
+            let sheet = gather("bash ./secret.sh", &[], Some(&ws), Some(&policy)).await;
+            let body = sheet.script_body.clone().expect("script body");
+            assert_eq!(body.status, ScriptBodyStatus::OutsideReach, "{tier:?}");
+            assert!(body.content.is_none(), "{tier:?}");
+            assert!(!sheet.suppress_eligible(), "{tier:?}");
+        }
+
+        // No policy at all is not a permissive answer. `tier_for` would report
+        // `Write` for every path on the box on an inert policy; `NoPolicy`
+        // never reaches the read.
+        for policy in [None, Some(FilePolicy::default())] {
+            let sheet = gather("bash ./secret.sh", &[], Some(&ws), policy.as_ref()).await;
+            let body = sheet.script_body.expect("script body");
+            assert_eq!(body.status, ScriptBodyStatus::OutsideReach);
+            assert!(body.content.is_none());
+        }
+
+        // ...and a readable-but-not-writable script is fine: the agent could
+        // have read it itself, so the judge learns nothing new.
+        let policy = policy_over(&ws, FileAccessTier::Read);
+        let sheet = gather("bash ./secret.sh", &[], Some(&ws), Some(&policy)).await;
+        assert_eq!(
+            sheet.script_body.unwrap().status,
+            ScriptBodyStatus::Included
+        );
+    }
+
+    /// Over the cap the body is refused, not truncated: the interesting line
+    /// goes at byte 17000 and a truncated read would show the judge a
+    /// perfectly ordinary first 16KB.
+    #[tokio::test]
+    async fn an_oversized_script_is_refused_rather_than_truncated() {
+        let ws = tempdir("body-large");
+        let mut script = "echo padding\n".repeat(2000);
+        script.push_str("rm -rf /\n");
+        assert!(script.len() as u64 > MAX_SCRIPT_BODY_BYTES);
+        std::fs::write(ws.join("big.sh"), &script).unwrap();
+
+        let sheet = gather(
+            "bash ./big.sh",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::TooLarge);
+        assert!(body.content.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_is_refused() {
+        let ws = tempdir("body-binary");
+        std::fs::write(
+            ws.join("blob.sh"),
+            [0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01, 0x02],
+        )
+        .unwrap();
+
+        let sheet = gather(
+            "bash ./blob.sh",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
+        assert_eq!(sheet.script_body.unwrap().status, ScriptBodyStatus::Binary);
+    }
+
+    /// `./harmless.sh -> /etc/hosts` must not be read through. The existence
+    /// axis is `symlink_metadata`, so a link is `Symlink` and never `File`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_script_is_not_followed() {
+        let ws = tempdir("body-symlink");
+        std::os::unix::fs::symlink("/etc/hosts", ws.join("harmless.sh")).unwrap();
+
+        let sheet = gather(
+            "bash ./harmless.sh",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Unreadable);
+        assert!(body.content.is_none());
+    }
+
+    /// The class that holds every `.env`, key and token on this box. Also the
+    /// git axis failing closed: an unproven answer is not a clean one.
+    #[tokio::test]
+    async fn a_git_ignored_script_is_never_read() {
+        let repo = tempdir("body-ignored");
+        if !git(&repo, &["init", "--quiet"]).await {
+            eprintln!("git unavailable; skipping");
+            return;
+        }
+        git(&repo, &["config", "user.email", "t@example.com"]).await;
+        git(&repo, &["config", "user.name", "t"]).await;
+        std::fs::write(repo.join(".gitignore"), "local-*.sh\n").unwrap();
+        std::fs::write(repo.join("local-secrets.sh"), "export TOKEN=abc\n").unwrap();
+        assert!(git(&repo, &["add", ".gitignore"]).await);
+        assert!(git(&repo, &["commit", "--quiet", "-m", "seed"]).await);
+
+        let sheet = gather(
+            "bash ./local-secrets.sh",
+            &[],
+            Some(&repo),
+            Some(&policy_over(&repo, FileAccessTier::Write)),
+        )
+        .await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Ignored);
+        assert!(body.content.is_none());
+    }
+
+    /// Secrets are redacted before the bytes reach a model or the audit chain.
+    #[tokio::test]
+    async fn secrets_are_redacted_before_the_judge_sees_them() {
+        let ws = tempdir("body-redact");
+        std::fs::write(
+            ws.join("env.sh"),
+            "export ANTHROPIC_API_KEY=sk-ant-0123456789\ncargo build\n",
+        )
+        .unwrap();
+
+        let sheet = gather(
+            "bash ./env.sh",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
+        let body = sheet.script_body.clone().expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert_eq!(body.redactions, 1);
+        let content = body.content.unwrap();
+        assert!(!content.contains("sk-ant-0123456789"), "{content}");
+        assert!(content.contains("cargo build"), "{content}");
+        assert!(sheet.as_log_token().contains("redacted=1"));
+    }
+
+    /// Guardrail 1 end to end: a command that does not execute exactly one
+    /// readable file reads nothing, and the sheet says so by omission.
+    #[tokio::test]
+    async fn commands_that_do_not_execute_a_single_file_read_nothing() {
+        let ws = tempdir("body-none");
+        std::fs::write(ws.join("a.sh"), "echo hi\n").unwrap();
+        let policy = policy_over(&ws, FileAccessTier::Write);
+
+        for cmd in ["rm ./a.sh", "cat ./a.sh", "bash -c \"echo hi\""] {
+            let sheet = gather(cmd, &[], Some(&ws), Some(&policy)).await;
+            assert!(sheet.script_body.is_none(), "{cmd}");
+        }
     }
 }

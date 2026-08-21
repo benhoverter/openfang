@@ -19,9 +19,19 @@
 //! files the *requesting agent itself* cannot — turning the gatekeeper into a
 //! privilege-escalation oracle for any agent that can name a path in a command.
 //!
-//! Nothing in this module reads file *contents*. Only `symlink_metadata`, the
-//! git index, and a pure tier lookup. There is no byte of user data in a
-//! [`PathFact`], so there is nothing to leak.
+//! A [`PathFact`] therefore carries no byte of user data: only
+//! `symlink_metadata`, the git index, and a pure tier lookup.
+//!
+//! # The one exception (ANAI-206)
+//!
+//! [`ScriptBody`] does read bytes, and it is the difference between a judge
+//! that can decide `bash ~/.openfang/scripts/deploy-local.sh` and one that
+//! guesses. It is not a tool and it is not a round trip: the daemon reads
+//! exactly one path, chosen by [`script_body_target`] from the command's own
+//! text, and only when that path is inside the requesting agent's `file_policy`
+//! reach. The oracle above is closed by the *reach* test — the judge cannot see
+//! anything the requesting agent could not have `cat`-ed itself — not by the
+//! absence of reads.
 //!
 //! # Why symlinks are never followed
 //!
@@ -256,6 +266,165 @@ impl PathFact {
     }
 }
 
+/// Hard cap on the script body handed to the judge, in bytes.
+///
+/// Over the cap the body is refused outright rather than truncated. A
+/// truncated script is a lie by omission: the interesting line goes at byte
+/// 17000 and the judge reads the first 16KB of a perfectly ordinary deploy
+/// script. Refusing is honest and the judge treats blindness as a reason to
+/// escalate.
+pub const MAX_SCRIPT_BODY_BYTES: u64 = 16 * 1024;
+
+/// Interpreters whose first non-flag argument is a script file to execute.
+///
+/// Deliberately the two-token form only — see [`script_body_target`].
+pub const SCRIPT_INTERPRETERS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "node", "ruby", "perl",
+];
+
+/// Substrings in an assignment's left-hand side that make its value a secret.
+pub const SECRET_KEY_HINTS: &[&str] = &[
+    "secret",
+    "token",
+    "password",
+    "passwd",
+    "apikey",
+    "api_key",
+    "credential",
+    "private_key",
+    "access_key",
+    "auth",
+];
+
+/// Value shapes that are a secret regardless of what they are assigned to.
+pub const SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "ASIA",
+    "-----BEGIN",
+];
+
+/// What happened when we tried to read the script a command executes.
+///
+/// Every variant but [`Included`](Self::Included) is a refusal, and a refusal
+/// is recorded rather than silently dropped: the judge is told it is blind, and
+/// the audit row carries the reason so the corpus can say which guardrail is
+/// costing coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptBodyStatus {
+    /// Content was read, redacted, and handed to the judge.
+    Included,
+    /// The path is not within the requesting agent's `file_policy` reach.
+    ///
+    /// **The anti-oracle guardrail.** The judge runs with daemon privileges, so
+    /// without this the gate would read files the requesting agent cannot and
+    /// summarise them into a verdict — a privilege-escalation oracle for any
+    /// agent that can name a path in a command. `NoPolicy` lands here too, for
+    /// the ANAI-190 reason: outside `file_policy` there is no reach to be
+    /// inside of.
+    OutsideReach,
+    /// Git-ignored. The class that holds every `.env`, key and token on the box.
+    Ignored,
+    /// The git axis did not answer in budget, so "not ignored" is unproven.
+    GitUnknown,
+    /// Larger than [`MAX_SCRIPT_BODY_BYTES`].
+    TooLarge,
+    /// Not valid UTF-8, or carrying control bytes in a shape no script has.
+    Binary,
+    /// Missing, a directory, a symlink, or the read itself failed.
+    Unreadable,
+}
+
+impl ScriptBodyStatus {
+    /// Short token for prompts and audit rows.
+    #[must_use]
+    pub fn as_token(self) -> &'static str {
+        match self {
+            Self::Included => "included",
+            Self::OutsideReach => "outside-reach",
+            Self::Ignored => "git-ignored",
+            Self::GitUnknown => "git-unknown",
+            Self::TooLarge => "too-large",
+            Self::Binary => "binary",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    #[must_use]
+    pub fn included(self) -> bool {
+        matches!(self, Self::Included)
+    }
+}
+
+/// ANAI-206 item 1: the body of the one script a command executes.
+///
+/// This is the only place in the gate that reads file *bytes*, and it exists
+/// because the alternative is worse. `bash ~/.openfang/scripts/deploy-local.sh`
+/// is structurally a read of that script; item 2 stopped the control-plane
+/// floor from short-circuiting on it, which is only sound if the judge can then
+/// see what the script does. Without this the judge would be guessing at 82% of
+/// the population it was built for.
+///
+/// Guardrails, all enforced before a byte is read (see the runtime half):
+///
+/// 1. **One path**, and it is the command's own script argument — never a path
+///    the judge chooses.
+/// 2. Never outside the requesting agent's `file_policy` reach.
+/// 3. Never git-ignored, and never on an unproven git answer.
+/// 4. [`MAX_SCRIPT_BODY_BYTES`], refused rather than truncated.
+/// 5. Binary content refused.
+/// 6. Secret shapes redacted on read.
+/// 7. The audit row says whether content was consulted, and why not when it
+///    was not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptBody {
+    /// The token as the agent wrote it. Untrusted; rendered, never executed.
+    pub raw: String,
+    /// Absolute resolved form, when resolution succeeded.
+    pub resolved: Option<String>,
+    pub status: ScriptBodyStatus,
+    /// Redacted, capped content. `Some` only when `status` is `Included`.
+    pub content: Option<String>,
+    /// How many secret-shaped spans were replaced.
+    pub redactions: usize,
+}
+
+impl ScriptBody {
+    /// The block that goes inside the judge's `<script-body>` fence.
+    ///
+    /// A refusal renders as a stated refusal, not as an empty span: "we could
+    /// not read it" and "it was empty" must not look the same to the judge.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let name = self.resolved.as_deref().unwrap_or(&self.raw);
+        match (&self.content, self.status) {
+            (Some(text), ScriptBodyStatus::Included) => {
+                let mut out = format!("# {name}\n");
+                if self.redactions > 0 {
+                    out.push_str(&format!(
+                        "# [{} secret-shaped span(s) redacted before this was shown]\n",
+                        self.redactions
+                    ));
+                }
+                out.push_str(text);
+                out
+            }
+            _ => format!(
+                "(not read: {} — {}. You are blind to what this command executes.)",
+                name,
+                self.status.as_token()
+            ),
+        }
+    }
+}
+
 /// Every path fact for one command, plus the reasons the sheet may be blind.
 ///
 /// The blindness flags are load-bearing. A fast-path that suppresses on a sheet
@@ -269,6 +438,15 @@ pub struct PathFactSheet {
     /// At least one argument was a glob, a variable expansion, or otherwise not
     /// resolvable to a single path. We do not know what it names.
     pub unresolved: bool,
+    /// ANAI-206 item 1: the body of the script this command executes, when the
+    /// command is a bare interpreter invocation against a single readable file.
+    ///
+    /// `#[serde(default)]` for the same reason the sheet itself carries one:
+    /// rows written before ANAI-206 have no such field, and a `GateRequest`
+    /// that fails to deserialize is a gate that fails *open* into the caller's
+    /// error path.
+    #[serde(default)]
+    pub script_body: Option<ScriptBody>,
 }
 
 impl PathFactSheet {
@@ -280,6 +458,13 @@ impl PathFactSheet {
     /// have done.
     #[must_use]
     pub fn suppress_eligible(&self) -> bool {
+        // A script we could not read is a command whose effects we do not know,
+        // whatever the metadata says. Strictly more conservative than
+        // pre-ANAI-206 behaviour, where the same command was eligible on
+        // metadata alone.
+        if matches!(&self.script_body, Some(b) if !b.status.included()) {
+            return false;
+        }
         !self.truncated
             && !self.unresolved
             && !self.facts.is_empty()
@@ -293,7 +478,7 @@ impl PathFactSheet {
     /// corpora must read absence as *unknown*, never as "no paths".
     #[must_use]
     pub fn as_log_token(&self) -> String {
-        if self.facts.is_empty() && !self.unresolved {
+        if self.facts.is_empty() && !self.unresolved && self.script_body.is_none() {
             return "none".to_string();
         }
         let recoverable = self.facts.iter().filter(|f| f.recoverable()).count();
@@ -313,6 +498,15 @@ impl PathFactSheet {
         }
         if self.unresolved {
             token.push_str(" unresolved");
+        }
+        // The audit flag for "content was consulted". Present on every row the
+        // feature touched, refusal included, so the corpus can price each
+        // guardrail instead of guessing at it.
+        if let Some(body) = &self.script_body {
+            token.push_str(&format!(" script={}", body.status.as_token()));
+            if body.redactions > 0 {
+                token.push_str(&format!(" redacted={}", body.redactions));
+            }
         }
         token
     }
@@ -406,6 +600,129 @@ pub fn extract_path_tokens(command: &str, inner: &[String]) -> (Vec<String>, boo
         }
     }
     (seen, unresolved)
+}
+
+/// The single path whose contents the judge is allowed to see, if any.
+///
+/// Guardrail 1, and the one that makes the rest defensible: the judge never
+/// picks a path. This returns *the command's own script argument* or nothing.
+///
+/// Deliberately narrow, and it will say `None` on forms that are obviously
+/// fine:
+///
+/// - Any shell separator, redirect, substitution or expansion in the command →
+///   `None`. A read is only sound when we can attribute the whole command to
+///   one interpreter and one file.
+/// - A non-empty `inner` → `None`. `bash -c '...'` has no file to read, and the
+///   text it runs is already in front of the judge inside the command fence.
+/// - An interpreter *flag* in the second position → `None`. `bash -x foo.sh` is
+///   not worth the parser it would take to be sure.
+/// - A second token that is not path-shaped → `None`. `bash deploy.sh` (bare
+///   name, resolved against the cwd) is a known coverage gap: `looks_like_path`
+///   excludes it, so there is no [`PathFact`] to check reach against. Left as a
+///   gap on purpose — the corpus can say whether it matters.
+///
+/// Tokens after the script path are the *script's* arguments and do not affect
+/// which file is read, so they are ignored rather than disqualifying.
+#[must_use]
+pub fn script_body_target(command: &str, inner: &[String]) -> Option<String> {
+    if !inner.is_empty() {
+        return None;
+    }
+    if command.contains([';', '&', '|', '\n', '`', '(', ')', '<', '>', '$']) {
+        return None;
+    }
+    let mut tokens = command.split_whitespace();
+    let bin = tokens.next()?;
+    let bin = bin.rsplit('/').next().unwrap_or(bin);
+    if !SCRIPT_INTERPRETERS.contains(&bin) {
+        return None;
+    }
+    let candidate = tokens.next()?.trim_matches(|c| c == '"' || c == '\'');
+    if candidate.starts_with('-') {
+        return None;
+    }
+    if !looks_like_path(candidate) || is_unresolvable(candidate) {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+/// Guardrail 6. Replace secret-shaped spans before the body reaches a model.
+///
+/// Two rules, both crude on purpose. This is not a secret scanner and does not
+/// need to be: the file is already inside the agent's own `file_policy` reach
+/// and is about to be executed with the agent's own authority, so the exposure
+/// this closes is narrow — a credential that would otherwise be copied verbatim
+/// into a model prompt and an audit chain. Over-redaction costs the judge a
+/// little context; under-redaction costs a token.
+///
+/// 1. An assignment whose left-hand side reads like a secret loses its value.
+/// 2. A token with a known credential prefix, or a long opaque run with no path
+///    separator in it, is replaced wholesale.
+///
+/// Returns the redacted text and how many spans were replaced.
+#[must_use]
+pub fn redact_secrets(text: &str) -> (String, usize) {
+    const REDACTED: &str = "[redacted]";
+    let mut count = 0usize;
+    let mut out: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        // Rule 1: assignment with a secret-shaped key.
+        if let Some(eq) = line.find('=') {
+            let lhs = &line[..eq];
+            let key = lhs
+                .rsplit(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or(lhs)
+                .to_ascii_lowercase();
+            if SECRET_KEY_HINTS.iter().any(|h| key.contains(h)) && !line[eq + 1..].trim().is_empty()
+            {
+                count += 1;
+                out.push(format!("{}={REDACTED}", &line[..eq]));
+                continue;
+            }
+        }
+        // Rule 2: value shapes, token by token, whitespace preserved well
+        // enough for a reader.
+        let mut parts: Vec<String> = Vec::new();
+        for token in line.split(' ') {
+            if looks_secret(token) {
+                count += 1;
+                parts.push(REDACTED.to_string());
+            } else {
+                parts.push(token.to_string());
+            }
+        }
+        out.push(parts.join(" "));
+    }
+
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    (joined, count)
+}
+
+/// True when a bare token is shaped like a credential.
+fn looks_secret(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| c == '"' || c == '\'' || c == ',' || c == ';');
+    if trimmed.is_empty() {
+        return false;
+    }
+    if SECRET_VALUE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return true;
+    }
+    // A long opaque run. Paths are excluded by the `/` test, and a run with no
+    // digit is almost always prose or an identifier.
+    trimmed.len() >= 40
+        && !trimmed.contains('/')
+        && trimmed.chars().any(|c| c.is_ascii_digit())
+        && trimmed.chars().any(|c| c.is_ascii_alphabetic())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '=' || c == '_' || c == '-')
 }
 
 #[cfg(test)]
@@ -564,6 +881,7 @@ mod tests {
             facts: vec![good.clone()],
             truncated: false,
             unresolved: false,
+            script_body: None,
         };
         assert!(sheet.suppress_eligible());
         let truncated = PathFactSheet {
@@ -603,6 +921,7 @@ mod tests {
             ],
             truncated: false,
             unresolved: false,
+            script_body: None,
         };
         assert!(!sheet.suppress_eligible());
     }
@@ -666,7 +985,186 @@ mod tests {
             ],
             truncated: false,
             unresolved: false,
+            script_body: None,
         };
         assert_eq!(sheet.as_log_token(), "n=2 rec=1 auth=1");
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-206 item 1: script body selection, redaction, and the audit flag.
+    // -----------------------------------------------------------------------
+
+    fn body(status: ScriptBodyStatus) -> ScriptBody {
+        ScriptBody {
+            raw: "~/.openfang/scripts/deploy-local.sh".into(),
+            resolved: Some("/home/x/.openfang/scripts/deploy-local.sh".into()),
+            status,
+            content: matches!(status, ScriptBodyStatus::Included).then(|| "set -e\n".to_string()),
+            redactions: 0,
+        }
+    }
+
+    /// The motivating case: one interpreter, one script path, nothing else.
+    #[test]
+    fn a_bare_interpreter_invocation_names_its_script() {
+        assert_eq!(
+            script_body_target("bash ~/.openfang/scripts/deploy-local.sh", &[]),
+            Some("~/.openfang/scripts/deploy-local.sh".to_string())
+        );
+        // ...and the script's own arguments do not change which file is read.
+        assert_eq!(
+            script_body_target("bash ./scripts/build.sh --dry-run", &[]),
+            Some("./scripts/build.sh".to_string())
+        );
+        assert_eq!(
+            script_body_target("/bin/sh /usr/local/bin/x.sh", &[]),
+            Some("/usr/local/bin/x.sh".to_string())
+        );
+    }
+
+    /// Guardrail 1. Anything the tokenizer cannot attribute to exactly one
+    /// interpreter and one file reads nothing at all.
+    #[test]
+    fn only_the_unambiguous_two_token_form_is_read() {
+        for cmd in [
+            // inline code, not a file
+            "bash -c \"rm ./x\"",
+            // interpreter flags: not worth the parser
+            "bash -x ./scripts/build.sh",
+            // separators, redirects, substitution, expansion
+            "bash ./a.sh && bash ./b.sh",
+            "bash ./a.sh > /tmp/out",
+            "bash $(echo ./a.sh)",
+            "bash ./a-$VERSION.sh",
+            // not an interpreter at all
+            "cat ./scripts/build.sh",
+            "rm -rf ~/.openfang/agents",
+            // no argument
+            "bash",
+            // stdin, a glob, a bare name with no path shape
+            "bash -",
+            "bash ./scripts/*.sh",
+            "bash deploy.sh",
+        ] {
+            assert_eq!(script_body_target(cmd, &[]), None, "{cmd}");
+        }
+    }
+
+    /// A lifted inner command means the wrapper carried code, not a file.
+    #[test]
+    fn a_wrapper_with_inner_commands_is_never_read() {
+        assert_eq!(
+            script_body_target("bash ./a.sh", &["rm ./x".to_string()]),
+            None
+        );
+    }
+
+    /// Guardrail 7. Every row the feature touched says so, refusal included —
+    /// otherwise the corpus cannot price a guardrail that is costing coverage.
+    #[test]
+    fn the_audit_token_records_whether_content_was_consulted() {
+        let sheet = PathFactSheet {
+            facts: vec![fact(
+                PathExistence::File,
+                GitFact::NoRepo,
+                true,
+                PathAuthority::Write,
+            )],
+            truncated: false,
+            unresolved: false,
+            script_body: Some(body(ScriptBodyStatus::Included)),
+        };
+        assert_eq!(sheet.as_log_token(), "n=1 rec=1 auth=1 script=included");
+
+        let refused = PathFactSheet {
+            script_body: Some(body(ScriptBodyStatus::OutsideReach)),
+            ..sheet.clone()
+        };
+        assert_eq!(
+            refused.as_log_token(),
+            "n=1 rec=1 auth=1 script=outside-reach"
+        );
+
+        let mut redacted_body = body(ScriptBodyStatus::Included);
+        redacted_body.redactions = 3;
+        let redacted = PathFactSheet {
+            script_body: Some(redacted_body),
+            ..sheet.clone()
+        };
+        assert!(redacted.as_log_token().contains("redacted=3"));
+    }
+
+    /// A script we could not read is a command whose effects we do not know,
+    /// whatever the metadata says.
+    #[test]
+    fn an_unread_script_poisons_the_sheet() {
+        let sheet = PathFactSheet {
+            facts: vec![fact(
+                PathExistence::File,
+                GitFact::NoRepo,
+                true,
+                PathAuthority::Write,
+            )],
+            truncated: false,
+            unresolved: false,
+            script_body: Some(body(ScriptBodyStatus::Included)),
+        };
+        assert!(sheet.suppress_eligible());
+        for status in [
+            ScriptBodyStatus::OutsideReach,
+            ScriptBodyStatus::Ignored,
+            ScriptBodyStatus::GitUnknown,
+            ScriptBodyStatus::TooLarge,
+            ScriptBodyStatus::Binary,
+            ScriptBodyStatus::Unreadable,
+        ] {
+            let blind = PathFactSheet {
+                script_body: Some(body(status)),
+                ..sheet.clone()
+            };
+            assert!(!blind.suppress_eligible(), "{}", status.as_token());
+        }
+    }
+
+    /// "We could not read it" and "it was empty" must not look the same.
+    #[test]
+    fn a_refusal_renders_as_a_stated_refusal() {
+        let rendered = body(ScriptBodyStatus::OutsideReach).render();
+        assert!(rendered.contains("outside-reach"), "{rendered}");
+        assert!(rendered.contains("blind"), "{rendered}");
+        assert!(!rendered.trim().is_empty());
+    }
+
+    #[test]
+    fn secret_assignments_lose_their_values() {
+        let (out, n) = redact_secrets(
+            "export ANTHROPIC_API_KEY=sk-ant-0123456789\n\
+             DB_PASSWORD='hunter2'\n\
+             echo hello\n",
+        );
+        assert_eq!(n, 2, "{out}");
+        assert!(!out.contains("sk-ant-0123456789"), "{out}");
+        assert!(!out.contains("hunter2"), "{out}");
+        // ...and the rest of the script survives, or the judge learns nothing.
+        assert!(out.contains("echo hello"), "{out}");
+        assert!(out.contains("export ANTHROPIC_API_KEY=[redacted]"), "{out}");
+    }
+
+    #[test]
+    fn bare_credential_shapes_are_redacted_without_an_assignment() {
+        let (out, n) = redact_secrets("curl -H \"Bearer ghp_abcdefghijklmnop0123\" https://x/\n");
+        assert_eq!(n, 1, "{out}");
+        assert!(!out.contains("ghp_"), "{out}");
+    }
+
+    /// Over-redaction is cheap; nuking every long path is not. A path has a
+    /// separator in it and must survive.
+    #[test]
+    fn long_paths_and_ordinary_script_text_survive_redaction() {
+        let script = "cargo build --release --manifest-path /Users/x/GitHub/Repos/openfang/crates/openfang-runtime/Cargo.toml\n\
+                      rsync -a ./target/release/openfang ~/.openfang/bin/openfang\n";
+        let (out, n) = redact_secrets(script);
+        assert_eq!(n, 0, "{out}");
+        assert_eq!(out, script);
     }
 }
