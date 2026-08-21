@@ -1042,14 +1042,276 @@ pub fn touches_control_plane(command: &str) -> bool {
 /// A line longer than the normalizer's own cap cannot be deobfuscated
 /// faithfully, so it falls back to plain containment and fails closed: naming
 /// the control plane in an unreadably long line counts as writing it.
+/// ANAI-206 item 4: the body is folded into *logical* lines before the scan.
+/// Item 2 made this predicate conjunctive — a segment must name the control
+/// plane *and* write it — so any shell construct that puts the verb and the
+/// path on different physical lines slipped through both halves. See
+/// [`logical_lines`] for the continuation and heredoc shapes and
+/// [`deferred_control_plane_write`] for the variable-laundering one.
 #[must_use]
 pub fn body_writes_control_plane(body: &str) -> bool {
-    body.lines().any(|line| {
-        if line.chars().count() > crate::cmd_norm::MAX_NORMALIZE_INPUT {
-            return names_control_plane(line);
+    let lines = logical_lines(body);
+    if lines.iter().any(line_writes_control_plane) {
+        return true;
+    }
+    deferred_control_plane_write(&lines)
+}
+
+/// One logical line of a script body, plus any heredoc payload it consumes.
+struct LogicalLine {
+    text: String,
+    heredoc_payload: Option<String>,
+}
+
+/// True if this one logical line writes the control plane.
+fn line_writes_control_plane(line: &LogicalLine) -> bool {
+    if line.text.chars().count() > crate::cmd_norm::MAX_NORMALIZE_INPUT {
+        return names_control_plane(&line.text);
+    }
+    if touches_control_plane(&line.text) {
+        return true;
+    }
+    // A heredoc payload is data, not argv, so the tokenizer cannot attribute it
+    // to the segment that consumes it: `rm -rf $(cat <<'EOF'` leaves the verb in
+    // one segment and the path in a payload the substitution parens have
+    // already split away. If the payload names the control plane and anything
+    // on the line writes, fail closed. Over-fires on a heredoc that merely
+    // mentions the control plane in prose; that costs one Discord prompt.
+    match &line.heredoc_payload {
+        Some(payload) if names_control_plane(payload) => {
+            let lowered = line.text.to_ascii_lowercase();
+            split_segments(&lowered).into_iter().any(|segment| {
+                let tokens: Vec<&str> = segment.split_whitespace().collect();
+                !tokens.is_empty() && segment_writes(&tokens)
+            })
         }
-        touches_control_plane(line)
-    })
+        _ => false,
+    }
+}
+
+/// Fold physical lines into the logical lines a shell would execute.
+///
+/// Two shapes split one command across lines, and the conjunctive test sees
+/// neither half:
+///
+/// ```text
+///   rm -rf \                 # verb, no path
+///     ~/.openfang/agents/    # path, no verb
+///
+///   cat <<EOF > /tmp/x       # verb, no path
+///   ~/.openfang/agents/      # path, no verb
+///   EOF
+/// ```
+///
+/// An odd number of trailing backslashes joins to the next line (an even number
+/// is a literal backslash and ends the command). A heredoc payload is folded
+/// back onto the line that opened it, since that line is what consumes it, and
+/// is kept separately as well for [`line_writes_control_plane`]'s data-position
+/// check.
+///
+/// Folding can push a logical line past the normalizer's cap, where the scan
+/// falls back to plain containment — fails closed, the direction this whole
+/// predicate leans. Trailing whitespace after a backslash is treated as a
+/// continuation even though bash would not, for the same reason.
+fn logical_lines(body: &str) -> Vec<LogicalLine> {
+    let mut out: Vec<LogicalLine> = Vec::new();
+    let mut pending: Option<String> = None;
+    let mut heredoc: Option<(String, usize)> = None;
+
+    for raw in body.lines() {
+        let state = heredoc
+            .as_ref()
+            .map(|(delim, idx)| (raw.trim() == delim.as_str(), *idx));
+        if let Some((terminates, idx)) = state {
+            if terminates {
+                heredoc = None;
+            } else {
+                let line = &mut out[idx];
+                line.text.push(' ');
+                line.text.push_str(raw);
+                let payload = line.heredoc_payload.get_or_insert_with(String::new);
+                payload.push('\n');
+                payload.push_str(raw);
+            }
+            continue;
+        }
+
+        let joined = match pending.take() {
+            Some(mut acc) => {
+                acc.push(' ');
+                acc.push_str(raw);
+                acc
+            }
+            None => raw.to_string(),
+        };
+
+        if let Some(head) = strip_continuation(&joined) {
+            pending = Some(head.to_string());
+            continue;
+        }
+
+        out.push(LogicalLine {
+            text: joined,
+            heredoc_payload: None,
+        });
+        let idx = out.len() - 1;
+        if let Some(delim) = heredoc_delimiter(&out[idx].text) {
+            heredoc = Some((delim, idx));
+        }
+    }
+
+    if let Some(acc) = pending {
+        out.push(LogicalLine {
+            text: acc,
+            heredoc_payload: None,
+        });
+    }
+    out
+}
+
+/// The line without its trailing continuation backslash, if it has one.
+fn strip_continuation(line: &str) -> Option<&str> {
+    let trimmed = line.trim_end_matches([' ', '\t', '\r']);
+    let backslashes = trimmed.chars().rev().take_while(|c| *c == '\\').count();
+    if backslashes % 2 == 1 {
+        Some(&trimmed[..trimmed.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// The heredoc delimiter this line opens, if any.
+///
+/// Quotes around the delimiter are stripped rather than honoured: `<<'EOF'`
+/// only changes whether the payload is expanded, not where it ends.
+fn heredoc_delimiter(line: &str) -> Option<String> {
+    let idx = line.find("<<")?;
+    let rest = &line[idx + 2..];
+    // `<<<` is a here-string — its payload is on this line already.
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    let mut delim = String::new();
+    for c in rest.trim_start().chars() {
+        if c.is_whitespace() || matches!(c, '>' | '<' | ';' | '&' | '|' | ')' | '`') {
+            break;
+        }
+        if matches!(c, '\'' | '"' | '\\') {
+            continue;
+        }
+        delim.push(c);
+    }
+    if delim.is_empty() {
+        None
+    } else {
+        Some(delim)
+    }
+}
+
+/// True if the body writes through a name that earlier took a control-plane
+/// value.
+///
+/// `set -- ~/.openfang/agents/` … `rm -rf "$@"` splits the path from the verb
+/// across *statements* rather than across lines, so [`logical_lines`] cannot
+/// help and the per-line conjunction never fires. The blunt fix — escalate on
+/// any expansion in any body that mentions the control plane — would put every
+/// real deploy script back where item 2 found it, so this instead tracks the
+/// specific names that took a control-plane value, forward, in execution order,
+/// transitively (`a=~/.openfang/agents; b="$a"; rm -rf "$b"`).
+///
+/// Known gaps, all fail-open and deliberate: arrays, `read`, indirect expansion
+/// (`${!x}`), and any value arriving from a command substitution this floor
+/// cannot evaluate. This closes the shape, not the class.
+fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
+    let mut tainted: Vec<String> = Vec::new();
+    for line in lines {
+        let lowered = line.text.to_ascii_lowercase();
+        for segment in split_segments(&lowered) {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            // Taint before checking: `f=~/.openfang/agents rm -rf "$f"` is one
+            // segment, and the assignment happens first.
+            taint_from_segment(&tokens, &mut tainted);
+            if tokens.iter().any(|t| references_tainted(t, &tainted)) && segment_writes(&tokens) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Record names this segment gives a control-plane value to.
+fn taint_from_segment(tokens: &[&str], tainted: &mut Vec<String>) {
+    for token in tokens {
+        if let Some((name, value)) = token.split_once('=') {
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            if names_control_plane(value) || references_tainted(value, tainted) {
+                let name = name.to_ascii_lowercase();
+                if !tainted.contains(&name) {
+                    tainted.push(name);
+                }
+            }
+        }
+    }
+    // Positional parameters: `set -- <control path>` is readable later as `$@`,
+    // `$*` or `$1`.
+    if basename(tokens[0]).as_str() == "set"
+        && tokens.contains(&"--")
+        && tokens
+            .iter()
+            .any(|t| names_control_plane(t) || references_tainted(t, tainted))
+    {
+        for positional in ["@", "*", "1", "2", "3"] {
+            let positional = positional.to_string();
+            if !tainted.contains(&positional) {
+                tainted.push(positional);
+            }
+        }
+    }
+}
+
+/// True if this token expands a tainted name.
+fn references_tainted(token: &str, tainted: &[String]) -> bool {
+    if tainted.is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = token.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        if j < chars.len() && chars[j] == '{' {
+            j += 1;
+        }
+        if j < chars.len() && matches!(chars[j], '@' | '*') {
+            if tainted.iter().any(|t| t.chars().eq([chars[j]])) {
+                return true;
+            }
+            j += 1;
+        } else {
+            let start = j;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let name: String = chars[start..j]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if !name.is_empty() && tainted.contains(&name) {
+                return true;
+            }
+        }
+        i = j.max(i + 1);
+    }
+    false
 }
 
 /// True if `s` names the control plane at all, read or write.
@@ -2121,6 +2383,68 @@ mod tests {
 
         let unreadably_long = format!("echo {} ~/.openfang/agents\n", "x".repeat(9000));
         assert!(body_writes_control_plane(&unreadably_long));
+    }
+
+    /// The hole security found in `17f71b2`. A `\`-continued command puts the
+    /// verb on one physical line and the control path on the next, and item 2's
+    /// conjunction sees a verb with no path followed by a path with no verb.
+    #[test]
+    fn a_continued_line_is_scanned_as_one_command() {
+        assert!(body_writes_control_plane(
+            "set -e\nrm -rf \\\n  ~/.openfang/agents/\n"
+        ));
+        // Trailing whitespace after the backslash is not a continuation to bash;
+        // joining anyway is the fail-closed direction.
+        assert!(body_writes_control_plane(
+            "cp ./a.toml \\  \n  ~/.openfang/agents/b.toml\n"
+        ));
+        // An even number of backslashes is a literal, not a join — and a read
+        // still reaches the judge.
+        assert!(!body_writes_control_plane(
+            "echo done \\\\\ncat ~/.openfang/config.toml\n"
+        ));
+        // A continuation at EOF still gets scanned rather than dropped.
+        assert!(body_writes_control_plane("rm -rf ~/.openfang/agents/ \\\n"));
+    }
+
+    /// A heredoc payload is data, so the path never appears as argv of the
+    /// segment that consumes it.
+    #[test]
+    fn a_heredoc_payload_belongs_to_the_line_that_opened_it() {
+        assert!(body_writes_control_plane(
+            "cat <<EOF > /tmp/x\n~/.openfang/agents/\nEOF\n"
+        ));
+        // Quoted delimiter, and the path split away behind substitution parens.
+        assert!(body_writes_control_plane(
+            "rm -rf $(cat <<'EOF'\n~/.openfang/agents/\nEOF\n)\n"
+        ));
+        // The terminator ends the fold: the next line is judged on its own, and
+        // a read is still a read.
+        assert!(!body_writes_control_plane(
+            "cat <<EOF\nhello\nEOF\nls ~/.openfang/agents\n"
+        ));
+        // `<<<` is a here-string, not a heredoc — nothing to fold.
+        assert!(!body_writes_control_plane(
+            "grep x <<< \"$PATH\"\ncat ./a\n"
+        ));
+    }
+
+    /// The path and the verb split across statements rather than across lines.
+    #[test]
+    fn a_control_path_laundered_through_a_variable_still_fires() {
+        assert!(body_writes_control_plane(
+            "set -- ~/.openfang/agents/\ncargo build\nrm -rf \"$@\"\n"
+        ));
+        // Transitive, in execution order.
+        assert!(body_writes_control_plane(
+            "target=~/.openfang/agents\nalias=\"$target\"\nrm -rf \"${alias}\"\n"
+        ));
+        // Untainted expansions are left alone: a script that reads the control
+        // plane and deletes its own build dir is not a floor case. This is the
+        // assertion that keeps item 2's win from being undone by item 4.
+        assert!(!body_writes_control_plane(
+            "cat ~/.openfang/config.toml\ntmp=./build\nrm -rf \"$tmp\"\n"
+        ));
     }
 
     /// A floor predicate is a floor predicate wherever it was computed.
