@@ -190,6 +190,12 @@ pub async fn build_gate_request(
         // demotion of `touches_control_plane`: a write to the judge's own
         // instructions is not a question the judge can be asked.
         policy_self_modification: openfang_types::gatekeeper::writes_gatekeeper_policy(raw_command),
+        // ANAI-206 commit 8. Ben's call, seconded by security: writing another
+        // agent's `allowed_commands` and writing the `[gatekeeper]` block are
+        // the self-modification sentence with a different subject. Reads of
+        // both stay demoted and reach the judge.
+        agent_config_write: openfang_types::gatekeeper::writes_agent_config(raw_command),
+        runtime_config_write: openfang_types::gatekeeper::writes_runtime_config(raw_command),
     };
 
     // ANAI-190. Gathered from the *comment-stripped* command, for the same

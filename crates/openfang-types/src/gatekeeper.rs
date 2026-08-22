@@ -743,6 +743,25 @@ pub struct GateFlags {
     /// [`writes_gatekeeper_policy`].
     #[serde(default)]
     pub policy_self_modification: bool,
+    /// ANAI-206 commit 8: a **write** at or under `~/.openfang/agents/`.
+    ///
+    /// Hard. Not the damage category and not quite the self-modification one
+    /// either: an agent's `agent.toml` carries its `allowed_commands`, so a
+    /// write here is one agent editing another agent's permission to run shell.
+    /// Same severity as [`GateFlags::policy_self_modification`], different
+    /// event — replacing the reviewer versus rewriting the reviewed — so it
+    /// gets its own flag and its own audit row. See [`writes_agent_config`].
+    ///
+    /// Reads are demoted and reach the judge.
+    #[serde(default)]
+    pub agent_config_write: bool,
+    /// ANAI-206 commit 8: a **write** to `~/.openfang/config.toml`.
+    ///
+    /// Hard. `[gatekeeper]` lives in that file, so this is the command that
+    /// turns the reviewer off, which is the same sentence as replacing it. See
+    /// [`writes_runtime_config`]. Reads are demoted and reach the judge.
+    #[serde(default)]
+    pub runtime_config_write: bool,
 }
 
 impl GateFlags {
@@ -766,6 +785,8 @@ impl GateFlags {
             || self.script_body_blind
             || self.substrate_destruction
             || self.policy_self_modification
+            || self.agent_config_write
+            || self.runtime_config_write
     }
 
     /// The predicates that bypass the judge entirely.
@@ -796,6 +817,12 @@ impl GateFlags {
     ///    `touches_control_plane` used to carry; demoting that flag wholesale
     ///    would have dropped it, which is a security regression hiding inside a
     ///    refactor.
+    /// 6. [`GateFlags::agent_config_write`] and 7.
+    ///    [`GateFlags::runtime_config_write`] — ANAI-206 commit 8, on Ben's
+    ///    call. Writing another agent's `allowed_commands`, or the
+    ///    `[gatekeeper]` block that decides whether any of this runs at all,
+    ///    are (5) with a different subject. Nothing an agent legitimately does
+    ///    requires either.
     ///
     /// Every other predicate still fires, still logs, and is rendered into the
     /// prompt for the judge to weigh against the path facts. Demotion moved who
@@ -807,6 +834,8 @@ impl GateFlags {
             || self.substrate_destruction
             || self.script_body_blind
             || self.policy_self_modification
+            || self.agent_config_write
+            || self.runtime_config_write
     }
 
     /// Compact `k=v` rendering for the audit log.
@@ -853,6 +882,12 @@ impl GateFlags {
         }
         if self.policy_self_modification {
             hit.push("policy_self_modification");
+        }
+        if self.agent_config_write {
+            hit.push("agent_config_write");
+        }
+        if self.runtime_config_write {
+            hit.push("runtime_config_write");
         }
         if hit.is_empty() {
             "none".to_string()
@@ -1799,40 +1834,122 @@ pub fn names_control_plane(s: &str) -> bool {
 /// trying to stop paying.
 #[must_use]
 pub fn names_substrate(s: &str) -> bool {
-    fn boundary(rest: &str) -> bool {
-        !rest
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-    }
+    control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Root | RootTail::Glob => true,
+        RootTail::Named(c) => SUBSTRATE_SUBTREES
+            .iter()
+            .any(|name| c.strip_prefix(name).is_some_and(control_boundary)),
+    })
+}
 
+/// True if `~/.openfang/agents` is named, at or under it.
+///
+/// ANAI-206 commit 8. See [`writes_agent_config`] for why this is its own
+/// predicate rather than a case of [`names_substrate`]: the substrate flag is
+/// about whole-tree destruction, this one is about a single-file edit to
+/// another agent's `allowed_commands`.
+#[must_use]
+pub fn names_agent_config(s: &str) -> bool {
+    control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Named(c) => c.strip_prefix("agents").is_some_and(control_boundary),
+        // A glob or the bare root is the substrate flag's business, and it is
+        // hard already. Claiming it here too would only blur the audit row.
+        _ => false,
+    })
+}
+
+/// True if `~/.openfang/config.toml` is named.
+///
+/// Boundary-checked, so `config.toml.bak` — an ordinary backup, not the live
+/// config — is not this.
+#[must_use]
+pub fn names_runtime_config(s: &str) -> bool {
+    control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Named(c) => c.strip_prefix("config.toml").is_some_and(control_boundary),
+        _ => false,
+    })
+}
+
+/// A component name ends here: what follows is punctuation, a separator, a
+/// quote, or nothing. Keeps `agents-archive` and `.openfangx` out.
+fn control_boundary(rest: &str) -> bool {
+    !rest
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// What sits directly under `~/.openfang/` at one occurrence of the root.
+#[derive(Debug, PartialEq, Eq)]
+enum RootTail {
+    /// The root itself: `~/.openfang`, `~/.openfang/`, `~/.openfang/.`.
+    Root,
+    /// A wildcard first component. `*` expands to every subtree there is and
+    /// `agent*` to at least one of them; neither resolves without touching the
+    /// filesystem, so both are treated as naming whatever they might name.
+    Glob,
+    /// A literal first component, still carrying whatever punctuation followed
+    /// it — callers boundary-check with `strip_prefix`.
+    Named(String),
+}
+
+/// Resolve the first path component under every occurrence of the control-plane
+/// root in `s`, lowercased.
+///
+/// ANAI-206 G1. The first version of [`names_substrate`] compared the raw tail
+/// against [`SUBSTRATE_SUBTREES`] with `strip_prefix`, so three ordinary shell
+/// spellings of the same directory walked past the hard floor:
+/// `rm -rf ~/.openfang/*` — the one glob that deletes *both* pinned subtrees at
+/// once — plus `~/.openfang/./agents` and `~/.openfang//agents`. A hard floor
+/// that one character defeats is not a floor.
+///
+/// Empty and `.` components are dropped, `..` pops, and an occurrence that pops
+/// past the root is abandoned: `~/.openfang/..` is the home directory and not
+/// our business. Declared gaps: bracket globs (`[ad]*`), brace expansion, and
+/// any component produced by a variable the daemon cannot expand — all three
+/// still fire the demoted control-plane flag and reach the judge.
+fn control_root_tails(s: &str) -> Vec<RootTail> {
     let lowered = s.to_ascii_lowercase();
+    let mut out: Vec<RootTail> = Vec::new();
     let mut rest: &str = &lowered;
     while let Some(idx) = rest.find(CONTROL_PLANE_ROOT_BARE) {
         let after = &rest[idx + CONTROL_PLANE_ROOT_BARE.len()..];
-        let hit = match after.chars().next() {
+        match after.chars().next() {
             // `~/.openfang` at end of token: the root itself.
-            None => true,
+            None => out.push(RootTail::Root),
             Some('/') => {
-                let sub = &after[1..];
-                // `~/.openfang/` — still the root.
-                sub.is_empty()
-                    || SUBSTRATE_SUBTREES
-                        .iter()
-                        .any(|name| sub.strip_prefix(name).is_some_and(boundary))
+                let mut stack: Vec<&str> = Vec::new();
+                let mut escaped = false;
+                for comp in after[1..].split('/') {
+                    if comp.is_empty() || comp == "." {
+                        continue;
+                    }
+                    if comp == ".." {
+                        if stack.pop().is_none() {
+                            escaped = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    stack.push(comp);
+                }
+                if !escaped {
+                    out.push(match stack.first() {
+                        None => RootTail::Root,
+                        Some(c) if c.contains('*') || c.contains('?') => RootTail::Glob,
+                        Some(c) => RootTail::Named((*c).to_string()),
+                    });
+                }
             }
             // `.openfangx`, `.openfang.tar.gz` — a different name that merely
             // starts the same way.
-            Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => false,
+            Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => {}
             // A quote, a separator, whitespace: the root.
-            Some(_) => true,
-        };
-        if hit {
-            return true;
+            Some(_) => out.push(RootTail::Root),
         }
         rest = &rest[idx + CONTROL_PLANE_ROOT_BARE.len()..];
     }
-    false
+    out
 }
 
 /// ANAI-206 commit 6: the one class of command the judge is not consulted
@@ -3316,6 +3433,10 @@ mod commit6_tests;
 #[cfg(test)]
 #[path = "gatekeeper_commit7_tests.rs"]
 mod commit7_tests;
+
+#[cfg(test)]
+#[path = "gatekeeper_commit8_tests.rs"]
+mod commit8_tests;
 /// ANAI-206 commit 6: a **write** to the judge's own policy file.
 ///
 /// The second member of [`GateFlags::hard`] that is about an attack on the
@@ -3337,14 +3458,61 @@ mod commit7_tests;
 /// `~/.openfang/`.
 #[must_use]
 pub fn writes_gatekeeper_policy(command: &str) -> bool {
+    writes_where(command, |s| s.contains(GATEKEEPER_POLICY_PATH))
+}
+
+/// ANAI-206 commit 8: a **write** at or under `~/.openfang/agents/`.
+///
+/// Hard, on Ben's call, and the reasoning is [`writes_gatekeeper_policy`]'s
+/// with a different subject. An agent's `agent.toml` carries its
+/// `allowed_commands` and its `exec_policy`, so a write here is one agent
+/// granting another agent — or itself — shell it was not given. There is no
+/// legitimate agent-side reason to do it; provisioning is the daemon's job.
+///
+/// Reads stay demoted on purpose. `grep -rn model ~/.openfang/agents/` is
+/// ordinary fleet traffic, fires `touches_control_plane`, and reaches the judge
+/// with the whole command in front of it and the fact sheet underneath it.
+///
+/// Scoped to the command line, like the other two write predicates. The same
+/// write inside a script body is the judge's problem: it fires
+/// `script_body_control_plane`, the body is rendered, and rule 4 tells the
+/// judge what a write under `~/.openfang/` means.
+#[must_use]
+pub fn writes_agent_config(command: &str) -> bool {
+    writes_where(command, names_agent_config)
+}
+
+/// ANAI-206 commit 8: a **write** to `~/.openfang/config.toml`.
+///
+/// The `[gatekeeper]` block lives there, so this is the command that turns the
+/// reviewer off — the same sentence as replacing it, which is why
+/// [`writes_gatekeeper_policy`] is hard. It is also the one place the leniency
+/// `scripts/` gets would be wrong: `scripts/` is code the judge can read, and
+/// this is the switch that decides whether it reads anything.
+///
+/// Boundary-checked via [`names_runtime_config`], so `config.toml.bak` is a
+/// backup file and not this.
+#[must_use]
+pub fn writes_runtime_config(command: &str) -> bool {
+    writes_where(command, names_runtime_config)
+}
+
+/// Shared shape of the three control-plane write predicates: over every deny
+/// variant, in some segment, a token the predicate names **and** a verb in that
+/// same segment that writes it.
+///
+/// Runs on `deny_variants` rather than raw text, like every other command-line
+/// predicate — one `""` in the middle of a path is exactly the shape that
+/// defeats a raw `contains`.
+fn writes_where(command: &str, names: impl Fn(&str) -> bool) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
         let lowered = v.to_ascii_lowercase();
-        if !lowered.contains(GATEKEEPER_POLICY_PATH) {
+        if !names(&lowered) {
             return false;
         }
         split_segments(&lowered).into_iter().any(|segment| {
             let tokens: Vec<&str> = segment.split_whitespace().collect();
-            tokens.iter().any(|t| t.contains(GATEKEEPER_POLICY_PATH)) && segment_writes(&tokens)
+            tokens.iter().any(|t| names(t)) && segment_writes(&tokens)
         })
     })
 }
