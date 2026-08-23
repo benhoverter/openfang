@@ -91,6 +91,10 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "memory_episode_close",
     "memory_status",
     "memory_note",
+    // ANAI-204. Tier-3 claim slots: `memory_fact` reads and writes one keyed
+    // slot, `memory_history` reads the supersession trail behind it.
+    "memory_fact",
+    "memory_history",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -1768,10 +1772,11 @@ mod tests {
     fn allowlist_cardinality_pin() {
         use openfang_mcp_bridge::{built_in_tools, DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
         // ANAI-166: 22 -> 23 (`memory_note`).
-        assert_eq!(ALLOWED_TOOLS.len(), 23, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-204: 23 -> 25 (`memory_fact`, `memory_history`).
+        assert_eq!(ALLOWED_TOOLS.len(), 25, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            23,
+            25,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -1781,8 +1786,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            19,
-            "DEFAULT_ALLOWED bridge-default cardinality (23 − 4 privileged)"
+            21,
+            "DEFAULT_ALLOWED bridge-default cardinality (25 − 4 privileged)"
         );
     }
 

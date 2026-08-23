@@ -69,6 +69,8 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "memory_episode_close"
             | "memory_status"
             | "memory_note"
+            | "memory_fact"
+            | "memory_history"
             | "agent_send"
             | "agent_list"
             | "agent_spawn"

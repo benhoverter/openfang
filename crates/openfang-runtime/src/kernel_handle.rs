@@ -34,6 +34,32 @@ pub struct AgentInfo {
     pub tools: Vec<String>,
 }
 
+/// One tier-3 fact write, as it crosses the handle boundary (ANAI-204).
+///
+/// A struct rather than six positional parameters: the write already carries
+/// two optional strings and an optional float, and a call site that has to
+/// count `None`s to line them up is a defect waiting for the next field. The
+/// fields are plain `String`s so the trait keeps its standing rule of not
+/// dragging `openfang-memory`'s types across the boundary — the vocabulary
+/// types (`FactScope`, `ClaimKey`, `FactStatus`) are parsed on the far side,
+/// where the store that enforces them lives.
+#[derive(Debug, Clone)]
+pub struct FactWriteRequest {
+    /// `agent` / `project` / `user`. Validated kernel-side.
+    pub scope: String,
+    /// What the claim is about. `None` is legal only for `agent` scope, which
+    /// derives it from the caller.
+    pub scope_ref: Option<String>,
+    /// The slot name, e.g. `repo.trunk_model`.
+    pub claim_key: String,
+    /// The claim itself, in prose.
+    pub claim: String,
+    /// `open` or `settled`. `None` means settled.
+    pub status: Option<String>,
+    /// 0.0..=1.0. `None` means 1.0.
+    pub confidence: Option<f64>,
+}
+
 /// Handle to kernel operations, passed into the agent loop so agents
 /// can interact with each other via tools.
 #[allow(clippy::too_many_arguments)]
@@ -147,6 +173,61 @@ pub trait KernelHandle: Send + Sync {
     /// `openfang-memory` episode types across the handle boundary, which every
     /// other method on here deliberately avoids.
     fn memory_status(&self, caller_agent_id: Option<&str>) -> Result<serde_json::Value, String>;
+
+    /// ANAI-204 (ADR 0001 §2.3): write a claim into its tier-3 slot,
+    /// superseding whatever was there.
+    ///
+    /// Returns the outcome as JSON — `created` / `affirmed` / `superseded`,
+    /// the resolved slot address, and on a supersession the claim that was
+    /// displaced. The caller usually wants that distinction: "I already
+    /// believed this" and "I have changed my mind" are different things to
+    /// report, and the tool layer cannot tell them apart from the outside
+    /// without re-reading the row it just wrote.
+    ///
+    /// Async because the write opens a transaction and, where an embedding
+    /// driver is configured, embeds the claim first.
+    ///
+    /// Defaulted to an error for the same reason [`Self::memory_search`] is:
+    /// a non-kernel implementor that silently accepted the write and dropped
+    /// it would be indistinguishable from a slot that never took.
+    async fn memory_fact_write(
+        &self,
+        _caller_agent_id: Option<&str>,
+        _request: FactWriteRequest,
+    ) -> Result<serde_json::Value, String> {
+        Err("memory_fact is not available on this kernel handle".to_string())
+    }
+
+    /// ANAI-204: the live claim in a slot, if any.
+    ///
+    /// Addressed by subject (`scope`, `scope_ref`, `claim_key`), never by
+    /// author — see the module docs on `openfang_memory::fact`. `scope_ref`
+    /// is `None` only for `agent` scope, which derives it from the caller.
+    fn memory_fact_get(
+        &self,
+        _caller_agent_id: Option<&str>,
+        _scope: &str,
+        _scope_ref: Option<&str>,
+        _claim_key: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("memory_fact is not available on this kernel handle".to_string())
+    }
+
+    /// ANAI-204: every claim that has occupied a slot, newest first.
+    ///
+    /// The audit path. Never part of automatic recall (§2.3.2) — a superseded
+    /// claim reaching the prompt is the failure the whole tier is built to
+    /// make unrepresentable, so reaching history takes an explicit call.
+    fn memory_fact_history(
+        &self,
+        _caller_agent_id: Option<&str>,
+        _scope: &str,
+        _scope_ref: Option<&str>,
+        _claim_key: &str,
+        _limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        Err("memory_history is not available on this kernel handle".to_string())
+    }
 
     /// ANAI-166 (ADR 0002 §2.2/§2.3): retrieval over the CALLER's episodic
     /// memory — semantic when an embedding driver is configured, LIKE matching

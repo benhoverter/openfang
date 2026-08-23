@@ -5,6 +5,7 @@
 
 use crate::consolidation::ConsolidationEngine;
 use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore};
+use crate::fact::{FactOutcome, FactStore, FactWrite};
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
 use crate::semantic::SemanticStore;
@@ -38,6 +39,7 @@ pub struct MemorySubstrate {
     consolidation: ConsolidationEngine,
     usage: UsageStore,
     episodes: EpisodeStore,
+    facts: FactStore,
 }
 
 impl MemorySubstrate {
@@ -70,6 +72,7 @@ impl MemorySubstrate {
                 Arc::clone(&shared),
                 memory_config.episode_idle_timeout_minutes,
             ),
+            facts: FactStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -125,7 +128,7 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             episodes: EpisodeStore::new(Arc::clone(&shared)),
-
+            facts: FactStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
         })
     }
@@ -213,6 +216,30 @@ impl MemorySubstrate {
     /// The agent's currently open episode, if any.
     pub fn current_episode(&self, agent_id: AgentId) -> OpenFangResult<Option<Episode>> {
         self.episodes.current(agent_id)
+    }
+
+    // -----------------------------------------------------------------
+    // Tier-3 facts (ADR 0001 §2.3)
+    // -----------------------------------------------------------------
+
+    /// The tier-3 fact store: keyed claim slots and their supersession
+    /// history.
+    ///
+    /// Handed out directly for reads, which are exact-key lookups cheap enough
+    /// to run inline. Writes go through [`Self::fact_upsert_async`] instead —
+    /// an upsert opens a transaction, and blocking the reactor on one from
+    /// inside the agent loop is exactly what the other `*_async` wrappers here
+    /// exist to avoid.
+    pub fn facts(&self) -> &FactStore {
+        &self.facts
+    }
+
+    /// Write a claim into its slot, off-reactor. See [`FactStore::upsert`].
+    pub async fn fact_upsert_async(&self, write: FactWrite) -> OpenFangResult<FactOutcome> {
+        let store = self.facts.clone();
+        tokio::task::spawn_blocking(move || store.upsert(write))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Get the shared database connection (for constructing stores from outside).

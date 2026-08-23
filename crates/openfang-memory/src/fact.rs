@@ -94,7 +94,7 @@
 //! This layer is the backstop that makes the vocabulary a property of the
 //! store rather than a habit of its callers.
 
-use crate::vocabulary::{check_scope_ref, nearest_keys, ClaimKey, FactScope};
+use crate::vocabulary::{nearest_keys, resolve_scope_ref, ClaimKey, FactScope};
 use chrono::Utc;
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -519,20 +519,7 @@ impl FactStore {
         // no caller can address another agent's slots; demanded for the rest,
         // because SQLite treats NULLs as distinct inside a unique index and an
         // absent ref would silently switch off the constraint it is part of.
-        let scope_ref = match (scope.takes_caller_ref(), write.scope_ref.as_deref()) {
-            (false, _) => agent.clone(),
-            (true, Some(given)) => {
-                check_scope_ref(scope, given)?;
-                given.to_string()
-            }
-            (true, None) => {
-                return Err(OpenFangError::InvalidInput(format!(
-                    "a {scope}-scoped fact needs a scope_ref naming what it is about \
-                     (the project or user slug). Without one the slot has no subject, so \
-                     the claim would be filed under whoever happened to write it."
-                )));
-            }
-        };
+        let scope_ref = resolve_scope_ref(scope, &agent, write.scope_ref.as_deref())?;
 
         let claim_key = ClaimKey::parse(&write.claim_key)
             .map_err(|e| Self::with_existing_keys(&conn, scope, &scope_ref, &write.claim_key, e))?;
@@ -773,6 +760,32 @@ impl FactStore {
             out.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))??);
         }
         Ok(out)
+    }
+
+    /// One history row, by its own id.
+    ///
+    /// Exists so a caller that has just superseded a claim can report *what it
+    /// replaced* without re-reading the slot. A second read of the live row
+    /// would race the next writer and could name the wrong outgoing claim,
+    /// which is worse than saying nothing at all.
+    /// [`FactOutcome::Superseded`] hands back the exact `history_id` this
+    /// looks up, so the answer is the row that write actually archived.
+    pub fn history_entry(&self, id: Uuid) -> OpenFangResult<Option<FactHistoryEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        conn.query_row(
+            "SELECT id, memory_id, authored_by, scope, scope_ref, claim_key, claim, status,
+                    confidence, episode_id, created_at, superseded_at, superseded_by_episode
+             FROM fact_history
+             WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+            row_to_history,
+        )
+        .optional()
+        .map_err(|e| OpenFangError::Memory(e.to_string()))?
+        .transpose()
     }
 }
 

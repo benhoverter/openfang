@@ -250,6 +250,41 @@ pub fn check_scope_ref(scope: FactScope, raw: &str) -> OpenFangResult<()> {
     Ok(())
 }
 
+/// Resolve the subject half of a slot address.
+///
+/// One function, called by the write path and by every read path, because a
+/// reader that resolves `scope_ref` differently from the writer addresses a
+/// *different slot* and reports the claim missing. That reads as data loss,
+/// and it is a two-line drift to introduce if each path does its own
+/// resolution.
+///
+/// `agent` scope derives its ref from the caller's own id and ignores anything
+/// supplied: honouring a caller-chosen agent ref would let one agent write
+/// into another's slot space, which is the ANAI-165 boundary reopened from
+/// inside tier 3. Every other scope demands one, because SQLite treats NULLs
+/// as distinct inside a unique index and an absent ref would silently switch
+/// off the constraint it is part of.
+pub fn resolve_scope_ref(
+    scope: FactScope,
+    agent_id: &str,
+    given: Option<&str>,
+) -> OpenFangResult<String> {
+    if !scope.takes_caller_ref() {
+        return Ok(agent_id.to_string());
+    }
+    match given {
+        Some(given) => {
+            check_scope_ref(scope, given)?;
+            Ok(given.to_string())
+        }
+        None => Err(OpenFangError::InvalidInput(format!(
+            "a {scope}-scoped fact needs a scope_ref naming what it is about \
+             (the project or user slug). Without one the slot has no subject, so \
+             the claim would be filed under whoever happened to write it."
+        ))),
+    }
+}
+
 /// A validated claim key.
 ///
 /// Constructing one is the only way to assert a key is in the vocabulary, so

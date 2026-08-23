@@ -9263,6 +9263,14 @@ fn resolve_memory_caller(
 /// enough that the tool result stays a status line rather than a log dump.
 const MEMORY_STATUS_RECENT_LIMIT: usize = 3;
 
+/// Hard ceiling on `memory_history` results (ANAI-204).
+///
+/// Clamped rather than trusted for the same reason `memory_search`'s limit is:
+/// an unbounded limit on a tool that renders into the caller's own turn is a
+/// context-window exhaustion primitive, and a slot with a long history is
+/// exactly where one would land.
+const MEMORY_HISTORY_MAX_LIMIT: usize = 20;
+
 /// ANAI-166 (ADR 0002 §2.1, principle 1): the `kind` discriminator lives in
 /// capture metadata, NOT in `MemorySource`.
 ///
@@ -10349,6 +10357,203 @@ impl KernelHandle for OpenFangKernel {
             "idle_timeout_minutes": status.idle_timeout_minutes,
             "minutes_until_timer_close": status.minutes_until_timer_close,
             "recent_episodes": status.recent.iter().map(episode_json).collect::<Vec<_>>(),
+        }))
+    }
+
+    // ANAI-204 (ADR 0001 §2.3): tier-3 claim slots.
+    //
+    // All three resolve the slot address through
+    // `openfang_memory::vocabulary::resolve_scope_ref`, the same function the
+    // store's own write path calls. That is deliberate and not incidental: a
+    // read that resolved `scope_ref` even slightly differently from the write
+    // would address a different slot and report the claim missing, which looks
+    // like data loss and is invisible in a diff.
+
+    async fn memory_fact_write(
+        &self,
+        caller_agent_id: Option<&str>,
+        request: kernel_handle::FactWriteRequest,
+    ) -> Result<serde_json::Value, String> {
+        use openfang_memory::fact::{FactOutcome, FactStatus, FactWrite};
+        use openfang_memory::vocabulary::{resolve_scope_ref, FactScope};
+
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+
+        // Vocabulary first, before anything with a side effect. The store
+        // re-checks all of this — it is the enforcement point and this is not
+        // — but resolving here is what lets the response name the slot that
+        // was actually written rather than the one the caller asked for.
+        let scope = FactScope::parse(&request.scope).map_err(|e| e.to_string())?;
+        let agent_ref = agent_id.to_string();
+        let scope_ref = resolve_scope_ref(scope, &agent_ref, request.scope_ref.as_deref())
+            .map_err(|e| e.to_string())?;
+
+        let status = match request.status.as_deref() {
+            None => FactStatus::Settled,
+            Some(s) => FactStatus::parse(s).map_err(|e| e.to_string())?,
+        };
+        let confidence = request.confidence.unwrap_or(1.0);
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err(format!(
+                "confidence {confidence} is outside 0.0..=1.0; omit it to assert the claim \
+                 outright"
+            ));
+        }
+
+        // A fact write is activity: it opens an episode if none is open and
+        // extends one that is. Same reasoning as `memory_note` — the write
+        // establishes the state, which is why ADR 0002 §2.6 refuses a separate
+        // `episode_open` verb. It also gives the claim the provenance
+        // `openfang-security` asked for: who asserted it, in which episode,
+        // and when, all carried into `fact_history` on supersession.
+        let episode_id = self
+            .memory
+            .ensure_open_episode_async(agent_id)
+            .await
+            .map_err(|e| format!("Fact write failed to resolve an episode: {e}"))?;
+
+        // Embed the claim so a fact is reachable by meaning as well as by
+        // exact slot address. Degraded, not fatal, for the same reason a note
+        // stores unembedded on failure: refusing the write would throw away
+        // the claim over a transient endpoint problem, and an unembedded fact
+        // is still exactly readable by its key.
+        let embedding = match self.embedding_driver {
+            Some(ref driver) => match driver.embed_one(&request.claim).await {
+                Ok(vec) => Some(vec),
+                Err(e) => {
+                    warn!(error = %e, "Fact claim embedding failed; storing without a vector");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let mut write = FactWrite::new(
+            agent_id,
+            request.scope.as_str(),
+            request.claim_key.as_str(),
+            request.claim.as_str(),
+        )
+        .with_status(status)
+        .with_confidence(confidence)
+        .with_source(openfang_types::memory::MemorySource::Conversation)
+        .with_episode(episode_id.to_string());
+        if let Some(ref given) = request.scope_ref {
+            write = write.with_scope_ref(given.clone());
+        }
+        if let Some(vector) = embedding {
+            write = write.with_embedding(vector);
+        }
+
+        let outcome = self
+            .memory
+            .fact_upsert_async(write)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // On a supersession, name what was displaced. Looked up by the exact
+        // `history_id` the write returned rather than by re-reading the slot:
+        // a second read would race the next writer and could report the wrong
+        // outgoing claim, which is worse than reporting none.
+        let (outcome_name, previous_claim) = match outcome {
+            FactOutcome::Created { .. } => ("created", None),
+            FactOutcome::Affirmed { .. } => ("affirmed", None),
+            FactOutcome::Superseded { history_id, .. } => (
+                "superseded",
+                self.memory
+                    .facts()
+                    .history_entry(history_id)
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.claim),
+            ),
+        };
+
+        Ok(serde_json::json!({
+            "outcome": outcome_name,
+            "id": outcome.id().0.to_string(),
+            "scope": scope.as_str(),
+            "scope_ref": scope_ref,
+            "claim_key": request.claim_key,
+            "previous_claim": previous_claim,
+            "episode_id": episode_id.to_string(),
+        }))
+    }
+
+    fn memory_fact_get(
+        &self,
+        caller_agent_id: Option<&str>,
+        scope: &str,
+        scope_ref: Option<&str>,
+        claim_key: &str,
+    ) -> Result<serde_json::Value, String> {
+        use openfang_memory::vocabulary::{resolve_scope_ref, FactScope};
+
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let scope = FactScope::parse(scope).map_err(|e| e.to_string())?;
+        let agent_ref = agent_id.to_string();
+        let scope_ref =
+            resolve_scope_ref(scope, &agent_ref, scope_ref).map_err(|e| e.to_string())?;
+
+        let fact = self
+            .memory
+            .facts()
+            .get(scope.as_str(), &scope_ref, claim_key)
+            .map_err(|e| format!("Fact read failed: {e}"))?;
+
+        Ok(serde_json::json!({
+            "scope": scope.as_str(),
+            "scope_ref": scope_ref,
+            "claim_key": claim_key,
+            "fact": fact.map(|f| serde_json::json!({
+                "claim": f.claim,
+                "status": f.status.as_str(),
+                "confidence": f.confidence,
+                "authored_by": f.authored_by,
+                "created_at": f.created_at,
+                "last_affirmed_at": f.last_affirmed_at,
+                "episode_id": f.episode_id,
+            })),
+        }))
+    }
+
+    fn memory_fact_history(
+        &self,
+        caller_agent_id: Option<&str>,
+        scope: &str,
+        scope_ref: Option<&str>,
+        claim_key: &str,
+        limit: usize,
+    ) -> Result<serde_json::Value, String> {
+        use openfang_memory::vocabulary::{resolve_scope_ref, FactScope};
+
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let scope = FactScope::parse(scope).map_err(|e| e.to_string())?;
+        let agent_ref = agent_id.to_string();
+        let scope_ref =
+            resolve_scope_ref(scope, &agent_ref, scope_ref).map_err(|e| e.to_string())?;
+        let limit = limit.clamp(1, MEMORY_HISTORY_MAX_LIMIT);
+
+        let entries = self
+            .memory
+            .facts()
+            .history(scope.as_str(), &scope_ref, claim_key, limit)
+            .map_err(|e| format!("Fact history read failed: {e}"))?;
+
+        Ok(serde_json::json!({
+            "scope": scope.as_str(),
+            "scope_ref": scope_ref,
+            "claim_key": claim_key,
+            "count": entries.len(),
+            "entries": entries.iter().map(|e| serde_json::json!({
+                "claim": e.claim,
+                "status": e.status.map(|s| s.as_str()),
+                "confidence": e.confidence,
+                "authored_by": e.authored_by,
+                "created_at": e.created_at,
+                "superseded_at": e.superseded_at,
+                "superseded_by_episode": e.superseded_by_episode,
+            })).collect::<Vec<_>>(),
         }))
     }
 

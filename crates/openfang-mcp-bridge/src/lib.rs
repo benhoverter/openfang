@@ -194,6 +194,21 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     // rows, and a note is append-only — there is no agent-facing verb that
     // removes or rewrites one (ADR 0002 §2.6).
     "memory_note",
+    // ANAI-204. These do NOT pass the "scoped to the caller's own rows" test —
+    // a `project`- or `user`-scoped slot belongs to its subject, so one agent
+    // can overwrite a claim another agent wrote. That is the design (see the
+    // v14 index amendment), not an oversight, and it is why they are listed
+    // here with a reason rather than by analogy to `memory_note`.
+    //
+    // Default-safe on a different test: no write destroys anything. A
+    // supersession copies the outgoing claim into `fact_history` in the same
+    // transaction, so the worst a confused agent can do is make a slot say
+    // something wrong *and leave a signed record of what it used to say*. There
+    // is no agent-facing verb that deletes a fact or a history row. `global`
+    // scope, the one case where a bad write would render into ~70 prompts, is
+    // refused at the writer.
+    "memory_fact",
+    "memory_history",
 ];
 
 /// Agent-lifecycle tools that are dispatchable by the daemon and advertised
@@ -643,6 +658,44 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "required": ["text"]
             })),
         ),
+        // Mirrors `openfang_runtime::tool_runner` → `memory_fact` /
+        // `memory_history` (ANAI-204). Descriptions and schemas are copied
+        // verbatim from the runtime definitions; Invariant C
+        // (`openfang_api::bridge_ipc::tests::advertised_tool_schemas_match_runtime`)
+        // asserts property-set equality, so a parameter added on one side and
+        // not the other fails the api suite rather than going quietly
+        // unreachable for every subprocess agent. Tail-appended, like every
+        // other bridge tool.
+        Tool::new(
+            "memory_fact",
+            "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "Whose truth this is: 'agent' (about you), 'project', or 'user'." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about - the project or user slug, e.g. \"openfang-fork\". Required for 'project' and 'user'; ignored for 'agent', which is always you." },
+                    "key": { "type": "string", "description": "The slot name, 'namespace.slot', e.g. \"repo.trunk_model\". Up to 7 dot-separated segments." },
+                    "claim": { "type": "string", "description": "The claim itself, in plain words. Omit to READ the slot instead of writing it." },
+                    "status": { "type": "string", "enum": ["open", "settled"], "description": "'settled' (default) for a stable belief; 'open' for an unfinished loop." },
+                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." }
+                },
+                "required": ["scope", "key"]
+            })),
+        ),
+        Tool::new(
+            "memory_history",
+            "Show every claim that has occupied a slot, newest first - what was believed, who asserted it, and when it stopped being true. The audit path for a fact whose current value looks wrong or surprising. Superseded claims never appear in ordinary recall, so this is the only way to see one.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "The slot's scope, same value you would pass to memory_fact." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about. Required for 'project' and 'user'; ignored for 'agent'." },
+                    "key": { "type": "string", "description": "The slot name, e.g. \"repo.trunk_model\"." },
+                    "limit": { "type": "integer", "description": "Maximum versions to return (default 5, maximum 20)." }
+                },
+                "required": ["scope", "key"]
+            })),
+        ),
     ]
 }
 
@@ -890,6 +943,8 @@ mod tests {
                 "memory_episode_close",
                 "memory_status",
                 "memory_note",
+                "memory_fact",
+                "memory_history",
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"

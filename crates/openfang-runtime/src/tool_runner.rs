@@ -751,6 +751,8 @@ pub async fn execute_tool(
         "memory_note" => tool_memory_note(input, kernel, caller_agent_id).await,
         "memory_episode_close" => tool_memory_episode_close(input, kernel, caller_agent_id),
         "memory_status" => tool_memory_status(kernel, caller_agent_id),
+        "memory_fact" => tool_memory_fact(input, kernel, caller_agent_id).await,
+        "memory_history" => tool_memory_history(input, kernel, caller_agent_id),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1310,6 +1312,43 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        // --- Fact tools (ANAI-204, ADR 0001 2.3) ---
+        //
+        // Grouped with the other memory tools for the same reason the episode
+        // tools are: this list is category-ordered and its drift test asserts
+        // membership, not position. The FLAT bridge lists are tail-appended
+        // instead, because the bridge surface test compares an exact ordered
+        // vec.
+        ToolDefinition {
+            name: "memory_fact".to_string(),
+            description: "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "Whose truth this is: 'agent' (about you), 'project', or 'user'." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about - the project or user slug, e.g. \"openfang-fork\". Required for 'project' and 'user'; ignored for 'agent', which is always you." },
+                    "key": { "type": "string", "description": "The slot name, 'namespace.slot', e.g. \"repo.trunk_model\". Up to 7 dot-separated segments." },
+                    "claim": { "type": "string", "description": "The claim itself, in plain words. Omit to READ the slot instead of writing it." },
+                    "status": { "type": "string", "enum": ["open", "settled"], "description": "'settled' (default) for a stable belief; 'open' for an unfinished loop." },
+                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." }
+                },
+                "required": ["scope", "key"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_history".to_string(),
+            description: "Show every claim that has occupied a slot, newest first - what was believed, who asserted it, and when it stopped being true. The audit path for a fact whose current value looks wrong or surprising. Superseded claims never appear in ordinary recall, so this is the only way to see one.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "The slot's scope, same value you would pass to memory_fact." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about. Required for 'project' and 'user'; ignored for 'agent'." },
+                    "key": { "type": "string", "description": "The slot name, e.g. \"repo.trunk_model\"." },
+                    "limit": { "type": "integer", "description": "Maximum versions to return (default 5, maximum 20)." }
+                },
+                "required": ["scope", "key"]
             }),
         },
         // --- Collaboration tools ---
@@ -3703,6 +3742,207 @@ async fn tool_memory_note(
         "Noted. It is attached to your current episode and will surface in memory_recall."
             .to_string(),
     )
+}
+
+// --- Tier-3 fact tools (ANAI-204, ADR 0001 §2.3) --------------------------
+
+/// Default number of superseded versions `memory_history` returns.
+///
+/// Small on purpose. The common question is "what did this used to say", not
+/// "give me the whole life of this slot"; a caller who wants more asks, and
+/// the kernel clamps the ask.
+const MEMORY_HISTORY_DEFAULT_LIMIT: usize = 5;
+
+/// Statuses an agent may name on a fact write.
+///
+/// Checked here as well as kernel-side so the rejection can say what the legal
+/// values are. The kernel's parse is the enforcement point; this one exists so
+/// a typo comes back as a menu rather than as a store error.
+const AGENT_FACT_STATUSES: &[&str] = &["open", "settled"];
+
+/// Pull the shared `(scope, scope_ref, key)` slot address out of a tool call.
+fn fact_address(input: &serde_json::Value) -> Result<(&str, Option<&str>, &str), String> {
+    let scope = input["scope"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(
+            "Missing 'scope' parameter — whose truth this is. Use one of: agent, project, user",
+        )?;
+    let key = input["key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .ok_or("Missing 'key' parameter — the slot name, e.g. \"repo.trunk_model\"")?;
+    let scope_ref = input["scope_ref"]
+        .as_str()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    Ok((scope, scope_ref, key))
+}
+
+async fn tool_memory_fact(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let (scope, scope_ref, key) = fact_address(input)?;
+    let claim = input["claim"]
+        .as_str()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+
+    // No claim means read. Deliberately not an error — reading a slot before
+    // writing it is the behaviour §2.3.3 wants, since a caller who has seen
+    // the existing key space selects from it instead of minting a
+    // near-duplicate. But a caller who MEANT to write and left `claim` off
+    // would otherwise get a success message for a call that changed nothing,
+    // so the read says so in as many words.
+    let Some(claim) = claim else {
+        let payload = kh.memory_fact_get(caller_agent_id, scope, scope_ref, key)?;
+        return Ok(render_fact_read(&payload));
+    };
+
+    if let Some(status) = input["status"].as_str().map(str::trim) {
+        if !status.is_empty() && !AGENT_FACT_STATUSES.contains(&status) {
+            return Err(format!(
+                "Unknown status '{status}'. Use one of: {}",
+                AGENT_FACT_STATUSES.join(", ")
+            ));
+        }
+    }
+
+    let request = crate::kernel_handle::FactWriteRequest {
+        scope: scope.to_string(),
+        scope_ref: scope_ref.map(str::to_string),
+        claim_key: key.to_string(),
+        claim: claim.to_string(),
+        status: input["status"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        confidence: input["confidence"].as_f64(),
+    };
+
+    let payload = kh.memory_fact_write(caller_agent_id, request).await?;
+    Ok(render_fact_write(&payload))
+}
+
+fn tool_memory_history(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let (scope, scope_ref, key) = fact_address(input)?;
+    let limit = input["limit"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or(MEMORY_HISTORY_DEFAULT_LIMIT);
+
+    let payload = kh.memory_fact_history(caller_agent_id, scope, scope_ref, key, limit)?;
+    Ok(render_fact_history(&payload))
+}
+
+/// `scope/scope_ref key` — the slot address as one readable token.
+fn fact_slot_label(payload: &serde_json::Value) -> String {
+    format!(
+        "{}/{} {}",
+        payload["scope"].as_str().unwrap_or("?"),
+        payload["scope_ref"].as_str().unwrap_or("?"),
+        payload["claim_key"].as_str().unwrap_or("?"),
+    )
+}
+
+fn render_fact_read(payload: &serde_json::Value) -> String {
+    let slot = fact_slot_label(payload);
+    let Some(fact) = payload.get("fact").filter(|f| !f.is_null()) else {
+        return format!(
+            "{slot}\n  (empty — no claim occupies this slot)\n\nRead only: no 'claim' was \
+             given, so nothing was written. Pass 'claim' to fill the slot."
+        );
+    };
+
+    let mut out = format!(
+        "{slot}\n  {}\n",
+        fact["claim"].as_str().unwrap_or("(unreadable claim)")
+    );
+    if let Some(status) = fact["status"].as_str() {
+        out.push_str(&format!("  status: {status}"));
+        if let Some(confidence) = fact["confidence"].as_f64() {
+            out.push_str(&format!("   confidence: {confidence}"));
+        }
+        out.push('\n');
+    }
+    if let Some(author) = fact["authored_by"].as_str() {
+        out.push_str(&format!("  asserted by: {author}\n"));
+    }
+    if let Some(created) = fact["created_at"].as_str() {
+        out.push_str(&format!("  believed since: {created}\n"));
+    }
+    if let Some(affirmed) = fact["last_affirmed_at"].as_str() {
+        out.push_str(&format!("  last re-affirmed: {affirmed}\n"));
+    }
+    out.push_str(
+        "\nRead only: no 'claim' was given, so nothing was written. Pass 'claim' to \
+         replace this.",
+    );
+    out
+}
+
+fn render_fact_write(payload: &serde_json::Value) -> String {
+    let slot = fact_slot_label(payload);
+    match payload["outcome"].as_str().unwrap_or("") {
+        "created" => format!("Created {slot}. This slot was empty; it now holds your claim."),
+        // Named distinctly from "created" on purpose: an agent that cannot
+        // tell "I already believed this" from "I have changed my mind" will
+        // report a no-op as news.
+        "affirmed" => format!(
+            "Affirmed {slot}. The claim was already exactly this, so nothing changed except \
+             the last-affirmed timestamp — no history entry was written."
+        ),
+        "superseded" => match payload["previous_claim"].as_str() {
+            Some(previous) => format!(
+                "Superseded {slot}. The previous claim was: {previous}\nIt is now in \
+                 fact_history and will never surface in recall; memory_history is the only \
+                 way back to it."
+            ),
+            None => format!(
+                "Superseded {slot}. The previous claim moved to fact_history and will never \
+                 surface in recall."
+            ),
+        },
+        other => format!("Wrote {slot} (outcome: {other})."),
+    }
+}
+
+fn render_fact_history(payload: &serde_json::Value) -> String {
+    let slot = fact_slot_label(payload);
+    let entries = payload["entries"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        return format!(
+            "{slot}\n  No superseded versions. Either the slot has never been overwritten, \
+             or it has never been written at all — memory_fact without a 'claim' tells you \
+             which."
+        );
+    }
+
+    let mut out = format!("{slot} — {} superseded version(s):\n", entries.len());
+    for entry in &entries {
+        out.push_str(&format!(
+            "  - {}\n",
+            entry["claim"].as_str().unwrap_or("(unreadable claim)")
+        ));
+        let author = entry["authored_by"].as_str().unwrap_or("unknown");
+        let held = entry["created_at"].as_str().unwrap_or("?");
+        let ended = entry["superseded_at"].as_str().unwrap_or("?");
+        out.push_str(&format!(
+            "      asserted by {author}, believed {held} until {ended}\n"
+        ));
+    }
+    out
 }
 
 /// Close reasons an AGENT may name (ANAI-194, ADR 0002 §2.2).
@@ -7223,6 +7463,14 @@ mod tests {
         // (caller, text, tags) per `memory_note`.
         #[allow(clippy::type_complexity)]
         notes: std::sync::Mutex<Vec<(Option<String>, String, Vec<String>)>>,
+        // ANAI-204: a stand-in slot table keyed by the RESOLVED address
+        // `scope/scope_ref/claim_key`, plus the claims each slot has displaced.
+        // The vocabulary and the uniqueness constraint are the store's job and
+        // are tested there; what these prove is that the tool layer addresses a
+        // slot by subject, threads a caller, and tells created/affirmed/
+        // superseded apart in what it renders.
+        facts: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        fact_history: std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>,
     }
 
     impl FakeKernelHandle {
@@ -7254,6 +7502,8 @@ mod tests {
                     serde_json::json!({"mode": "semantic", "count": 0, "results": []}),
                 ),
                 notes: std::sync::Mutex::new(Vec::new()),
+                facts: std::sync::Mutex::new(std::collections::HashMap::new()),
+                fact_history: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
         }
 
@@ -7499,6 +7749,278 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"memory_episode_close"));
         assert!(names.contains(&"memory_status"));
+    }
+
+    // --- ANAI-204: tier-3 fact tools ---------------------------------------
+
+    #[test]
+    fn fact_tools_are_advertised_with_the_slot_address() {
+        let defs = builtin_tool_definitions();
+        for name in ["memory_fact", "memory_history"] {
+            let def = defs
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("{name} must be declared"));
+            let props = def
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .unwrap_or_else(|| panic!("{name} must declare properties"));
+            // The slot address is the whole contract. A tool that advertises
+            // `key` without `scope`/`scope_ref` invites the caller to address a
+            // slot by name alone, which is the pre-amendment mistake in a
+            // different costume.
+            for param in ["scope", "scope_ref", "key"] {
+                assert!(props.contains_key(param), "{name} is missing {param}");
+            }
+            let required: Vec<&str> = def
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .expect("required must be present")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(
+                required,
+                vec!["scope", "key"],
+                "{name}: scope and key are the minimum addressable slot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fact_write_distinguishes_created_affirmed_and_superseded() {
+        // The distinction is the whole reason the handle returns an outcome
+        // rather than unit: an agent that renders "affirmed" as "created" is
+        // reporting a no-op as news, and one that renders "superseded" the same
+        // way has silently changed its mind without saying so.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+
+        let created = tool_memory_fact(
+            &serde_json::json!({
+                "scope": "project",
+                "scope_ref": "openfang-fork",
+                "key": "repo.trunk_model",
+                "claim": "main is the trunk of record",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(created.starts_with("Created"), "{created}");
+        assert!(
+            created.contains("project/openfang-fork repo.trunk_model"),
+            "{created}"
+        );
+
+        let affirmed = tool_memory_fact(
+            &serde_json::json!({
+                "scope": "project",
+                "scope_ref": "openfang-fork",
+                "key": "repo.trunk_model",
+                "claim": "main is the trunk of record",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(affirmed.starts_with("Affirmed"), "{affirmed}");
+        assert!(
+            affirmed.contains("no history entry"),
+            "an affirmation must say it wrote no history: {affirmed}"
+        );
+
+        let superseded = tool_memory_fact(
+            &serde_json::json!({
+                "scope": "project",
+                "scope_ref": "openfang-fork",
+                "key": "repo.trunk_model",
+                "claim": "upstream/main is the trunk of record",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(superseded.starts_with("Superseded"), "{superseded}");
+        assert!(
+            superseded.contains("main is the trunk of record"),
+            "a supersession must name what it displaced: {superseded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_read_without_a_claim_says_it_wrote_nothing() {
+        // A caller who meant to write and omitted `claim` gets a read. That is
+        // the right behaviour — reading before writing is what keeps the key
+        // space from growing near-duplicates — but it must not read as success.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+
+        let empty = tool_memory_fact(
+            &serde_json::json!({"scope": "agent", "key": "agent.working_style"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(empty.contains("empty"), "{empty}");
+        assert!(
+            empty.contains("nothing was written"),
+            "a claimless call must disclose that it wrote nothing: {empty}"
+        );
+
+        tool_memory_fact(
+            &serde_json::json!({
+                "scope": "agent",
+                "key": "agent.working_style",
+                "claim": "small reviewable diffs",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        let filled = tool_memory_fact(
+            &serde_json::json!({"scope": "agent", "key": "agent.working_style"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(filled.contains("small reviewable diffs"), "{filled}");
+        assert!(
+            filled.contains("nothing was written"),
+            "the disclosure must survive a non-empty slot too: {filled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_write_derives_the_agent_slot_ref_from_the_caller() {
+        // ANAI-165 from inside tier 3: an `agent`-scoped slot is addressed by
+        // the caller's own id, and a supplied ref must not be able to point the
+        // write at a sibling's slot space. The store is the enforcement point;
+        // this asserts the tool does not invent a ref of its own on the way.
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_fact(
+            &serde_json::json!({
+                "scope": "agent",
+                "key": "agent.working_style",
+                "claim": "reads before writing",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("agent/agent-x agent.working_style"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn fact_write_refuses_a_status_outside_the_vocabulary() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let err = tool_memory_fact(
+            &serde_json::json!({
+                "scope": "agent",
+                "key": "agent.working_style",
+                "claim": "anything",
+                "status": "superseded",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        // Named specifically: `superseded` is the one status a caller is most
+        // likely to reach for and the one the design says cannot exist, because
+        // a superseded claim has left `memories` entirely.
+        assert!(
+            err.contains("open, settled"),
+            "the rejection must offer the menu: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fact_tools_refuse_a_half_addressed_slot() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        for input in [
+            serde_json::json!({"key": "repo.trunk_model"}),
+            serde_json::json!({"scope": "project"}),
+            serde_json::json!({"scope": "  ", "key": "repo.trunk_model"}),
+        ] {
+            assert!(
+                tool_memory_fact(&input, Some(&kh), Some("agent-x"))
+                    .await
+                    .is_err(),
+                "memory_fact accepted a half-addressed slot: {input}"
+            );
+            assert!(
+                tool_memory_history(&input, Some(&kh), Some("agent-x")).is_err(),
+                "memory_history accepted a half-addressed slot: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_reports_an_empty_trail_without_implying_an_empty_slot() {
+        // "No history" and "no fact" are different states and a caller that
+        // conflates them concludes the slot is empty when it is merely
+        // unchanged. The empty rendering has to say which question it answered.
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_history(
+            &serde_json::json!({
+                "scope": "project",
+                "scope_ref": "openfang-fork",
+                "key": "repo.trunk_model",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("No superseded versions"), "{out}");
+        assert!(
+            out.contains("memory_fact"),
+            "the empty trail must point at the tool that answers the other question: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_renders_each_displaced_claim_with_its_author() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        for claim in ["local-main is the trunk", "main is the trunk"] {
+            tool_memory_fact(
+                &serde_json::json!({
+                    "scope": "project",
+                    "scope_ref": "openfang-fork",
+                    "key": "repo.trunk_model",
+                    "claim": claim,
+                }),
+                Some(&kh),
+                Some("agent-x"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let out = tool_memory_history(
+            &serde_json::json!({
+                "scope": "project",
+                "scope_ref": "openfang-fork",
+                "key": "repo.trunk_model",
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .unwrap();
+        assert!(out.contains("local-main is the trunk"), "{out}");
+        assert!(
+            out.contains("asserted by agent-x"),
+            "provenance must reach the render, not just the row: {out}"
+        );
     }
 
     #[tokio::test]
@@ -7813,6 +8335,106 @@ mod tests {
         }
         fn memory_status(&self, _caller: Option<&str>) -> Result<serde_json::Value, String> {
             Ok(self.status.lock().unwrap().clone())
+        }
+
+        async fn memory_fact_write(
+            &self,
+            caller: Option<&str>,
+            request: crate::kernel_handle::FactWriteRequest,
+        ) -> Result<serde_json::Value, String> {
+            let scope_ref = request
+                .scope_ref
+                .clone()
+                .unwrap_or_else(|| caller.unwrap_or("unattributed").to_string());
+            let addr = format!("{}/{}/{}", request.scope, scope_ref, request.claim_key);
+            let previous = self
+                .facts
+                .lock()
+                .unwrap()
+                .insert(addr.clone(), request.claim.clone());
+            let (outcome, previous_claim) = match previous {
+                None => ("created", None),
+                Some(p) if p == request.claim => ("affirmed", None),
+                Some(p) => ("superseded", Some(p)),
+            };
+            if let Some(ref displaced) = previous_claim {
+                self.fact_history
+                    .lock()
+                    .unwrap()
+                    .entry(addr)
+                    .or_default()
+                    .insert(
+                        0,
+                        serde_json::json!({
+                            "claim": displaced,
+                            "authored_by": caller,
+                            "created_at": "2026-08-21T00:00:00+00:00",
+                            "superseded_at": "2026-08-21T01:00:00+00:00",
+                        }),
+                    );
+            }
+            Ok(serde_json::json!({
+                "outcome": outcome,
+                "id": "00000000-0000-0000-0000-000000000001",
+                "scope": request.scope,
+                "scope_ref": scope_ref,
+                "claim_key": request.claim_key,
+                "previous_claim": previous_claim,
+            }))
+        }
+
+        fn memory_fact_get(
+            &self,
+            caller: Option<&str>,
+            scope: &str,
+            scope_ref: Option<&str>,
+            claim_key: &str,
+        ) -> Result<serde_json::Value, String> {
+            let scope_ref = scope_ref
+                .map(str::to_string)
+                .unwrap_or_else(|| caller.unwrap_or("unattributed").to_string());
+            let addr = format!("{scope}/{scope_ref}/{claim_key}");
+            let claim = self.facts.lock().unwrap().get(&addr).cloned();
+            Ok(serde_json::json!({
+                "scope": scope,
+                "scope_ref": scope_ref,
+                "claim_key": claim_key,
+                "fact": claim.map(|c| serde_json::json!({
+                    "claim": c,
+                    "status": "settled",
+                    "confidence": 1.0,
+                    "authored_by": caller,
+                })),
+            }))
+        }
+
+        fn memory_fact_history(
+            &self,
+            caller: Option<&str>,
+            scope: &str,
+            scope_ref: Option<&str>,
+            claim_key: &str,
+            limit: usize,
+        ) -> Result<serde_json::Value, String> {
+            let scope_ref = scope_ref
+                .map(str::to_string)
+                .unwrap_or_else(|| caller.unwrap_or("unattributed").to_string());
+            let addr = format!("{scope}/{scope_ref}/{claim_key}");
+            let mut entries = self
+                .fact_history
+                .lock()
+                .unwrap()
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+            entries.truncate(limit);
+            Ok(serde_json::json!({
+                "scope": scope,
+                "scope_ref": scope_ref,
+                "claim_key": claim_key,
+                "count": entries.len(),
+                "entries": entries,
+            }))
         }
         async fn memory_search(
             &self,

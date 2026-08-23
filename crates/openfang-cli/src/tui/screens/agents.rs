@@ -23,6 +23,8 @@ const TOOL_OPTIONS: &[(&str, &str)] = &[
     ),
     ("memory_status", "Inspect open episode and idle countdown"),
     ("memory_note", "Jot an unstructured note into memory"),
+    ("memory_fact", "Read or write a durable claim slot"),
+    ("memory_history", "See what a claim slot used to say"),
     ("web_fetch", "Fetch web pages"),
     ("shell_exec", "Execute shell commands"),
     ("agent_send", "Send messages to other agents"),
@@ -49,6 +51,11 @@ const DEFAULT_TOOLS: &[bool] = &[
     false, // memory_status
     // Off by default for the same reason: a write tool nobody asked for.
     false, // memory_note
+    // Off by default. A `project`-scoped write lands in a slot other agents
+    // read, so which agents get the fact surface is a rollout decision and not
+    // a side effect of ticking a box in the builder.
+    false, // memory_fact
+    false, // memory_history
     true,  // web_fetch
     false, // shell_exec
     false, // agent_send

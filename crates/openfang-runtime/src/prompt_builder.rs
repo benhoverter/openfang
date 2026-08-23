@@ -665,7 +665,9 @@ pub fn tool_category(name: &str) -> &'static str {
         | "memory_recall"
         | "memory_note"
         | "memory_episode_close"
-        | "memory_status" => "Memory",
+        | "memory_status"
+        | "memory_fact"
+        | "memory_history" => "Memory",
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" | "agent_activate" => "Agents",
 
@@ -727,6 +729,8 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "search memory for relevant context",
         "memory_episode_close" => "close and label the current episode",
         "memory_status" => "check your open episode and idle countdown",
+        "memory_fact" => "read or write one durable claim slot",
+        "memory_history" => "show what a claim slot used to say",
 
         // Agents
         "agent_send" => "send a message to another agent",

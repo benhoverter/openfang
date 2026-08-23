@@ -378,6 +378,8 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "memory_episode_close",
     "memory_status",
     "memory_note",
+    "memory_fact",
+    "memory_history",
 ];
 
 /// True if `name` shadows an OpenFang built-in tool.
