@@ -1438,12 +1438,16 @@ mod tests {
 
     #[test]
     fn policy_cache_bounds_rejected() {
-        let mut p = ApprovalPolicy::default();
-        p.cache_ttl_secs = MAX_CACHE_TTL_SECS + 1;
+        let p = ApprovalPolicy {
+            cache_ttl_secs: MAX_CACHE_TTL_SECS + 1,
+            ..Default::default()
+        };
         assert!(p.validate().unwrap_err().contains("cache_ttl_secs"));
 
-        let mut p = ApprovalPolicy::default();
-        p.cache_max_uses = MAX_CACHE_MAX_USES + 1;
+        let p = ApprovalPolicy {
+            cache_max_uses: MAX_CACHE_MAX_USES + 1,
+            ..Default::default()
+        };
         assert!(p.validate().unwrap_err().contains("cache_max_uses"));
     }
 

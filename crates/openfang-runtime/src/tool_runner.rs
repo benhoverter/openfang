@@ -6121,6 +6121,10 @@ mod tests {
         );
     }
 
+    // The guard is held for the whole test on purpose: it exists to serialize
+    // tests that mutate the process-global wake-emit window, so releasing it
+    // before the first await is exactly the thing it is there to prevent.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn explicit_reply_survives_an_exhausted_aggregate_ceiling() {
         // ANAI-200 regression. The aggregate ceiling used to be checked AFTER
