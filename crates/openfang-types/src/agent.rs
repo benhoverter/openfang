@@ -468,6 +468,59 @@ pub fn validate_agent_name(name: &str) -> Result<(), String> {
 }
 
 /// Complete agent manifest — defines everything about an agent.
+/// Maximum length of a project slug. 48 is not arbitrary: it is
+/// `openfang_memory::vocabulary::MAX_SEGMENT`, the cap on one segment of a
+/// tier-3 slot address. A project slug that a manifest accepts but a fact slot
+/// rejects is a member who cannot address its own project's claims.
+pub const MAX_PROJECT_SLUG_LEN: usize = 48;
+
+/// ANAI-208. Validate one project slug.
+///
+/// This grammar is deliberately identical to the `scope_ref` grammar in
+/// `openfang_memory::vocabulary::check_scope_ref`, and memory defers to this
+/// function rather than re-deriving it. The two must not drift: a
+/// project-scoped fact is addressed by `(scope, scope_ref, claim_key)`, so if
+/// a manifest may declare `Openfang-Fork` while a slot may only be
+/// `openfang-fork`, membership is spelled one way and the claim another, and
+/// the member reads its own project's slot as empty. That is the §2.3.3 dedup
+/// miss arriving through the address instead of through the key.
+///
+/// Lowercase-only, unlike agent names. Agent names had to stay
+/// case-permissive because 15 registered agents already carried an uppercase
+/// experiment-arm label; project slugs have no such history — there are zero
+/// declared projects on disk today — so the stricter rule costs nothing now
+/// and buys case-collision safety forever.
+pub fn validate_project_slug(slug: &str) -> Result<(), String> {
+    if slug.is_empty() {
+        return Err("a project slug must not be empty".to_string());
+    }
+    if slug.len() > MAX_PROJECT_SLUG_LEN {
+        return Err(format!(
+            "project slug {slug:?} is {} bytes; the maximum is {MAX_PROJECT_SLUG_LEN}",
+            slug.len()
+        ));
+    }
+    let mut chars = slug.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => {
+            return Err(format!(
+                "project slug {slug:?} must start with a lowercase letter or digit"
+            ));
+        }
+    }
+    if let Some(bad) =
+        chars.find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-'))
+    {
+        return Err(format!(
+            "project slug {slug:?} contains {bad:?}; allowed: a-z, 0-9, '_' and '-'. \
+             Project slugs are addresses, not labels — they are half the uniqueness key \
+             of a project-scoped memory slot."
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentManifest {
@@ -506,6 +559,23 @@ pub struct AgentManifest {
     /// MCP server allowlist (empty = all connected MCP servers available).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub mcp_servers: Vec<String>,
+    /// ANAI-208. Declared project membership — the projects this agent works
+    /// on, by slug. Empty is legal and means "belongs to no project": several
+    /// agents (assistant, moderator, orchestrator) legitimately have none, and
+    /// an absent key must never brick an agent on daemon restart.
+    ///
+    /// A list rather than a single string because agents genuinely span
+    /// projects (`openfang-alpha` is on the fork *and* the fleet), and a flat
+    /// list of strings rather than a reference into a declared registry
+    /// because the only consumer today needs set-membership. Inventing a
+    /// registry before we know what a project is to the rest of the system is
+    /// a guess that gets rewritten; the list is forward-compatible with one.
+    ///
+    /// Membership is *declared*, never derived from cwd or workspace path:
+    /// derivation misfires on multi-repo agents and makes membership an
+    /// accident of filesystem layout.
+    #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
+    pub projects: Vec<String>,
     /// Custom metadata.
     #[serde(default, deserialize_with = "crate::serde_compat::map_lenient")]
     pub metadata: HashMap<String, serde_json::Value>,
@@ -582,6 +652,40 @@ impl AgentManifest {
             _ => DEFAULT_MAX_HISTORY_MESSAGES,
         }
     }
+
+    /// ANAI-208. Is this agent a declared member of `project`?
+    ///
+    /// The whole membership relation, in one predicate. Every consumer — the
+    /// memory reader deciding whether a `project`-scoped slot is visible, a
+    /// fleet query asking who is on `tttb` — goes through here rather than
+    /// matching on the vector itself, so "member" means one thing system-wide.
+    ///
+    /// No project is legal and means member of nothing: an agent with an empty
+    /// list is not a member of every project by omission. Default-deny, same
+    /// posture as `mcp_servers` gating on the bridge — except `mcp_servers`
+    /// treats empty as "all", which is the opposite, and that difference is
+    /// deliberate. An empty allowlist withholds a capability the agent could
+    /// otherwise have; an empty membership list withholds nothing, it states a
+    /// fact about the world. Reading absent membership as universal membership
+    /// would make all 71 undeclared agents members of every project on the
+    /// first daemon start after this lands.
+    pub fn is_member_of(&self, project: &str) -> bool {
+        self.projects.iter().any(|p| p == project)
+    }
+
+    /// Validate every declared slug, returning each rejection with its index.
+    ///
+    /// Returns errors rather than failing, because the two call sites want
+    /// opposite things: spawn rejects, and manifest *load* of an
+    /// already-registered agent logs and continues. That asymmetry is the same
+    /// one `validate_agent_name` documents — a value that slipped through
+    /// historically must not brick a running agent on daemon restart.
+    pub fn project_slug_errors(&self) -> Vec<String> {
+        self.projects
+            .iter()
+            .filter_map(|p| validate_project_slug(p).err())
+            .collect()
+    }
 }
 
 fn default_true() -> bool {
@@ -606,6 +710,7 @@ impl Default for AgentManifest {
             tools: HashMap::new(),
             skills: Vec::new(),
             mcp_servers: Vec::new(),
+            projects: Vec::new(),
             metadata: HashMap::new(),
             tags: Vec::new(),
             routing: None,
@@ -913,6 +1018,100 @@ mod tests {
         );
     }
 
+    // ----- ANAI-208: project membership -----
+
+    #[test]
+    fn project_slugs_accept_the_shapes_real_projects_use() {
+        for ok in [
+            "openfang",
+            "openfang-fork",
+            "tttb",
+            "kimiya_spike05",
+            "a",
+            "9lives",
+        ] {
+            assert!(
+                validate_project_slug(ok).is_ok(),
+                "{ok:?} should be a legal project slug"
+            );
+        }
+    }
+
+    #[test]
+    fn project_slugs_reject_anything_that_is_not_an_address() {
+        // Uppercase is rejected deliberately: `Openfang` and `openfang` would
+        // be two slots holding contradictory claims about one project.
+        for bad in [
+            "",
+            "OpenFang",
+            "-leading-hyphen",
+            "_leading_underscore",
+            "has space",
+            "has.dot",
+            "inject\nnewline",
+        ] {
+            assert!(
+                validate_project_slug(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        let long = "a".repeat(MAX_PROJECT_SLUG_LEN + 1);
+        assert!(validate_project_slug(&long).is_err());
+        assert!(validate_project_slug(&"a".repeat(MAX_PROJECT_SLUG_LEN)).is_ok());
+    }
+
+    #[test]
+    fn absent_projects_key_parses_and_means_no_membership() {
+        // Backward compatibility with all ~71 manifests on disk, none of which
+        // declares the key. An absent `projects` must never fail a load: that
+        // would brick the entire fleet on the first restart after this ships.
+        let manifest: AgentManifest = toml::from_str(
+            r#"
+            name = "legacy-agent"
+            version = "0.1.0"
+            "#,
+        )
+        .expect("a manifest without `projects` must still parse");
+        assert!(manifest.projects.is_empty());
+        assert!(!manifest.is_member_of("openfang"));
+        assert!(manifest.project_slug_errors().is_empty());
+    }
+
+    #[test]
+    fn declared_projects_parse_from_toml_and_drive_membership() {
+        let manifest: AgentManifest = toml::from_str(
+            r#"
+            name = "openfang-alpha"
+            projects = ["openfang-fork", "fleet"]
+            "#,
+        )
+        .expect("a manifest with `projects` must parse");
+        assert_eq!(manifest.projects, vec!["openfang-fork", "fleet"]);
+        assert!(manifest.is_member_of("openfang-fork"));
+        assert!(manifest.is_member_of("fleet"));
+
+        // Membership is exact. Not a prefix, not a substring, not case-folded
+        // — the slug is half a slot address, so near-misses must miss.
+        assert!(!manifest.is_member_of("openfang"));
+        assert!(!manifest.is_member_of("openfang-fork-2"));
+        assert!(!manifest.is_member_of("OPENFANG-FORK"));
+        assert!(!manifest.is_member_of(""));
+    }
+
+    #[test]
+    fn malformed_slugs_are_reported_not_dropped() {
+        let manifest = AgentManifest {
+            projects: vec!["good".into(), "Bad Slug".into(), "also-good".into()],
+            ..Default::default()
+        };
+        let errs = manifest.project_slug_errors();
+        assert_eq!(errs.len(), 1, "expected exactly one rejection: {errs:?}");
+        assert!(errs[0].contains("Bad Slug"));
+        // Reported, but still present and still matchable: load must not
+        // silently rewrite what an operator declared.
+        assert!(manifest.is_member_of("Bad Slug"));
+    }
+
     #[test]
     fn test_agent_manifest_serialization() {
         let manifest = AgentManifest {
@@ -931,6 +1130,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec!["test".to_string()],
             routing: None,

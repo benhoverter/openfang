@@ -231,6 +231,18 @@ pub fn check_scope_ref(scope: FactScope, raw: &str) -> OpenFangResult<()> {
             "scope_ref {raw:?} exceeds {MAX_SEGMENT} characters"
         )));
     }
+    // ANAI-208. A project ref is a declared project slug, so its grammar is
+    // owned by the manifest schema and borrowed here rather than re-derived.
+    // Two copies of "what a slug is" that drift by one character mean a
+    // manifest can declare a membership that can never address its own slot,
+    // and the member reads its own project's claims as empty.
+    if matches!(scope, FactScope::Project) {
+        return openfang_types::agent::validate_project_slug(raw)
+            // Re-framed in this caller's vocabulary. The rule comes from the
+            // manifest, but the caller passed a `scope_ref` and an error that
+            // only says "project slug" names a field they did not use.
+            .map_err(|e| OpenFangError::InvalidInput(format!("invalid scope_ref: {e}")));
+    }
     let mut chars = raw.chars();
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
@@ -731,6 +743,41 @@ mod tests {
         assert!(check_scope_ref(FactScope::Project, "").is_err());
         assert!(check_scope_ref(FactScope::Project, "OpenFang").is_err());
         assert!(check_scope_ref(FactScope::Project, "of fork").is_err());
+    }
+
+    /// ANAI-208. The manifest's idea of a project slug and memory's idea of a
+    /// project `scope_ref` must be the same idea.
+    ///
+    /// If they drift, an operator can declare a membership in `agent.toml`
+    /// that the fact store refuses to address — the agent is a member of a
+    /// project whose claims it cannot read — or the reverse, a slot addressed
+    /// under a slug no manifest may ever declare, so the claim is unreachable
+    /// by any member. Both present as an empty slot, which reads as data loss.
+    /// The delegation in `check_scope_ref` is what keeps them identical; this
+    /// asserts the delegation is still there.
+    #[test]
+    fn project_scope_refs_and_manifest_project_slugs_are_the_same_grammar() {
+        for candidate in [
+            "openfang",
+            "openfang-fork",
+            "kimiya_spike05",
+            "9lives",
+            "a",
+            "",
+            "OpenFang",
+            "of fork",
+            "-leading",
+            "_leading",
+            "has.dot",
+            &"a".repeat(MAX_SEGMENT),
+            &"a".repeat(MAX_SEGMENT + 1),
+        ] {
+            assert_eq!(
+                check_scope_ref(FactScope::Project, candidate).is_ok(),
+                openfang_types::agent::validate_project_slug(candidate).is_ok(),
+                "manifest and memory disagree about {candidate:?}"
+            );
+        }
     }
 
     #[test]

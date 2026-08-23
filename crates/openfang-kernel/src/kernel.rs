@@ -1933,6 +1933,16 @@ impl OpenFangKernel {
             return Err(KernelError::OpenFang(OpenFangError::InvalidInput(reason)));
         }
 
+        // ANAI-208. Same edge, same reasoning as the name: spawn is where a
+        // human is present to be told why. A malformed project slug is not a
+        // security problem, it is an addressing one — the agent would declare
+        // a membership that the fact store can never resolve to a slot — so it
+        // is worth failing loudly here while it is cheap to fix.
+        if let Some(reason) = manifest.project_slug_errors().into_iter().next() {
+            warn!(agent = %name, %reason, "Spawn rejected: invalid project membership");
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(reason)));
+        }
+
         // PRE-FLIGHT: reject a duplicate name BEFORE touching any state.
         //
         // `registry.register()` below is the authoritative uniqueness gate, but
@@ -8903,6 +8913,19 @@ pub(crate) fn merge_disk_manifest_preserving_kernel_defaults(
         );
         disk.name = entry.name.clone();
     }
+    // ANAI-208, manifest-load half. Warn, keep, never reject. A slug typo in
+    // one agent.toml must not brick that agent on the next daemon restart —
+    // the failure it causes is a project-scoped fact that cannot be addressed,
+    // which is inconvenient, and the cure of refusing to load is an outage.
+    // The membership predicate is exact-match, so a malformed slug simply
+    // never matches anything.
+    for reason in disk.project_slug_errors() {
+        warn!(
+            agent = %entry.name,
+            "Invalid project slug in agent.toml; keeping it as declared, but it will never \
+             match a project: {reason}"
+        );
+    }
     if disk.workspace.is_none() && entry.workspace.is_some() {
         disk.workspace = entry.workspace.clone();
     }
@@ -9257,6 +9280,62 @@ fn resolve_memory_caller(
             .map(|e| e.id)
             .ok_or_else(|| format!("Memory caller not found: {caller}")),
     }
+}
+
+/// ANAI-208. The readership relation for `project`-scoped facts.
+///
+/// Called by the fact write path and by both read paths, immediately after
+/// `resolve_scope_ref` and before any store access — the same
+/// one-function-for-writer-and-reader discipline `resolve_scope_ref` itself
+/// exists for. A gate applied on write but not on read leaks; applied on read
+/// but not on write lets a non-member plant a claim that members then read as
+/// authoritative.
+///
+/// Only `project` scope is gated. `agent` scope derives its ref from the
+/// caller and cannot address anyone else's slots (ANAI-165); `user` and
+/// `global` have no membership relation to check and keep the behaviour they
+/// shipped with.
+///
+/// **Default-deny, and that means project scope is inert until manifests
+/// declare membership.** Zero agents declare a project today, so every
+/// project-scoped call fails here until the backfill lands. That is the
+/// intended posture and not an oversight: project scope had no reader at all
+/// before this, so nothing that worked stops working, and the alternative —
+/// treating an undeclared agent as a member of everything — would hand all 71
+/// agents write access to every project's claim space on the first daemon
+/// start after this ships. The error names the fix.
+fn require_project_membership(
+    registry: &AgentRegistry,
+    agent_id: AgentId,
+    scope: openfang_memory::vocabulary::FactScope,
+    scope_ref: &str,
+) -> Result<(), String> {
+    use openfang_memory::vocabulary::FactScope;
+
+    if !matches!(scope, FactScope::Project) {
+        return Ok(());
+    }
+
+    let entry = registry
+        .get(agent_id)
+        .ok_or_else(|| format!("Memory caller not found: {agent_id}"))?;
+
+    if entry.manifest.is_member_of(scope_ref) {
+        return Ok(());
+    }
+
+    let declared = if entry.manifest.projects.is_empty() {
+        "it declares no project membership".to_string()
+    } else {
+        format!("it declares: {}", entry.manifest.projects.join(", "))
+    };
+    Err(format!(
+        "agent '{}' is not a member of project '{scope_ref}' — {declared}. \
+         Project-scoped facts are visible to declared members only; add \
+         `projects = [\"{scope_ref}\"]` to the agent's agent.toml and restart it \
+         (ANAI-208).",
+        entry.manifest.name
+    ))
 }
 
 /// How many closed episodes `memory_status` reports. Enough to orient, few
@@ -10387,6 +10466,7 @@ impl KernelHandle for OpenFangKernel {
         let agent_ref = agent_id.to_string();
         let scope_ref = resolve_scope_ref(scope, &agent_ref, request.scope_ref.as_deref())
             .map_err(|e| e.to_string())?;
+        require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
 
         let status = match request.status.as_deref() {
             None => FactStatus::Settled,
@@ -10494,6 +10574,8 @@ impl KernelHandle for OpenFangKernel {
         let agent_ref = agent_id.to_string();
         let scope_ref =
             resolve_scope_ref(scope, &agent_ref, scope_ref).map_err(|e| e.to_string())?;
+        require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
+        require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
 
         let fact = self
             .memory
@@ -11811,6 +11893,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -11856,6 +11939,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -11908,6 +11992,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -11953,6 +12038,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -12006,6 +12092,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -12068,6 +12155,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,
@@ -12183,6 +12271,7 @@ mod tests {
             tools: HashMap::new(),
             skills: vec![],
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags,
             routing: None,
@@ -12231,6 +12320,104 @@ mod tests {
         // UUID lookup should also work
         let found_by_id = registry.get(agent_id);
         assert!(found_by_id.is_some());
+    }
+
+    // ----- ANAI-208: the project readership gate -----
+
+    fn register_with_projects(
+        registry: &AgentRegistry,
+        name: &str,
+        projects: Vec<String>,
+    ) -> AgentId {
+        let mut manifest = test_manifest(name, "test", vec![]);
+        manifest.projects = projects;
+        let id = AgentId::new();
+        registry
+            .register(AgentEntry {
+                id,
+                name: name.to_string(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn project_facts_require_declared_membership() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        let member = register_with_projects(&registry, "memb", vec!["openfang-fork".into()]);
+        let stranger = register_with_projects(&registry, "strange", vec!["tttb".into()]);
+        let undeclared = register_with_projects(&registry, "undecl", vec![]);
+
+        assert!(
+            require_project_membership(&registry, member, FactScope::Project, "openfang-fork")
+                .is_ok()
+        );
+
+        // A member of *some* project is not thereby a member of this one.
+        let denied =
+            require_project_membership(&registry, stranger, FactScope::Project, "openfang-fork")
+                .expect_err("non-member must be refused");
+        assert!(denied.contains("openfang-fork"), "{denied}");
+        assert!(
+            denied.contains("tttb"),
+            "error should name what it declares"
+        );
+
+        // Default-deny: undeclared is a member of nothing. This is the case
+        // that covers all 71 agents on the first restart after this ships.
+        let denied =
+            require_project_membership(&registry, undeclared, FactScope::Project, "openfang-fork")
+                .expect_err("undeclared agent must be refused");
+        assert!(
+            denied.contains("declares no project membership"),
+            "{denied}"
+        );
+        assert!(denied.contains("projects = "), "error must name the fix");
+    }
+
+    #[test]
+    fn the_gate_applies_only_to_project_scope() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        let undeclared = register_with_projects(&registry, "undecl", vec![]);
+
+        // `agent` derives its ref from the caller (ANAI-165) and `user`/
+        // `global` have no membership relation. Gating them here would break
+        // the scopes that shipped working in ANAI-204.
+        for scope in [FactScope::Agent, FactScope::User, FactScope::Global] {
+            assert!(
+                require_project_membership(&registry, undeclared, scope, "anything").is_ok(),
+                "{scope} must not be gated on project membership"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_an_agent_that_left_the_registry() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        let ghost = AgentId::new();
+        assert!(
+            require_project_membership(&registry, ghost, FactScope::Project, "openfang-fork")
+                .is_err(),
+            "an unknown caller must not pass the gate"
+        );
     }
 
     #[test]
