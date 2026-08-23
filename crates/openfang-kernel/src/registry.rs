@@ -127,6 +127,33 @@ impl AgentRegistry {
             .unwrap_or_default()
     }
 
+    /// ANAI-208. Set an agent's declared project membership in the registry.
+    ///
+    /// Exists because roughly a third of the running fleet has no `agent.toml`
+    /// at all — spawned agents whose manifests live only in SQLite and are
+    /// restored at boot. Backfilling membership by editing files would reach
+    /// the ~45 agents that have files and silently miss the ~26 that do not,
+    /// and the missing cohort is the largest single project group. A query
+    /// that under-reports looks exactly like a query that works.
+    ///
+    /// Rejects a malformed slug rather than warning: this is a deliberate,
+    /// attended call, not a daemon-restart manifest load, so there is someone
+    /// to hand the error to. Persistence is the caller's job — see
+    /// `Kernel::set_agent_projects`, which pairs this with `save_agent`.
+    pub fn update_projects(&self, id: AgentId, projects: Vec<String>) -> OpenFangResult<()> {
+        for slug in &projects {
+            openfang_types::agent::validate_project_slug(slug)
+                .map_err(OpenFangError::InvalidInput)?;
+        }
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.projects = projects;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Add a child agent ID to a parent's children list.
     pub fn add_child(&self, parent_id: AgentId, child_id: AgentId) {
         if let Some(mut entry) = self.agents.get_mut(&parent_id) {
@@ -506,6 +533,31 @@ mod tests {
     fn projects_of_unknown_agent_is_empty_not_a_panic() {
         let registry = AgentRegistry::new();
         assert!(registry.projects_of(AgentId::new()).is_empty());
+    }
+
+    #[test]
+    fn update_projects_sets_membership_and_refuses_a_malformed_slug() {
+        let registry = AgentRegistry::new();
+        let entry = test_entry("kimiya-spike05-c1");
+        let id = entry.id;
+        registry.register(entry).unwrap();
+
+        registry.update_projects(id, vec!["kimiya".into()]).unwrap();
+        assert_eq!(registry.projects_of(id), vec!["kimiya".to_string()]);
+        assert_eq!(registry.agents_in_project("kimiya").len(), 1);
+
+        // A bad slug is refused whole — no partial application, or the agent
+        // would end up in some of the projects it asked for and not others.
+        let err = registry
+            .update_projects(id, vec!["openfang".into(), "Bad Slug".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Bad Slug"), "{err}");
+        assert_eq!(registry.projects_of(id), vec!["kimiya".to_string()]);
+
+        // And membership can be cleared back to none.
+        registry.update_projects(id, vec![]).unwrap();
+        assert!(registry.projects_of(id).is_empty());
     }
 
     #[test]

@@ -7808,6 +7808,73 @@ pub async fn set_agent_mcp_servers(
 
 // ── Provider Key Management Endpoints ──────────────────────────────────
 
+/// GET /api/agents/{id}/projects — Get an agent's declared project membership.
+///
+/// ANAI-208. Reads the registry, not the file, because roughly a third of the
+/// fleet has no `agent.toml` — their manifests live only in SQLite.
+pub async fn get_agent_projects(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "projects": entry.manifest.projects,
+            // Empty means member of nothing, never member of everything —
+            // the opposite of the `mcp_servers` allowlist convention, so the
+            // mode is spelled out rather than inferred by the caller.
+            "mode": if entry.manifest.projects.is_empty() { "none" } else { "declared" },
+        })),
+    )
+}
+
+/// PUT /api/agents/{id}/projects — Set an agent's declared project membership.
+///
+/// ANAI-208. The backfill path for file-less agents. Malformed slugs are
+/// rejected here rather than warned about: this call has a caller to hand the
+/// error to, unlike a daemon-restart manifest load.
+pub async fn set_agent_projects(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id = match crate::agent_ref::resolve_agent_ref(&state, &id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let projects: Vec<String> = body["projects"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    match state.kernel.set_agent_projects(agent_id, projects.clone()) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "projects": projects})),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
 /// POST /api/providers/{name}/key — Save an API key for a provider.
 ///
 /// SECURITY: Writes to `~/.openfang/secrets.env`, sets env var in process,

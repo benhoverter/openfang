@@ -4245,6 +4245,26 @@ impl OpenFangKernel {
         Ok(())
     }
 
+    /// ANAI-208. Set an agent's declared project membership and persist it.
+    ///
+    /// The backfill path for agents that have no `agent.toml` — spawned
+    /// workers whose manifests live only in SQLite. `save_agent` is what makes
+    /// the change outlive the process: without it the membership evaporates on
+    /// the next restart and the agent silently drops out of its project, which
+    /// presents as a fact that used to be readable and now is not.
+    pub fn set_agent_projects(&self, agent_id: AgentId, projects: Vec<String>) -> KernelResult<()> {
+        self.registry
+            .update_projects(agent_id, projects.clone())
+            .map_err(KernelError::OpenFang)?;
+
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent(&entry);
+        }
+
+        info!(agent_id = %agent_id, projects = ?projects, "Agent project membership updated");
+        Ok(())
+    }
+
     /// Update an agent's tool allowlist and/or blocklist.
     pub fn set_agent_tool_filters(
         &self,
