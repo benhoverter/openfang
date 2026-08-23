@@ -229,6 +229,27 @@ pub async fn build_gate_request(
         .as_ref()
         .is_some_and(|b| b.destroys_substrate);
 
+    // ANAI-206 commit 9, C6-3. The other three hard flags, one level down.
+    //
+    // The line above is the whole argument: commit 6 accepted that a hard flag
+    // scoped to the command line has a one-line bypass, and then left the other
+    // three scoped to the command line anyway. Commit 8's doc comment defended
+    // that with "the same write inside a script body is the judge's problem",
+    // which is the argument commit 6 had already rejected for the flag directly
+    // above. Same `|=`, same reason, no new mechanism.
+    flags.policy_self_modification |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.writes_gatekeeper_policy);
+    flags.agent_config_write |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.writes_agent_config);
+    flags.runtime_config_write |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.writes_runtime_config);
+
     // ANAI-206 F1. Item 2 let a control-plane *read* fall through to the judge
     // on the strength of item 1 handing over the body. Where item 1 refused,
     // that trade was never paid for — the command reached the judge with a

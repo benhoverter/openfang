@@ -78,8 +78,8 @@ pub async fn gather(
     // ANAI-206 item 1. The one place in the gate that reads file bytes, and it
     // runs last on purpose: every guardrail it enforces is a fact the two
     // phases above computed.
-    let mut script_body =
-        script_body_target(command, inner).map(|raw| read_script_body(&raw, &facts));
+    let mut script_body = script_body_target(command, inner)
+        .map(|raw| read_script_body(&raw, &facts, canon_ws.as_deref(), file_policy));
 
     // ANAI-206 item 3, second phase: stat the paths the body named.
     //
@@ -115,7 +115,12 @@ pub async fn gather(
 /// `raw` is [`script_body_target`]'s answer, so it is always a token the
 /// command itself wrote and always one the sheet already stat'd — the judge
 /// never chooses a path.
-fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) {
+fn read_script_body(
+    raw: &str,
+    facts: &[PathFact],
+    canon_ws: Option<&Path>,
+    file_policy: Option<&FilePolicy>,
+) -> (ScriptBody, Vec<String>) {
     let mut body = ScriptBody {
         raw: raw.to_string(),
         resolved: None,
@@ -128,6 +133,9 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
         body_unresolved: false,
         writes_control_plane: false,
         destroys_substrate: false,
+        writes_gatekeeper_policy: false,
+        writes_agent_config: false,
+        writes_runtime_config: false,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
@@ -148,6 +156,44 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     // `NoPolicy` because outside `file_policy` there is no reach to be inside
     // of — the ANAI-190 rule, unchanged.
     if !matches!(fact.authority, PathAuthority::Read | PathAuthority::Write) {
+        body.status = ScriptBodyStatus::OutsideReach;
+        return (body, Vec::new());
+    }
+
+    // Guardrail 2b — ANAI-206 commit 9, G3.
+    //
+    // `fact.authority` above was computed against a *lexically* normalized path
+    // (`resolve` → `lexical_normalize`). That is correct for the fact sheet: an
+    // unresolvable or symlinked leaf should still yield a fact rather than a
+    // hole. It is the wrong basis for a *read*. `O_NOFOLLOW` below refuses a
+    // symlinked leaf, but the kernel always traverses symlinked **parents** and
+    // no open flag changes that:
+    //
+    // ```text
+    //   ln -s /somewhere/outside ./s
+    //   bash ./s/x.sh
+    // ```
+    //
+    // resolves lexically to `<workspace>/s/x.sh`, so authority is `Write`,
+    // guardrail 2 passes, the leaf is a real regular file so `symlink_metadata`
+    // says `File`, and `O_NOFOLLOW` opens it without complaint. The body of a
+    // file outside this agent's `file_policy` reach then lands in the judge
+    // prompt and in the audit chain — with no race to win, which makes it worse
+    // than the TOCTOU F8 filed and fixed with `O_NOFOLLOW`.
+    //
+    // Canonicalize the **parent**, which resolves every intermediate link, and
+    // re-ask `file_policy` about the real location. The leaf is deliberately
+    // left unresolved: a symlinked leaf must keep being refused by identity
+    // (`PathExistence::File` from `symlink_metadata`, then `O_NOFOLLOW`) rather
+    // than being laundered into its target's authority here.
+    let Some(real) = canonical_parent_path(fact.resolved.as_deref()) else {
+        // No parent, or a parent that does not exist. Nothing to read.
+        return (body, Vec::new());
+    };
+    if !matches!(
+        authority_for(&real, canon_ws, file_policy),
+        PathAuthority::Read | PathAuthority::Write
+    ) {
         body.status = ScriptBodyStatus::OutsideReach;
         return (body, Vec::new());
     }
@@ -180,9 +226,6 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
         return (body, Vec::new());
     }
 
-    let Some(path) = fact.resolved.as_ref() else {
-        return (body, Vec::new());
-    };
     // Guardrail 4b — ANAI-206 F8, the TOCTOU the security review found.
     //
     // Everything above was decided against a *path*, stat'd earlier in
@@ -197,10 +240,14 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     // `O_NOFOLLOW` refuses at `open`, and every check from here down is against
     // the handle rather than the name: we validate the bytes we are holding,
     // not a path we re-resolve.
+    //
+    // Opened at `real` — the parent-canonicalized path guardrail 2b actually
+    // authorized — rather than at the lexical form, so the bytes read come from
+    // the location `file_policy` was asked about.
     let Ok(mut file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .open(&real)
     else {
         return (body, Vec::new());
     };
@@ -252,6 +299,15 @@ fn read_script_body(raw: &str, facts: &[PathFact]) -> (ScriptBody, Vec<String>) 
     // substrate on line 40 of the file this command runs bypasses the judge for
     // exactly the same reason it does on the command line.
     body.destroys_substrate = openfang_types::gatekeeper::body_destroys_substrate(&text);
+    // ANAI-206 commit 9, C6-3. The other three hard flags, which commit 6 and
+    // commit 8 both left scoped to the command line. A hard flag that stops at
+    // the command line has a one-line bypass — put the line in a file and run
+    // the file — and commit 6 had already rejected that argument for
+    // `substrate_destruction` by adding the predicate above it.
+    body.writes_gatekeeper_policy =
+        openfang_types::gatekeeper::body_writes_gatekeeper_policy(&text);
+    body.writes_agent_config = openfang_types::gatekeeper::body_writes_agent_config(&text);
+    body.writes_runtime_config = openfang_types::gatekeeper::body_writes_runtime_config(&text);
 
     // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
     //
@@ -389,6 +445,25 @@ fn home_dir() -> Option<PathBuf> {
     {
         std::env::var("HOME").ok().map(PathBuf::from)
     }
+}
+
+/// The path with every symlink in its **parent** chain resolved, and its final
+/// component left exactly as written.
+///
+/// ANAI-206 commit 9, G3. `Path::canonicalize` on the whole path would follow a
+/// symlinked leaf too, which is precisely the identity check `O_NOFOLLOW` and
+/// `symlink_metadata` exist to keep. Canonicalizing only the parent gives the
+/// real directory the file lives in — the thing `file_policy` must be asked
+/// about — without dissolving the leaf.
+///
+/// `None` when the path has no parent (the filesystem root, which is not a
+/// script) or when the parent does not resolve, in which case there is nothing
+/// to read either.
+fn canonical_parent_path(resolved: Option<&str>) -> Option<PathBuf> {
+    let lexical = Path::new(resolved?);
+    let parent = lexical.parent()?;
+    let name = lexical.file_name()?;
+    Some(parent.canonicalize().ok()?.join(name))
 }
 
 /// Fold `.` and `..` without touching the filesystem.
@@ -1190,7 +1265,7 @@ mod tests {
             authority: PathAuthority::Write,
         };
 
-        let (body, tokens) = read_script_body("./swapped.sh", &[lying_fact]);
+        let (body, tokens) = read_script_body("./swapped.sh", &[lying_fact], None, None);
         assert!(
             body.content.is_none(),
             "O_NOFOLLOW must refuse the link even when the fact says File"
@@ -1199,8 +1274,68 @@ mod tests {
         assert!(tokens.is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // ANAI-206 commit 9: G3 — a symlinked *parent* beats `O_NOFOLLOW`
+    // -----------------------------------------------------------------------
+
+    /// The finding F8's fix did not cover, and the worse half of it: no race at
+    /// all.
+    ///
+    /// `O_NOFOLLOW` refuses a symlinked leaf. The kernel always traverses
+    /// symlinked *parents* and no open flag changes that, and
+    /// `path_facts::resolve` normalizes **lexically** on purpose — so the
+    /// authority guardrail 2 checks is the authority of a directory that does
+    /// not exist. Point a link inside the workspace at a directory outside the
+    /// agent's `file_policy` reach, put an ordinary regular file behind it, and
+    /// every guardrail passes: lexical path is in-workspace, tier is `Write`,
+    /// `symlink_metadata` on the leaf says `File`, `O_NOFOLLOW` opens it.
+    ///
+    /// Guardrail 2b canonicalizes the parent and re-asks. Note the file is a
+    /// real regular file with no link in sight at the leaf, which is what makes
+    /// this different from the TOCTOU above.
+    #[tokio::test]
+    async fn a_symlinked_parent_cannot_launder_a_body_into_reach() {
+        let (ws, policy) = writable_ws("body-parent-link");
+        let outside = tempdir("body-parent-link-outside");
+        std::fs::write(outside.join("x.sh"), "echo pwned\n").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("s")).unwrap();
+
+        let sheet = gather("bash ./s/x.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(
+            body.status,
+            ScriptBodyStatus::OutsideReach,
+            "a body behind a symlinked parent must be refused, not rendered"
+        );
+        assert!(body.content.is_none());
+        assert!(
+            !body.content.iter().any(|c| c.contains("pwned")),
+            "the out-of-reach bytes must never reach the prompt or the audit row"
+        );
+    }
+
+    /// The over-refusal direction. A symlinked parent that resolves to a
+    /// directory still inside the agent's reach is ordinary — plenty of real
+    /// workspaces have one — and must still read.
+    #[tokio::test]
+    async fn a_symlinked_parent_inside_reach_still_reads() {
+        let (ws, policy) = writable_ws("body-parent-link-ok");
+        std::fs::create_dir_all(ws.join("real")).unwrap();
+        std::fs::write(ws.join("real/x.sh"), "cargo build\n").unwrap();
+        std::os::unix::fs::symlink(ws.join("real"), ws.join("s")).unwrap();
+
+        let sheet = gather("bash ./s/x.sh", &[], Some(&ws), Some(&policy)).await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Included);
+        assert!(body.content.unwrap().contains("cargo build"));
+    }
+
     /// The ordinary path still reads, so the `O_NOFOLLOW` open is not a blanket
     /// refusal.
+    ///
+    /// (Commit 9 adds guardrail 2b above the open; this is also the assertion
+    /// that parent-canonicalization did not turn every ordinary read into a
+    /// refusal.)
     #[tokio::test]
     async fn a_real_file_still_reads_through_the_nofollow_open() {
         let (ws, policy) = writable_ws("body-nofollow-ok");

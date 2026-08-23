@@ -521,6 +521,26 @@ pub struct ScriptBody {
     /// that line and noticing.
     #[serde(default)]
     pub destroys_substrate: bool,
+    /// ANAI-206 commit 9 (C6-3): some logical line of the body **writes**
+    /// `~/.openfang/gatekeeper.md`.
+    ///
+    /// Wired to
+    /// [`GateFlags::policy_self_modification`](crate::gatekeeper::GateFlags::policy_self_modification).
+    /// Commit 6 made that flag hard and left it scoped to the command line,
+    /// which left the bypass as one line of shell moved into a file. See
+    /// [`gatekeeper::body_writes_gatekeeper_policy`](crate::gatekeeper::body_writes_gatekeeper_policy).
+    #[serde(default)]
+    pub writes_gatekeeper_policy: bool,
+    /// ANAI-206 commit 9 (C6-3): some logical line of the body **writes** at or
+    /// under `~/.openfang/agents/`. Wired to
+    /// [`GateFlags::agent_config_write`](crate::gatekeeper::GateFlags::agent_config_write).
+    #[serde(default)]
+    pub writes_agent_config: bool,
+    /// ANAI-206 commit 9 (C6-3): some logical line of the body **writes**
+    /// `~/.openfang/config.toml`. Wired to
+    /// [`GateFlags::runtime_config_write`](crate::gatekeeper::GateFlags::runtime_config_write).
+    #[serde(default)]
+    pub writes_runtime_config: bool,
 }
 
 /// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
@@ -1285,6 +1305,9 @@ mod tests {
             body_unresolved: false,
             writes_control_plane: false,
             destroys_substrate: false,
+            writes_gatekeeper_policy: false,
+            writes_agent_config: false,
+            writes_runtime_config: false,
         }
     }
 
