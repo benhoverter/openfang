@@ -1606,6 +1606,15 @@ impl OpenFangKernel {
                                             || disk_manifest.skills != entry.manifest.skills
                                             || disk_manifest.mcp_servers
                                                 != entry.manifest.mcp_servers
+                                            // ANAI-208. Without this, a file
+                                            // edit that adds `projects` and
+                                            // changes nothing else is a silent
+                                            // no-op at boot: the merge never
+                                            // fires, the DB copy stands, and
+                                            // the operator's declaration does
+                                            // nothing with no error anywhere.
+                                            || disk_manifest.projects
+                                                != entry.manifest.projects
                                             // Fields previously missing from this check (#1087):
                                             // Only compare workspace when the TOML explicitly sets
                                             // one, so the kernel-assigned default path in the DB
@@ -4252,6 +4261,16 @@ impl OpenFangKernel {
     /// the change outlive the process: without it the membership evaporates on
     /// the next restart and the agent silently drops out of its project, which
     /// presents as a fact that used to be readable and now is not.
+    ///
+    /// **Precedence: for an agent that HAS an `agent.toml`, the file wins on
+    /// boot.** `merge_disk_manifest_preserving_kernel_defaults` adopts the disk
+    /// manifest's `projects` wholesale, and the boot-time comparison now
+    /// includes the field, so a DB-only change to a file-backed agent lasts
+    /// until the next restart and no longer. That is deliberate — membership is
+    /// a *declaration*, and a declaration whose file says one thing while the
+    /// database says another is not a declaration. The consequence for the
+    /// backfill runbook: file-backed agents get file edits, file-less agents
+    /// get this call, and the two cohorts never cross.
     pub fn set_agent_projects(&self, agent_id: AgentId, projects: Vec<String>) -> KernelResult<()> {
         self.registry
             .update_projects(agent_id, projects.clone())
@@ -12438,6 +12457,33 @@ mod tests {
                 .is_err(),
             "an unknown caller must not pass the gate"
         );
+    }
+
+    /// ANAI-208, precedence. For an agent that has an `agent.toml`, the file is
+    /// the declaration and the DB copy is a cache of it.
+    ///
+    /// This is what makes the backfill runbook two disjoint cohorts rather than
+    /// a race: file-backed agents get file edits, file-less agents get
+    /// `set_agent_projects`, and a `PUT` against a file-backed agent lasts
+    /// exactly until its next restart. Better to pin that here than to let
+    /// someone discover it as an agent that quietly left its project.
+    #[test]
+    fn the_file_is_authoritative_for_projects_when_one_exists() {
+        let mut entry = test_manifest("demo", "x", vec![]);
+        entry.projects = vec!["kimiya".to_string()];
+
+        let mut disk = entry.clone();
+        disk.projects = vec![];
+        let merged = merge_disk_manifest_preserving_kernel_defaults(disk, &entry);
+        assert!(
+            merged.projects.is_empty(),
+            "an agent.toml that declares no project must win over the DB copy"
+        );
+
+        let mut disk = entry.clone();
+        disk.projects = vec!["openfang".to_string()];
+        let merged = merge_disk_manifest_preserving_kernel_defaults(disk, &entry);
+        assert_eq!(merged.projects, vec!["openfang".to_string()]);
     }
 
     #[test]

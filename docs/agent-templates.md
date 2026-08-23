@@ -830,6 +830,11 @@ tags = ["tag1", "tag2"]
 # rejected at spawn and warned about (but kept) on daemon restart, so a typo
 # never takes a running agent offline.
 # projects = ["openfang-fork"]
+#
+# Precedence: if this file exists, it wins. The `PUT /api/agents/{id}/projects`
+# endpoint exists for agents spawned without an agent.toml (their manifests live
+# only in the database); used against a file-backed agent, its effect lasts only
+# until that agent's next restart.
 
 # Optional per-agent history cap (issue #871). Falls back to the runtime
 # default (20) when unset. Bump it for primary/orchestrator agents that need
