@@ -301,6 +301,53 @@ impl WakeEnvelope {
                 .unwrap_or_else(crate::async_reply::default_timeout_secs),
         )
     }
+
+    /// The exact prompt text a woken turn sees — obligation preamble included.
+    ///
+    /// ## Why this exists (ANAI-209, failure class A)
+    ///
+    /// Every other leg of the reply guarantee is *recovery*: ANAI-198 auto-closes
+    /// on the callee's final text, ANAI-199 synthesizes on error, ANAI-201 mints a
+    /// `Timeout` on elapse. All three pay the sender SOMETHING, but only
+    /// [`ReplyKind::Explicit`] is an actual answer — the rest hand the initiator a
+    /// body labelled "evidence, not a reply". Observed live on 2026-08-23: the
+    /// callee ran a full, correct turn and simply never called
+    /// `agent_reply_async`, because nothing in its prompt told it that it owed one.
+    ///
+    /// The kernel already knows the debt exists at wake time (it mints the
+    /// reply-right in the same critical section). This states it. It is a prompt
+    /// change, not a mechanism change: the recovery legs stay exactly as they are,
+    /// this only makes them rarer.
+    ///
+    /// Returns [`Self::message`] verbatim for a **reply** wake ([`Self::is_reply`]):
+    /// leg-4 turns are minted NO reply-right, so a directive there would instruct
+    /// the initiator to call a tool that is guaranteed to fail closed.
+    ///
+    /// `correlation` is the wake task id — the same value the kernel keys the
+    /// reply-right by, and the one that appears in every synthesized close.
+    pub fn turn_prompt(&self, correlation: &str) -> String {
+        if self.is_reply {
+            return self.message.clone();
+        }
+        let sender = &self.sender;
+        let secs = self.timeout().as_secs();
+        format!(
+            "[kernel] You were woken by an async request from '{sender}' (correlation \
+             {correlation}). You owe that sender exactly one reply.\n\n\
+             You MUST end this turn by calling `agent_reply_async` with your answer. It \
+             takes no target — the reply is routed back to '{sender}' automatically, and \
+             it is available on this turn even if it is not in your usual tool list.\n\n\
+             You have {secs}s. If you end the turn without calling it, the kernel closes \
+             the correlation on your behalf and '{sender}' receives your turn text \
+             labelled as evidence rather than as an answer — a strictly worse outcome \
+             than replying.\n\n\
+             If you CANNOT do what was asked — missing tool, missing permission, \
+             ambiguous request — call `agent_reply_async` and say exactly that. A refusal \
+             is a valid answer. Silence is not.\n\n\
+             --- request from '{sender}' ---\n{}",
+            self.message
+        )
+    }
 }
 
 /// Provenance of a terminal reply (ANAI-199): who produced it, and therefore
@@ -661,5 +708,86 @@ mod tests {
         assert_eq!(env.requested_timeout_secs, Some(7));
         let back = WakeEnvelope::from_payload(&env.to_payload().unwrap()).unwrap();
         assert_eq!(back, env);
+    }
+
+    /// ANAI-209 helper: a plain origination wake, the shape `agent_send_async`
+    /// builds.
+    fn origination(message: &str) -> WakeEnvelope {
+        WakeEnvelope {
+            target: "worker-b".into(),
+            sender: "orchestrator".into(),
+            message: message.into(),
+            lineage: WakeLineage::root_at("orchestrator"),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: None,
+            reply_kind: ReplyKind::default(),
+            timeout_secs: Some(90),
+            requested_timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn an_origination_wake_states_the_reply_obligation() {
+        let prompt = origination("run the migration").turn_prompt("corr-1");
+
+        // The obligation itself, by name — this is the whole point.
+        assert!(
+            prompt.contains("agent_reply_async"),
+            "the woken turn must be told which tool discharges the debt: {prompt}"
+        );
+        assert!(
+            prompt.contains("MUST"),
+            "the obligation must not read as optional"
+        );
+        // Correlation and counterparty, so the turn can reason about what it owes.
+        assert!(prompt.contains("corr-1"));
+        assert!(prompt.contains("orchestrator"));
+        // The deadline the kernel will actually enforce (ANAI-201), not the default.
+        assert!(
+            prompt.contains("90s"),
+            "the enforced deadline must be disclosed: {prompt}"
+        );
+        // Refusal is explicitly licensed — the NO SHELL case must not go silent.
+        assert!(prompt.contains("refusal is a valid answer"));
+        // The sender's actual request survives verbatim.
+        assert!(prompt.contains("run the migration"));
+    }
+
+    #[test]
+    fn a_reply_wake_carries_no_directive() {
+        // Leg 4: the initiator's turn is minted NO reply-right, so instructing it
+        // to call `agent_reply_async` would order it to fail closed.
+        let mut env = origination("here is your answer");
+        env.is_reply = true;
+        env.reply_kind = ReplyKind::Explicit;
+
+        let prompt = env.turn_prompt("corr-1");
+        assert_eq!(
+            prompt, "here is your answer",
+            "a reply wake must pass through byte-identically"
+        );
+    }
+
+    #[test]
+    fn the_directive_precedes_the_request_body() {
+        // Ordering is load-bearing: a directive appended AFTER an arbitrarily long
+        // delegated payload is the thing most likely to be skimmed past.
+        let prompt = origination("BODY").turn_prompt("corr-1");
+        let directive = prompt.find("agent_reply_async").expect("directive present");
+        let body = prompt.rfind("BODY").expect("body present");
+        assert!(directive < body, "the obligation must lead: {prompt}");
+    }
+
+    #[test]
+    fn the_disclosed_deadline_tracks_the_fallback_for_a_pre_anai_201_payload() {
+        // A wake enqueued before ANAI-201 has no stamped deadline; `timeout()`
+        // falls back to config, and the prompt must quote what will be ENFORCED
+        // rather than claim the correlation is unbounded.
+        let mut env = origination("legacy");
+        env.timeout_secs = None;
+        let secs = env.timeout().as_secs();
+        assert!(env.turn_prompt("corr-1").contains(&format!("{secs}s")));
     }
 }

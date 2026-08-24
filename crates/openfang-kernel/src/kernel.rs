@@ -6132,9 +6132,19 @@ impl OpenFangKernel {
 
         // origin threading (audit finding #3) is a documented follow-up: a wake
         // that raises an approval prompt has no inbound route yet, so pass None.
+        //
+        // ANAI-209 (failure class A): hand the woken turn its reply OBLIGATION,
+        // not just its request. Every other leg of the guarantee is recovery
+        // AFTER the callee stayed silent (auto-close/error/timeout); this is the
+        // only leg that reduces how often the silence happens at all. It is a
+        // prompt change, not a mechanism change — the recovery legs are
+        // untouched, they just fire less. `turn_prompt` is a pass-through for a
+        // reply wake (leg 4 is minted no reply-right, so a directive there would
+        // instruct the initiator to call a tool guaranteed to fail closed).
+        let turn_message = envelope.turn_prompt(&task_id);
         let send_fut = self.send_message_with_handle_and_blocks(
             target_id,
-            &envelope.message,
+            &turn_message,
             handle,
             None,
             Some(envelope.sender.clone()),
