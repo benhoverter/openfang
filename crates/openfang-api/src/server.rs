@@ -277,6 +277,12 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_mcp_servers).put(routes::set_agent_mcp_servers),
         )
         .route(
+            // ANAI-208: declared project membership, settable for agents that
+            // have no agent.toml to edit.
+            "/api/agents/{id}/projects",
+            axum::routing::get(routes::get_agent_projects).put(routes::set_agent_projects),
+        )
+        .route(
             "/api/agents/{id}/identity",
             axum::routing::patch(routes::update_agent_identity),
         )

@@ -170,6 +170,7 @@ impl SetupWizard {
             tools: HashMap::new(),
             skills: intent.skills.clone(),
             mcp_servers: vec![],
+            projects: vec![],
             metadata: HashMap::new(),
             tags: vec![],
             routing: None,

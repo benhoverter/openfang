@@ -815,6 +815,27 @@ module = "builtin:chat"
 # Optional metadata
 tags = ["tag1", "tag2"]
 
+# Optional project membership (ANAI-208). The projects this agent works on,
+# by slug. Absent or empty means the agent belongs to no project, which is
+# legal — several agents legitimately have none.
+#
+# Slugs are addresses, not labels: lowercase `[a-z0-9][a-z0-9_-]*`, max 48
+# characters. The same grammar governs the `scope_ref` of a project-scoped
+# memory fact, so a slug you can declare here is exactly a slug the memory
+# subsystem can address.
+#
+# Membership is the readership relation for project-scoped facts. It is
+# default-deny: `memory_fact` and `memory_history` refuse a `project` scope
+# unless the calling agent declares that project here. A malformed slug is
+# rejected at spawn and warned about (but kept) on daemon restart, so a typo
+# never takes a running agent offline.
+# projects = ["openfang-fork"]
+#
+# Precedence: if this file exists, it wins. The `PUT /api/agents/{id}/projects`
+# endpoint exists for agents spawned without an agent.toml (their manifests live
+# only in the database); used against a file-backed agent, its effect lasts only
+# until that agent's next restart.
+
 # Optional per-agent history cap (issue #871). Falls back to the runtime
 # default (20) when unset. Bump it for primary/orchestrator agents that need
 # longer conversational memory, lower it for short-lived worker agents so

@@ -334,6 +334,7 @@ mod tests {
                 tools: HashMap::new(),
                 skills: vec![],
                 mcp_servers: vec![],
+                projects: vec![],
                 metadata: HashMap::new(),
                 tags: vec![],
                 routing: None,

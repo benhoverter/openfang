@@ -101,6 +101,59 @@ impl AgentRegistry {
         self.agents.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// ANAI-208. Every agent that declares membership in `project`.
+    ///
+    /// The fleet query "which agents are on tttb", answered from declarations
+    /// instead of from Ben's memory. Order is registry order, which is
+    /// unspecified — callers that render this should sort.
+    pub fn agents_in_project(&self, project: &str) -> Vec<AgentEntry> {
+        self.agents
+            .iter()
+            .filter(|e| e.value().manifest.is_member_of(project))
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
+    /// ANAI-208. The projects one agent declares, or an empty vector if the
+    /// agent is unknown.
+    ///
+    /// Unknown-agent and no-membership collapse to the same answer on purpose:
+    /// both mean "no project claim can be made on this agent's behalf", and
+    /// every consumer treats them identically.
+    pub fn projects_of(&self, id: AgentId) -> Vec<String> {
+        self.agents
+            .get(&id)
+            .map(|e| e.value().manifest.projects.clone())
+            .unwrap_or_default()
+    }
+
+    /// ANAI-208. Set an agent's declared project membership in the registry.
+    ///
+    /// Exists because roughly a third of the running fleet has no `agent.toml`
+    /// at all — spawned agents whose manifests live only in SQLite and are
+    /// restored at boot. Backfilling membership by editing files would reach
+    /// the ~45 agents that have files and silently miss the ~26 that do not,
+    /// and the missing cohort is the largest single project group. A query
+    /// that under-reports looks exactly like a query that works.
+    ///
+    /// Rejects a malformed slug rather than warning: this is a deliberate,
+    /// attended call, not a daemon-restart manifest load, so there is someone
+    /// to hand the error to. Persistence is the caller's job — see
+    /// `Kernel::set_agent_projects`, which pairs this with `save_agent`.
+    pub fn update_projects(&self, id: AgentId, projects: Vec<String>) -> OpenFangResult<()> {
+        for slug in &projects {
+            openfang_types::agent::validate_project_slug(slug)
+                .map_err(OpenFangError::InvalidInput)?;
+        }
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.projects = projects;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Add a child agent ID to a parent's children list.
     pub fn add_child(&self, parent_id: AgentId, child_id: AgentId) {
         if let Some(mut entry) = self.agents.get_mut(&parent_id) {
@@ -412,6 +465,7 @@ mod tests {
                 tools: HashMap::new(),
                 skills: vec![],
                 mcp_servers: vec![],
+                projects: vec![],
                 metadata: HashMap::new(),
                 tags: vec![],
                 routing: None,
@@ -438,6 +492,72 @@ mod tests {
             onboarding_completed: false,
             onboarding_completed_at: None,
         }
+    }
+
+    #[test]
+    fn agents_in_project_answers_from_declarations() {
+        let registry = AgentRegistry::new();
+
+        let mut on_fork = test_entry("openfang-alpha");
+        on_fork.manifest.projects = vec!["openfang-fork".into(), "fleet".into()];
+        let mut also_fork = test_entry("openfang-memory");
+        also_fork.manifest.projects = vec!["openfang-fork".into()];
+        let undeclared = test_entry("assistant");
+        let undeclared_id = undeclared.id;
+
+        registry.register(on_fork).unwrap();
+        registry.register(also_fork).unwrap();
+        registry.register(undeclared).unwrap();
+
+        let mut members: Vec<String> = registry
+            .agents_in_project("openfang-fork")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        members.sort();
+        assert_eq!(members, vec!["openfang-alpha", "openfang-memory"]);
+
+        assert_eq!(registry.agents_in_project("fleet").len(), 1);
+
+        // The load-bearing negative: an agent that declares nothing is a
+        // member of nothing, not a member of everything by omission. Get this
+        // backwards and all 71 undeclared agents join every project at once.
+        assert!(registry.projects_of(undeclared_id).is_empty());
+        assert!(!registry
+            .agents_in_project("openfang-fork")
+            .iter()
+            .any(|e| e.name == "assistant"));
+    }
+
+    #[test]
+    fn projects_of_unknown_agent_is_empty_not_a_panic() {
+        let registry = AgentRegistry::new();
+        assert!(registry.projects_of(AgentId::new()).is_empty());
+    }
+
+    #[test]
+    fn update_projects_sets_membership_and_refuses_a_malformed_slug() {
+        let registry = AgentRegistry::new();
+        let entry = test_entry("kimiya-spike05-c1");
+        let id = entry.id;
+        registry.register(entry).unwrap();
+
+        registry.update_projects(id, vec!["kimiya".into()]).unwrap();
+        assert_eq!(registry.projects_of(id), vec!["kimiya".to_string()]);
+        assert_eq!(registry.agents_in_project("kimiya").len(), 1);
+
+        // A bad slug is refused whole — no partial application, or the agent
+        // would end up in some of the projects it asked for and not others.
+        let err = registry
+            .update_projects(id, vec!["openfang".into(), "Bad Slug".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Bad Slug"), "{err}");
+        assert_eq!(registry.projects_of(id), vec!["kimiya".to_string()]);
+
+        // And membership can be cleared back to none.
+        registry.update_projects(id, vec![]).unwrap();
+        assert!(registry.projects_of(id).is_empty());
     }
 
     #[test]
