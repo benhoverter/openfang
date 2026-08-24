@@ -1155,7 +1155,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                    eventual agent_reply_async answer auto-posted to that channel."
                 + " You are GUARANTEED exactly one reply per call: if the target answers, you \
                    get its answer; if it cannot or does not, the daemon closes the correlation \
-                   itself and tells you why. Pass timeout_secs to bound how long that takes.",
+                   itself and tells you why. Pass timeout_secs to bound how long that takes."
+                + " Pass requires_tools to refuse the send outright when the target lacks a \
+                   tool the work needs, instead of spending the whole deadline discovering it.",
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1163,6 +1165,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" },
                     "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." },
                     "timeout_secs": { "type": "integer", "description": "Optional deadline in seconds. You are guaranteed a reply within roughly this long: if the target has not answered by then, its turn is ABORTED and the daemon sends you a timeout reply instead. Set it to how long you actually expect the work to take, with headroom — an over-tight value kills legitimate work, and partial side effects from the aborted turn may persist. Clamped into the operator's configured band; omit to accept the configured default." }
+                    ,"requires_tools": { "type": "array", "items": { "type": "string" }, "description": "Optional pre-flight: tool names the target MUST have for this work (e.g. [\"shell_exec\"]). Checked BEFORE the wake is enqueued — if any is missing the call fails immediately, names what is missing, mints NO correlation and consumes no deadline, so nothing was sent and re-sending a corrected request is safe. Use it whenever the request depends on a specific capability; without it you spend the full deadline learning the target could never have done it. Omit for no check." }
                 },
                 "required": ["agent_id", "message"]
             }),
@@ -3181,6 +3184,71 @@ async fn tool_agent_send_async(
         .find(|a| a.id == target_raw || a.name == target_raw)
         .map(|a| a.id.clone())
         .ok_or_else(|| format!("Async wake target not found: {target_raw}"))?;
+
+    // ANAI-210 (failure class B): refuse a wake the target structurally cannot
+    // serve, BEFORE anything durable exists.
+    //
+    // The reply guarantee bounds how long a sender waits; it cannot make the
+    // answer useful. Sending `sleep 60` to an agent with no `shell_exec` (the
+    // observed 2026-08-23 case) costs the sender its entire deadline to learn a
+    // static fact about the target's manifest. This turns that into an
+    // immediate, side-effect-free refusal.
+    //
+    // Placement is the point: ahead of the surface default, the lineage/cycle
+    // and depth checks, both wake budgets, and `wake_post`. Nothing has been
+    // charged and no correlation has been minted, so the refusal leaves the
+    // system byte-identical to never having called — which is what makes
+    // re-sending a corrected request safe.
+    //
+    // Fail-OPEN by design: `agent_tool_names` returning `None` means "cannot
+    // determine" (unresolvable agent, or a handle that does not implement the
+    // lookup), and is treated as no evidence rather than as an empty tool set.
+    // A pre-flight that invents refusals is worse than one that occasionally
+    // lets a doomed send through to the deadline it would have hit anyway.
+    // Omitting `requires_tools` skips the check entirely, so every existing
+    // caller is unaffected.
+    let required_tools: Vec<String> = input["requires_tools"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !required_tools.is_empty() {
+        if let Some(available) = kh.agent_tool_names(&target) {
+            let missing: Vec<&str> = required_tools
+                .iter()
+                .filter(|req| !available.iter().any(|have| have == *req))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                warn!(
+                    target = %target,
+                    sender = %sender,
+                    missing = ?missing,
+                    "ANAI-210: async wake refused at pre-flight — target lacks required tools"
+                );
+                return Err(format!(
+                    "Async wake NOT sent: '{target_raw}' lacks required tool(s): {}. \
+                     No correlation was minted, no deadline consumed, and no side effects \
+                     exist — this is a pre-flight refusal, not a failed delivery. Re-send \
+                     to a target that has them, or drop the requirement if the target can \
+                     do the work another way.",
+                    missing.join(", ")
+                ));
+            }
+        } else {
+            info!(
+                target = %target,
+                "agent_send_async: requires_tools pre-flight skipped — target tool set \
+                 unavailable, proceeding (ANAI-210 fails open)"
+            );
+        }
+    }
 
     // ANAI-125: default the surfacing route to the ORIGINATOR's OWN channel
     // binding when the caller omitted `surface_to`. This makes the common case
@@ -6165,6 +6233,224 @@ mod tests {
         );
     }
 
+    // ---- ANAI-210: `requires_tools` pre-flight on agent_send_async ---------
+    //
+    // Failure class B: a wake the target structurally cannot serve. The reply
+    // guarantee bounds the wait but cannot make the answer useful, so the whole
+    // point of these tests is that the refusal happens BEFORE anything durable
+    // exists — no correlation, no queue row, no deadline consumed.
+
+    #[tokio::test]
+    async fn requires_tools_refuses_a_target_missing_the_tool() {
+        // The observed 2026-08-23 case, in miniature: `sleep 60` addressed to an
+        // agent with no `shell_exec`. Without the pre-flight the sender burns its
+        // entire deadline to learn a static fact about the target's manifest.
+        let fake = Arc::new(FakeKernelHandle::new().with_agent("no-shell", &["file_read"]));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({
+            "agent_id": "no-shell",
+            "message": "run `sleep 60` and tell me when it finishes",
+            "requires_tools": ["shell_exec"],
+        });
+
+        let err = tool_agent_send_async(&input, Some(&handle), Some("origin-agent"))
+            .await
+            .expect_err("a target missing a required tool must be refused");
+
+        assert!(
+            err.contains("shell_exec"),
+            "the refusal must NAME the missing tool so the caller can correct it; got: {err}"
+        );
+        assert!(
+            err.contains("NOT sent"),
+            "the refusal must say nothing was sent, not merely that it failed; got: {err}"
+        );
+        // The property that makes a corrected re-send safe: no queue row exists.
+        assert!(
+            fake.wake_posts.lock().unwrap().is_empty(),
+            "a pre-flight refusal must enqueue no wake at all"
+        );
+    }
+
+    // Reaches the process-global emit window, so it must serialize against the
+    // tests that deliberately saturate it — otherwise a satisfied pre-flight
+    // fails on the CEILING error and reads as a pre-flight bug. Held across the
+    // awaits on purpose: that is what the guard is for.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn requires_tools_proceeds_when_the_target_has_them_all() {
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        // The check must be a filter, not a wall: a satisfied requirement is
+        // invisible and the send behaves exactly as it did before ANAI-210.
+        let fake =
+            Arc::new(FakeKernelHandle::new().with_agent("has-shell", &["shell_exec", "file_read"]));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({
+            "agent_id": "has-shell",
+            "message": "run the smoke",
+            "requires_tools": ["shell_exec"],
+        });
+
+        let out = tool_agent_send_async(&input, Some(&handle), Some("origin-has"))
+            .await
+            .expect("a target holding every required tool must not be refused");
+        assert!(
+            out.contains("Async wake queued"),
+            "the satisfied path must reach the ordinary enqueue; got: {out}"
+        );
+        assert_eq!(
+            fake.wake_posts.lock().unwrap().len(),
+            1,
+            "exactly one wake must be enqueued on the satisfied path"
+        );
+    }
+
+    // Reaches the process-global emit window, so it must serialize against the
+    // tests that deliberately saturate it — otherwise a satisfied pre-flight
+    // fails on the CEILING error and reads as a pre-flight bug. Held across the
+    // awaits on purpose: that is what the guard is for.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn requires_tools_fails_open_when_the_tool_set_is_unknown() {
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        // `agent_tool_names` -> None means "cannot determine", NOT "no tools".
+        // Reading it as an empty set would make every mock handle — and every
+        // agent the registry cannot resolve tools for — refuse every send. A
+        // pre-flight that invents refusals is strictly worse than one that
+        // occasionally lets a doomed send through to the deadline it would have
+        // hit anyway, so the unknown case degrades to pre-ANAI-210 behaviour.
+        let fake = Arc::new(FakeKernelHandle::new().with_opaque_agent("opaque"));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({
+            "agent_id": "opaque",
+            "message": "do the thing",
+            "requires_tools": ["shell_exec"],
+        });
+
+        let out = tool_agent_send_async(&input, Some(&handle), Some("origin-opaque"))
+            .await
+            .expect("an undeterminable tool set must fail OPEN, not refuse");
+        assert!(
+            out.contains("Async wake queued"),
+            "fail-open must reach the ordinary enqueue; got: {out}"
+        );
+    }
+
+    // Reaches the process-global emit window, so it must serialize against the
+    // tests that deliberately saturate it — otherwise a satisfied pre-flight
+    // fails on the CEILING error and reads as a pre-flight bug. Held across the
+    // awaits on purpose: that is what the guard is for.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_absent_or_blank_requires_tools_is_a_no_op() {
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        // Backward compatibility, stated as a test: every pre-ANAI-210 caller
+        // omits the field, and must be unaffected even against a target with an
+        // EMPTY effective tool set — the input that would trip a naive check.
+        // Whitespace-only entries are filtered for the same reason: a caller
+        // that passes `[""]` meant "no requirement", not "require the tool
+        // named empty string", and refusing there would be a pure regression.
+        let fake = Arc::new(FakeKernelHandle::new().with_agent("toolless", &[]));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+
+        for requires in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(["   ", ""]),
+        ] {
+            let input = serde_json::json!({
+                "agent_id": "toolless",
+                "message": "legacy caller",
+                "requires_tools": requires,
+            });
+            let out = tool_agent_send_async(&input, Some(&handle), Some("origin-legacy"))
+                .await
+                .expect("an absent or blank requirement must never refuse");
+            assert!(
+                out.contains("Async wake queued"),
+                "no-op path must enqueue as before; got: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_preflight_names_every_missing_tool_not_just_the_first() {
+        // A caller that has to re-send once per missing tool learns the target's
+        // shape one deadline at a time. Report the whole gap in one refusal.
+        let fake = Arc::new(FakeKernelHandle::new().with_agent("partial", &["shell_exec"]));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({
+            "agent_id": "partial",
+            "message": "read a file and browse",
+            "requires_tools": ["shell_exec", "file_read", "web_fetch"],
+        });
+
+        let err = tool_agent_send_async(&input, Some(&handle), Some("origin-partial"))
+            .await
+            .expect_err("a partially-equipped target must still be refused");
+        assert!(
+            err.contains("file_read") && err.contains("web_fetch"),
+            "both missing tools must be named; got: {err}"
+        );
+        assert!(
+            !err.contains("shell_exec"),
+            "the tool the target DOES have must not appear in the missing list; got: {err}"
+        );
+    }
+
+    // Held for the whole test on purpose — it serializes the process-global
+    // wake-emit window, so releasing it before the first await defeats it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_preflight_refuses_ahead_of_the_aggregate_ceiling() {
+        // Ordering is the feature. The refusal sits ahead of the surface
+        // default, lineage/cycle, depth, BOTH wake budgets and `wake_post`, so a
+        // doomed send costs the fleet's emission budget nothing. Saturating the
+        // aggregate ceiling and still getting the TOOLS error — not the ceiling
+        // error — is the observable proof that the check runs first.
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        for _ in 0..openfang_types::agent_wake::emit_max() {
+            assert!(wake_emit_admit(), "priming the window must admit");
+        }
+        assert!(
+            !wake_emit_admit(),
+            "precondition: the aggregate ceiling must now be refusing"
+        );
+
+        let fake = Arc::new(FakeKernelHandle::new().with_agent("no-shell-2", &["file_read"]));
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({
+            "agent_id": "no-shell-2",
+            "message": "run `sleep 60`",
+            "requires_tools": ["shell_exec"],
+        });
+
+        let err = tool_agent_send_async(&input, Some(&handle), Some("origin-ceiling-2"))
+            .await
+            .expect_err("the send must be refused");
+        assert!(
+            err.contains("shell_exec"),
+            "the pre-flight must win the race against the ceiling; got: {err}"
+        );
+        assert!(
+            !err.contains("ceiling"),
+            "reaching the ceiling check means the pre-flight ran too late; got: {err}"
+        );
+        reset_wake_emit_window();
+    }
+
     #[tokio::test]
     async fn reply_right_absent_without_a_minted_right() {
         // No right in the registry (origin / channel / cron / API turn, OR a
@@ -7475,6 +7761,14 @@ mod tests {
         // superseded apart in what it renders.
         facts: std::sync::Mutex<std::collections::HashMap<String, String>>,
         fact_history: std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>,
+        // ANAI-210: a stand-in registry for the `requires_tools` pre-flight.
+        // `agents` feeds target resolution (`list_agents`); `agent_tools` is the
+        // EFFECTIVE tool set the kernel would resolve for that agent, which is
+        // deliberately a different thing from `AgentInfo::tools` (the raw
+        // manifest declaration). An id absent from `agent_tools` models the
+        // "cannot determine" answer the pre-flight must fail open on.
+        agents: std::sync::Mutex<Vec<crate::kernel_handle::AgentInfo>>,
+        agent_tools: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
     }
 
     impl FakeKernelHandle {
@@ -7508,7 +7802,41 @@ mod tests {
                 notes: std::sync::Mutex::new(Vec::new()),
                 facts: std::sync::Mutex::new(std::collections::HashMap::new()),
                 fact_history: std::sync::Mutex::new(std::collections::HashMap::new()),
+                agents: std::sync::Mutex::new(Vec::new()),
+                agent_tools: std::sync::Mutex::new(std::collections::HashMap::new()),
             }
+        }
+
+        // ANAI-210: register a resolvable target whose effective tool set is
+        // known. Use `with_opaque_agent` for one whose set is not.
+        fn with_agent(self, name: &str, tools: &[&str]) -> Self {
+            self.agent_tools.lock().unwrap().insert(
+                name.to_string(),
+                tools.iter().map(|t| t.to_string()).collect(),
+            );
+            self.with_opaque_agent(name)
+        }
+
+        // ANAI-210: a target that resolves but whose tool set the handle cannot
+        // report — the `None` branch the pre-flight fails open on.
+        fn with_opaque_agent(self, name: &str) -> Self {
+            self.agents
+                .lock()
+                .unwrap()
+                .push(crate::kernel_handle::AgentInfo {
+                    id: name.to_string(),
+                    name: name.to_string(),
+                    state: "Running".into(),
+                    model_provider: "test".into(),
+                    model_name: "test".into(),
+                    description: String::new(),
+                    tags: Vec::new(),
+                    // Intentionally empty: the raw manifest declaration is NOT
+                    // what the pre-flight reads, and leaving it empty here
+                    // proves the check consults `agent_tool_names` instead.
+                    tools: Vec::new(),
+                });
+            self
         }
 
         // ANAI-166: canned search payload, in the kernel's wire shape.
@@ -8293,7 +8621,13 @@ mod tests {
             Err("not used".into())
         }
         fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
-            vec![]
+            self.agents.lock().unwrap().clone()
+        }
+        // ANAI-210: the effective tool set, keyed by the id/name the fake
+        // registered. `None` for an unregistered agent models the real kernel's
+        // "unresolvable" answer, which the pre-flight must treat as no evidence.
+        fn agent_tool_names(&self, agent_id: &str) -> Option<Vec<String>> {
+            self.agent_tools.lock().unwrap().get(agent_id).cloned()
         }
         fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
             Ok(())

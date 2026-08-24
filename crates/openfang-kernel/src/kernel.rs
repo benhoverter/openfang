@@ -5811,6 +5811,9 @@ impl OpenFangKernel {
             .memory
             .reap_in_flight_wakes(
                 None,
+                // Boot sweep reaps unconditionally, so a deadline rule would
+                // be dead weight here.
+                None,
                 "wake orphaned by daemon restart (dispatcher died mid-flight); failed closed, not re-dispatched",
             )
             .await
@@ -5819,7 +5822,8 @@ impl OpenFangKernel {
                 debug!("Wake boot-reaper: no orphaned in-flight wakes");
             }
             Ok(reaped) => {
-                let mut callers: Vec<&str> = reaped.iter().map(|(_, c)| c.as_str()).collect();
+                let mut callers: Vec<&str> =
+                    reaped.iter().map(|w| w.created_by.as_str()).collect();
                 callers.sort_unstable();
                 callers.dedup();
                 warn!(
@@ -5829,13 +5833,23 @@ impl OpenFangKernel {
                      process; their callers' per-caller slots are freed and their queued wakes \
                      will now dispatch"
                 );
-                for (task_id, created_by) in &reaped {
+                for w in &reaped {
                     self.audit_wake_completion(
-                        created_by,
+                        &w.created_by,
                         "unknown",
-                        task_id,
+                        &w.task_id,
                         "reaped: orphaned by daemon restart",
                     );
+                    // ANAI-217: freeing the slot is only half the job. Each of
+                    // these rows is a correlation whose sender is still owed a
+                    // reply, and the reply-right that recorded that debt died
+                    // with the process — so nothing else will ever pay it.
+                    self.pay_reaped_wake_debt(
+                        w,
+                        "the daemon restarted while the target's turn was in flight, cutting the \
+                         turn short and killing its dispatcher",
+                    )
+                    .await;
                 }
             }
             Err(e) => {
@@ -5844,6 +5858,89 @@ impl OpenFangKernel {
                 warn!(error = %e, "Wake boot-reaper failed; a starved caller may remain wedged");
             }
         }
+    }
+
+    /// ANAI-217: discharge the reply debt of a wake the reaper just failed
+    /// closed, so the ANAI-196 guarantee survives a daemon restart.
+    ///
+    /// ## The hole this closes
+    ///
+    /// Every other leg of the guarantee runs kernel code at the END of the
+    /// callee's turn: auto-close (ANAI-198), the error legs (ANAI-199), the
+    /// deadline abort (ANAI-201). A daemon restart runs none of them — the
+    /// detached dispatch task simply ceases, and the reply-right recording the
+    /// debt was in-memory, so it ceases with it. The sender's expectation,
+    /// meanwhile, is durable: it sits in that agent's transcript waiting for an
+    /// answer that no code path will ever produce. The reaper was already
+    /// visiting exactly these rows to free their per-caller slots; it just
+    /// threw the payload away. Now it doesn't, and the debt gets paid from the
+    /// envelope the row itself carries.
+    ///
+    /// `how` is the caller's one-clause diagnosis of what killed the turn. It
+    /// varies (restart vs. dead dispatcher vs. blown deadline) and the sender
+    /// genuinely needs to know which, because they imply different amounts of
+    /// completed work.
+    ///
+    /// Reuses [`Self::emit_synthetic_reply`], which supplies the two properties
+    /// that make this safe: it refuses to synthesize for a wake that is itself
+    /// a reply (so a reaped reply cannot recurse), and it declines — loudly —
+    /// when the sender no longer resolves.
+    ///
+    /// ## The one thing it cannot know
+    ///
+    /// Whether the callee called `agent_reply_async` before it died. That reply
+    /// is a separate queue row carrying no correlation id, so there is nothing
+    /// to check against. The body therefore says so outright and tells the
+    /// sender to prefer the real answer — a possible duplicate the reader is
+    /// warned about beats a silence it is not.
+    async fn pay_reaped_wake_debt(&self, reaped: &openfang_memory::ReapedWake, how: &str) {
+        if reaped.payload.is_empty() {
+            warn!(
+                correlation = %reaped.task_id,
+                caller = %reaped.created_by,
+                "ANAI-217: reaped wake has no decodable payload; its sender cannot be \
+                 identified and the reply debt is UNPAYABLE — recorded here only"
+            );
+            return;
+        }
+        let envelope = match openfang_types::wake::WakeEnvelope::from_payload(&reaped.payload) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(
+                    correlation = %reaped.task_id,
+                    caller = %reaped.created_by,
+                    error = %e,
+                    "ANAI-217: reaped wake payload does not parse as an envelope; the reply \
+                     debt is UNPAYABLE — recorded here only"
+                );
+                return;
+            }
+        };
+        self.emit_synthetic_reply(
+            &envelope,
+            &reaped.task_id,
+            openfang_types::wake::ReplyKind::Error,
+            format!(
+                "[kernel] Your async request to '{}' was CUT SHORT and will NOT be answered \
+                 (correlation {}).\n\n\
+                 What happened: {how}.\n\n\
+                 The wake was failed closed by the daemon's reaper. It is NOT still running, it \
+                 will NOT be re-dispatched, and this is the only reply you will receive for this \
+                 correlation.\n\n\
+                 The turn had STARTED, so side effects up to that point MAY exist and are NOT \
+                 enumerated here: files written, messages sent, agents spawned, memory rows \
+                 stored. Whatever the turn held in memory is gone; only durable artifacts \
+                 survive.\n\n\
+                 If '{}' managed to call `agent_reply_async` before it died, you may ALSO \
+                 receive its real answer separately — that one is authoritative and this notice \
+                 is superseded.\n\n\
+                 Recovery is investigation-led, NOT a retry. Inspect what the target actually \
+                 did before re-sending anything; an unchanged re-send duplicates whatever side \
+                 effects already landed.",
+                envelope.target, reaped.task_id, envelope.target,
+            ),
+        )
+        .await;
     }
 
     /// Periodic stale-claim sweep for wakes whose dispatcher died WITHOUT a
@@ -5879,6 +5976,12 @@ impl OpenFangKernel {
                     .memory
                     .reap_in_flight_wakes(
                         Some(stale_after),
+                        // ANAI-217: a row that states its own deadline gets
+                        // judged against THAT, not against the flat cutoff the
+                        // sweep must use for rows that state nothing.
+                        Some(std::time::Duration::from_secs(
+                            openfang_types::wake::REAP_DEADLINE_GRACE_SECS,
+                        )),
                         "wake exceeded the stale-claim timeout (dispatcher presumed dead); \
                          failed closed, not re-dispatched",
                     )
@@ -5886,19 +5989,40 @@ impl OpenFangKernel {
                 {
                     Ok(reaped) if reaped.is_empty() => {}
                     Ok(reaped) => {
-                        for (task_id, created_by) in &reaped {
+                        for w in &reaped {
                             warn!(
-                                task_id = %task_id,
-                                caller = %created_by,
+                                task_id = %w.task_id,
+                                caller = %w.created_by,
                                 stale_after_secs = stale_secs,
+                                past_deadline = w.past_deadline,
                                 "Stale-wake reaper: failed closed a wake stuck in flight"
                             );
                             kernel.audit_wake_completion(
-                                created_by,
+                                &w.created_by,
                                 "unknown",
-                                task_id,
-                                "reaped: stale claim timeout",
+                                &w.task_id,
+                                if w.past_deadline {
+                                    "reaped: stated deadline + grace elapsed"
+                                } else {
+                                    "reaped: stale claim timeout"
+                                },
                             );
+                            // ANAI-217: same debt, different cause of death —
+                            // no restart happened, so nothing at all ran at the
+                            // end of this turn to close the correlation.
+                            let how = if w.past_deadline {
+                                "the target's dispatcher died without a daemon restart, and the \
+                                 turn's own stated deadline (plus grace) has since elapsed with \
+                                 nobody left to abort it"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "the target's dispatcher stopped reporting (panicked task or \
+                                     wedged loop) and the claim exceeded the operator's \
+                                     stale-wake cutoff of {stale_secs}s"
+                                )
+                            };
+                            kernel.pay_reaped_wake_debt(w, &how).await;
                         }
                     }
                     Err(e) => warn!(error = %e, "Stale-wake reaper sweep failed"),
@@ -6132,9 +6256,19 @@ impl OpenFangKernel {
 
         // origin threading (audit finding #3) is a documented follow-up: a wake
         // that raises an approval prompt has no inbound route yet, so pass None.
+        //
+        // ANAI-209 (failure class A): hand the woken turn its reply OBLIGATION,
+        // not just its request. Every other leg of the guarantee is recovery
+        // AFTER the callee stayed silent (auto-close/error/timeout); this is the
+        // only leg that reduces how often the silence happens at all. It is a
+        // prompt change, not a mechanism change — the recovery legs are
+        // untouched, they just fire less. `turn_prompt` is a pass-through for a
+        // reply wake (leg 4 is minted no reply-right, so a directive there would
+        // instruct the initiator to call a tool guaranteed to fail closed).
+        let turn_message = envelope.turn_prompt(&task_id);
         let send_fut = self.send_message_with_handle_and_blocks(
             target_id,
-            &envelope.message,
+            &turn_message,
             handle,
             None,
             Some(envelope.sender.clone()),
@@ -10182,6 +10316,36 @@ impl KernelHandle for OpenFangKernel {
     /// delegates to the private helper that also feeds the prompt summary.
     fn channel_binding_route(&self, agent_name: &str) -> Option<String> {
         self.agent_channel_binding_route(agent_name)
+    }
+
+    /// ANAI-210: expose a target's effective tool set so `agent_send_async` can
+    /// pre-flight a caller-declared `requires_tools` list and refuse before
+    /// minting a correlation. Resolution mirrors the real turn path — same
+    /// `available_tools_with_registry` the kernel feeds the LLM — so the answer
+    /// is the tool list the target would genuinely be offered, not a manifest
+    /// re-reading that would drift from it.
+    ///
+    /// Accepts UUID or name, matching the tool's own target resolution. `None`
+    /// for an unresolvable agent, which the caller treats as "no evidence"
+    /// rather than "no tools" — a pre-flight must never invent a refusal.
+    ///
+    /// The per-turn `entry.mode.filter_tools` narrowing is deliberately NOT
+    /// applied here: it can only ever remove tools, so skipping it biases this
+    /// answer toward "present", i.e. toward letting the send through. That is
+    /// the safe direction — the wrong answer degrades to today's behaviour
+    /// instead of blocking a legitimate wake.
+    fn agent_tool_names(&self, agent_id: &str) -> Option<Vec<String>> {
+        let id: AgentId = match agent_id.parse() {
+            Ok(id) => id,
+            Err(_) => self.registry.find_by_name(agent_id).map(|e| e.id)?,
+        };
+        self.registry.get(id)?;
+        Some(
+            self.available_tools_with_registry(id, None)
+                .into_iter()
+                .map(|t| t.name)
+                .collect(),
+        )
     }
 
     async fn spawn_agent(
@@ -14251,6 +14415,176 @@ system_prompt = "You are a test agent."
         );
         // The reply roots a fresh chain, so origin's leg-4 turn is a clean leaf.
         assert_eq!(reply.lineage.depth(), 1);
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-217: the reaper pays too — the guarantee survives a daemon restart
+    // -----------------------------------------------------------------------
+
+    /// Build a `ReapedWake` the way the substrate's sweep would, from an
+    /// envelope the test controls.
+    fn reaped(
+        task_id: &str,
+        envelope: &openfang_types::wake::WakeEnvelope,
+        past_deadline: bool,
+    ) -> openfang_memory::ReapedWake {
+        openfang_memory::ReapedWake {
+            task_id: task_id.to_string(),
+            created_by: envelope.sender.clone(),
+            payload: envelope.to_payload().unwrap(),
+            past_deadline,
+        }
+    }
+
+    fn anai217_envelope(sender: &str, target: &str) -> openfang_types::wake::WakeEnvelope {
+        openfang_types::wake::WakeEnvelope {
+            target: target.into(),
+            sender: sender.into(),
+            message: "do the thing".into(),
+            lineage: openfang_types::wake::WakeLineage::root_at(sender),
+            trigger: TurnTrigger::AgentCall,
+            origin: None,
+            is_reply: false,
+            surface_to: Some("discord:1086446153098342510".into()),
+            reply_kind: Default::default(),
+            timeout_secs: Some(600),
+            requested_timeout_secs: None,
+        }
+    }
+
+    /// THE hole this closes: a daemon restart kills the dispatch task AND the
+    /// in-memory reply-right that recorded the debt, so no end-of-turn code path
+    /// exists to pay the sender. Every other leg of ANAI-196 runs kernel code at
+    /// turn end; this one has no turn end. Before this, the reaper freed the
+    /// per-caller slot and the sender waited forever.
+    #[tokio::test]
+    async fn a_reaped_wake_pays_the_sender_an_error_reply() {
+        let (_tmp, kernel) = anai199_kernel("initiator-r");
+        let envelope = anai217_envelope("initiator-r", "deep-target");
+
+        kernel
+            .pay_reaped_wake_debt(
+                &reaped("corr-reaped", &envelope, false),
+                "the daemon restarted while the target's turn was in flight",
+            )
+            .await;
+
+        let (_id, reply) = kernel
+            .memory
+            .claim_wake_for_dispatch(8)
+            .await
+            .expect("wake queue readable")
+            .expect(
+                "the reaper must close the correlation — otherwise a daemon restart mid-turn \
+                 leaves the sender waiting forever (ANAI-217)",
+            );
+
+        assert_eq!(reply.target, "initiator-r", "the reply goes to the sender");
+        assert_eq!(
+            reply.sender, "deep-target",
+            "attributed to the agent the sender addressed"
+        );
+        assert!(reply.is_reply, "a synthesized reply is terminal");
+        assert_eq!(reply.reply_kind, openfang_types::wake::ReplyKind::Error);
+        // The body must carry the four clauses an orchestrator needs, or it
+        // pattern-matches "failed" straight to a blind retry over side effects
+        // that already landed.
+        assert!(
+            reply.message.contains("CUT SHORT"),
+            "must state the turn was cut short: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("the daemon restarted"),
+            "must carry the caller's specific diagnosis: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("MAY exist"),
+            "must warn that side effects may exist — the turn HAD started: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("NOT a retry"),
+            "must steer off blind retry: {}",
+            reply.message
+        );
+        assert!(
+            reply.message.contains("authoritative"),
+            "must warn that a real answer may also arrive and outranks this: {}",
+            reply.message
+        );
+        // A failure reaches the same human channel a success would have.
+        assert_eq!(
+            reply.surface_to.as_deref(),
+            Some("discord:1086446153098342510")
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A reaped wake that was ITSELF a terminal reply owes nobody anything.
+    /// Synthesizing here would mint a reply to a reply — the recursion the
+    /// depth-1 guard in `emit_synthetic_reply` exists to refuse.
+    #[tokio::test]
+    async fn a_reaped_reply_wake_owes_nothing() {
+        let (_tmp, kernel) = anai199_kernel("initiator-s");
+        let mut envelope = anai217_envelope("initiator-s", "deep-target");
+        envelope.is_reply = true;
+
+        kernel
+            .pay_reaped_wake_debt(
+                &reaped("corr-reply", &envelope, false),
+                "the daemon restarted",
+            )
+            .await;
+
+        assert!(
+            kernel
+                .memory
+                .claim_wake_for_dispatch(8)
+                .await
+                .expect("wake queue readable")
+                .is_none(),
+            "a reaped terminal reply must not produce a reply of its own"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// An unreadable payload means the sender cannot be identified at all. The
+    /// row is still reaped (it holds a per-caller slot regardless), but the debt
+    /// is unpayable — and must fail LOUDLY into the log rather than enqueue a
+    /// wake addressed to nobody.
+    #[tokio::test]
+    async fn a_reaped_wake_with_an_unreadable_payload_enqueues_nothing() {
+        let (_tmp, kernel) = anai199_kernel("initiator-t");
+
+        for payload in [Vec::new(), b"not an envelope".to_vec()] {
+            kernel
+                .pay_reaped_wake_debt(
+                    &openfang_memory::ReapedWake {
+                        task_id: "corr-poison".into(),
+                        created_by: "initiator-t".into(),
+                        payload,
+                        past_deadline: false,
+                    },
+                    "the daemon restarted",
+                )
+                .await;
+        }
+
+        assert!(
+            kernel
+                .memory
+                .claim_wake_for_dispatch(8)
+                .await
+                .expect("wake queue readable")
+                .is_none(),
+            "an undecodable reaped wake must enqueue nothing"
+        );
 
         kernel.shutdown();
     }

@@ -28,6 +28,39 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+/// One wake row failed closed by [`MemorySubstrate::reap_in_flight_wakes`].
+///
+/// ## Why the payload rides along (ANAI-217)
+///
+/// The reaper's original contract was purely *unwedging*: free the per-caller
+/// in-flight slot and preserve an audit trail. But a reaped wake is a
+/// correlation the initiator is still owed a reply on, and the reply-right that
+/// records that debt lives in kernel memory — so a daemon restart destroys the
+/// debt record while the *sender's* expectation survives in its own transcript.
+/// The result was the one hole left in the ANAI-196 guarantee: process-scoped,
+/// not durable. Paying it requires the sender and the surfacing route, which
+/// exist only inside the envelope, which exists only in the row's payload.
+/// Hence: the reaper returns the payload and the kernel discharges the debt.
+///
+/// `payload` is the raw envelope BLOB, EMPTY when the column was null or
+/// unreadable. Empty means "this row's debt cannot be paid" — the row
+/// is still reaped (it holds a slot regardless), and the caller reports the
+/// unpayable debt rather than dropping it silently.
+#[derive(Debug, Clone)]
+pub struct ReapedWake {
+    /// Task-queue row id — the correlation id the sender is waiting on.
+    pub task_id: String,
+    /// The caller whose per-caller slot this row was holding.
+    pub created_by: String,
+    /// Decoded `WakeEnvelope` payload; empty if absent or undecodable.
+    pub payload: Vec<u8>,
+    /// True when the row was reaped for blowing its OWN stated deadline plus
+    /// grace, rather than for sitting past the operator's flat stale cutoff.
+    /// Changes only the wording of the diagnosis, but the two are genuinely
+    /// different findings and the reply body should not conflate them.
+    pub past_deadline: bool,
+}
+
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
 pub struct MemorySubstrate {
@@ -978,13 +1011,27 @@ impl MemorySubstrate {
     /// Only wake-titled rows are touched; an ordinary agent's `in_progress`
     /// collaboration task is none of this function's business.
     ///
-    /// Returns the `(task_id, created_by)` pairs reaped, so the caller can log
-    /// which callers were unwedged.
+    /// ## Deadline-aware staleness (ANAI-217)
+    ///
+    /// `deadline_grace` narrows the periodic sweep for rows that carry an
+    /// ANAI-201 deadline: such a row is ALSO reaped once
+    /// `claimed_at + envelope.timeout() + grace` has passed, even if the flat
+    /// `stale_after` cutoff has not. The flat cutoff has to be set far above
+    /// any legitimate turn because it applies to rows whose intended duration
+    /// is unknown; a row that states its own deadline is not in that position,
+    /// and holding its caller's slot for the flat hour after a bound it already
+    /// blew is pure latency. `None` disables the rule (behaviour identical to
+    /// pre-ANAI-217). Ignored on the boot sweep, which reaps unconditionally.
+    ///
+    /// Returns the reaped rows, payload included, so the caller can decode the
+    /// envelope and discharge the sender's reply debt (ANAI-217) rather than
+    /// merely log which callers were unwedged.
     pub async fn reap_in_flight_wakes(
         &self,
         stale_after: Option<std::time::Duration>,
+        deadline_grace: Option<std::time::Duration>,
         reason: &str,
-    ) -> OpenFangResult<Vec<(String, String)>> {
+    ) -> OpenFangResult<Vec<ReapedWake>> {
         let conn = Arc::clone(&self.conn);
         let wake_like = format!("{}%", openfang_types::wake::WAKE_TASK_PREFIX);
         let reason = reason.to_string();
@@ -1003,7 +1050,7 @@ impl MemorySubstrate {
             // orphans that motivated this sweep would survive it.
             let mut stmt = db
                 .prepare(
-                    "SELECT id, created_by, COALESCE(NULLIF(claimed_at, ''), created_at)
+                    "SELECT id, created_by, COALESCE(NULLIF(claimed_at, ''), created_at), payload
                      FROM task_queue
                      WHERE status = 'in_progress' AND title LIKE ?1",
                 )
@@ -1014,41 +1061,89 @@ impl MemorySubstrate {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1).unwrap_or_default(),
                         row.get::<_, Option<String>>(2).unwrap_or(None),
+                        row.get::<_, Vec<u8>>(3).unwrap_or_default(),
                     ))
                 })
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let mut doomed: Vec<(String, String)> = Vec::new();
+            let mut doomed: Vec<ReapedWake> = Vec::new();
             for row in rows {
-                let (id, created_by, at) = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                let (id, created_by, at, payload) =
+                    row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                // Read as raw bytes: `payload` is a BLOB column and the queue's
+                // contract is opaque bytes (the base64 in `task_claim`/
+                // `task_list` is a JSON-transport artifact, not storage). A
+                // missing or unreadable value yields an empty Vec rather than a
+                // skip — the row still holds a per-caller slot and must still be
+                // reaped; the caller treats empty-or-unparseable as "debt
+                // unpayable" and says so in the log rather than dropping it.
+                // Parse rather than compare timestamp strings: a row written in
+                // a different RFC3339 offset would order wrong
+                // lexicographically and get reaped while live.
+                let claimed = at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc));
                 match cutoff {
                     // Boot sweep: no cutoff, everything in flight is an orphan.
-                    None => doomed.push((id, created_by)),
+                    None => doomed.push(ReapedWake {
+                        task_id: id,
+                        created_by,
+                        payload,
+                        past_deadline: false,
+                    }),
                     Some(cut) => {
-                        // Parse rather than compare timestamp strings: a row
-                        // written in a different RFC3339 offset would order
-                        // wrong lexicographically and get reaped while live.
                         // An unparseable/missing stamp is NOT reaped — a live
                         // loop killed by a bad timestamp is worse than an
-                        // orphan that waits for the next boot sweep.
-                        let stale = at
-                            .as_deref()
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                            .map(|t| t.with_timezone(&chrono::Utc) < cut)
+                        // orphan that waits for the next boot sweep. Both rules
+                        // below key off it, so bail once here.
+                        let Some(claimed) = claimed else { continue };
+                        let stale = claimed < cut;
+                        // ANAI-217: the row's own stated deadline, when it has
+                        // one, is a tighter and better-founded bound than the
+                        // flat cutoff. Any failure to derive it (no grace
+                        // configured, unparseable payload, arithmetic
+                        // overflow) falls back to `stale` alone — the rule can
+                        // only ever reap MORE than before, never less, and
+                        // never on a guess.
+                        let past_deadline = deadline_grace
+                            .and_then(|g| {
+                                let env =
+                                    openfang_types::wake::WakeEnvelope::from_payload(&payload)
+                                        .ok()?;
+                                let bound =
+                                    chrono::Duration::from_std(env.timeout().checked_add(g)?)
+                                        .ok()?;
+                                Some(claimed.checked_add_signed(bound)? < now)
+                            })
                             .unwrap_or(false);
-                        if stale {
-                            doomed.push((id, created_by));
+                        if stale || past_deadline {
+                            doomed.push(ReapedWake {
+                                task_id: id,
+                                created_by,
+                                payload,
+                                past_deadline,
+                            });
                         }
                     }
                 }
             }
 
             let now_s = now.to_rfc3339();
-            for (id, _) in &doomed {
+            for w in &doomed {
+                // Say which rule fired: a row reaped for blowing its own
+                // deadline is a different diagnosis from one that sat past the
+                // operator's flat cutoff, and the row's `result` is the only
+                // durable record of either.
+                let result = if w.past_deadline {
+                    format!("{reason} (stated deadline + grace elapsed)")
+                } else {
+                    reason.clone()
+                };
                 db.execute(
                     "UPDATE task_queue SET status = 'completed', result = ?2, completed_at = ?3
                      WHERE id = ?1 AND status = 'in_progress'",
-                    rusqlite::params![id, &reason, &now_s],
+                    rusqlite::params![&w.task_id, &result, &now_s],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
             }
@@ -1642,13 +1737,20 @@ mod tests {
 
         // Boot sweep: no cutoff, everything in flight is an orphan.
         let reaped = substrate
-            .reap_in_flight_wakes(None, "wake orphaned by daemon restart")
+            .reap_in_flight_wakes(None, None, "wake orphaned by daemon restart")
             .await
             .unwrap();
         assert_eq!(reaped.len(), 2);
-        for (id, created_by) in &reaped {
-            assert!(orphans.contains(id));
-            assert_eq!(created_by, "orch");
+        for w in &reaped {
+            assert!(orphans.contains(&w.task_id));
+            assert_eq!(w.created_by, "orch");
+            // ANAI-217: the payload must survive the reap, or the kernel has
+            // nothing to address the outstanding reply to.
+            assert!(
+                !w.payload.is_empty(),
+                "a reaped wake must carry its envelope so the debt can be paid"
+            );
+            assert!(!w.past_deadline, "the boot sweep reaps unconditionally");
         }
 
         // Fail-CLOSED, not requeued: the orphans are completed with a
@@ -1689,7 +1791,7 @@ mod tests {
 
         // Fresh claim, one-hour staleness bound: nothing is reaped.
         let spared = substrate
-            .reap_in_flight_wakes(Some(std::time::Duration::from_secs(3600)), "stale")
+            .reap_in_flight_wakes(Some(std::time::Duration::from_secs(3600)), None, "stale")
             .await
             .unwrap();
         assert!(spared.is_empty(), "a just-claimed wake must not be reaped");
@@ -1697,15 +1799,105 @@ mod tests {
         // Zero-second bound reaps the wake — and ONLY the wake. An ordinary
         // agent's in-flight collaboration task is not the reaper's business.
         let reaped = substrate
-            .reap_in_flight_wakes(Some(std::time::Duration::ZERO), "stale claim timeout")
+            .reap_in_flight_wakes(Some(std::time::Duration::ZERO), None, "stale claim timeout")
             .await
             .unwrap();
         assert_eq!(reaped.len(), 1);
-        assert_eq!(reaped[0].0, wake["id"].as_str().unwrap());
+        assert_eq!(reaped[0].task_id, wake["id"].as_str().unwrap());
 
         let still_running = substrate.task_list(Some("in_progress")).await.unwrap();
         assert_eq!(still_running.len(), 1);
         assert_eq!(still_running[0]["id"], regular["id"]);
+    }
+
+    /// ANAI-217: a wake that states its OWN deadline is judged against that,
+    /// not against the operator's flat stale cutoff.
+    ///
+    /// The pair is the point. Both rows are claimed in the same instant and
+    /// swept with the same one-hour cutoff, so the flat rule spares both; the
+    /// only thing separating them is the deadline each carries in its own
+    /// payload. A regression that reverts to the flat rule fails on the first
+    /// row; one that ignores the deadline entirely and reaps everything fails
+    /// on the second.
+    #[tokio::test]
+    async fn test_stale_reaper_honors_the_wakes_own_deadline() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+
+        let mut expired = sample_wake_envelope("worker-fast", "orch");
+        expired.timeout_secs = Some(0); // already past its bound at claim time
+        let mut patient = sample_wake_envelope("worker-slow", "orch");
+        patient.timeout_secs = Some(3600); // nowhere near its bound
+
+        for env in [&expired, &patient] {
+            substrate
+                .task_post_wake(
+                    &format!("{WAKE_TASK_PREFIX}{}", env.target),
+                    &env.message,
+                    Some(&env.target),
+                    Some("orch"),
+                    &env.to_payload().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = substrate.task_claim_wake(4).await.unwrap().unwrap();
+        let second = substrate.task_claim_wake(4).await.unwrap().unwrap();
+        let claimed: Vec<&str> = vec![
+            first["title"].as_str().unwrap(),
+            second["title"].as_str().unwrap(),
+        ];
+        assert_eq!(claimed.len(), 2, "both wakes must be in flight");
+
+        // Deadline rule OFF: the flat hour spares both, as it always did.
+        let spared = substrate
+            .reap_in_flight_wakes(Some(std::time::Duration::from_secs(3600)), None, "stale")
+            .await
+            .unwrap();
+        assert!(
+            spared.is_empty(),
+            "with the deadline rule disabled, the flat cutoff must spare both"
+        );
+
+        // Deadline rule ON: only the row that blew its own bound is reaped.
+        let reaped = substrate
+            .reap_in_flight_wakes(
+                Some(std::time::Duration::from_secs(3600)),
+                Some(std::time::Duration::ZERO),
+                "stale claim timeout",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reaped.len(),
+            1,
+            "exactly the wake past its own deadline is reaped"
+        );
+        assert!(
+            reaped[0].past_deadline,
+            "the row must report WHICH rule reaped it — the diagnosis differs"
+        );
+        let env = WakeEnvelope::from_payload(&reaped[0].payload).unwrap();
+        assert_eq!(env.target, "worker-fast");
+
+        // The spared one is still in flight, still dispatching.
+        let still_running = substrate.task_list(Some("in_progress")).await.unwrap();
+        assert_eq!(still_running.len(), 1);
+        assert!(still_running[0]["title"]
+            .as_str()
+            .unwrap()
+            .ends_with("worker-slow"));
+
+        // And the reaped row's `result` names the rule, not just "stale".
+        let completed = substrate.task_list(Some("completed")).await.unwrap();
+        assert_eq!(completed.len(), 1);
+        assert!(
+            completed[0]["result"]
+                .as_str()
+                .unwrap()
+                .contains("stated deadline + grace elapsed"),
+            "the durable record must say why: {:?}",
+            completed[0]["result"]
+        );
     }
 
     /// The honesty fix's data source: per-caller wake depth, so the enqueue can
