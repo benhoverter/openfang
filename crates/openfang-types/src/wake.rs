@@ -62,6 +62,23 @@ use crate::turn::TurnTrigger;
 /// default). Enforced against [`WakeLineage::depth`] at the wake entrypoint.
 pub const DEFAULT_MAX_WAKE_DEPTH: usize = 5;
 
+/// ANAI-217: grace added to a wake's OWN stated deadline before the periodic
+/// stale sweep is willing to reap it.
+///
+/// A wake that carries an ANAI-201 deadline tells the reaper exactly how long
+/// it was ever supposed to run, which is a far better-founded bound than the
+/// flat `stale_wake_secs` cutoff (default 1h) the sweep must otherwise apply to
+/// rows of unknown intended duration. The grace covers the gap between "the
+/// deadline elapsed" and "the in-process timeout would have fired and closed
+/// the correlation itself": if the dispatcher is alive, it aborts the turn at
+/// the deadline and completes the row, so a row still `in_progress` this far
+/// past its own bound has no live dispatcher.
+///
+/// Sized to be unmistakable rather than tight — the cost of waiting is one more
+/// sweep interval, the cost of reaping a live loop is a bogus failure stamped
+/// on work that was about to succeed.
+pub const REAP_DEADLINE_GRACE_SECS: u64 = 120;
+
 /// Reserved task-queue title/`task_type` prefix that marks a queued task as an
 /// `agent_send_async` wake. Single source of truth shared by three sites:
 ///

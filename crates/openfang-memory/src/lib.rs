@@ -23,4 +23,4 @@ pub mod usage;
 pub mod vocabulary;
 
 mod substrate;
-pub use substrate::MemorySubstrate;
+pub use substrate::{MemorySubstrate, ReapedWake};
