@@ -2231,10 +2231,16 @@ pub struct MemoryConfig {
     /// Idle gap (minutes) after which the next captured turn starts a NEW
     /// episode instead of resuming the open one (ADR 0001 §2.2).
     ///
-    /// `0` or negative disables close-on-timer entirely — episodes then only
-    /// ever close explicitly. Default 120: long enough that a lunch break does
-    /// not shred one work session into three, short enough that yesterday's
-    /// context is not stapled onto this morning's.
+    /// **Default 0 — close-on-timer is disabled fleet-wide.** Zero or negative
+    /// means episodes only ever close explicitly, and the idle sweep task does
+    /// not spawn at all (ANAI-219). Arming it is a deliberate, one-way act:
+    /// the first sweep after boot closes every episode already past the gap.
+    /// 120 is the value to reach for when you do arm it — long enough that a
+    /// lunch break does not shred one work session into three, short enough
+    /// that yesterday's context is not stapled onto this morning's.
+    ///
+    /// `[memory]` is restart-required (`config_reload`), and the sweep task
+    /// spawns at boot: editing this does nothing until the daemon bounces.
     #[serde(default = "default_episode_idle_timeout")]
     pub episode_idle_timeout_minutes: i64,
 }

@@ -358,12 +358,12 @@ impl EpisodeStore {
     /// again; this is the sweep for agents that went quiet. Safe to call from
     /// the consolidation tick.
     ///
-    /// **Nothing calls it, and nothing is going to.** With the idle timer off
-    /// by default ([`DEFAULT_IDLE_TIMEOUT_MINUTES`]) there is no reaping to do:
-    /// it returns 0 immediately. Kept, not deleted, because it is the working
-    /// half of the mechanism a deployment that sets a positive timeout would
-    /// need, and it is covered by tests. If you are here because episodes are
-    /// staying open, that is the design — see the const.
+    /// ANAI-219 gave it a caller: the kernel's episode-sweep task, on its own
+    /// 60s tick, spawned only when `episode_idle_timeout_minutes > 0`. With
+    /// the idle timer off by default ([`DEFAULT_IDLE_TIMEOUT_MINUTES`]) that
+    /// task never spawns and this returns 0 immediately, so the default
+    /// deployment is unchanged. If you are here because episodes are staying
+    /// open, that is the timer being off — see the const.
     pub fn sweep_idle(&self) -> OpenFangResult<usize> {
         if self.idle_timeout_minutes <= 0 {
             return Ok(0);

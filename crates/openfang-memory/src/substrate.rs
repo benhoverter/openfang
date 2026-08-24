@@ -171,6 +171,22 @@ impl MemorySubstrate {
         &self.usage
     }
 
+    /// In-memory substrate with the episode idle timer armed (tests only).
+    ///
+    /// [`Self::open_in_memory`] takes the default timeout of 0, which is the
+    /// right default but makes every timer path untestable through the
+    /// substrate's own API.
+    #[cfg(test)]
+    pub(crate) fn open_in_memory_with_idle_timeout(
+        decay_rate: f32,
+        idle_timeout_minutes: i64,
+    ) -> OpenFangResult<Self> {
+        let mut substrate = Self::open_in_memory(decay_rate)?;
+        substrate.episodes =
+            EpisodeStore::with_idle_timeout(Arc::clone(&substrate.conn), idle_timeout_minutes);
+        Ok(substrate)
+    }
+
     // -----------------------------------------------------------------
     // Episodes (ADR 0001 §2.2)
     // -----------------------------------------------------------------
@@ -249,6 +265,17 @@ impl MemorySubstrate {
     /// The agent's currently open episode, if any.
     pub fn current_episode(&self, agent_id: AgentId) -> OpenFangResult<Option<Episode>> {
         self.episodes.current(agent_id)
+    }
+
+    /// Async wrapper for [`EpisodeStore::sweep_idle`] — the fleet-wide reaper
+    /// for open episodes past the idle gap. Runs from the kernel's sweep task
+    /// (ANAI-219), which is an async context, so the SQLite `UPDATE` goes on
+    /// the blocking pool like every other write path here.
+    pub async fn sweep_idle_episodes_async(&self) -> OpenFangResult<usize> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.sweep_idle())
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     // -----------------------------------------------------------------
@@ -2008,5 +2035,67 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// ANAI-219: the sweep the kernel task calls is inert at the default
+    /// timeout of 0. This is the whole safety argument for landing A unarmed —
+    /// if it ever stops holding, arming becomes accidental.
+    #[tokio::test]
+    async fn idle_sweep_is_inert_when_the_timer_is_off() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent = AgentId::new();
+        let episode = substrate.ensure_open_episode_async(agent).await.unwrap();
+        backdate_episode(&substrate, episode, 10_000);
+
+        assert_eq!(substrate.sweep_idle_episodes_async().await.unwrap(), 0);
+        assert!(
+            substrate.current_episode(agent).unwrap().unwrap().is_open(),
+            "timeout 0 must leave even an ancient episode open"
+        );
+    }
+
+    /// ...and with the timer armed, the same call closes the quiet agent's
+    /// episode without that agent taking another turn. That is the gap the
+    /// lazy `ensure_open` path cannot cover.
+    #[tokio::test]
+    async fn idle_sweep_closes_a_quiet_agents_episode() {
+        let substrate = MemorySubstrate::open_in_memory_with_idle_timeout(0.1, 120).unwrap();
+        let quiet = AgentId::new();
+        let active = AgentId::new();
+        let stale = substrate.ensure_open_episode_async(quiet).await.unwrap();
+        substrate.ensure_open_episode_async(active).await.unwrap();
+        backdate_episode(&substrate, stale, 121);
+
+        assert_eq!(substrate.sweep_idle_episodes_async().await.unwrap(), 1);
+
+        let closed = substrate.episodes().get(stale).unwrap().unwrap();
+        assert!(!closed.is_open());
+        assert_eq!(closed.close_reason, Some(CloseReason::Timer));
+        assert!(
+            closed.summary.is_none(),
+            "A closes; it does not summarise — that is B (ANAI-220)"
+        );
+        assert!(
+            substrate.current_episode(active).unwrap().unwrap().is_open(),
+            "the sweep must not touch an episode inside its idle gap"
+        );
+
+        // Idempotent: nothing left past the cutoff on the next tick.
+        assert_eq!(substrate.sweep_idle_episodes_async().await.unwrap(), 0);
+    }
+
+    /// Force an episode's activity clock into the past so the timer path can be
+    /// exercised without sleeping.
+    fn backdate_episode(substrate: &MemorySubstrate, id: uuid::Uuid, minutes: i64) {
+        let ts = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+        substrate
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE episodes SET opened_at = ?2, last_activity_at = ?2 WHERE id = ?1",
+                rusqlite::params![id.to_string(), ts],
+            )
+            .unwrap();
     }
 }

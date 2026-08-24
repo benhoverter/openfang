@@ -5615,6 +5615,54 @@ impl OpenFangKernel {
             }
         }
 
+        // Episode idle sweep (ANAI-219): closes episodes whose agent went
+        // quiet past `episode_idle_timeout_minutes`.
+        //
+        // Deliberately NOT folded into the consolidation tick above. That tick
+        // defaults to 24h and is gated on `consolidation_interval_hours > 0`,
+        // so sharing it would (a) leave a 120-minute idle gap unswept for ~22
+        // hours and (b) make "turn off confidence decay" silently also mean
+        // "stop closing episodes". Two unrelated behaviours, one knob. No.
+        {
+            let idle_timeout_minutes = self.config.memory.episode_idle_timeout_minutes;
+            if idle_timeout_minutes > 0 {
+                let kernel = Arc::clone(self);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(
+                        std::time::Duration::from_secs(EPISODE_SWEEP_TICK_SECS),
+                    );
+                    // No `interval.tick()` skip here, unlike the consolidation
+                    // task above: `tokio::time::interval` fires immediately on
+                    // its first tick, and we want that. ANAI-168 (see the
+                    // comment in that task) is the scar from assuming a
+                    // restart-often daemon ever reaches tick two.
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() {
+                            break;
+                        }
+                        match kernel.memory.sweep_idle_episodes_async().await {
+                            Ok(0) => {}
+                            Ok(closed) => {
+                                info!(
+                                    closed,
+                                    idle_timeout_minutes,
+                                    "Episode idle sweep closed timed-out episodes"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Episode idle sweep failed: {e}");
+                            }
+                        }
+                    }
+                });
+                info!(
+                    "Episode idle sweep scheduled every {EPISODE_SWEEP_TICK_SECS}s \
+                     (idle timeout {idle_timeout_minutes} minute(s))"
+                );
+            }
+        }
+
         // Connect to configured + extension MCP servers
         let has_mcp = self
             .effective_mcp_servers
@@ -9513,6 +9561,16 @@ fn require_project_membership(
 /// How many closed episodes `memory_status` reports. Enough to orient, few
 /// enough that the tool result stays a status line rather than a log dump.
 const MEMORY_STATUS_RECENT_LIMIT: usize = 3;
+
+/// How often the episode idle sweep runs (ANAI-219).
+///
+/// Fixed, not configurable: the knob that matters is
+/// `memory.episode_idle_timeout_minutes`, and a second cadence key would only
+/// let the two disagree. 60s is cheap — `sweep_idle` is one indexed `UPDATE`
+/// against `episodes`, less work than the `ensure_open` already on every
+/// captured turn — and it keeps close latency well inside a minute of the
+/// configured gap.
+const EPISODE_SWEEP_TICK_SECS: u64 = 60;
 
 /// Hard ceiling on `memory_history` results (ANAI-204).
 ///
