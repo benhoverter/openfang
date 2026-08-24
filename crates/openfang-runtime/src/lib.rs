@@ -14,6 +14,7 @@ pub mod agent_tool_context;
 pub mod apply_patch;
 pub mod audit;
 pub mod auth_cooldown;
+pub mod background_llm;
 pub mod bridge_auth;
 pub mod browser;
 pub mod command_lane;
