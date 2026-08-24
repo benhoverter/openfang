@@ -10194,6 +10194,36 @@ impl KernelHandle for OpenFangKernel {
         self.agent_channel_binding_route(agent_name)
     }
 
+    /// ANAI-210: expose a target's effective tool set so `agent_send_async` can
+    /// pre-flight a caller-declared `requires_tools` list and refuse before
+    /// minting a correlation. Resolution mirrors the real turn path — same
+    /// `available_tools_with_registry` the kernel feeds the LLM — so the answer
+    /// is the tool list the target would genuinely be offered, not a manifest
+    /// re-reading that would drift from it.
+    ///
+    /// Accepts UUID or name, matching the tool's own target resolution. `None`
+    /// for an unresolvable agent, which the caller treats as "no evidence"
+    /// rather than "no tools" — a pre-flight must never invent a refusal.
+    ///
+    /// The per-turn `entry.mode.filter_tools` narrowing is deliberately NOT
+    /// applied here: it can only ever remove tools, so skipping it biases this
+    /// answer toward "present", i.e. toward letting the send through. That is
+    /// the safe direction — the wrong answer degrades to today's behaviour
+    /// instead of blocking a legitimate wake.
+    fn agent_tool_names(&self, agent_id: &str) -> Option<Vec<String>> {
+        let id: AgentId = match agent_id.parse() {
+            Ok(id) => id,
+            Err(_) => self.registry.find_by_name(agent_id).map(|e| e.id)?,
+        };
+        self.registry.get(id)?;
+        Some(
+            self.available_tools_with_registry(id, None)
+                .into_iter()
+                .map(|t| t.name)
+                .collect(),
+        )
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,

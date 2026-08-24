@@ -367,6 +367,43 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// The effective tool names an agent would be offered on its next turn —
+    /// builtins after `capabilities.tools`, profile, allow/blocklist and
+    /// `exec_policy` filtering.
+    ///
+    /// ## Why (ANAI-210, failure class B)
+    ///
+    /// An `agent_send_async` to a target that structurally CANNOT do the work
+    /// — the observed case was `sleep 60` sent to an agent with no
+    /// `shell_exec` — is not a failure the reply guarantee can improve on. The
+    /// target answers "I can't", or stays silent and burns the sender's whole
+    /// deadline, to establish a fact that was knowable before the wake was ever
+    /// enqueued. This exposes that fact so the send can fail fast instead.
+    ///
+    /// `agent_id` may be a UUID or a name, matching `agent_send_async`'s own
+    /// target resolution. `None` means "cannot determine" — an unknown agent,
+    /// or a handle that does not implement this — and callers MUST treat it as
+    /// *no evidence of absence* rather than as an empty tool set, or a mock
+    /// handle would start refusing every send. The default returns `None`, so
+    /// pre-flight degrades to exactly today's behaviour.
+    ///
+    /// Advisory by construction: it is a snapshot read of the registry, and a
+    /// manifest edit or per-turn mode filter between the check and the target's
+    /// turn can still move the set. A false "present" simply degrades to
+    /// today's behaviour; a false "missing" cannot happen, because a tool named
+    /// here is one the resolver actually produced.
+    ///
+    /// Deliberately NOT [`AgentInfo::tools`], which is the raw
+    /// `capabilities.tools` declaration: that list is EMPTY for an agent with
+    /// unrestricted access (empty or `"*"` means "all tools"), so reading it as
+    /// the effective set would refuse every send to the least restricted agents
+    /// in the fleet. It also predates profile, allow/blocklist and `exec_policy`
+    /// filtering, so it drifts from what the agent is actually offered.
+    fn agent_tool_names(&self, agent_id: &str) -> Option<Vec<String>> {
+        let _ = agent_id;
+        None
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 

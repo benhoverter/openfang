@@ -384,7 +384,9 @@ pub fn built_in_tools() -> Vec<Tool> {
              You are GUARANTEED exactly one reply per call: if the target \
              answers, you get its answer; if it cannot or does not, the daemon \
              closes the correlation itself and tells you why. Pass timeout_secs \
-             to bound how long that takes.",
+             to bound how long that takes. Pass requires_tools to refuse the send \
+             outright when the target lacks a tool the work needs, instead of \
+             spending the whole deadline discovering it.",
             obj(json!({
                 "type": "object",
                 "properties": {
@@ -392,6 +394,7 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "message": { "type": "string", "description": "The message delivered to the target when it runs" },
                     "surface_to": { "type": "string", "description": "Optional channel route, formatted \"<channel>:<recipient>\" (e.g. \"discord:1086446153098342510\"). When set, the target's one-shot agent_reply_async answer is auto-posted to this channel by the daemon. Omit for a pure fire-and-forget wake with no surfacing." },
                     "timeout_secs": { "type": "integer", "description": "Optional deadline in seconds. You are guaranteed a reply within roughly this long: if the target has not answered by then, its turn is ABORTED and the daemon sends you a timeout reply instead. Set it to how long you actually expect the work to take, with headroom — an over-tight value kills legitimate work, and partial side effects from the aborted turn may persist. Clamped into the operator's configured band; omit to accept the configured default." }
+                    ,"requires_tools": { "type": "array", "items": { "type": "string" }, "description": "Optional pre-flight: tool names the target MUST have for this work (e.g. [\"shell_exec\"]). Checked BEFORE the wake is enqueued — if any is missing the call fails immediately, names what is missing, mints NO correlation and consumes no deadline, so nothing was sent and re-sending a corrected request is safe. Use it whenever the request depends on a specific capability; without it you spend the full deadline learning the target could never have done it. Omit for no check." }
                 },
                 "required": ["agent_id", "message"]
             })),
