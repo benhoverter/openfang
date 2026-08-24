@@ -2204,6 +2204,15 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+    /// `[memory.consolidation]` — the **model-backed** episode-summary pass
+    /// (ANAI-226). Ships disabled; see [`ConsolidationConfig::enabled`].
+    ///
+    /// Not to be confused with [`MemoryConfig::consolidation_interval_hours`]
+    /// directly above, which paces the deterministic decay + MEMORY.md sweep
+    /// and makes no model calls. Two different jobs that history gave similar
+    /// names: that one is a *cadence*, this one is a *model call*.
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
     /// Whether the deterministic MEMORY.md managed-block sweep runs (ANAI-168).
     /// On by default; it makes no model calls and only rewrites the fenced
     /// region of each agent's MEMORY.md. Set false to disable entirely.
@@ -2262,12 +2271,178 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            consolidation: ConsolidationConfig::default(),
             memory_md_sweep: default_memory_md_sweep(),
             backend: default_memory_backend(),
             http_url: None,
             http_token_env: None,
             episode_idle_timeout_minutes: default_episode_idle_timeout(),
         }
+    }
+}
+
+/// `[memory.consolidation]` in `config.toml`: the second daemon-owned model
+/// call (ANAI-226), after the approval gatekeeper.
+///
+/// Shape deliberately mirrors
+/// [`crate::gatekeeper::GatekeeperConfig`] so the daemon has **one** idiom for
+/// "a model call with no agent turn in flight" rather than two dialects — same
+/// `enabled` / `provider` / `model` / `timeout_secs` / `failure_threshold`
+/// vocabulary, fed to the same `BackgroundLlmRequest`.
+///
+/// # What the daemon does with this
+///
+/// When an episode closes (ANAI-219's idle sweep, or an explicit
+/// `memory_episode_close`), the close is committed **first** with a null
+/// summary; the summary is synthesized afterwards, out of transaction. A
+/// provider outage therefore costs a summary, never a close.
+///
+/// `[memory.consolidation]` carries no interval key on purpose: summarisation
+/// happens *on close*, so the idle sweep's cadence already is consolidation's
+/// cadence. A second timer here would be a second answer to a question that
+/// already has one.
+///
+/// **Changes require a daemon restart.** `[memory]` as a whole is on
+/// `config_reload`'s restart-required list, and the sweep task that drives
+/// this is spawned at boot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsolidationConfig {
+    /// Master switch. Ships **off**.
+    ///
+    /// Off, episode lifecycle still works end to end — episodes open, close on
+    /// the idle timer, and simply carry a null summary. Deterministic memory
+    /// behaviour is free; a recurring unattended model call that spends real
+    /// tokens on a fleet the operator did not opt in for is not, and is not a
+    /// thing anyone should inherit from a version bump.
+    pub enabled: bool,
+    /// Provider for the summariser. Empty = the daemon's default provider.
+    pub provider: String,
+    /// Pinned summariser model, as a **canonical catalog id, never an alias**.
+    ///
+    /// `"haiku"` resolves through the alias table to whatever the newest Haiku
+    /// happens to be, which lets a catalog bump silently change what writes
+    /// into memory. Never the closing agent's own model either: an agent must
+    /// not choose the model that summarises it, and the fallback chain quietly
+    /// becoming the summariser is a regression no test would catch.
+    ///
+    /// Haiku-class by default because this is a bounded compression of text the
+    /// daemon already holds — the cheap tier is the right tier, and it will run
+    /// on every close forever.
+    pub model: String,
+    /// Wall-clock budget for one summary call.
+    ///
+    /// Expiry means the episode keeps its null summary and the daemon moves
+    /// on — the opposite of the gatekeeper's fail-closed escalation, and the
+    /// reason `background_complete` reports rather than decides.
+    pub timeout_secs: u64,
+    /// Output ceiling for one summary. A summary that needs an essay is not a
+    /// summary, and a small ceiling bounds the blast radius of a prompt-injected
+    /// episode talking the summariser into writing at length.
+    pub max_tokens: u32,
+    /// Consecutive failures before this purpose's circuit breaker opens.
+    ///
+    /// The breaker is **per-purpose**: tripping consolidation must not disarm
+    /// the approval judge, and vice versa. It does not self-recover — recovery
+    /// is the call site's, as a probe on a later tick.
+    pub failure_threshold: u32,
+    /// Maximum episodes summarised in a single sweep tick. Concurrency is 1.
+    ///
+    /// Serialised on purpose: the sweep is on a timer, so there is no latency
+    /// argument for parallelism, and N concurrent unattended calls turn a
+    /// provider hiccup into a thundering herd against one breaker.
+    ///
+    /// **8 is a deliberately conservative starting number, not a measured
+    /// one.** Whatever the cap defers must be logged, never silently dropped:
+    /// a silent cap reads as "we did them all".
+    pub max_per_tick: u32,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            timeout_secs: 30,
+            max_tokens: 512,
+            failure_threshold: 3,
+            max_per_tick: 8,
+        }
+    }
+}
+
+#[cfg(test)]
+mod consolidation_config_tests {
+    use super::*;
+
+    /// ANAI-226: the shipped defaults are the inert ones, and the summariser is
+    /// pinned to a canonical catalog id rather than an alias — `"haiku"` would
+    /// resolve through the alias table to whatever the newest Haiku happens to
+    /// be, silently changing what writes into memory on a catalog bump.
+    #[test]
+    fn defaults_are_inert_and_the_summariser_is_pinned_by_id() {
+        let cfg = ConsolidationConfig::default();
+        assert!(!cfg.enabled, "the model pass must ship off");
+        assert!(cfg.provider.is_empty(), "empty = daemon default provider");
+        assert_eq!(cfg.max_per_tick, 8);
+        assert!(
+            !cfg.model.is_empty(),
+            "an empty model id reaches the driver verbatim; there is no fallback"
+        );
+        assert!(
+            cfg.model.contains('-') && cfg.model != "haiku",
+            "the summariser must be pinned to a canonical id, never an alias"
+        );
+    }
+
+    /// The block is optional: a `config.toml` written before ANAI-226 must keep
+    /// parsing, and must come back inert rather than half-populated.
+    #[test]
+    fn absent_block_defaults_to_inert() {
+        let mem: MemoryConfig = toml::from_str("consolidation_interval_hours = 24").unwrap();
+        assert!(!mem.consolidation.enabled);
+        assert_eq!(mem.consolidation.max_per_tick, 8);
+    }
+
+    /// `[memory.consolidation]` is a nested table under `[memory]`, so it has to
+    /// coexist with the flat `consolidation_*` keys that already live there —
+    /// including `consolidation_interval_hours`, which paces a different job
+    /// entirely and must not be shadowed by the table's name.
+    #[test]
+    fn nested_table_coexists_with_the_flat_consolidation_keys() {
+        let toml_src = "\
+consolidation_interval_hours = 12
+consolidation_threshold = 500
+
+[consolidation]
+enabled = true
+model = \"claude-haiku-4-5-20251001\"
+max_per_tick = 3
+";
+        let mem: MemoryConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(mem.consolidation_interval_hours, 12);
+        assert_eq!(mem.consolidation_threshold, 500);
+        assert!(mem.consolidation.enabled);
+        assert_eq!(mem.consolidation.max_per_tick, 3);
+        // Unset keys inside the table still come from the defaults.
+        assert_eq!(mem.consolidation.failure_threshold, 3);
+        assert_eq!(mem.consolidation.timeout_secs, 30);
+    }
+
+    /// `config_reload` diffs `[memory]` by its serialized form and puts any
+    /// change on the restart-required list. The nested block must therefore
+    /// round-trip through serde, or an operator edit would be invisible.
+    #[test]
+    fn nested_block_round_trips_for_the_reload_diff() {
+        let mut mem = MemoryConfig::default();
+        mem.consolidation.enabled = true;
+        let before = serde_json::to_string(&MemoryConfig::default()).unwrap();
+        let after = serde_json::to_string(&mem).unwrap();
+        assert_ne!(
+            before, after,
+            "a consolidation edit must be visible to the reload diff"
+        );
     }
 }
 
