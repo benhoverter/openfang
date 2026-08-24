@@ -118,19 +118,17 @@ pub struct OpenFangKernel {
     pub metering: Arc<MeteringEngine>,
     /// Default LLM driver (from kernel config).
     default_driver: Arc<dyn LlmDriver>,
-    /// ANAI-154: the approval gatekeeper's judge driver, built once on first
-    /// use from `[gatekeeper]`.
+    /// ANAI-225: driver caches and circuit breakers for daemon-owned model
+    /// calls — one slot per [`BackgroundPurpose`], keyed so a wedged judge
+    /// cannot disable an unrelated background consumer.
     ///
-    /// Deliberately NOT `default_driver`: the judge model is pinned so that an
-    /// agent cannot be reviewed by the model it chose, and so a fallback
-    /// provider silently becoming the reviewer is impossible. `None` inside the
-    /// `OnceLock` means construction failed — every command then escalates.
-    gatekeeper_driver: std::sync::OnceLock<Option<Arc<dyn LlmDriver>>>,
-    /// ANAI-154 circuit breaker: consecutive gatekeeper failures. Once it
-    /// crosses `[gatekeeper] failure_threshold` the gate is disabled for the
-    /// life of the process and everything escalates to a human. A judge that
-    /// keeps erroring is a judge nobody should be relying on to stay quiet.
-    gatekeeper_failures: std::sync::atomic::AtomicU32,
+    /// Deliberately NOT `default_driver`: each purpose's model is pinned so
+    /// that an agent cannot be reviewed (or summarised) by the model it chose,
+    /// and so a fallback provider silently becoming the reviewer is impossible.
+    ///
+    /// Was `gatekeeper_driver` + `gatekeeper_failures` before ANAI-225; the
+    /// gatekeeper is now this state's first consumer, not its owner.
+    pub(crate) background_llm: crate::background_llm::BackgroundLlmState,
     /// WASM sandbox engine (shared across all WASM agent executions).
     wasm_sandbox: WasmSandbox,
     /// RBAC authentication manager.
@@ -1454,8 +1452,7 @@ impl OpenFangKernel {
             audit_log: Arc::new(AuditLog::with_db(memory.usage_conn())),
             metering,
             default_driver: driver,
-            gatekeeper_driver: std::sync::OnceLock::new(),
-            gatekeeper_failures: std::sync::atomic::AtomicU32::new(0),
+            background_llm: crate::background_llm::BackgroundLlmState::new(),
             wasm_sandbox,
             auth,
             model_catalog: std::sync::RwLock::new(model_catalog),
@@ -7848,7 +7845,9 @@ impl OpenFangKernel {
         set
     }
 
-    fn lookup_provider_url(&self, provider: &str) -> Option<String> {
+    // ANAI-225: `pub(crate)` so `background_llm::background_complete` can build
+    // a driver for a daemon-owned call without duplicating URL resolution.
+    pub(crate) fn lookup_provider_url(&self, provider: &str) -> Option<String> {
         // 1. Boot-time config (from config.toml [provider_urls])
         if let Some(url) = self.config.provider_urls.get(provider) {
             return Some(url.clone());
@@ -11392,8 +11391,10 @@ impl KernelHandle for OpenFangKernel {
         // ANAI-189: each failure path carries its own `JudgeOutcome`, so the
         // audit row can distinguish "the judge escalated" from "the judge never
         // answered and we failed closed". Same verdict, very different facts.
+        use openfang_runtime::background_llm::{
+            BackgroundFailure, BackgroundLlmOutcome, BackgroundLlmRequest, BackgroundPurpose,
+        };
         use openfang_types::gatekeeper::{GateReview, GateVerdict, JudgeOutcome};
-        use std::sync::atomic::Ordering;
 
         let cfg = &self.config.gatekeeper;
         // ANAI-187: shadow mode needs the judge to actually run — that is the
@@ -11404,105 +11405,73 @@ impl KernelHandle for OpenFangKernel {
             return GateReview::failed(JudgeOutcome::Inert);
         }
 
-        // Circuit breaker. A gate that has failed `failure_threshold` times in a
-        // row is not a gate; leaving it in circuit means every command pays the
-        // latency for an answer that will be `Escalate` anyway.
-        if self.gatekeeper_failures.load(Ordering::Relaxed) >= cfg.failure_threshold {
-            return GateReview::failed(JudgeOutcome::CircuitOpen);
-        }
-
-        let driver = self.gatekeeper_driver.get_or_init(|| {
-            let provider = if cfg.provider.is_empty() {
-                self.config.default_model.provider.clone()
-            } else {
-                cfg.provider.clone()
-            };
-            let env_var = self.config.resolve_api_key_env(&provider);
-            let driver_config = DriverConfig {
-                provider: provider.clone(),
-                api_key: self.resolve_credential(&env_var),
-                base_url: self.lookup_provider_url(&provider),
-                skip_permissions: true,
-                subprocess_timeout_secs: None,
-            };
-            match drivers::create_driver(&driver_config, self.token_issuer()) {
-                Ok(d) => {
-                    info!(
-                        target: "openfang::gatekeeper",
-                        provider = %provider,
-                        model = %cfg.model,
-                        shadow = %cfg.shadow,
-                        "Approval gatekeeper enabled"
-                    );
-                    Some(d)
-                }
-                Err(e) => {
-                    warn!(
-                        target: "openfang::gatekeeper",
-                        provider = %provider,
-                        error = %e,
-                        "Gatekeeper driver init failed — every command will escalate"
-                    );
-                    None
-                }
-            }
-        });
-        let Some(driver) = driver.as_ref() else {
-            return GateReview::failed(JudgeOutcome::ProviderError);
-        };
-
-        let request = CompletionRequest {
+        // ANAI-225: the invocation itself is now
+        // `OpenFangKernel::background_complete`, shared with other daemon-owned
+        // model calls. Everything that remains here is *judge*, not *call*.
+        let call = BackgroundLlmRequest {
+            purpose: BackgroundPurpose::Gatekeeper,
+            provider: cfg.provider.clone(),
             model: cfg.model.clone(),
-            messages: vec![openfang_types::message::Message {
-                role: openfang_types::message::Role::User,
-                content: openfang_types::message::MessageContent::Blocks(vec![
-                    openfang_types::message::ContentBlock::Text {
-                        text: req.user_prompt(),
-                        provider_metadata: None,
-                    },
-                ]),
-                ..Default::default()
-            }],
-            tools: vec![],
+            system: Some(req.system_prompt()),
+            user: req.user_prompt(),
             // One word out. A judge that cannot say SUPPRESS in 16 tokens has
             // not earned a suppression, and a small ceiling is itself a defense:
             // there is no room for the model to be talked into an essay.
             max_tokens: 16,
-            temperature: 0.0,
-            system: Some(req.system_prompt()),
-            thinking: None,
-            // No caller attribution: the judge is the daemon's, not the
-            // calling agent's, and must not inherit its identity or tools.
-            caller_agent_id: None,
-            allowed_tools: None,
+            timeout_secs: cfg.timeout_secs,
+            // Circuit breaker. A gate that has failed `failure_threshold` times
+            // in a row is not a gate; leaving it in circuit means every command
+            // pays the latency for an answer that will be `Escalate` anyway.
+            failure_threshold: cfg.failure_threshold,
         };
 
-        let call = tokio::time::timeout(
-            std::time::Duration::from_secs(cfg.timeout_secs),
-            driver.complete(request),
-        )
-        .await;
+        // The judge's "I am live" line is an operator-facing contract, so it is
+        // emitted here — on the call that actually builds the driver — rather
+        // than by the shared primitive, which knows nothing about shadow mode.
+        let first_call = !self.background_driver_built(BackgroundPurpose::Gatekeeper);
+        let result = self.background_complete(&call).await;
+        if first_call && self.background_driver_ready(BackgroundPurpose::Gatekeeper) {
+            let provider = if cfg.provider.is_empty() {
+                self.config.default_model.provider.as_str()
+            } else {
+                cfg.provider.as_str()
+            };
+            info!(
+                target: "openfang::gatekeeper",
+                provider = %provider,
+                model = %cfg.model,
+                shadow = %cfg.shadow,
+                "Approval gatekeeper enabled"
+            );
+        }
 
-        let outcome = match call {
-            Ok(Ok(response)) => match GateVerdict::parse(&response.text()) {
+        let outcome = match result {
+            BackgroundLlmOutcome::Answered(text) => match GateVerdict::parse(&text) {
                 Some(v) => {
-                    self.gatekeeper_failures.store(0, Ordering::Relaxed);
+                    self.background_llm
+                        .note_success(BackgroundPurpose::Gatekeeper);
                     return GateReview::answered(v);
                 }
                 None => {
                     warn!(
                         target: "openfang::gatekeeper",
-                        raw = %openfang_types::truncate_str(&response.text(), 120),
+                        raw = %openfang_types::truncate_str(&text, 120),
                         "Gatekeeper returned an unparseable verdict — escalating"
                     );
                     JudgeOutcome::Unparseable
                 }
             },
-            Ok(Err(e)) => {
-                warn!(target: "openfang::gatekeeper", error = %e, "Gatekeeper call failed — escalating");
+            // An already-open breaker returns before the counter is touched,
+            // exactly as it did pre-ANAI-225: counting a call that never
+            // happened would make the one-shot trip log unreachable.
+            BackgroundLlmOutcome::Failed(BackgroundFailure::CircuitOpen) => {
+                return GateReview::failed(JudgeOutcome::CircuitOpen);
+            }
+            BackgroundLlmOutcome::Failed(BackgroundFailure::ProviderError) => {
+                warn!(target: "openfang::gatekeeper", "Gatekeeper call failed — escalating");
                 JudgeOutcome::ProviderError
             }
-            Err(_elapsed) => {
+            BackgroundLlmOutcome::Failed(BackgroundFailure::TimedOut) => {
                 warn!(
                     target: "openfang::gatekeeper",
                     timeout_secs = cfg.timeout_secs,
@@ -11512,7 +11481,9 @@ impl KernelHandle for OpenFangKernel {
             }
         };
 
-        let failures = self.gatekeeper_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let failures = self
+            .background_llm
+            .note_failure(BackgroundPurpose::Gatekeeper);
         if failures == cfg.failure_threshold {
             warn!(
                 target: "openfang::gatekeeper",

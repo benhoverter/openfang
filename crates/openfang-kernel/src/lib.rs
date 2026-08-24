@@ -7,6 +7,7 @@ pub mod approval;
 pub mod auth;
 pub mod auto_reply;
 pub mod background;
+pub mod background_llm;
 pub mod capabilities;
 pub mod config;
 pub mod config_reload;
