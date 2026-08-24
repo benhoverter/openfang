@@ -169,3 +169,9 @@ lto = "thin"
 codegen-units = 8
 opt-level = 2
 strip = false
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
