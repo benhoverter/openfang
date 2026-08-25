@@ -828,7 +828,7 @@ pub async fn execute_tool(
         "memory_store" => tool_memory_store(input, kernel, caller_agent_id),
         "memory_recall" => tool_memory_recall(input, kernel, caller_agent_id).await,
         "memory_note" => tool_memory_note(input, kernel, caller_agent_id).await,
-        "memory_episode_close" => tool_memory_episode_close(input, kernel, caller_agent_id),
+        "memory_episode_close" => tool_memory_episode_close(input, kernel, caller_agent_id).await,
         "memory_status" => tool_memory_status(kernel, caller_agent_id),
         "memory_fact" => tool_memory_fact(input, kernel, caller_agent_id).await,
         "memory_history" => tool_memory_history(input, kernel, caller_agent_id),
@@ -1382,7 +1382,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
-                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided" },
+                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
                     "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
                 },
                 "required": ["title"]
@@ -4103,7 +4103,22 @@ fn render_fact_history(payload: &serde_json::Value) -> String {
 /// exists.
 const AGENT_CLOSE_REASONS: &[&str] = &["explicit"];
 
-fn tool_memory_episode_close(
+/// ANAI-252: an agent-authored wrap-up is *material*, never the summary.
+///
+/// Writing it into `episodes.summary` used to suppress consolidation outright.
+/// The summariser's selector is `closed_at IS NOT NULL AND summary IS NULL`
+/// (`EpisodeStore::awaiting_summary`), so a filled column made the episode
+/// ineligible: the close succeeded, the agent's text sat in a column nothing
+/// queries at recall time, and the corpus got **no embedded row at all**. The
+/// agent that wrote the most careful wrap-up got the least recallable memory,
+/// and it looked like the feature working.
+///
+/// So the text lands as a note on the still-open episode instead. That keeps
+/// it (embedded, recallable, attached to the right episode), leaves `summary`
+/// null so the episode stays a consolidation candidate, and — because
+/// `episode_material` reads `memories` — feeds it to the summariser as input.
+/// Invariant: every closed episode yields exactly one embedded summary row.
+async fn tool_memory_episode_close(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     caller_agent_id: Option<&str>,
@@ -4114,7 +4129,7 @@ fn tool_memory_episode_close(
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or("Missing 'title' parameter — an episode closed without a label is a boundary nobody can find again")?;
-    let summary = input["summary"]
+    let wrapup = input["summary"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -4126,7 +4141,25 @@ fn tool_memory_episode_close(
         ));
     }
 
-    match kh.memory_episode_close(caller_agent_id, reason, Some(title), summary)? {
+    // Before the close, so it attaches to the episode being closed rather than
+    // to the one that opens next. Failure aborts the close rather than
+    // dropping the wrap-up silently — closing is idempotent, so a retry costs
+    // nothing, whereas a swallowed note is exactly the silent amnesia this
+    // path exists to prevent.
+    if let Some(text) = wrapup {
+        kh.memory_note(caller_agent_id, text, &["episode-wrapup".to_string()])
+            .await
+            .map_err(|e| {
+                format!(
+                    "Could not record the wrap-up note, so nothing was closed: {e}. \
+                     Retry — closing is idempotent."
+                )
+            })?;
+    }
+
+    // `None`, always: see this function's doc comment. The summary column is
+    // the daemon consolidator's to fill.
+    match kh.memory_episode_close(caller_agent_id, reason, Some(title), None)? {
         Some(id) => Ok(format!(
             "Closed episode {id} as '{title}'. The next captured turn starts a new one."
         )),
@@ -8040,8 +8073,11 @@ mod tests {
 
     // --- ANAI-194: episode tools -------------------------------------------
 
-    #[test]
-    fn episode_close_passes_title_and_summary_through() {
+    /// ANAI-252: the title reaches the kernel; the wrap-up does NOT reach the
+    /// summary column, because filling it makes the episode invisible to
+    /// `awaiting_summary` and the corpus never gets an embedded row.
+    #[tokio::test]
+    async fn episode_close_routes_the_wrapup_to_a_note_not_the_summary_column() {
         let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
         let out = tool_memory_episode_close(
@@ -8049,25 +8085,52 @@ mod tests {
             Some(&kh),
             Some("agent-x"),
         )
+        .await
         .unwrap();
         assert!(out.contains("ep-1"), "{out}");
         let calls = fake.episode_closes.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "explicit", "reason defaults to explicit");
         assert_eq!(calls[0].2.as_deref(), Some("git trunk cutover"));
-        assert_eq!(calls[0].3.as_deref(), Some("retired the octopus"));
+        assert_eq!(
+            calls[0].3, None,
+            "a filled summary column suppresses consolidation - it must stay null"
+        );
+        drop(calls);
+
+        let notes = fake.notes.lock().unwrap();
+        assert_eq!(notes.len(), 1, "the wrap-up must survive as a note");
+        assert_eq!(notes[0].1, "retired the octopus");
+        assert_eq!(notes[0].2, vec!["episode-wrapup".to_string()]);
+    }
+
+    /// No wrap-up, no note. The close is still a close.
+    #[tokio::test]
+    async fn episode_close_without_a_wrapup_writes_no_note() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_memory_episode_close(
+            &serde_json::json!({"title": "git trunk cutover"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.episode_closes.lock().unwrap().len(), 1);
+        assert!(fake.notes.lock().unwrap().is_empty());
     }
 
     /// The agent cannot see the episodes table, so asking twice is reasonable.
     /// A hard error would read as "your memory is broken" when nothing is.
-    #[test]
-    fn episode_close_with_nothing_open_is_not_an_error() {
+    #[tokio::test]
+    async fn episode_close_with_nothing_open_is_not_an_error() {
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
         let out = tool_memory_episode_close(
             &serde_json::json!({"title": "whatever"}),
             Some(&kh),
             Some("agent-x"),
         )
+        .await
         .unwrap();
         assert!(out.contains("No episode was open"), "{out}");
     }
@@ -8075,8 +8138,8 @@ mod tests {
     /// `timer` is the system's to write and `topic-switch` is deferred until
     /// the judgment it depends on exists (ADR 0002 §2.6). Neither may be
     /// claimed by an agent, or the close reason stops being evidence.
-    #[test]
-    fn episode_close_refuses_system_and_deferred_reasons() {
+    #[tokio::test]
+    async fn episode_close_refuses_system_and_deferred_reasons() {
         let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
         for reason in ["timer", "topic-switch", "abandoned", "nonsense"] {
@@ -8085,6 +8148,7 @@ mod tests {
                 Some(&kh),
                 Some("agent-x"),
             )
+            .await
             .unwrap_err();
             assert!(
                 err.contains("not available to agents") || err.contains(reason),
@@ -8097,11 +8161,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn episode_close_requires_a_usable_title() {
+    #[tokio::test]
+    async fn episode_close_requires_a_usable_title() {
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
         for input in [serde_json::json!({}), serde_json::json!({"title": "   "})] {
-            assert!(tool_memory_episode_close(&input, Some(&kh), Some("agent-x")).is_err());
+            assert!(
+                tool_memory_episode_close(&input, Some(&kh), Some("agent-x"))
+                    .await
+                    .is_err()
+            );
         }
     }
 

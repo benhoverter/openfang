@@ -628,7 +628,7 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
-                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided" },
+                    "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
                     "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
                 },
                 "required": ["title"]
