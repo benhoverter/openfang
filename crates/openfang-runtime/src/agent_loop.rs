@@ -679,12 +679,24 @@ pub async fn run_agent_loop(
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
     if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
+        // `kind` is hydrated back into the fragment's metadata by the semantic
+        // store on recall (the column is the store of record, v13) — so it is
+        // available here without a MemoryFragment change. It drives the
+        // per-row character budget (ANAI-231).
+        let mem_rows: Vec<crate::prompt_builder::RecalledMemory> = memories
             .iter()
-            .map(|m| (String::new(), m.content.clone()))
+            .map(|m| {
+                crate::prompt_builder::RecalledMemory::of_kind(
+                    m.metadata
+                        .get(openfang_memory::semantic::KIND_KEY)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    m.content.clone(),
+                )
+            })
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_rows));
     }
 
     // Add the user message to session history.
@@ -2372,12 +2384,24 @@ pub async fn run_agent_loop_streaming(
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
     if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
+        // `kind` is hydrated back into the fragment's metadata by the semantic
+        // store on recall (the column is the store of record, v13) — so it is
+        // available here without a MemoryFragment change. It drives the
+        // per-row character budget (ANAI-231).
+        let mem_rows: Vec<crate::prompt_builder::RecalledMemory> = memories
             .iter()
-            .map(|m| (String::new(), m.content.clone()))
+            .map(|m| {
+                crate::prompt_builder::RecalledMemory::of_kind(
+                    m.metadata
+                        .get(openfang_memory::semantic::KIND_KEY)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    m.content.clone(),
+                )
+            })
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_rows));
     }
 
     // Add the user message to session history.

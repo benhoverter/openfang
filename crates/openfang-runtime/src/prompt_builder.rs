@@ -5,6 +5,50 @@
 //! with a single, testable, ordered prompt builder.
 
 use crate::str_utils::safe_truncate_str;
+use openfang_memory::{episode, fact};
+
+/// `kind` value for a deliberate agent-authored note (`memory_note`).
+///
+/// Declared here rather than imported: the note kind is currently a private
+/// constant in the kernel's tool surface. If it is ever promoted to a shared
+/// vocabulary const, this should become an import — a second spelling of a
+/// kind is exactly the drift ANAI-229 warned about.
+const KIND_NOTE: &str = "note";
+
+/// One recalled memory row as the prompt builder needs it.
+///
+/// Replaces the old `(key, content)` pair so the row's `kind` can reach the
+/// budget decision. `kind` is `Option` because the pre-v13 corpus has rows with
+/// no discriminator at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecalledMemory {
+    /// Storage key, if the row has one. Empty for vector-recalled rows.
+    pub key: String,
+    /// Row `kind` (`turn` / `summary` / `note` / `fact`), if known.
+    pub kind: Option<String>,
+    /// The recalled text.
+    pub content: String,
+}
+
+impl RecalledMemory {
+    /// A keyed row of unknown kind — the old `(key, content)` shape.
+    pub fn keyed(key: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            kind: None,
+            content: content.into(),
+        }
+    }
+
+    /// A vector-recalled row: no key, but a kind we can budget against.
+    pub fn of_kind(kind: Option<String>, content: impl Into<String>) -> Self {
+        Self {
+            key: String::new(),
+            kind,
+            content: content.into(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Prompt section character budgets
@@ -27,8 +71,38 @@ const BUDGET_WORKSPACE_CONTEXT: usize = 1000;
 const BUDGET_CONTEXT_MD: usize = 8000;
 /// Cross-channel canonical conversation summary.
 const BUDGET_CANONICAL_CONTEXT: usize = 500;
-/// A single recalled memory row.
-const BUDGET_RECALLED_MEMORY: usize = 500;
+/// A single recalled memory row, by `kind` (ANAI-231).
+///
+/// A flat 500 was correct when every row was a raw captured turn. Consolidation
+/// (ANAI-220/B) added `summary` rows that average ~840 chars and peak at ~1.1 KB
+/// — pre-compressed, highest-value content that the flat cap guillotined
+/// mid-sentence. Distilled kinds get a budget that fits them whole; raw turns
+/// keep the old cap, because a turn is sediment and the cap is what stops five
+/// of them from eating the prompt.
+///
+/// Worst case (5 summaries, unreachable today) is ~7.5 KB / ~1.9 K tokens.
+const BUDGET_RECALLED_SUMMARY: usize = 1500;
+/// A recalled `fact` row — a single durable claim; short by construction.
+const BUDGET_RECALLED_FACT: usize = 1500;
+/// A recalled `note` row — deliberate, human-ish, but not compressed.
+const BUDGET_RECALLED_NOTE: usize = 1000;
+/// A recalled `turn` row, or a row with no `kind` at all (pre-v13 corpus).
+const BUDGET_RECALLED_TURN: usize = 500;
+
+/// Per-row character budget for a recalled memory of the given `kind`.
+///
+/// `None` — a pre-v13 row that carries no discriminator — is budgeted as a
+/// turn. That is the conservative read: the unbackfilled corpus is
+/// overwhelmingly captured turns, and guessing generously would let 46 K
+/// legacy rows each claim a summary-sized slice of the prompt.
+fn budget_for_kind(kind: Option<&str>) -> usize {
+    match kind {
+        Some(episode::SUMMARY_KIND) => BUDGET_RECALLED_SUMMARY,
+        Some(fact::KIND_FACT) => BUDGET_RECALLED_FACT,
+        Some(KIND_NOTE) => BUDGET_RECALLED_NOTE,
+        _ => BUDGET_RECALLED_TURN,
+    }
+}
 /// Prompt context contributed by prompt-only skills.
 const BUDGET_SKILL_PROMPT_CONTEXT: usize = 2000;
 /// IDENTITY.md — personality frontmatter.
@@ -55,8 +129,8 @@ pub struct PromptContext {
     pub base_system_prompt: String,
     /// Tool names this agent has access to.
     pub granted_tools: Vec<String>,
-    /// Recalled memories as (key, content) pairs.
-    pub recalled_memories: Vec<(String, String)>,
+    /// Recalled memories, carrying `kind` so budgeting can be per-kind.
+    pub recalled_memories: Vec<RecalledMemory>,
     /// Skill summary text (from kernel.build_skill_summary()).
     pub skill_summary: String,
     /// Prompt context from prompt-only skills.
@@ -255,7 +329,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(ref bootstrap) = ctx.bootstrap_md {
             if !bootstrap.trim().is_empty() {
                 // Only inject if no user_name memory exists (first-run heuristic)
-                let has_user_name = ctx.recalled_memories.iter().any(|(k, _)| k == "user_name");
+                let has_user_name = ctx.recalled_memories.iter().any(|m| m.key == "user_name");
                 if !has_user_name && ctx.user_name.is_none() {
                     sections.push(format!(
                         "## First-Run Protocol\n{}",
@@ -382,7 +456,7 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// Build the memory section (Section 4).
 ///
 /// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
-pub fn build_memory_section(memories: &[(String, String)]) -> String {
+pub fn build_memory_section(memories: &[RecalledMemory]) -> String {
     let mut out = String::from("## Memory\n");
     if memories.is_empty() {
         out.push_str(
@@ -396,12 +470,20 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
              - Store important preferences, decisions, and context with memory_store for future use.",
         );
         out.push_str("\n\nRecalled memories:\n");
-        for (key, content) in memories.iter().take(5) {
-            let capped = cap_str(content, BUDGET_RECALLED_MEMORY, "recalled memory");
-            if key.is_empty() {
+        for mem in memories.iter().take(5) {
+            let kind = mem.kind.as_deref();
+            // The label carries the kind so the truncation marker (and its
+            // warn! line) says WHICH budget was too small. A marker that just
+            // says "recalled memory" cannot tell us whether 1500 is wrong.
+            let label = match kind {
+                Some(k) => format!("recalled {k}"),
+                None => "recalled memory".to_string(),
+            };
+            let capped = cap_str(&mem.content, budget_for_kind(kind), &label);
+            if mem.key.is_empty() {
                 out.push_str(&format!("- {capped}\n"));
             } else {
-                out.push_str(&format!("- [{key}] {capped}\n"));
+                out.push_str(&format!("- [{}] {}\n", mem.key, capped));
             }
         }
     }
@@ -1005,8 +1087,8 @@ mod tests {
     #[test]
     fn test_memory_section_with_items() {
         let memories = vec![
-            ("pref".to_string(), "User likes dark mode".to_string()),
-            ("ctx".to_string(), "Working on Rust project".to_string()),
+            RecalledMemory::keyed("pref", "User likes dark mode"),
+            RecalledMemory::keyed("ctx", "Working on Rust project"),
         ];
         let section = build_memory_section(&memories);
         assert!(section.contains("Recalled memories"));
@@ -1018,8 +1100,8 @@ mod tests {
 
     #[test]
     fn test_memory_cap_at_5() {
-        let memories: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("k{i}"), format!("value {i}")))
+        let memories: Vec<RecalledMemory> = (0..10)
+            .map(|i| RecalledMemory::keyed(format!("k{i}"), format!("value {i}")))
             .collect();
         let section = build_memory_section(&memories);
         assert!(section.contains("[k0]"));
@@ -1030,12 +1112,74 @@ mod tests {
     #[test]
     fn test_memory_content_capped() {
         let long_content = "x".repeat(1000);
-        let memories = vec![("k".to_string(), long_content)];
+        let memories = vec![RecalledMemory::keyed("k", long_content)];
         let section = build_memory_section(&memories);
-        // Capped at BUDGET_RECALLED_MEMORY, with a visible truncation marker.
+        // A row with no `kind` is budgeted as a turn: 500, unchanged.
         assert!(section.contains("recalled memory truncated"));
         assert!(section.contains("500 of 1000 chars shown, 500 omitted"));
         assert!(section.len() < 1400);
+    }
+
+    /// ANAI-231, the whole point: a summary of the measured real-world size
+    /// (~840 avg, ~1120 peak) must reach the prompt intact.
+    #[test]
+    fn a_real_sized_summary_is_not_truncated() {
+        let summary = "s".repeat(1120);
+        let memories = vec![RecalledMemory::of_kind(Some("summary".to_string()), &summary)];
+        let section = build_memory_section(&memories);
+        assert!(
+            !section.contains("truncated"),
+            "a 1120-char summary must survive the 1500 budget whole"
+        );
+        assert!(section.contains(&summary));
+    }
+
+    /// The budget is per-kind, not global: raising it for summaries must not
+    /// raise it for the 17 K raw turn rows that would otherwise flood the
+    /// prompt.
+    #[test]
+    fn a_turn_keeps_the_old_500_budget() {
+        let memories = vec![RecalledMemory::of_kind(
+            Some("turn".to_string()),
+            "t".repeat(1000),
+        )];
+        let section = build_memory_section(&memories);
+        assert!(section.contains("recalled turn truncated"));
+        assert!(section.contains("500 of 1000 chars shown"));
+    }
+
+    /// The truncation marker names the kind whose budget was too small —
+    /// otherwise the logs cannot tell us which number to retune.
+    #[test]
+    fn the_truncation_marker_names_the_kind() {
+        let memories = vec![RecalledMemory::of_kind(
+            Some("note".to_string()),
+            "n".repeat(2000),
+        )];
+        let section = build_memory_section(&memories);
+        assert!(section.contains("recalled note truncated"));
+        assert!(section.contains("1000 of 2000 chars shown"));
+    }
+
+    /// An unrecognised kind falls back to the turn budget rather than to the
+    /// most generous one. A future kind must not silently get 1500 chars.
+    #[test]
+    fn an_unknown_kind_falls_back_to_the_turn_budget() {
+        assert_eq!(budget_for_kind(Some("no-such-kind")), BUDGET_RECALLED_TURN);
+        assert_eq!(budget_for_kind(None), BUDGET_RECALLED_TURN);
+        assert_eq!(budget_for_kind(Some("summary")), BUDGET_RECALLED_SUMMARY);
+        assert_eq!(budget_for_kind(Some("fact")), BUDGET_RECALLED_FACT);
+        assert_eq!(budget_for_kind(Some("note")), BUDGET_RECALLED_NOTE);
+    }
+
+    /// The kind constants this module budgets against are the same spellings
+    /// the store writes. If a kind is ever renamed, this fails instead of the
+    /// budget silently reverting to 500.
+    #[test]
+    fn the_kind_spellings_match_the_store() {
+        assert_eq!(episode::SUMMARY_KIND, "summary");
+        assert_eq!(fact::KIND_FACT, "fact");
+        assert_eq!(openfang_memory::semantic::KIND_TURN, "turn");
     }
 
     #[test]
