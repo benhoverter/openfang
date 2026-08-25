@@ -67,6 +67,53 @@ pub const DEFAULT_IDLE_TIMEOUT_MINUTES: i64 = 0;
 /// corrupt 35k existing rows by rewriting their metadata.
 pub const EPISODE_ID_KEY: &str = "episode_id";
 
+/// How far back a summariser tick is allowed to look for closed-but-unsummarised
+/// episodes (ANAI-220).
+///
+/// The obvious selector — `closed_at IS NOT NULL AND summary IS NULL` — is not
+/// a "what did this tick close" query, it is **the backfill**: on the first
+/// armed tick it would sweep up every historical null-summary episode ever
+/// closed. Backfill is a deliberate, separately-authorised pass, so the live
+/// path is bounded by close recency instead.
+///
+/// It is deliberately wider than one tick. The idle sweep is not the only
+/// close path: [`EpisodeStore::ensure_open`] lazily timer-closes on the
+/// agent's own turn, and a 30-second model call has no business on a turn's
+/// critical path — so those episodes must be picked up by a *later* tick than
+/// the one that closed them.
+///
+/// An episode that ages out of this window keeps its null summary forever
+/// (until a backfill). That is the intended cost: no answer means leave the
+/// summary null and move on, never retry — a close that waits on a provider is
+/// a close a provider outage can lose.
+pub const SUMMARY_LOOKBACK_MINUTES: i64 = 60;
+
+/// Fewest episode-linked rows an episode must have before it is worth a model
+/// call.
+///
+/// `turn_count` counts *turns*; only stored memories carry `episode_id`, and
+/// measured against the live fleet the two diverge hard — 82 turns against 6
+/// linked rows on one agent, 14 turns against 0 on another. Summarising an
+/// episode with no material spends a call to write a polished null, so the
+/// floor is on material, never on `turn_count`.
+pub const MIN_MATERIAL_ROWS: usize = 2;
+
+/// Ceiling on rows fed to one summary call. The output ceiling
+/// (`consolidation.max_tokens`) bounds what comes back; this bounds what goes
+/// out, so one pathological episode cannot turn a cheap call into an expensive
+/// one.
+pub const MAX_MATERIAL_ROWS: usize = 40;
+
+/// `memories.kind` for a consolidation-written episode summary.
+///
+/// **Not `note`.** `memory_note` writes `kind = 'note'` carrying the same
+/// `episode_id`, so sharing the discriminator would make "has this episode
+/// already been summarised?" answer *true* for any episode where the agent
+/// happened to jot something — silently skipping exactly the episodes with the
+/// most material. Its own value keeps the idempotency check a single indexed
+/// lookup on `episode_id` with no `json_extract` in sight.
+pub const SUMMARY_KIND: &str = "summary";
+
 /// Why an episode was closed (ADR §2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
@@ -383,6 +430,132 @@ impl EpisodeStore {
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(n)
+    }
+
+    // -----------------------------------------------------------------
+    // Consolidation support (ANAI-220): close -> summary
+    // -----------------------------------------------------------------
+
+    /// Closed episodes that still have no summary and closed no earlier than
+    /// `cutoff`, oldest close first, capped at `limit`.
+    ///
+    /// Returns `(candidates, pending_total)`. `pending_total` is the *unclipped*
+    /// count in the same window, so the caller can report what `limit` deferred
+    /// rather than silently dropping it — a cap that logs nothing reads as "we
+    /// did them all".
+    ///
+    /// `cutoff` is the caller's, but it is not optional by design: see
+    /// [`SUMMARY_LOOKBACK_MINUTES`] for why an unbounded version of this query
+    /// is the backfill and not this.
+    pub fn awaiting_summary(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: usize,
+    ) -> OpenFangResult<(Vec<Episode>, usize)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let cutoff = cutoff.to_rfc3339();
+
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM episodes \
+                 WHERE closed_at IS NOT NULL AND summary IS NULL AND closed_at >= ?1",
+                rusqlite::params![cutoff],
+                |row| row.get(0),
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_COLS} WHERE closed_at IS NOT NULL AND summary IS NULL \
+                 AND closed_at >= ?1 ORDER BY closed_at ASC LIMIT ?2"
+            ))
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![cutoff, limit as i64], row_to_episode)
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let episodes: Vec<Episode> = rows.filter_map(|r| r.ok()).collect();
+        Ok((episodes, pending.max(0) as usize))
+    }
+
+    /// The episode's material, oldest first: the content of every live memory
+    /// row stamped with this episode, capped at `max_rows`.
+    ///
+    /// Reads `memories` rather than `episodes` — the one place this module
+    /// crosses over — because `episode_id` is a promoted, indexed column there
+    /// (schema v12) and the episode is the only thing that knows what its own
+    /// material is.
+    pub fn material(&self, id: Uuid, max_rows: usize) -> OpenFangResult<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT content FROM memories \
+                 WHERE episode_id = ?1 AND deleted = 0 ORDER BY created_at ASC LIMIT ?2",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![id.to_string(), max_rows as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Has a summary row already been written for this episode?
+    ///
+    /// The other half of idempotency: [`Self::set_summary`] guards the
+    /// `episodes` column, this guards the recallable `memories` row, so a
+    /// re-run (or a future backfill crossing the live path) cannot leave two
+    /// summaries of one episode in the corpus. Keyed on `SUMMARY_KIND`, not
+    /// `note` — see that constant.
+    pub fn has_summary_row(&self, id: Uuid) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT 1 FROM memories \
+                 WHERE episode_id = ?1 AND kind = ?2 AND deleted = 0 LIMIT 1",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        stmt.exists(rusqlite::params![id.to_string(), SUMMARY_KIND])
+            .map_err(|e| OpenFangError::Memory(e.to_string()))
+    }
+
+    /// Write a derived title/summary onto an already-closed episode. Returns
+    /// whether this call is the one that wrote it.
+    ///
+    /// `summary IS NULL` in the WHERE clause is the idempotency guard *and* the
+    /// precedence rule: a closer's own wrap-up (`close_current`) was written by
+    /// someone who was there, and a derived summary must never overwrite it.
+    ///
+    /// Deliberately separate from the close: the close commits first with a
+    /// null summary and this runs afterwards, out of transaction, so a provider
+    /// outage costs a summary and never a close.
+    pub fn set_summary(
+        &self,
+        id: Uuid,
+        title: Option<&str>,
+        summary: &str,
+    ) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE episodes SET title = COALESCE(title, ?2), summary = ?3 \
+                 WHERE id = ?1 AND closed_at IS NOT NULL AND summary IS NULL",
+                rusqlite::params![id.to_string(), title, summary],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(n > 0)
     }
 
     /// Most recent episodes for an agent, newest first.
@@ -800,5 +973,212 @@ mod tests {
         assert_eq!(closed.close_reason, Some(CloseReason::Timer));
         assert_eq!(closed.summary, None);
         assert_eq!(closed.title, None);
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-220: close -> summary support
+    // -----------------------------------------------------------------
+
+    /// Stamp a live memory row onto an episode. Mirrors the column list
+    /// `SemanticStore::remember_sqlite` writes, so the reads under test see the
+    /// same shape the capture path produces.
+    fn insert_memory(
+        shared: &Arc<Mutex<Connection>>,
+        agent: AgentId,
+        episode_id: Uuid,
+        kind: Option<&str>,
+        content: &str,
+        created_at: DateTime<Utc>,
+    ) {
+        shared
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories (id, agent_id, content, source, scope, confidence, \
+                 metadata, created_at, accessed_at, access_count, deleted, embedding, \
+                 episode_id, kind) \
+                 VALUES (?1, ?2, ?3, '\"observation\"', 'episodic', 1.0, '{}', ?4, ?4, 0, 0, \
+                 NULL, ?5, ?6)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    agent.0.to_string(),
+                    content,
+                    created_at.to_rfc3339(),
+                    episode_id.to_string(),
+                    kind,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Backdate a CLOSED episode's close so the lookback window can be
+    /// exercised without waiting an hour.
+    fn backdate_close(shared: &Arc<Mutex<Connection>>, id: Uuid, minutes: i64) {
+        let ts = (Utc::now() - Duration::minutes(minutes)).to_rfc3339();
+        shared
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE episodes SET closed_at = ?2 WHERE id = ?1",
+                rusqlite::params![id.to_string(), ts],
+            )
+            .unwrap();
+    }
+
+    fn close_now(s: &EpisodeStore, agent: AgentId) -> Uuid {
+        s.ensure_open(agent).unwrap();
+        s.close_current(agent, CloseReason::Explicit, None, None)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The candidate set is closed-and-unsummarised only. An open episode is
+    /// still being written; a summarised one is done.
+    #[test]
+    fn awaiting_summary_takes_only_closed_unsummarised_episodes() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        let b = AgentId::new();
+        let d = AgentId::new();
+
+        let bare = close_now(&s, a);
+        s.ensure_open(b).unwrap(); // open: not a candidate
+        let authored = s.ensure_open(d).unwrap();
+        s.close_current(d, CloseReason::Explicit, Some("t"), Some("the closer's own"))
+            .unwrap();
+
+        let (found, pending) = s.awaiting_summary(Utc::now() - Duration::hours(1), 10).unwrap();
+        assert_eq!(pending, 1);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, bare);
+        assert_ne!(found[0].id, authored);
+    }
+
+    /// **The backfill guard.** Without the cutoff this selector is
+    /// `closed_at IS NOT NULL AND summary IS NULL`, which is every null-summary
+    /// episode ever closed. Deleting this test is how B silently becomes a
+    /// fleet-wide backfill on its first armed tick.
+    #[test]
+    fn awaiting_summary_is_bounded_by_close_recency_not_all_history() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+        let ancient = close_now(&s, a);
+        backdate_close(&c, ancient, SUMMARY_LOOKBACK_MINUTES + 5);
+
+        let cutoff = Utc::now() - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+        let (found, pending) = s.awaiting_summary(cutoff, 10).unwrap();
+        assert!(found.is_empty(), "a stale close is backfill work, not live work");
+        assert_eq!(pending, 0);
+    }
+
+    /// A cap must report what it deferred. `pending` is the unclipped count so
+    /// the caller can say "8 summarized, 4 deferred" rather than implying it
+    /// did them all.
+    #[test]
+    fn awaiting_summary_reports_what_the_cap_deferred() {
+        let (s, _c) = store(120);
+        for _ in 0..5 {
+            close_now(&s, AgentId::new());
+        }
+        let (found, pending) = s.awaiting_summary(Utc::now() - Duration::hours(1), 3).unwrap();
+        assert_eq!(found.len(), 3, "the cap clips the batch");
+        assert_eq!(pending, 5, "but not the count the caller logs");
+    }
+
+    /// Material is the episode's linked rows, oldest first and capped — never
+    /// `turn_count`, which counts turns and not stored content.
+    #[test]
+    fn material_is_linked_rows_oldest_first_and_capped() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+        let ep = s.ensure_open(a).unwrap();
+        let other = s.ensure_open(AgentId::new()).unwrap();
+
+        let t0 = Utc::now() - Duration::minutes(10);
+        insert_memory(&c, a, ep, None, "first", t0);
+        insert_memory(&c, a, ep, Some("note"), "second", t0 + Duration::minutes(1));
+        insert_memory(&c, a, ep, None, "third", t0 + Duration::minutes(2));
+        insert_memory(&c, a, other, None, "not mine", t0);
+
+        assert_eq!(s.material(ep, 40).unwrap(), vec!["first", "second", "third"]);
+        assert_eq!(s.material(ep, 2).unwrap(), vec!["first", "second"]);
+    }
+
+    /// An episode whose agent talked for a dozen turns but stored nothing has
+    /// no material. The floor is on rows, and this is the population it exists
+    /// for: measured on the live fleet, 14 turns / 0 linked rows.
+    #[test]
+    fn a_high_turn_count_episode_can_still_have_no_material() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        let ep = s.ensure_open(a).unwrap();
+        for _ in 0..13 {
+            s.ensure_open(a).unwrap();
+        }
+        assert_eq!(s.current(a).unwrap().unwrap().turn_count, 14);
+        assert!(s.material(ep, 40).unwrap().len() < MIN_MATERIAL_ROWS);
+    }
+
+    /// The idempotency key must not collide with `memory_note`. If it did,
+    /// every episode the agent jotted a note in would be read as
+    /// already-summarised — skipping exactly the episodes richest in material.
+    #[test]
+    fn a_hand_written_note_is_not_a_summary_row() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+        let ep = s.ensure_open(a).unwrap();
+        insert_memory(&c, a, ep, Some("note"), "an agent's own note", Utc::now());
+        assert!(!s.has_summary_row(ep).unwrap());
+
+        insert_memory(&c, a, ep, Some(SUMMARY_KIND), "the derived summary", Utc::now());
+        assert!(s.has_summary_row(ep).unwrap());
+    }
+
+    /// Re-running over an already-summarised episode is a no-op. This is the
+    /// property that makes a later backfill safe to point at the live path.
+    #[test]
+    fn set_summary_writes_once_and_then_no_ops() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        let ep = close_now(&s, a);
+
+        assert!(s.set_summary(ep, Some("landed B"), "wired close to summary").unwrap());
+        assert!(
+            !s.set_summary(ep, Some("second try"), "a different summary").unwrap(),
+            "a re-run must not rewrite a summary"
+        );
+
+        let row = s.get(ep).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("landed B"));
+        assert_eq!(row.summary.as_deref(), Some("wired close to summary"));
+    }
+
+    /// A closer who was there beats a model that was not. `close_current`'s
+    /// wrap-up is authored; a derived summary must never overwrite it.
+    #[test]
+    fn set_summary_never_overwrites_the_closers_own_wrap_up() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        s.ensure_open(a).unwrap();
+        let ep = s
+            .close_current(a, CloseReason::Explicit, Some("mine"), Some("I was there"))
+            .unwrap()
+            .unwrap();
+
+        assert!(!s.set_summary(ep, Some("derived"), "I was not").unwrap());
+        let row = s.get(ep).unwrap().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("I was there"));
+        assert_eq!(row.title.as_deref(), Some("mine"));
+    }
+
+    /// An open episode is not summarisable — the close is what makes the
+    /// interval final.
+    #[test]
+    fn set_summary_refuses_an_open_episode() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        let ep = s.ensure_open(a).unwrap();
+        assert!(!s.set_summary(ep, None, "premature").unwrap());
+        assert_eq!(s.get(ep).unwrap().unwrap().summary, None);
     }
 }
