@@ -368,7 +368,7 @@ pub async fn execute_tool(
             // The gate is inert unless the operator turned it on: the kernel's
             // impl returns `Escalate` when `[gatekeeper] enabled = false`, and
             // the trait default returns `Escalate` for every non-kernel handle.
-            let gate_outcome = crate::gatekeeper::review(
+            let gate_decision = crate::gatekeeper::review(
                 kh,
                 agent_id_str,
                 tool_name,
@@ -383,11 +383,44 @@ pub async fn execute_tool(
             )
             .await;
 
+            // ANAI-241: the token joining this review to whatever the human
+            // does next. `None` means the gate never ran (disabled, non-shell,
+            // no exec policy) — the disposition row is still written, and says
+            // so, because "approved with no judge involved" is a real fact.
+            let gate_corr = gate_decision.as_ref().map(|d| d.correlation_id.clone());
+            let gate_outcome = gate_decision.map(|d| d.outcome);
+
+            // What the disposition rows below identify the command by.
+            // Verbatim, same as the verdict row — a record whose dangerous
+            // tail was cut is not a record (ANAI-151).
+            let disposition_subject = input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(tool_name)
+                .to_string();
+
             // `Deny` never prompts. The judge may only NARROW — it cannot
             // resurrect anything the allowlist wall already rejected — so a
             // deny here is strictly a refusal to spend the operator's attention
             // on something it considers plainly hostile.
             if let Some(crate::gatekeeper::GateOutcome::Deny(reason)) = &gate_outcome {
+                // Recorded before the early return so the disposition table is
+                // a complete census of gated commands on its own. Without this
+                // row, "what fraction of gated commands reached a human" needs
+                // a join against the verdict table to find the ones that never
+                // could — and a denominator you have to remember to widen is a
+                // denominator that gets reported wrong.
+                crate::gatekeeper::record_disposition(
+                    kh,
+                    agent_id_str,
+                    tool_name,
+                    &disposition_subject,
+                    gate_corr.as_deref(),
+                    crate::gatekeeper::HitlDisposition::Decided(
+                        openfang_types::approval::ApprovalDecision::GatekeeperDenied,
+                    ),
+                    0,
+                );
                 return ToolResult {
                     tool_use_id: tool_use_id.to_string(),
                     content: reason.clone(),
@@ -405,6 +438,26 @@ pub async fn execute_tool(
                 debug!(
                     tool_name,
                     "Approval suppressed by gatekeeper; executing without prompt"
+                );
+                // `wait_ms = 0` is not a placeholder — it is the measurement.
+                // A suppression's whole value is the operator-latency it did
+                // not spend, and this row is where that sits next to the
+                // escalations that did spend it.
+                //
+                // Structurally unreachable while `shadow = true`: shadow
+                // rewrites every verdict to `Escalate` before the caller sees
+                // it. The first `gatekeeper_suppressed` row in the chain is
+                // therefore the flip becoming real, with a timestamp.
+                crate::gatekeeper::record_disposition(
+                    kh,
+                    agent_id_str,
+                    tool_name,
+                    &disposition_subject,
+                    gate_corr.as_deref(),
+                    crate::gatekeeper::HitlDisposition::Decided(
+                        openfang_types::approval::ApprovalDecision::GatekeeperSuppressed,
+                    ),
+                    0,
                 );
             }
 
@@ -456,7 +509,14 @@ pub async fn execute_tool(
                         .take(openfang_types::approval::MAX_COMMAND_LEN)
                         .collect::<String>()
                 });
-                match kh
+                // ANAI-241: latency-to-human. Started here rather than at the
+                // top of the gate because this is the only span the operator
+                // is actually in — the judge's own latency is already recorded
+                // separately on the verdict row, and folding the two together
+                // would make model slowness indistinguishable from a human at
+                // lunch.
+                let prompt_started = std::time::Instant::now();
+                let approval = kh
                     .request_approval(
                         agent_id_str,
                         tool_name,
@@ -466,8 +526,27 @@ pub async fn execute_tool(
                         command.as_deref(),
                         gatekeeper_note.as_deref(),
                     )
-                    .await
-                {
+                    .await;
+                let wait_ms = prompt_started.elapsed().as_millis();
+
+                // One call, every arm, before any early return. The whole
+                // point of this row is that it exists for commands whose
+                // handling ends badly; writing it per-arm invites exactly the
+                // omission that leaves a hole shaped like the interesting case.
+                crate::gatekeeper::record_disposition(
+                    kh,
+                    agent_id_str,
+                    tool_name,
+                    &disposition_subject,
+                    gate_corr.as_deref(),
+                    match &approval {
+                        Ok(d) => crate::gatekeeper::HitlDisposition::Decided(*d),
+                        Err(_) => crate::gatekeeper::HitlDisposition::Error,
+                    },
+                    wait_ms,
+                );
+
+                match approval {
                     Ok(openfang_types::approval::ApprovalDecision::Approved) => {
                         debug!(tool_name, "Approval granted, proceeding with execution");
                     }
@@ -7718,6 +7797,7 @@ mod tests {
         // audit sink, so a test can prove one verdict writes exactly one row
         // and that the row carries the VERBATIM command.
         gate_audits: std::sync::Mutex<Vec<(String, String, String, String)>>,
+        gate_dispositions: std::sync::Mutex<Vec<(String, String, String, String)>>,
         // ANAI-187: shadow mode. Defaults false, matching the trait default,
         // so every pre-existing test still acts on verdicts.
         gate_shadow: std::sync::atomic::AtomicBool,
@@ -7789,6 +7869,7 @@ mod tests {
                 gate_verdict: std::sync::Mutex::new(None),
                 gate_consulted: std::sync::atomic::AtomicBool::new(false),
                 gate_audits: std::sync::Mutex::new(Vec::new()),
+                gate_dispositions: std::sync::Mutex::new(Vec::new()),
                 gate_shadow: std::sync::atomic::AtomicBool::new(false),
                 memory: std::sync::Mutex::new(std::collections::HashMap::new()),
                 memory_calls: std::sync::Mutex::new(Vec::new()),
@@ -8960,6 +9041,21 @@ mod tests {
                 outcome.to_string(),
             ));
         }
+
+        fn audit_gatekeeper_disposition(
+            &self,
+            agent_id: &str,
+            command: &str,
+            metadata: &str,
+            disposition: &str,
+        ) {
+            self.gate_dispositions.lock().unwrap().push((
+                agent_id.to_string(),
+                command.to_string(),
+                metadata.to_string(),
+                disposition.to_string(),
+            ));
+        }
     }
 
     #[tokio::test]
@@ -9170,6 +9266,107 @@ mod tests {
             assert!(
                 metadata.contains("consulted_model="),
                 "{token}: the row must say whether a model was in the decision"
+            );
+        }
+    }
+
+    /// ANAI-241: every gated command leaves exactly one disposition row, and
+    /// that row joins to its verdict row.
+    ///
+    /// The verdict row says what the judge wanted. Until now nothing said what
+    /// happened next, so post-flip "the human approved this" and "the judge
+    /// suppressed it and the human never saw it" were indistinguishable in the
+    /// chain — which is the entire safety boundary the `enabled = true` flip
+    /// moves. `human_decided` is the bit that answers it and is asserted here
+    /// per-arm, because a `false` that should be `true` reads as a quiet
+    /// operator rather than as a missing human.
+    ///
+    /// The `gk=` join is asserted rather than assumed: without it the only key
+    /// is (agent, command), which is ambiguous exactly where it matters most —
+    /// a build wrapper invoked five times in a minute is five identical rows.
+    #[tokio::test]
+    async fn test_every_gated_command_writes_one_correlated_disposition_row() {
+        use openfang_types::approval::ApprovalDecision;
+        use openfang_types::gatekeeper::GateVerdict;
+
+        let tail = "y".repeat(600);
+        for (verdict, decision, token, human) in [
+            (
+                GateVerdict::Suppress,
+                ApprovalDecision::Approved,
+                "gatekeeper_suppressed",
+                false,
+            ),
+            (
+                GateVerdict::Deny,
+                ApprovalDecision::Approved,
+                "gatekeeper_denied",
+                false,
+            ),
+            (
+                GateVerdict::Escalate,
+                ApprovalDecision::Approved,
+                "approved",
+                true,
+            ),
+            (
+                GateVerdict::Escalate,
+                ApprovalDecision::Denied,
+                "denied",
+                true,
+            ),
+            (
+                GateVerdict::Escalate,
+                ApprovalDecision::TimedOut,
+                "timed_out",
+                false,
+            ),
+        ] {
+            let fake = Arc::new(
+                FakeKernelHandle::new()
+                    .with_gate_verdict(verdict)
+                    .with_approval_decision(decision),
+            );
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let policy = gate_policy("grep");
+            let command = format!("grep --version {tail}");
+
+            let _ = run_gated(&handle, &policy, &command).await;
+
+            let rows = fake.gate_dispositions.lock().unwrap().clone();
+            assert_eq!(
+                rows.len(),
+                1,
+                "{token}: expected exactly one disposition row"
+            );
+            let (agent, cmd, metadata, disposition) = &rows[0];
+            assert_eq!(agent, "test-agent");
+            assert_eq!(disposition, token);
+            assert_eq!(
+                cmd, &command,
+                "{token}: the disposition row must carry the verbatim, untruncated command"
+            );
+            assert!(
+                metadata.contains(&format!("human_decided={human}")),
+                "{token}: expected human_decided={human} in {metadata}"
+            );
+
+            // The join key must be present on BOTH rows and identical.
+            let gk_of = |m: &str| {
+                m.split_whitespace()
+                    .find_map(|f| f.strip_prefix("gk="))
+                    .map(str::to_string)
+                    .unwrap_or_default()
+            };
+            let verdict_gk = gk_of(&fake.gate_audits.lock().unwrap()[0].2);
+            let disposition_gk = gk_of(metadata);
+            assert!(
+                !verdict_gk.is_empty() && verdict_gk != "none",
+                "{token}: the verdict row must carry a correlation id"
+            );
+            assert_eq!(
+                verdict_gk, disposition_gk,
+                "{token}: the disposition row must join to its verdict row"
             );
         }
     }

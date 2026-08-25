@@ -5628,9 +5628,9 @@ impl OpenFangKernel {
             if idle_timeout_minutes > 0 {
                 let kernel = Arc::clone(self);
                 tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(
-                        std::time::Duration::from_secs(EPISODE_SWEEP_TICK_SECS),
-                    );
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        EPISODE_SWEEP_TICK_SECS,
+                    ));
                     // No `interval.tick()` skip here, unlike the consolidation
                     // task above: `tokio::time::interval` fires immediately on
                     // its first tick, and we want that. ANAI-168 (see the
@@ -11457,6 +11457,28 @@ impl KernelHandle for OpenFangKernel {
         );
         self.approval_manager
             .record_gatekeeper_verdict(agent_id, command, outcome);
+    }
+
+    /// ANAI-241: durable row for the human's disposition of a gated command.
+    ///
+    /// One sink, not two — unlike the verdict row. The recent-approvals feed
+    /// already carries the genuine approval record for anything that prompted;
+    /// mirroring the disposition there would double every entry and corrupt
+    /// exactly the rates that feed is read for. The Merkle chain is the only
+    /// place this belongs.
+    fn audit_gatekeeper_disposition(
+        &self,
+        agent_id: &str,
+        command: &str,
+        metadata: &str,
+        disposition: &str,
+    ) {
+        self.audit_log.record(
+            agent_id,
+            openfang_runtime::audit::AuditAction::GatekeeperDisposition,
+            format!("{metadata} command={command}"),
+            disposition,
+        );
     }
 
     /// ANAI-187: shadow mode — consult the judge, record it, escalate anyway.

@@ -542,6 +542,33 @@ pub trait KernelHandle: Send + Sync {
         let _ = (agent_id, command, metadata, outcome);
     }
 
+    /// ANAI-241: append what the HUMAN did with a gated command.
+    ///
+    /// `audit_gatekeeper_verdict` records the judge's opinion at review time.
+    /// It cannot record the operator's, because the operator has not decided
+    /// yet — the row is sealed into the hash chain seconds to minutes before
+    /// the click. So the disposition is its own row, correlated by the
+    /// `gk=<uuid>` token both `metadata` strings carry.
+    ///
+    /// This is the instrument the `enabled = true` flip needs and does not
+    /// have. In shadow every command prompts, so "judge said suppress" and
+    /// "human approved" are both true of the same command and the chain is
+    /// unambiguous. Post-flip they diverge, and nothing today distinguishes a
+    /// command a human approved from one the judge suppressed and the human
+    /// never saw. That difference IS the safety boundary.
+    ///
+    /// Synchronous, infallible, no-op by default — same contract as the
+    /// verdict row. A gate must never block or fail on its own bookkeeping.
+    fn audit_gatekeeper_disposition(
+        &self,
+        agent_id: &str,
+        command: &str,
+        metadata: &str,
+        disposition: &str,
+    ) {
+        let _ = (agent_id, command, metadata, disposition);
+    }
+
     /// Request approval for a tool execution. Blocks until approved/denied/timed out.
     /// Returns the verbatim `ApprovalDecision`. It deliberately does NOT
     /// collapse to a bool: "Ben said no", "nobody was looking", and "your

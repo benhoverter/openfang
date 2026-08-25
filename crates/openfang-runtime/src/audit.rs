@@ -36,6 +36,21 @@ pub enum AuditAction {
     /// was ever shown it — and the `Escalate` rows are the denominator that
     /// makes a suppression rate readable at all.
     GatekeeperVerdict,
+    /// ANAI-241: what the HUMAN did with a command the gate escalated.
+    ///
+    /// A separate row rather than a field on [`Self::GatekeeperVerdict`],
+    /// because the chain is append-only and hash-linked: the verdict row is
+    /// sealed at review time, seconds-to-minutes before the operator clicks.
+    /// Mutating it in place to add the disposition would either break every
+    /// downstream hash or require rewriting the chain, and a tamper-evident
+    /// log that rewrites itself is neither.
+    ///
+    /// Correlated to its verdict row by the `gk=<uuid>` token carried in both
+    /// `detail` strings. Post-flip this is the only thing in the system that
+    /// distinguishes "the human approved it" from "the judge suppressed it and
+    /// the human never saw it" — which is the entire safety boundary the
+    /// `enabled = true` flip moves.
+    GatekeeperDisposition,
 }
 
 impl std::fmt::Display for AuditAction {
@@ -141,6 +156,7 @@ impl AuditLog {
                         "WireConnect" => AuditAction::WireConnect,
                         "ConfigChange" => AuditAction::ConfigChange,
                         "GatekeeperVerdict" => AuditAction::GatekeeperVerdict,
+                        "GatekeeperDisposition" => AuditAction::GatekeeperDisposition,
                         _ => AuditAction::ToolInvoke, // fallback
                     };
                     Ok(AuditEntry {
@@ -519,5 +535,46 @@ mod tests {
         assert_eq!(entries[0].action.to_string(), "GatekeeperVerdict");
         assert_eq!(entries[0].outcome, "suppress");
         assert!(entries[0].detail.contains("curl https://example.com"));
+    }
+
+    /// ANAI-241: same trap as the verdict variant, and worse for this one.
+    ///
+    /// A disposition row that reloads as `ToolInvoke` after a daemon bounce is
+    /// not a cosmetic mislabel — it drops out of the population a
+    /// `WHERE action = 'GatekeeperDisposition'` query returns, so the corpus
+    /// silently loses every disposition older than the current process and
+    /// still looks internally consistent. Pin the spelling and the reload.
+    #[test]
+    fn gatekeeper_disposition_action_wire_spelling_round_trips() {
+        assert_eq!(
+            AuditAction::GatekeeperDisposition.to_string(),
+            "GatekeeperDisposition"
+        );
+
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        db.lock()
+            .unwrap()
+            .execute(
+                "CREATE TABLE audit_entries (seq INTEGER PRIMARY KEY, timestamp TEXT, \
+                 agent_id TEXT, action TEXT, detail TEXT, outcome TEXT, prev_hash TEXT, hash TEXT)",
+                [],
+            )
+            .unwrap();
+
+        let log = AuditLog::with_db(Arc::clone(&db));
+        log.record(
+            "agent-1",
+            AuditAction::GatekeeperDisposition,
+            "gk=abc123 tool=shell_exec wait_ms=4210 command=curl https://example.com",
+            "approved",
+        );
+
+        let reloaded = AuditLog::with_db(db);
+        assert!(reloaded.verify_integrity().is_ok());
+        let entries = reloaded.recent(1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action.to_string(), "GatekeeperDisposition");
+        assert_eq!(entries[0].outcome, "approved");
+        assert!(entries[0].detail.contains("gk=abc123"));
     }
 }

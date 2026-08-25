@@ -51,6 +51,112 @@ pub enum GateOutcome {
     Deny(String),
 }
 
+/// ANAI-241: one gate review, plus the token that ties it to what happened next.
+///
+/// `review` seals its audit row before the human is ever prompted, so the
+/// disposition necessarily lands in a later row. `correlation_id` is what
+/// joins them; without it the only join key is `(agent, command)`, which is
+/// ambiguous exactly where it matters most — a build wrapper invoked five
+/// times in a minute is five identical rows.
+pub struct GateDecision {
+    /// Opaque token, also emitted as `gk=<id>` on both audit rows.
+    pub correlation_id: String,
+    /// What the caller should do next.
+    pub outcome: GateOutcome,
+}
+
+/// What became of a gated command once the gate was done with it.
+///
+/// Deliberately NOT a fresh vocabulary. `Decided` carries an
+/// `ApprovalDecision` verbatim, including the two record-only variants
+/// (`GatekeeperSuppressed`, `GatekeeperDenied`) that `request_approval` never
+/// returns but which exist precisely to name "no human was asked, and here is
+/// why". Inventing parallel tokens here would let the disposition vocabulary
+/// drift from the decision vocabulary it reports on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitlDisposition {
+    /// Resolved — by a human, or by the gate deciding no human was needed.
+    Decided(openfang_types::approval::ApprovalDecision),
+    /// The approval subsystem itself errored. Not a decision by anyone, and
+    /// must not be counted as one in either direction.
+    Error,
+}
+
+impl HitlDisposition {
+    pub fn as_log_token(self) -> &'static str {
+        match self {
+            Self::Decided(d) => d.as_log_token(),
+            Self::Error => "error",
+        }
+    }
+
+    /// Did a human actually look at this command?
+    ///
+    /// This is the one bit the flip turns on, so it is computed here once
+    /// rather than re-derived by every query. `Denied` counts — a refusal is
+    /// attention spent. `TimedOut` does not: nobody was watching, which is the
+    /// failure mode this whole epic is about and must stay separable from
+    /// active approval. `Backpressure` does not: the prompt was never shown.
+    pub fn human_decided(self) -> bool {
+        use openfang_types::approval::ApprovalDecision;
+        matches!(
+            self,
+            Self::Decided(ApprovalDecision::Approved) | Self::Decided(ApprovalDecision::Denied)
+        )
+    }
+}
+
+/// ANAI-241: append the human's disposition for one gated command.
+///
+/// `correlation_id` is `None` when the gate never ran for this command (gate
+/// disabled, non-shell tool, no exec policy) — the row is still worth writing,
+/// because "a human approved this and no judge was involved" is a real and
+/// distinct fact, but it has no verdict row to join to and says so.
+///
+/// `wait_ms` is latency-to-human: how long the agent sat blocked on the
+/// prompt. Zero for a suppression, which is precisely the number the flip is
+/// supposed to buy.
+pub fn record_disposition(
+    kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
+    agent_id: &str,
+    tool_name: &str,
+    command: &str,
+    correlation_id: Option<&str>,
+    disposition: HitlDisposition,
+    wait_ms: u128,
+) {
+    let token = disposition.as_log_token();
+    // Bound once. `%correlation_id.unwrap_or(..)` does not parse as a method
+    // call inside `tracing::info!` — the sigil binds the bare ident and the
+    // remainder of the expression is read as a field-name suffix.
+    let gk = correlation_id.unwrap_or("none");
+
+    tracing::info!(
+        target: "openfang::gatekeeper",
+        agent = %agent_id,
+        gk = %gk,
+        tool = %tool_name,
+        hitl = %token,
+        human_decided = %disposition.human_decided(),
+        wait_ms = %wait_ms,
+        command = %command,
+        "Gatekeeper disposition"
+    );
+
+    kernel.audit_gatekeeper_disposition(
+        agent_id,
+        command,
+        &format!(
+            "gk={} tool={} wait_ms={} human_decided={}",
+            gk,
+            tool_name,
+            wait_ms,
+            disposition.human_decided()
+        ),
+        token,
+    );
+}
+
 /// ANAI-185(a). Running totals for gate outcomes, process-lifetime.
 ///
 /// `Deny` is the reason this exists. It is the one verdict that terminates a
@@ -296,7 +402,12 @@ pub async fn review(
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
     workspace_root: Option<&std::path::Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
-) -> Option<GateOutcome> {
+) -> Option<GateDecision> {
+    // ANAI-241. Minted before anything can fail, so the token on the verdict
+    // row is the token the disposition row will carry, unconditionally. Short
+    // form — the join only has to be unique within a corpus, not globally, and
+    // a full UUID triples the width of the busiest field in the detail string.
+    let correlation_id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
     if !crate::tool_runner::is_shell_tool(tool_name) {
         return None;
     }
@@ -365,6 +476,7 @@ pub async fn review(
     tracing::info!(
         target: "openfang::gatekeeper",
         agent = %agent_id,
+        gk = %correlation_id,
         verdict = %verdict.as_log_token(),
         shadow = %shadow,
         latency_ms = %latency_ms,
@@ -427,7 +539,8 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={}",
+            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={}",
+            correlation_id,
             consulted,
             outcome.as_log_token(),
             latency_ms,
@@ -451,26 +564,29 @@ pub async fn review(
         },
     );
 
-    Some(match effective {
-        // ANAI-187: shadow escalations say what they would have done, so the
-        // operator reading the prompt is reading the judge's opinion rather
-        // than guessing at it.
-        GateVerdict::Escalate if shadow => GateOutcome::Escalate(format!(
-            "gatekeeper: shadow mode, would have said {} (floor: {})",
-            verdict.as_log_token(),
-            req.flags.as_log_string()
-        )),
-        GateVerdict::Suppress => GateOutcome::Suppress,
-        GateVerdict::Escalate => GateOutcome::Escalate(format!(
-            "gatekeeper: escalated (floor: {})",
-            req.flags.as_log_string()
-        )),
-        GateVerdict::Deny => GateOutcome::Deny(format!(
-            "Blocked by the approval gatekeeper. The command was judged hostile or \
-             catastrophic and was not shown for approval. Floor: {}. If this is wrong, \
-             ask the operator directly rather than retrying.",
-            req.flags.as_log_string()
-        )),
+    Some(GateDecision {
+        correlation_id,
+        outcome: match effective {
+            // ANAI-187: shadow escalations say what they would have done, so
+            // the operator reading the prompt is reading the judge's opinion
+            // rather than guessing at it.
+            GateVerdict::Escalate if shadow => GateOutcome::Escalate(format!(
+                "gatekeeper: shadow mode, would have said {} (floor: {})",
+                verdict.as_log_token(),
+                req.flags.as_log_string()
+            )),
+            GateVerdict::Suppress => GateOutcome::Suppress,
+            GateVerdict::Escalate => GateOutcome::Escalate(format!(
+                "gatekeeper: escalated (floor: {})",
+                req.flags.as_log_string()
+            )),
+            GateVerdict::Deny => GateOutcome::Deny(format!(
+                "Blocked by the approval gatekeeper. The command was judged hostile or \
+                 catastrophic and was not shown for approval. Floor: {}. If this is wrong, \
+                 ask the operator directly rather than retrying.",
+                req.flags.as_log_string()
+            )),
+        },
     })
 }
 
