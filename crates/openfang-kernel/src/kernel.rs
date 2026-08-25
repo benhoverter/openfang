@@ -5663,6 +5663,45 @@ impl OpenFangKernel {
             }
         }
 
+        // Episode close -> summary (ANAI-220). Ships inert:
+        // `[memory.consolidation].enabled` defaults to false, so this task does
+        // not spawn and nothing makes a model call.
+        //
+        // Its OWN task, adjacent to the idle sweep above rather than inside it,
+        // for the same reason that sweep is not inside the 24h consolidation
+        // tick: `episode_idle_timeout_minutes = 0` is the shipped default, and
+        // hanging summarisation off the sweep would mean the default fleet can
+        // never summarise an explicit close — a close that needs no timer at
+        // all. Two unrelated behaviours, one knob. No.
+        {
+            if self.config.memory.consolidation.enabled {
+                let kernel = Arc::clone(self);
+                let model = self.config.memory.consolidation.model.clone();
+                tokio::spawn(async move {
+                    let mut state = crate::episode_summary::EpisodeSummarizer::new();
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        crate::episode_summary::CONSOLIDATION_TICK_SECS,
+                    ));
+                    // No first-tick skip, same as the sweep: episodes closed
+                    // before the last restart are waiting right now, and a
+                    // restart-often daemon does not reliably reach tick two
+                    // (ANAI-168).
+                    loop {
+                        interval.tick().await;
+                        if kernel.supervisor.is_shutting_down() {
+                            break;
+                        }
+                        kernel.consolidate_closed_episodes(&mut state).await;
+                    }
+                });
+                info!(
+                    model = %model,
+                    "Episode consolidation scheduled every {}s",
+                    crate::episode_summary::CONSOLIDATION_TICK_SECS
+                );
+            }
+        }
+
         // Connect to configured + extension MCP servers
         let has_mcp = self
             .effective_mcp_servers
@@ -9590,7 +9629,7 @@ const MEMORY_HISTORY_MAX_LIMIT: usize = 20;
 /// tools-model-tables coupling the ADR forbids. A metadata key is ours, is
 /// filterable, and can grow `fact`/`summary` in stage 3 without touching an
 /// enum that crosses a service boundary.
-const MEMORY_KIND_KEY: &str = "kind";
+pub(crate) const MEMORY_KIND_KEY: &str = "kind";
 
 /// `kind` value for an agent-authored note (ADR 0002 §2.2, `memory_note`).
 const MEMORY_KIND_NOTE: &str = "note";
@@ -9601,7 +9640,7 @@ const MEMORY_KIND_NOTE: &str = "note";
 /// for consolidation on exactly the same footing as a captured turn, and
 /// giving it its own scope would hide it from every consolidation query that
 /// already filters on `episodic`.
-const MEMORY_NOTE_SCOPE: &str = "episodic";
+pub(crate) const MEMORY_NOTE_SCOPE: &str = "episodic";
 
 /// Ceiling on `memory_recall`'s `limit`.
 ///

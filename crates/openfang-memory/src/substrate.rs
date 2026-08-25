@@ -278,6 +278,54 @@ impl MemorySubstrate {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Closed, unsummarised episodes inside the lookback window, plus the
+    /// unclipped pending count. See [`EpisodeStore::awaiting_summary`] — the
+    /// window is what keeps the live summariser from being a backfill.
+    pub async fn episodes_awaiting_summary_async(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> OpenFangResult<(Vec<Episode>, usize)> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.awaiting_summary(cutoff, limit))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// The episode's linked rows, oldest first, capped.
+    pub async fn episode_material_async(
+        &self,
+        id: uuid::Uuid,
+        max_rows: usize,
+    ) -> OpenFangResult<Vec<String>> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.material(id, max_rows))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Has a derived summary row already been written for this episode?
+    pub async fn episode_has_summary_row_async(&self, id: uuid::Uuid) -> OpenFangResult<bool> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.has_summary_row(id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Write a derived title/summary onto a closed episode. `false` means
+    /// something else got there first — see [`EpisodeStore::set_summary`].
+    pub async fn set_episode_summary_async(
+        &self,
+        id: uuid::Uuid,
+        title: Option<String>,
+        summary: String,
+    ) -> OpenFangResult<bool> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.set_summary(id, title.as_deref(), &summary))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     // -----------------------------------------------------------------
     // Tier-3 facts (ADR 0001 §2.3)
     // -----------------------------------------------------------------
