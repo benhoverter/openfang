@@ -1058,10 +1058,17 @@ mod tests {
         let bare = close_now(&s, a);
         s.ensure_open(b).unwrap(); // open: not a candidate
         let authored = s.ensure_open(d).unwrap();
-        s.close_current(d, CloseReason::Explicit, Some("t"), Some("the closer's own"))
-            .unwrap();
+        s.close_current(
+            d,
+            CloseReason::Explicit,
+            Some("t"),
+            Some("the closer's own"),
+        )
+        .unwrap();
 
-        let (found, pending) = s.awaiting_summary(Utc::now() - Duration::hours(1), 10).unwrap();
+        let (found, pending) = s
+            .awaiting_summary(Utc::now() - Duration::hours(1), 10)
+            .unwrap();
         assert_eq!(pending, 1);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, bare);
@@ -1081,7 +1088,10 @@ mod tests {
 
         let cutoff = Utc::now() - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
         let (found, pending) = s.awaiting_summary(cutoff, 10).unwrap();
-        assert!(found.is_empty(), "a stale close is backfill work, not live work");
+        assert!(
+            found.is_empty(),
+            "a stale close is backfill work, not live work"
+        );
         assert_eq!(pending, 0);
     }
 
@@ -1094,7 +1104,9 @@ mod tests {
         for _ in 0..5 {
             close_now(&s, AgentId::new());
         }
-        let (found, pending) = s.awaiting_summary(Utc::now() - Duration::hours(1), 3).unwrap();
+        let (found, pending) = s
+            .awaiting_summary(Utc::now() - Duration::hours(1), 3)
+            .unwrap();
         assert_eq!(found.len(), 3, "the cap clips the batch");
         assert_eq!(pending, 5, "but not the count the caller logs");
     }
@@ -1114,7 +1126,10 @@ mod tests {
         insert_memory(&c, a, ep, None, "third", t0 + Duration::minutes(2));
         insert_memory(&c, a, other, None, "not mine", t0);
 
-        assert_eq!(s.material(ep, 40).unwrap(), vec!["first", "second", "third"]);
+        assert_eq!(
+            s.material(ep, 40).unwrap(),
+            vec!["first", "second", "third"]
+        );
         assert_eq!(s.material(ep, 2).unwrap(), vec!["first", "second"]);
     }
 
@@ -1145,7 +1160,14 @@ mod tests {
         insert_memory(&c, a, ep, Some("note"), "an agent's own note", Utc::now());
         assert!(!s.has_summary_row(ep).unwrap());
 
-        insert_memory(&c, a, ep, Some(SUMMARY_KIND), "the derived summary", Utc::now());
+        insert_memory(
+            &c,
+            a,
+            ep,
+            Some(SUMMARY_KIND),
+            "the derived summary",
+            Utc::now(),
+        );
         assert!(s.has_summary_row(ep).unwrap());
     }
 
@@ -1157,9 +1179,12 @@ mod tests {
         let a = AgentId::new();
         let ep = close_now(&s, a);
 
-        assert!(s.set_summary(ep, Some("landed B"), "wired close to summary").unwrap());
+        assert!(s
+            .set_summary(ep, Some("landed B"), "wired close to summary")
+            .unwrap());
         assert!(
-            !s.set_summary(ep, Some("second try"), "a different summary").unwrap(),
+            !s.set_summary(ep, Some("second try"), "a different summary")
+                .unwrap(),
             "a re-run must not rewrite a summary"
         );
 

@@ -2124,7 +2124,11 @@ mod tests {
             "A closes; it does not summarise — that is B (ANAI-220)"
         );
         assert!(
-            substrate.current_episode(active).unwrap().unwrap().is_open(),
+            substrate
+                .current_episode(active)
+                .unwrap()
+                .unwrap()
+                .is_open(),
             "the sweep must not touch an episode inside its idle gap"
         );
 

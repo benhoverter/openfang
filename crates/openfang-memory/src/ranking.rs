@@ -181,7 +181,10 @@ pub fn shadow_delta(candidates: &[ShadowCandidate], limit: usize) -> ShadowDelta
     ShadowDelta {
         candidates: candidates.len(),
         returned: n,
-        entered: entered_idx.iter().map(|i| candidates[*i].id.clone()).collect(),
+        entered: entered_idx
+            .iter()
+            .map(|i| candidates[*i].id.clone())
+            .collect(),
         entered_kinds: entered_idx.iter().map(kind_label).collect(),
         left: left_idx.iter().map(|i| candidates[*i].id.clone()).collect(),
         left_kinds: left_idx.iter().map(kind_label).collect(),
@@ -252,9 +255,15 @@ mod tests {
     /// same guard ANAI-231 put on the budget table, for the same reason.
     #[test]
     fn kind_spellings_match_the_constants() {
-        assert_eq!(weight_for_kind(Some(crate::episode::SUMMARY_KIND)), WEIGHT_SUMMARY);
+        assert_eq!(
+            weight_for_kind(Some(crate::episode::SUMMARY_KIND)),
+            WEIGHT_SUMMARY
+        );
         assert_eq!(weight_for_kind(Some(crate::fact::KIND_FACT)), WEIGHT_FACT);
-        assert_eq!(weight_for_kind(Some(crate::semantic::KIND_TURN)), WEIGHT_DEFAULT);
+        assert_eq!(
+            weight_for_kind(Some(crate::semantic::KIND_TURN)),
+            WEIGHT_DEFAULT
+        );
     }
 
     #[test]
@@ -300,10 +309,7 @@ mod tests {
     /// block is read top-down and ANAI-231's budget is spent in order.
     #[test]
     fn reorder_within_the_top_set_is_reported() {
-        let cands = vec![
-            c("t1", Some("turn"), 0.80),
-            c("s1", Some("summary"), 0.75),
-        ];
+        let cands = vec![c("t1", Some("turn"), 0.80), c("s1", Some("summary"), 0.75)];
         let d = shadow_delta(&cands, 2);
         assert!(d.entered.is_empty());
         assert!(d.left.is_empty());

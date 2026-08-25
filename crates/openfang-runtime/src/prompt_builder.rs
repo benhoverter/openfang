@@ -1125,7 +1125,10 @@ mod tests {
     #[test]
     fn a_real_sized_summary_is_not_truncated() {
         let summary = "s".repeat(1120);
-        let memories = vec![RecalledMemory::of_kind(Some("summary".to_string()), &summary)];
+        let memories = vec![RecalledMemory::of_kind(
+            Some("summary".to_string()),
+            &summary,
+        )];
         let section = build_memory_section(&memories);
         assert!(
             !section.contains("truncated"),
