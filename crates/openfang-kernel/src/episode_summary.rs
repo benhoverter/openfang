@@ -189,11 +189,22 @@ impl OpenFangKernel {
                 }
             };
 
-            // The floor is on stored rows, never on `turn_count`: turns count
-            // turns, and only stored memories carry `episode_id`. Measured on
-            // the live fleet the two diverge hard (82 turns / 6 rows on one
-            // agent, 14 / 0 on another), so trusting `turn_count` would spend a
-            // model call to write a polished null.
+            // The floor is on stored rows, never on `turn_count`.
+            //
+            // The "82 turns / 6 rows" divergence this comment used to cite was
+            // a measurement artifact, not a capture bug (ANAI-229): it counted
+            // `json_extract(metadata, '$.episode_id')`, but since the v13-era
+            // column lift `semantic.rs` REMOVES that key from the JSON and
+            // stores it in the `memories.episode_id` column, rehydrating it
+            // only on read. Counted on the column, the live fleet runs ~1:1
+            // (61/61, 54/54, 14/14). Do not re-derive this from the JSON.
+            //
+            // The floor stays, because the two quantities still cannot be
+            // assumed equal: `ensure_open` bumps the turn before the write, so
+            // a failed or in-flight `remember` leaves a gap (one live episode
+            // sits at 90/88), `material` excludes soft-deleted rows, and a
+            // turn that stores nothing is a turn with nothing to summarise.
+            // Trusting `turn_count` would spend a model call on a polished null.
             if material.len() < MIN_MATERIAL_ROWS {
                 tally.no_material += 1;
                 continue;
