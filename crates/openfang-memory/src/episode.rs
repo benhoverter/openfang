@@ -118,6 +118,19 @@ pub const MIN_MATERIAL_ROWS: usize = 2;
 /// one.
 pub const MAX_MATERIAL_ROWS: usize = 40;
 
+/// How much of an over-cap material window is spent on the episode's opening.
+///
+/// `max_rows / MATERIAL_HEAD_DIVISOR` rows of head, the remainder of tail.
+/// Before ANAI-238 the window was a plain `ORDER BY created_at ASC LIMIT`, so
+/// an episode longer than `MAX_MATERIAL_ROWS` was summarised from its *oldest*
+/// rows only. Measured live: a 107-row episode produced an accurate,
+/// well-written summary that stopped two days short of the work it was meant
+/// to describe. That is worse than a bad summary, because supersession
+/// (ANAI-235) hides every turn under a summarised episode — so the 67 rows the
+/// summariser never read became unrecallable behind a summary that does not
+/// mention them. Head keeps how the episode opened; tail keeps what it became.
+pub const MATERIAL_HEAD_DIVISOR: usize = 4;
+
 /// `memories.kind` for a consolidation-written episode summary.
 ///
 /// **Not `note`.** `memory_note` writes `kind = 'note'` carrying the same
@@ -494,30 +507,73 @@ impl EpisodeStore {
         Ok((episodes, pending.max(0) as usize))
     }
 
-    /// The episode's material, oldest first: the content of every live memory
-    /// row stamped with this episode, capped at `max_rows`.
+    /// The episode's material, oldest first: the content of its live memory
+    /// rows, capped at `max_rows`.
+    ///
+    /// Under the cap this is every row. Over it, the window is head + tail —
+    /// see [`MATERIAL_HEAD_DIVISOR`] for why it is not a plain `ASC LIMIT`.
+    /// The elided middle is replaced by one synthetic marker row, so the
+    /// summariser is told the material is discontiguous rather than being
+    /// handed a gap it will silently narrate over. That marker is the one way
+    /// the result can exceed `max_rows`, by exactly one element.
     ///
     /// Reads `memories` rather than `episodes` — the one place this module
     /// crosses over — because `episode_id` is a promoted, indexed column there
     /// (schema v12) and the episode is the only thing that knows what its own
     /// material is.
+    ///
+    /// Both orderings break ties on `id`, giving a total order: without it two
+    /// rows sharing a `created_at` could land in both the head and the tail.
     pub fn material(&self, id: Uuid, max_rows: usize) -> OpenFangResult<Vec<String>> {
+        const ASC: &str = "SELECT content FROM memories \
+             WHERE episode_id = ?1 AND deleted = 0 \
+             ORDER BY created_at ASC, id ASC LIMIT ?2";
+        const DESC: &str = "SELECT content FROM memories \
+             WHERE episode_id = ?1 AND deleted = 0 \
+             ORDER BY created_at DESC, id DESC LIMIT ?2";
+
         let conn = self
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT content FROM memories \
-                 WHERE episode_id = ?1 AND deleted = 0 ORDER BY created_at ASC LIMIT ?2",
+        let id = id.to_string();
+
+        let fetch = |sql: &str, limit: usize| -> OpenFangResult<Vec<String>> {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let mut stmt = conn
+                .prepare(sql)
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![&id, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        };
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE episode_id = ?1 AND deleted = 0",
+                rusqlite::params![&id],
+                |row| row.get(0),
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        let rows = stmt
-            .query_map(rusqlite::params![id.to_string(), max_rows as i64], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let total = total.max(0) as usize;
+
+        if total <= max_rows {
+            return fetch(ASC, max_rows);
+        }
+
+        let head = max_rows / MATERIAL_HEAD_DIVISOR;
+        let tail = max_rows - head;
+        let mut window = fetch(ASC, head)?;
+        window.push(format!("[… {} rows elided …]", total - max_rows));
+        let mut newest = fetch(DESC, tail)?;
+        newest.reverse();
+        window.extend(newest);
+        Ok(window)
     }
 
     /// Has a summary row already been written for this episode?
@@ -1128,9 +1184,65 @@ mod tests {
 
         assert_eq!(
             s.material(ep, 40).unwrap(),
-            vec!["first", "second", "third"]
+            vec!["first", "second", "third"],
+            "under the cap, every row, oldest first"
         );
-        assert_eq!(s.material(ep, 2).unwrap(), vec!["first", "second"]);
+        // Over the cap the window is head + tail. With max_rows = 2 the head
+        // divisor floors to zero, so the whole budget goes to the tail — the
+        // pre-ANAI-238 window returned ["first", "second"] and dropped the
+        // newest row, which is the bug.
+        assert_eq!(
+            s.material(ep, 2).unwrap(),
+            vec!["[… 1 rows elided …]", "second", "third"]
+        );
+    }
+
+    /// The regression guard for ANAI-238: whatever else the window drops, it
+    /// may never drop the newest row. A summary that omits the end of the
+    /// episode is stale by construction, and ANAI-235 then hides the rows that
+    /// would have corrected it.
+    #[test]
+    fn material_always_contains_the_newest_row() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+        let ep = s.ensure_open(a).unwrap();
+
+        let t0 = Utc::now() - Duration::minutes(200);
+        for i in 0..100 {
+            insert_memory(
+                &c,
+                a,
+                ep,
+                None,
+                &format!("row {i}"),
+                t0 + Duration::minutes(i),
+            );
+        }
+
+        let window = s.material(ep, MAX_MATERIAL_ROWS).unwrap();
+        assert_eq!(
+            window.last().map(String::as_str),
+            Some("row 99"),
+            "the newest row is always in the window"
+        );
+        assert_eq!(
+            window.first().map(String::as_str),
+            Some("row 0"),
+            "and so is the oldest — head keeps how the episode opened"
+        );
+        assert_eq!(
+            window.len(),
+            MAX_MATERIAL_ROWS + 1,
+            "cap plus exactly one elision marker"
+        );
+
+        let head = MAX_MATERIAL_ROWS / MATERIAL_HEAD_DIVISOR;
+        assert_eq!(window[head], "[… 60 rows elided …]");
+        assert_eq!(window[head - 1], format!("row {}", head - 1));
+        assert_eq!(
+            window[head + 1],
+            format!("row {}", 100 - (MAX_MATERIAL_ROWS - head))
+        );
     }
 
     /// An episode whose agent talked for a dozen turns but stored nothing has
