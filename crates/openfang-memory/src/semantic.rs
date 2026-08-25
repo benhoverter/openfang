@@ -268,6 +268,38 @@ impl SemanticStore {
             "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding, episode_id, kind
              FROM memories WHERE deleted = 0",
         );
+
+        // Supersession (ANAI-235, option (a) of the 2026-08-25 design note).
+        //
+        // A turn whose episode has already been summarised is not deleted —
+        // it is made unrecallable, because the summary written from it is a
+        // strictly better answer to any query the turn would have matched.
+        // Recall is the only reader that skips it; export, audit and the
+        // summariser's own `EpisodeStore::material` all still see it.
+        //
+        // The condition is deliberately keyed on the SUMMARY ROW EXISTING IN
+        // THE CORPUS, not on `episodes.summary IS NOT NULL`. Those two can
+        // disagree — `set_summary` writes the column and the recallable row in
+        // separate steps — and only one of them is the thing that will
+        // actually be surfaced. Hiding material behind a replacement that
+        // recall cannot reach is how a memory system loses information for
+        // real. This form also gives a rollback that needs no rebuild:
+        // soft-delete the summary row and every turn under it becomes
+        // recallable again on the next query.
+        //
+        // Scoped to `kind = 'turn'`. Notes, facts and summaries are authored,
+        // not accumulated; nothing supersedes them but their own successor.
+        // Rows with a NULL `kind` (none exist post-purge, but the arm is
+        // free) are not turns as far as this predicate is concerned and
+        // survive.
+        sql.push_str(&format!(
+            " AND NOT (memories.kind = '{KIND_TURN}' AND memories.episode_id IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM memories s \
+                           WHERE s.episode_id = memories.episode_id \
+                             AND s.kind = '{SUMMARY_KIND}' AND s.deleted = 0))",
+            SUMMARY_KIND = crate::episode::SUMMARY_KIND,
+        ));
+
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
 
@@ -530,6 +562,24 @@ impl SemanticStore {
 
         // If we have a query embedding, re-rank by cosine similarity
         if let Some(qe) = query_embedding {
+            // Candidate-window tripwire (rider on ANAI-233).
+            //
+            // `fetch_limit` is a hard LIMIT on what cosine is even allowed to
+            // look at. Past it, relevance stops being a function of the query
+            // and becomes a function of `accessed_at` — and it fails SILENTLY:
+            // recall still returns `limit` rows and they still look plausible.
+            // A full window is not proof of starvation (a corpus of exactly
+            // `fetch_limit` rows is fine), which is why this is `warn` and not
+            // an error; it is the only signal that the ceiling is now load-
+            // bearing.
+            if fragments.len() >= fetch_limit {
+                warn!(
+                    fetch_limit,
+                    candidates = fragments.len(),
+                    "recall candidate window full — rows beyond it were never scored"
+                );
+            }
+
             // Score once, then sort — decorate/sort/undecorate.
             //
             // The previous form recomputed two cosines *inside* the
@@ -573,11 +623,8 @@ impl SemanticStore {
 
             // The shipped ranking, unchanged: descending similarity, stable,
             // so ties keep the candidate-window order the SQL ORDER BY chose.
-            let mut scored: Vec<(f32, MemoryFragment)> =
-                sims.into_iter().zip(fragments).collect();
-            scored.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let mut scored: Vec<(f32, MemoryFragment)> = sims.into_iter().zip(fragments).collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(limit);
             fragments = scored.into_iter().map(|(_, f)| f).collect();
             debug!(
@@ -1534,6 +1581,208 @@ mod tests {
                 .any(|f| f.content == "main is the trunk of record"),
             "the fact fell out of the candidate window; got: {:?}",
             hits.iter().map(|f| &f.content).collect::<Vec<_>>()
+        );
+    }
+
+    // ---- ANAI-235: supersession of summarised turns --------------------
+
+    fn episode_kind_meta(episode: &str, kind: &str) -> HashMap<String, serde_json::Value> {
+        HashMap::from([
+            (
+                crate::episode::EPISODE_ID_KEY.to_string(),
+                serde_json::json!(episode),
+            ),
+            (KIND_KEY.to_string(), serde_json::json!(kind)),
+        ])
+    }
+
+    fn write(
+        store: &SemanticStore,
+        agent: AgentId,
+        content: &str,
+        meta: HashMap<String, serde_json::Value>,
+    ) -> MemoryId {
+        store
+            .remember(agent, content, MemorySource::Conversation, "episodic", meta)
+            .unwrap()
+    }
+
+    fn contents(store: &SemanticStore, agent: AgentId) -> Vec<String> {
+        store
+            .recall("", 50, Some(MemoryFilter::agent(agent)))
+            .unwrap()
+            .into_iter()
+            .map(|f| f.content)
+            .collect()
+    }
+
+    /// The point of the whole ticket: once the summary exists in the corpus,
+    /// the transcript it was derived from stops competing with it.
+    #[test]
+    fn a_turn_is_recallable_until_its_episode_has_a_summary_row() {
+        let store = setup();
+        let agent = AgentId::new();
+        let episode = uuid::Uuid::new_v4().to_string();
+        write(
+            &store,
+            agent,
+            "raw turn",
+            episode_kind_meta(&episode, KIND_TURN),
+        );
+
+        assert_eq!(contents(&store, agent), vec!["raw turn".to_string()]);
+
+        write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&episode, crate::episode::SUMMARY_KIND),
+        );
+
+        assert_eq!(
+            contents(&store, agent),
+            vec!["the summary".to_string()],
+            "the turn should have been superseded, and the summary must not supersede itself"
+        );
+    }
+
+    /// Supersession is per-episode. A summary is not a licence to hide the
+    /// rest of the corpus.
+    #[test]
+    fn a_turn_under_a_different_episode_is_untouched() {
+        let store = setup();
+        let agent = AgentId::new();
+        let summarised = uuid::Uuid::new_v4().to_string();
+        let live = uuid::Uuid::new_v4().to_string();
+        write(
+            &store,
+            agent,
+            "old turn",
+            episode_kind_meta(&summarised, KIND_TURN),
+        );
+        write(
+            &store,
+            agent,
+            "current turn",
+            episode_kind_meta(&live, KIND_TURN),
+        );
+        write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&summarised, crate::episode::SUMMARY_KIND),
+        );
+
+        let got = contents(&store, agent);
+        assert!(got.contains(&"current turn".to_string()), "got: {got:?}");
+        assert!(!got.contains(&"old turn".to_string()), "got: {got:?}");
+    }
+
+    /// Authored rows are not sediment. A note or a fact sitting in a
+    /// summarised episode is not replaced by the summary of that episode.
+    #[test]
+    fn authored_rows_in_a_summarised_episode_are_not_superseded() {
+        let store = setup();
+        let agent = AgentId::new();
+        let episode = uuid::Uuid::new_v4().to_string();
+        write(&store, agent, "a note", episode_kind_meta(&episode, "note"));
+        write(
+            &store,
+            agent,
+            "a turn",
+            episode_kind_meta(&episode, KIND_TURN),
+        );
+        write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&episode, crate::episode::SUMMARY_KIND),
+        );
+
+        let got = contents(&store, agent);
+        assert!(got.contains(&"a note".to_string()), "got: {got:?}");
+        assert!(!got.contains(&"a turn".to_string()), "got: {got:?}");
+    }
+
+    /// The rollback path, and the reason the predicate keys on the corpus row
+    /// rather than `episodes.summary`: soft-deleting the summary restores the
+    /// material with no rebuild and no migration.
+    #[test]
+    fn soft_deleting_the_summary_row_restores_its_turns() {
+        let store = setup();
+        let agent = AgentId::new();
+        let episode = uuid::Uuid::new_v4().to_string();
+        write(
+            &store,
+            agent,
+            "raw turn",
+            episode_kind_meta(&episode, KIND_TURN),
+        );
+        let summary = write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&episode, crate::episode::SUMMARY_KIND),
+        );
+        assert!(!contents(&store, agent).contains(&"raw turn".to_string()));
+
+        store.forget(summary).unwrap();
+
+        assert_eq!(contents(&store, agent), vec!["raw turn".to_string()]);
+    }
+
+    /// A turn with no episode cannot be superseded by anything — there is no
+    /// episode whose summary would replace it. Guards the `episode_id IS NOT
+    /// NULL` arm against a NULL-matches-NULL rewrite.
+    #[test]
+    fn an_unlinked_turn_is_never_superseded() {
+        let store = setup();
+        let agent = AgentId::new();
+        let episode = uuid::Uuid::new_v4().to_string();
+        write(
+            &store,
+            agent,
+            "unlinked turn",
+            kind_meta(serde_json::json!(KIND_TURN)),
+        );
+        write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&episode, crate::episode::SUMMARY_KIND),
+        );
+
+        assert!(contents(&store, agent).contains(&"unlinked turn".to_string()));
+    }
+
+    /// The summariser must still see what it is summarising. Supersession is
+    /// a recall-path predicate, not a delete: `EpisodeStore::material` reads
+    /// the same rows and must be unaffected.
+    #[test]
+    fn supersession_does_not_hide_material_from_the_summariser() {
+        let store = setup();
+        let agent = AgentId::new();
+        let episode = uuid::Uuid::new_v4();
+        let key = episode.to_string();
+        write(
+            &store,
+            agent,
+            "raw turn",
+            episode_kind_meta(&key, KIND_TURN),
+        );
+        write(
+            &store,
+            agent,
+            "the summary",
+            episode_kind_meta(&key, crate::episode::SUMMARY_KIND),
+        );
+
+        let material = crate::episode::EpisodeStore::new(store.conn.clone())
+            .material(episode, 100)
+            .unwrap();
+        assert!(
+            material.contains(&"raw turn".to_string()),
+            "got: {material:?}"
         );
     }
 }
