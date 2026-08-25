@@ -98,11 +98,18 @@ pub const SUMMARY_LOOKBACK_MINUTES: i64 = 60;
 /// Fewest episode-linked rows an episode must have before it is worth a model
 /// call.
 ///
-/// `turn_count` counts *turns*; only stored memories carry `episode_id`, and
-/// measured against the live fleet the two diverge hard — 82 turns against 6
-/// linked rows on one agent, 14 turns against 0 on another. Summarising an
-/// episode with no material spends a call to write a polished null, so the
-/// floor is on material, never on `turn_count`.
+/// `turn_count` counts *turns*; only stored memories carry `episode_id`. On the
+/// live fleet the two track closely (90 turns / 88 linked rows on this agent,
+/// exact parity on several others) — an earlier note here cited a hard
+/// divergence (82/6, 14/0), which was a measurement artifact: that query read
+/// `json_extract(metadata,'$.episode_id')` and so counted only rows written
+/// before the linkage was lifted into an indexed column (ANAI-229, not-a-bug).
+///
+/// The floor still belongs on material rather than on `turn_count`, for two
+/// live reasons: `ensure_open` bumps the turn *before* the write, so an
+/// in-flight or failed `remember` leaves a real gap, and material excludes
+/// soft-deleted rows, which turns cannot see. Summarising an episode with no
+/// material spends a call to write a polished null.
 pub const MIN_MATERIAL_ROWS: usize = 2;
 
 /// Ceiling on rows fed to one summary call. The output ceiling
@@ -1112,8 +1119,9 @@ mod tests {
     }
 
     /// An episode whose agent talked for a dozen turns but stored nothing has
-    /// no material. The floor is on rows, and this is the population it exists
-    /// for: measured on the live fleet, 14 turns / 0 linked rows.
+    /// no material. Synthetic: on the live fleet turns and linked rows track
+    /// closely, so this is the defensive edge (deletes, failed writes), not a
+    /// measured population — see `MIN_MATERIAL_ROWS`.
     #[test]
     fn a_high_turn_count_episode_can_still_have_no_material() {
         let (s, _c) = store(120);
