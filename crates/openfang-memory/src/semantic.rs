@@ -530,22 +530,56 @@ impl SemanticStore {
 
         // If we have a query embedding, re-rank by cosine similarity
         if let Some(qe) = query_embedding {
-            fragments.sort_by(|a, b| {
-                let sim_a = a
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                let sim_b = b
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                sim_b
-                    .partial_cmp(&sim_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            // Score once, then sort — decorate/sort/undecorate.
+            //
+            // The previous form recomputed two cosines *inside* the
+            // comparator, so a 5000-row candidate window paid ~123k dot
+            // products over 384-dimension vectors to answer 5000. That was
+            // affordable when nothing else needed the scores; shadow ranking
+            // (ANAI-232) needs them a second time, and computing them twice
+            // more was not the way to get them.
+            let sims: Vec<f32> = fragments
+                .iter()
+                .map(|f| {
+                    f.embedding
+                        .as_deref()
+                        .map(|e| cosine_similarity(qe, e))
+                        // Sentinel: a row with no embedding is unrankable
+                        // against a query embedding and sorts last. Cosine
+                        // is bounded at -1.0, so this cannot collide with a
+                        // real score except in the degenerate exactly-
+                        // opposite case, which sorts last anyway.
+                        .unwrap_or(-1.0)
+                })
+                .collect();
+
+            // Shadow ranking: log-only, changes nothing below. See
+            // `crate::ranking` for why the measurement precedes the weights.
+            let shadow_agent = filter
+                .as_ref()
+                .and_then(|f| f.agent_id)
+                .map(|a| a.0.to_string())
+                .unwrap_or_else(|| "<unfiltered>".to_string());
+            let shadow_candidates: Vec<crate::ranking::ShadowCandidate> = fragments
+                .iter()
+                .zip(sims.iter())
+                .map(|(f, &similarity)| crate::ranking::ShadowCandidate {
+                    id: f.id.0.to_string(),
+                    kind: kind_from_metadata(&f.metadata),
+                    similarity,
+                })
+                .collect();
+            crate::ranking::log_shadow_delta(&shadow_agent, &shadow_candidates, limit);
+
+            // The shipped ranking, unchanged: descending similarity, stable,
+            // so ties keep the candidate-window order the SQL ORDER BY chose.
+            let mut scored: Vec<(f32, MemoryFragment)> =
+                sims.into_iter().zip(fragments).collect();
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
             });
-            fragments.truncate(limit);
+            scored.truncate(limit);
+            fragments = scored.into_iter().map(|(_, f)| f).collect();
             debug!(
                 "Vector recall: {} results from {} candidates",
                 fragments.len(),
