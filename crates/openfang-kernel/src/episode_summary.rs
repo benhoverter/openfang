@@ -67,6 +67,13 @@ pub(crate) const CONSOLIDATION_TICK_SECS: u64 = 60;
 /// on the very first call, the `OnceLock` has cached that failure for the life
 /// of the process and no probe can rescue it. This probe recovers provider
 /// errors and timeouts, not a poisoned driver cell.
+///
+/// **Coupled to [`SUMMARY_LOOKBACK_MINUTES`].** At [`CONSOLIDATION_TICK_SECS`]
+/// this is ~30 minutes, and two failed probe intervals exceed the 60-minute
+/// lookback — so a provider outage of about an hour orphans that hour's
+/// episodes to a future backfill even after the probe recovers. That boundary
+/// is accepted, not accidental; it stops being accepted if these two constants
+/// drift apart. Move them together.
 const PROBE_AFTER_TICKS: u32 = 30;
 
 /// Per-material-row character ceiling fed to the model.
@@ -258,6 +265,15 @@ impl OpenFangKernel {
                 // Something wrote a summary between the select and here — an
                 // explicit close by the agent itself, most likely. Its author
                 // was there and this one was not; leave it alone.
+                //
+                // Known shape, not a surprise (alpha, ANAI-220 review): the
+                // corpus row above is already written, so the episode ends up
+                // carrying *their* summary while recall surfaces *ours*. Two
+                // summaries of one episode, disagreeing. Narrow — it needs an
+                // explicit close inside a single tick's select-to-write gap —
+                // and the alternative orderings are worse: column-first strands
+                // summarised episodes with nothing recallable, and holding a
+                // lock across a model call puts the provider on the close path.
                 Ok(false) => {}
                 Err(e) => {
                     warn!(target: "openfang::consolidation", episode = %ep.id, error = %e,
@@ -273,7 +289,12 @@ impl OpenFangKernel {
         let deferred = pending
             .saturating_sub(tally.summarized as usize)
             .saturating_sub(tally.no_material as usize);
-        if tally.summarized > 0 || deferred > 0 || tally.no_material > 0 {
+        //
+        // `no_material` deliberately does NOT fire this line on its own: a thin
+        // episode re-selects every tick for the life of the lookback window, so
+        // announcing it would `info!` ~60 times about work that costs nothing.
+        // It is still reported as a field whenever the line does fire.
+        if tally.summarized > 0 || deferred > 0 {
             info!(
                 target: "openfang::consolidation",
                 summarized = tally.summarized,

@@ -86,6 +86,13 @@ pub const EPISODE_ID_KEY: &str = "episode_id";
 /// (until a backfill). That is the intended cost: no answer means leave the
 /// summary null and move on, never retry — a close that waits on a provider is
 /// a close a provider outage can lose.
+///
+/// **Coupled to `episode_summary::PROBE_AFTER_TICKS`.** The breaker's half-open
+/// probe waits ~30 minutes between attempts, so two failed probes span longer
+/// than this window: an episode closed at the moment the breaker tripped can
+/// age out before a probe ever succeeds. The probe recovers the *task*, not
+/// that hour's *material*. Widening the probe interval, or narrowing this
+/// window, widens that hole — change one and re-check the other.
 pub const SUMMARY_LOOKBACK_MINUTES: i64 = 60;
 
 /// Fewest episode-linked rows an episode must have before it is worth a model
