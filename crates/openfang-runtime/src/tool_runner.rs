@@ -9174,6 +9174,47 @@ mod tests {
         }
     }
 
+    /// ANAI-240: the deterministic sheet verdict is recorded on every row.
+    ///
+    /// `PathFactSheet::suppress_eligible` had zero production call sites until
+    /// this landed — the stricter of the two mechanisms was never asked, so the
+    /// corpus could not say how often the judge suppressed something no
+    /// deterministic rule would have granted. `grep --version` names no path at
+    /// all, so the sheet is empty and therefore ineligible; a `Suppress`
+    /// verdict on it is exactly the disagreement the field exists to count.
+    #[tokio::test]
+    async fn test_deterministic_eligibility_is_recorded_alongside_the_verdict() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let _ = run_gated(&handle, &gate_policy("grep"), "grep --version").await;
+        let metadata = fake.gate_audits.lock().unwrap()[0].2.clone();
+        assert!(
+            metadata.contains("det=ineligible"),
+            "an empty sheet is not deterministic-eligible: {metadata}"
+        );
+        assert!(
+            metadata.contains("det_disagree=true"),
+            "a model suppression the sheet refuses must be countable: {metadata}"
+        );
+
+        // The other side: an escalate is never a disagreement, whatever the
+        // sheet says. The judge is allowed to be the stricter mechanism.
+        let strict = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = strict.clone();
+        let _ = run_gated(&handle, &gate_policy("grep"), "grep --version").await;
+        let metadata = strict.gate_audits.lock().unwrap()[0].2.clone();
+        assert!(
+            metadata.contains("det_disagree=false"),
+            "an escalate must never count as a disagreement: {metadata}"
+        );
+    }
+
     /// ANAI-189: `consulted_model` must describe the MODEL, not the floor.
     ///
     /// The bug this pins: `consulted` was a structural constant on the

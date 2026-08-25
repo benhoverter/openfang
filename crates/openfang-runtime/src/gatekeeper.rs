@@ -341,6 +341,24 @@ pub async fn review(
         verdict
     };
 
+    // ANAI-240. The deterministic sheet verdict: computed, recorded, never
+    // acted on.
+    //
+    // `PathFactSheet::suppress_eligible` has held the script body to exactly
+    // the command's own bar since ANAI-206 item 3, and until now had no
+    // production call site at all — tests only. It was measurement scaffolding
+    // that never got wired, which left the corpus unable to answer the one
+    // question the `enabled` flip turns on: how often the judge suppresses
+    // something no deterministic rule would have granted.
+    //
+    // Two fields, not one. `det_eligible` is what the code would have allowed.
+    // `det_disagree` is the population worth reading: a model suppression the
+    // sheet refuses. The converse — sheet eligible, judge escalates — is the
+    // two mechanisms agreeing about who holds authority (the judge is allowed
+    // to be the stricter one) and is deliberately not flagged.
+    let det_eligible = req.path_facts.suppress_eligible();
+    let det_disagree = verdict == GateVerdict::Suppress && !det_eligible;
+
     // §5 logging contract. FULL command, never truncated: this log IS the
     // review mechanism for every command the judge suppresses, so a truncation
     // here is a hole in the audit trail, not a cosmetic choice.
@@ -354,6 +372,8 @@ pub async fn review(
         judge = %outcome.as_log_token(),
         floor_hit = %req.flags.as_log_string(),
         path_facts = %req.path_facts.as_log_token(),
+        det_eligible = %det_eligible,
+        det_disagree = %det_disagree,
         bases = ?req.bases,
         inner = ?req.inner,
         command = %raw_command,
@@ -407,12 +427,14 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}]",
+            "tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={}",
             consulted,
             outcome.as_log_token(),
             latency_ms,
             req.flags.as_log_string(),
-            req.path_facts.as_log_token()
+            req.path_facts.as_log_token(),
+            if det_eligible { "eligible" } else { "ineligible" },
+            det_disagree
         ),
         // ANAI-187: a shadow verdict carries a `shadow_` prefix. Two reasons,
         // both load-bearing. A reader of the chain must never mistake an
