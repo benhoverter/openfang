@@ -24,6 +24,43 @@ where
         .collect())
 }
 
+/// Context-window policy exposed in the `[context]` config section (ANAI-260).
+///
+/// Fleet-wide, deliberately not per-agent. A per-agent working-set target
+/// would need someone to know that agent's steady-state token curve, which
+/// nobody does; the realistic outcome is dozens of manifests carrying the
+/// default and two hand-fiddled ones drifting out of sync with the code. The
+/// per-agent escape hatch already exists and is coarser on purpose:
+/// `max_history_messages` in a manifest is honoured verbatim.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Fraction of the model's real context window we *want* to sit at.
+    ///
+    /// Sets the compactor's proactive trigger — the lowest rung of the
+    /// ladder — and nothing else. The 0.85 safety valve and 0.92 emergency
+    /// path are pressure ratios and stay pinned.
+    ///
+    /// Ships at `0.70`, identical to the compiled default, so landing this
+    /// changes no behaviour. Lower it on a second bounce (0.40 is the
+    /// interesting sweep point) and watch the `context_pressure` log target
+    /// for compaction frequency and cost.
+    ///
+    /// Must satisfy `0.10 <= working_set_ratio < 0.85`. A value outside that
+    /// range is refused at install time — the compiled default stays live and
+    /// an error is logged — rather than clamped into something the operator
+    /// did not ask for.
+    pub working_set_ratio: f64,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            working_set_ratio: 0.70,
+        }
+    }
+}
+
 /// DM (direct message) policy for a channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1581,6 +1618,10 @@ pub struct KernelConfig {
     /// installed at boot via `crate::turn_context::install`.
     #[serde(default)]
     pub turn_context: TurnContextConfig,
+    /// Context-window policy ([context], ANAI-260). Global, installed at boot
+    /// via `openfang_runtime::compactor::install_working_set_ratio`.
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 /// Per-turn context envelope settings exposed in the `[turn_context]` config
@@ -1982,6 +2023,7 @@ impl Default for KernelConfig {
             async_reply: AsyncReplyConfig::default(),
             skills: HashMap::new(),
             turn_context: TurnContextConfig::default(),
+            context: ContextConfig::default(),
         }
     }
 }
@@ -5399,6 +5441,31 @@ mod tests {
         assert_eq!(c.agent_wake.max_inflight, 16);
         assert_eq!(c.agent_wake.per_caller_max, 6);
         assert_eq!(c.agent_wake.stale_wake_secs, 900);
+    }
+
+    #[test]
+    fn test_context_config_defaults_to_the_compiled_ratio() {
+        // ANAI-260 step 2 ships behaviour-identical: the shipped default must
+        // equal the compactor's compiled trigger, so landing the knob moves
+        // nothing until an operator turns it.
+        let c = KernelConfig::default();
+        assert_eq!(c.context.working_set_ratio, 0.70);
+    }
+
+    #[test]
+    fn test_context_config_absent_section_uses_defaults() {
+        let c: KernelConfig = toml::from_str("").unwrap();
+        assert_eq!(c.context.working_set_ratio, 0.70);
+    }
+
+    #[test]
+    fn test_context_config_from_toml() {
+        let toml_str = r#"
+            [context]
+            working_set_ratio = 0.40
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.context.working_set_ratio, 0.40);
     }
 
     #[test]

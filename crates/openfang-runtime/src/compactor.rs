@@ -16,8 +16,109 @@ use openfang_memory::session::Session;
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
+
+/// Fraction of the context window at which the compactor's token trigger
+/// fires, by default.
+///
+/// ANAI-260: the single source of truth for the lowest rung of the context
+/// ladder. `history_trim` used to carry a private `SMART_PATH_RATIO = 0.70`
+/// whose doc comment said it "mirrors" this value — a mirror, not a
+/// derivation, so moving one moved only one and the pressure logs would then
+/// report the wrong stage as responsible. It now reads this constant.
+///
+/// The ladder, lowest to highest, all measured against the model's real
+/// window: this (compactor, summarises what it removes) <
+/// [`history_trim::TOKEN_TRIM_RATIO`](crate::history_trim::TOKEN_TRIM_RATIO)
+/// (0.85, dumb valve) <
+/// [`context_overflow::RECOVERY_ENTRY_RATIO`](crate::context_overflow::RECOVERY_ENTRY_RATIO)
+/// (0.92, emergency).
+pub const DEFAULT_TOKEN_THRESHOLD_RATIO: f64 = 0.70;
+
+/// Operator-installed working-set ratio, stored as raw `f64` bits.
+///
+/// `0` is the "nothing installed" sentinel: `f64::from_bits(0)` is `0.0`,
+/// which [`install_working_set_ratio`] rejects, so a zero here can only mean
+/// the boot-time install has not run (or was refused).
+static WORKING_SET_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Lowest ratio the operator knob will accept.
+///
+/// Below this the compactor would summarise a session that has barely begun,
+/// paying an LLM call per turn to destroy context nobody was short of. The
+/// knob exists to hold the working set *small*, not to hold it *empty*.
+pub const MIN_WORKING_SET_RATIO: f64 = 0.10;
+
+/// Install the operator-configured working-set ratio (`[context]
+/// working_set_ratio`, ANAI-260 step 2).
+///
+/// This is a **policy** dial, not a safety one. It moves only the lowest rung
+/// of the ladder — the point at which the compactor proactively summarises,
+/// because that is where we *want* the working set to sit. The 0.85 valve and
+/// the 0.92 emergency path are pressure ratios: they mark where things break,
+/// and they do not move with a performance preference.
+///
+/// Rejects, rather than clamps, anything that would invert the ladder. A
+/// refused install leaves the compiled default in place and the ladder
+/// self-consistent; a clamp would silently give the operator a number they
+/// did not ask for. Deliberately *not* a boot refusal: an unusable
+/// performance dial should not take the fleet down, and the config layer here
+/// is warnings-only by construction.
+///
+/// Idempotent in effect but not first-write-wins — the last successful
+/// install is the live value, so a config hot-reload can move it.
+pub fn install_working_set_ratio(ratio: f64) -> Result<(), String> {
+    validate_working_set_ratio(ratio)?;
+    WORKING_SET_RATIO_BITS.store(ratio.to_bits(), Ordering::Relaxed);
+    Ok(())
+}
+
+/// The ladder rules [`install_working_set_ratio`] enforces, as a pure
+/// function.
+///
+/// Split out so the rules are testable without touching the process-global —
+/// a test that installed a value would leak it into every other test in the
+/// binary, since the store is deliberately not first-write-wins.
+pub fn validate_working_set_ratio(ratio: f64) -> Result<(), String> {
+    if !ratio.is_finite() {
+        return Err(format!(
+            "working_set_ratio must be a finite number, got {ratio}"
+        ));
+    }
+    if ratio < MIN_WORKING_SET_RATIO {
+        return Err(format!(
+            "working_set_ratio {ratio} is below the {MIN_WORKING_SET_RATIO} floor; \
+             the compactor would fire on near-empty sessions"
+        ));
+    }
+    if ratio >= crate::history_trim::TOKEN_TRIM_RATIO {
+        return Err(format!(
+            "working_set_ratio {ratio} would invert the context ladder: it must stay \
+             below the {} safety valve (and therefore below the {} emergency path)",
+            crate::history_trim::TOKEN_TRIM_RATIO,
+            crate::context_overflow::RECOVERY_ENTRY_RATIO
+        ));
+    }
+    Ok(())
+}
+
+/// The live working-set ratio: the operator's value if one was successfully
+/// installed, else [`DEFAULT_TOKEN_THRESHOLD_RATIO`].
+///
+/// Every consumer of the lowest ladder rung must read *this*, not the
+/// constant — that is the whole point of ANAI-260 step 1. A caller that reads
+/// the constant directly re-creates the mirror the de-duplication removed,
+/// except now the drift is operator-triggered instead of merely possible.
+pub fn working_set_ratio() -> f64 {
+    let bits = WORKING_SET_RATIO_BITS.load(Ordering::Relaxed);
+    if bits == 0 {
+        DEFAULT_TOKEN_THRESHOLD_RATIO
+    } else {
+        f64::from_bits(bits)
+    }
+}
 
 /// Configuration for session compaction.
 #[derive(Debug, Clone)]
@@ -67,7 +168,7 @@ impl Default for CompactionConfig {
             summarization_overhead_tokens: 4096,
             max_chunk_chars: 80_000,
             max_retries: 3,
-            token_threshold_ratio: 0.7,
+            token_threshold_ratio: working_set_ratio(),
             min_token_ratio: 0.25,
             context_window_tokens: 200_000,
         }
@@ -892,6 +993,48 @@ mod tests {
             context_window_tokens: 0,
             label: None,
         }
+    }
+
+    // ANAI-260 step 2: the operator knob. These exercise the pure validator
+    // only — installing would mutate a process-global that every other test in
+    // this binary reads through `working_set_ratio()`.
+
+    #[test]
+    fn working_set_ratio_accepts_the_useful_range() {
+        for r in [0.10, 0.30, 0.40, 0.70, 0.84] {
+            assert!(
+                validate_working_set_ratio(r).is_ok(),
+                "{r} should be an acceptable working-set ratio"
+            );
+        }
+    }
+
+    #[test]
+    fn working_set_ratio_refuses_to_invert_the_ladder() {
+        // At or above the safety valve the compactor would stop being the
+        // first responder, and the pressure logs would blame the wrong rung.
+        assert!(validate_working_set_ratio(crate::history_trim::TOKEN_TRIM_RATIO).is_err());
+        assert!(validate_working_set_ratio(0.90).is_err());
+        assert!(validate_working_set_ratio(crate::context_overflow::RECOVERY_ENTRY_RATIO).is_err());
+    }
+
+    #[test]
+    fn working_set_ratio_refuses_degenerate_values() {
+        assert!(validate_working_set_ratio(0.0).is_err());
+        assert!(validate_working_set_ratio(-0.5).is_err());
+        assert!(validate_working_set_ratio(0.01).is_err());
+        assert!(validate_working_set_ratio(f64::NAN).is_err());
+        assert!(validate_working_set_ratio(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn working_set_ratio_defaults_when_nothing_installed() {
+        // No test in this binary installs, so the sentinel path is live.
+        assert_eq!(working_set_ratio(), DEFAULT_TOKEN_THRESHOLD_RATIO);
+        assert_eq!(
+            CompactionConfig::default().token_threshold_ratio,
+            DEFAULT_TOKEN_THRESHOLD_RATIO
+        );
     }
 
     #[test]
