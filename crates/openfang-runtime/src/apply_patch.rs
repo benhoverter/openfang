@@ -188,6 +188,22 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
                         && !body[i].trim().starts_with("***")
                     {
                         let hl = body[i];
+                        // ANAI-254: a change line that resumes *after* trailing
+                        // context begins a new hunk. Folding it into the current
+                        // hunk merged two non-adjacent regions into one anchor
+                        // (context_before + all old_lines) that can never match
+                        // the file, so every multi-region hunk failed.
+                        if past_change && (hl.starts_with('-') || hl.starts_with('+')) {
+                            let carry = std::mem::take(&mut context_after);
+                            hunks.push(Hunk {
+                                context_before: std::mem::take(&mut context_before),
+                                old_lines: std::mem::take(&mut old_lines),
+                                new_lines: std::mem::take(&mut new_lines),
+                                context_after: carry.clone(),
+                            });
+                            context_before = carry;
+                            past_change = false;
+                        }
                         if let Some(stripped) = hl.strip_prefix('-') {
                             in_change = true;
                             past_change = false;
@@ -392,6 +408,21 @@ pub async fn apply_patch(
                 // Apply hunks sequentially
                 match apply_hunks(&original, hunks) {
                     Ok(patched) => {
+                        // ANAI-254: the counter must derive from a confirmed
+                        // *change*, not merely from a successful write. A patch
+                        // whose hunks resolved to byte-identical content used to
+                        // report "1 updated" for a file that never changed, and
+                        // any verification run downstream then certified source
+                        // that was never edited.
+                        if move_to.is_none() && patched == original {
+                            result.errors.push(format!(
+                                "{}: hunks applied cleanly but produced no change — \
+                                 the file already matches the patched content. \
+                                 Nothing was written.",
+                                path
+                            ));
+                            continue;
+                        }
                         // Determine target path (move or in-place)
                         let target = if let Some(new_path) = move_to {
                             match resolve_patch_path(new_path, workspace_root, file_policy) {
@@ -511,9 +542,38 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
             .map(|s| s.as_str())
             .collect();
 
-        if anchor.is_empty() && hunk.old_lines.is_empty() {
-            // Pure insertion hunk — append new lines at end
-            lines.extend(hunk.new_lines.iter().cloned());
+        // ANAI-254: a hunk carrying neither `-` nor `+` lines changes nothing.
+        // It used to "apply" cleanly, rewrite the file with identical bytes and
+        // still count as `1 updated` — a success report for work that never
+        // happened. Refuse loudly instead.
+        if hunk.old_lines.is_empty() && hunk.new_lines.is_empty() {
+            return Err(format!(
+                "Hunk {} is context-only: it has no '-' or '+' lines, so there is \
+                 nothing to apply. A hunk must state at least one removal or addition.",
+                hunk_idx + 1
+            ));
+        }
+
+        if anchor.is_empty() {
+            // Pure insertion with no leading anchor. ANAI-254: this used to
+            // append at end-of-file unconditionally, silently landing the
+            // insertion nowhere near where the patch said it went. Prefer the
+            // trailing context as the anchor and insert *before* it; only fall
+            // back to appending when the hunk supplied no anchor at all.
+            let after: Vec<&str> = hunk.context_after.iter().map(|s| s.as_str()).collect();
+            if after.is_empty() {
+                lines.extend(hunk.new_lines.iter().cloned());
+                continue;
+            }
+            let pos = find_anchor(&lines, &after)
+                .or_else(|| find_anchor_fuzzy(&lines, &after))
+                .ok_or_else(|| {
+                    format!(
+                        "Hunk {} failed: could not find the trailing context lines in file",
+                        hunk_idx + 1
+                    )
+                })?;
+            lines.splice(pos..pos, hunk.new_lines.iter().cloned());
             continue;
         }
 
@@ -935,5 +995,115 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    // ---- ANAI-254: silent no-op writes ----
+
+    fn hunk(before: &[&str], old: &[&str], new: &[&str], after: &[&str]) -> Hunk {
+        Hunk {
+            context_before: before.iter().map(|s| s.to_string()).collect(),
+            old_lines: old.iter().map(|s| s.to_string()).collect(),
+            new_lines: new.iter().map(|s| s.to_string()).collect(),
+            context_after: after.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_context_only_hunk_is_refused_rather_than_silently_applied() {
+        // Previously this rewrote the file with identical bytes and reported
+        // success. The whole point of the fix: refusing loudly is fine, lying
+        // is not.
+        let err = apply_hunks(
+            "alpha\nbravo\n",
+            &[hunk(&["alpha", "bravo"], &[], &[], &[])],
+        )
+        .expect_err("a hunk with no '-' or '+' lines must be an error");
+        assert!(
+            err.contains("context-only"),
+            "the error must name the cause, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_patch_that_changes_nothing_is_not_counted_as_updated() {
+        let dir = std::env::temp_dir().join(format!("of_patch_noop_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("f.txt"), "alpha\nbravo\n")
+            .await
+            .unwrap();
+
+        // Hunks that resolve to exactly the existing content.
+        let ops = vec![PatchOp::UpdateFile {
+            path: "f.txt".to_string(),
+            move_to: None,
+            hunks: vec![hunk(&["alpha"], &["bravo"], &["bravo"], &[])],
+        }];
+        let result = apply_patch(&ops, &dir, None, None).await;
+
+        assert_eq!(
+            result.files_updated, 0,
+            "the counter must derive from a confirmed change, not from a successful write"
+        );
+        assert!(
+            !result.is_ok(),
+            "a no-op patch must surface an error, not report success"
+        );
+        assert!(
+            result.summary().contains("error"),
+            "the summary the agent reads must not say 'updated', got: {}",
+            result.summary()
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn a_pure_insertion_lands_before_its_trailing_context_not_at_eof() {
+        let out = apply_hunks(
+            "alpha\nbravo\ncharlie\n",
+            &[hunk(&[], &[], &["INSERTED"], &["charlie"])],
+        )
+        .unwrap();
+        assert_eq!(out, "alpha\nbravo\nINSERTED\ncharlie\n");
+    }
+
+    #[test]
+    fn a_pure_insertion_with_no_anchor_at_all_still_appends() {
+        // Back-compat: with neither leading nor trailing context there is
+        // nothing to anchor on, so end-of-file remains the only answer.
+        let out = apply_hunks("alpha\nbravo\n", &[hunk(&[], &[], &["TAIL"], &[])]).unwrap();
+        assert_eq!(out, "alpha\nbravo\nTAIL\n");
+    }
+
+    #[test]
+    fn a_hunk_with_two_change_regions_splits_and_both_apply() {
+        let ops = parse_patch(
+            "*** Begin Patch\n\
+             *** Update File: f.txt\n\
+             @@\n\
+             \x20alpha\n\
+             -bravo\n\
+             +BRAVO\n\
+             \x20charlie\n\
+             -delta\n\
+             +DELTA\n\
+             *** End Patch\n",
+        )
+        .expect("a two-region hunk must parse");
+
+        let hunks = match &ops[0] {
+            PatchOp::UpdateFile { hunks, .. } => hunks,
+            other => panic!("expected an update op, got {other:?}"),
+        };
+        assert_eq!(
+            hunks.len(),
+            2,
+            "a change resuming after trailing context starts a new hunk"
+        );
+
+        let out = apply_hunks("alpha\nbravo\ncharlie\ndelta\n", hunks)
+            .expect("both regions must anchor against the file");
+        assert_eq!(out, "alpha\nBRAVO\ncharlie\nDELTA\n");
     }
 }
