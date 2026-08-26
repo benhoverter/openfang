@@ -98,18 +98,17 @@ use tracing::{debug, info};
 /// `context_pressure=off` to mute it.
 pub const TARGET: &str = "context_pressure";
 
-/// Ratio of the context window at which the compactor's token trigger fires.
-/// Mirrors `CompactionConfig::token_threshold_ratio`.
+/// ANAI-260: the compactor's trigger ratio is no longer mirrored here. This
+/// module reads
+/// [`compactor::DEFAULT_TOKEN_THRESHOLD_RATIO`](crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO)
+/// directly, so the two cannot drift.
 ///
-/// ANAI-244: the overflow pipeline's first stage used to fire here too, which
-/// is why it preempted everything. It now enters at
-/// `context_overflow::RECOVERY_ENTRY_RATIO` (0.92).
-const SMART_PATH_RATIO: f64 = 0.70;
-
 /// ANAI-242. Fraction of the context window at which the token-aware valve
 /// fires.
 ///
-/// Deliberately **above** [`SMART_PATH_RATIO`]: the compactor should get the
+/// Deliberately **above**
+/// [`compactor::DEFAULT_TOKEN_THRESHOLD_RATIO`](crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO):
+/// the compactor should get the
 /// first attempt at relieving pressure, because it summarises what it
 /// removes and this does not. Deliberately **below**
 /// `context_overflow::RECOVERY_ENTRY_RATIO` (0.92), so the valve is still a
@@ -233,11 +232,16 @@ pub struct PressureObservation {
     /// Was a canonical-context message injected at index 0 this turn?
     pub canonical_context_present: bool,
     /// Would the compactor's token trigger have fired on this prompt
-    /// (70% of the window)?
+    /// (`compactor::DEFAULT_TOKEN_THRESHOLD_RATIO` of the window)?
     pub over_compactor_token_threshold: bool,
-    /// Would the overflow recovery pipeline's first stage have fired
-    /// (also 70%)? Same threshold today; kept distinct because ANAI-244 may
-    /// move one and not the other.
+    /// Would the overflow recovery pipeline have fired
+    /// (`context_overflow::RECOVERY_ENTRY_RATIO` of the window)?
+    ///
+    /// ANAI-260: this used to be assigned the *compactor's* threshold result,
+    /// a leftover from before ANAI-244 moved overflow entry up to 0.92. The
+    /// two fields reported the same bit, so the logs could not distinguish
+    /// "the compactor should have handled this" from "the emergency path
+    /// should have".
     pub over_overflow_threshold: bool,
     /// What the valve decided to do about all of the above.
     pub plan: TrimPlan,
@@ -303,8 +307,12 @@ pub fn observe(
         0
     };
 
-    let smart_threshold = (context_window as f64 * SMART_PATH_RATIO) as usize;
-    let over_threshold = estimated_tokens > smart_threshold;
+    let compactor_threshold =
+        (context_window as f64 * crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO) as usize;
+    let over_compactor = estimated_tokens > compactor_threshold;
+    let overflow_threshold =
+        (context_window as f64 * crate::context_overflow::RECOVERY_ENTRY_RATIO) as usize;
+    let over_overflow = estimated_tokens > overflow_threshold;
 
     let plan = plan_trim(
         messages,
@@ -322,8 +330,8 @@ pub fn observe(
         window_used_pct,
         explicit_cap,
         canonical_context_present,
-        over_compactor_token_threshold: over_threshold,
-        over_overflow_threshold: over_threshold,
+        over_compactor_token_threshold: over_compactor,
+        over_overflow_threshold: over_overflow,
         plan,
     }
 }
@@ -675,12 +683,38 @@ mod tests {
     /// the careful path gets first refusal.
     #[test]
     fn valve_trigger_sits_above_the_compactor_trigger() {
-        const _: () = assert!(TOKEN_TRIM_RATIO > SMART_PATH_RATIO);
+        const _: () = assert!(TOKEN_TRIM_RATIO > crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO);
         const _: () = assert!(TOKEN_RELEASE_RATIO < TOKEN_TRIM_RATIO);
         // 75% of the window: over the compactor's 70%, under the valve's 85%.
         let obs = observe(&msgs(30, 20_000), 30, "sys", &[], 200_000, None, false);
         assert!(obs.over_compactor_token_threshold);
         assert!(!obs.trimmed());
+    }
+
+    /// ANAI-260. The de-duplication itself, asserted: the ratio this module
+    /// measures the smart path against is the one the compactor actually
+    /// uses. A future `working_set_ratio` knob moves both or neither.
+    #[test]
+    fn smart_path_ratio_is_the_compactors_own_ratio() {
+        let config = crate::compactor::CompactionConfig::default();
+        assert!(
+            (config.token_threshold_ratio - crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO).abs()
+                < f64::EPSILON
+        );
+    }
+
+    /// ANAI-260. The overflow bit is the *overflow* bit. At 75% of the window
+    /// the compactor should have acted and the emergency path should not
+    /// have; before the fix both flags read true.
+    #[test]
+    fn overflow_flag_tracks_the_overflow_entry_ratio() {
+        let obs = observe(&msgs(30, 20_000), 30, "sys", &[], 200_000, None, false);
+        assert!(obs.over_compactor_token_threshold);
+        assert!(!obs.over_overflow_threshold);
+        // ...and above 0.92 both are true.
+        let hot = observe(&msgs(40, 20_000), 40, "sys", &[], 200_000, None, false);
+        assert!(hot.over_compactor_token_threshold);
+        assert!(hot.over_overflow_threshold);
     }
 
     /// A small-window model reaches its thresholds at a prompt a 200k model

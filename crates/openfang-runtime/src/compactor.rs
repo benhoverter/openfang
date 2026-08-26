@@ -19,6 +19,23 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Fraction of the context window at which the compactor's token trigger
+/// fires, by default.
+///
+/// ANAI-260: the single source of truth for the lowest rung of the context
+/// ladder. `history_trim` used to carry a private `SMART_PATH_RATIO = 0.70`
+/// whose doc comment said it "mirrors" this value — a mirror, not a
+/// derivation, so moving one moved only one and the pressure logs would then
+/// report the wrong stage as responsible. It now reads this constant.
+///
+/// The ladder, lowest to highest, all measured against the model's real
+/// window: this (compactor, summarises what it removes) <
+/// [`history_trim::TOKEN_TRIM_RATIO`](crate::history_trim::TOKEN_TRIM_RATIO)
+/// (0.85, dumb valve) <
+/// [`context_overflow::RECOVERY_ENTRY_RATIO`](crate::context_overflow::RECOVERY_ENTRY_RATIO)
+/// (0.92, emergency).
+pub const DEFAULT_TOKEN_THRESHOLD_RATIO: f64 = 0.70;
+
 /// Configuration for session compaction.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -67,7 +84,7 @@ impl Default for CompactionConfig {
             summarization_overhead_tokens: 4096,
             max_chunk_chars: 80_000,
             max_retries: 3,
-            token_threshold_ratio: 0.7,
+            token_threshold_ratio: DEFAULT_TOKEN_THRESHOLD_RATIO,
             min_token_ratio: 0.25,
             context_window_tokens: 200_000,
         }
