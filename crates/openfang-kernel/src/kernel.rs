@@ -41,7 +41,7 @@ use openfang_types::turn::{TurnPolicy, TurnTrigger};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Built-in tools that are **always surfaced to the LLM**, even for agents that
 /// declare an explicit `capabilities.tools` list which does not name them.
@@ -5588,6 +5588,26 @@ impl OpenFangKernel {
         // config, ANAI-128) so the runtime envelope resolver picks them up.
         // Idempotent: first call at boot wins. `TurnContextConfig` is `Copy`.
         openfang_types::turn_context::install(self.config.turn_context);
+
+        // Install the operator-configured working-set ratio ([context]
+        // working_set_ratio, ANAI-260). Policy dial, not a safety one: it moves
+        // the compactor's proactive trigger only. A refused value leaves the
+        // compiled 0.70 default live and the ladder self-consistent — we log it
+        // loudly rather than failing the boot, because an unusable performance
+        // preference should not take the fleet down.
+        match openfang_runtime::compactor::install_working_set_ratio(
+            self.config.context.working_set_ratio,
+        ) {
+            Ok(()) => info!(
+                working_set_ratio = self.config.context.working_set_ratio,
+                "Context working-set ratio installed"
+            ),
+            Err(e) => error!(
+                configured = self.config.context.working_set_ratio,
+                fallback = openfang_runtime::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO,
+                "Refusing [context] working_set_ratio, keeping the compiled default: {e}"
+            ),
+        }
 
         // Install operator-configured agent-wake limits ([agent_wake] config,
         // ANAI-111) so the producer's rate backstops and the wake-consumer's

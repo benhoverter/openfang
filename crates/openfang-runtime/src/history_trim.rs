@@ -232,7 +232,8 @@ pub struct PressureObservation {
     /// Was a canonical-context message injected at index 0 this turn?
     pub canonical_context_present: bool,
     /// Would the compactor's token trigger have fired on this prompt
-    /// (`compactor::DEFAULT_TOKEN_THRESHOLD_RATIO` of the window)?
+    /// (`compactor::working_set_ratio()` of the window — the operator's
+    /// `[context] working_set_ratio` if installed, else the 0.70 default)?
     pub over_compactor_token_threshold: bool,
     /// Would the overflow recovery pipeline have fired
     /// (`context_overflow::RECOVERY_ENTRY_RATIO` of the window)?
@@ -308,7 +309,7 @@ pub fn observe(
     };
 
     let compactor_threshold =
-        (context_window as f64 * crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO) as usize;
+        (context_window as f64 * crate::compactor::working_set_ratio()) as usize;
     let over_compactor = estimated_tokens > compactor_threshold;
     let overflow_threshold =
         (context_window as f64 * crate::context_overflow::RECOVERY_ENTRY_RATIO) as usize;
@@ -698,7 +699,7 @@ mod tests {
     fn smart_path_ratio_is_the_compactors_own_ratio() {
         let config = crate::compactor::CompactionConfig::default();
         assert!(
-            (config.token_threshold_ratio - crate::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO).abs()
+            (config.token_threshold_ratio - crate::compactor::working_set_ratio()).abs()
                 < f64::EPSILON
         );
     }
