@@ -42,6 +42,15 @@ pub struct CompactionConfig {
     pub max_retries: u32,
     /// Trigger compaction when estimated tokens exceed this fraction of context_window_tokens.
     pub token_threshold_ratio: f64,
+    /// Floor, as a fraction of `context_window_tokens`, below which the
+    /// message-count trigger is ignored.
+    ///
+    /// ANAI-243. Without this the count trigger fires on any session past
+    /// `threshold` messages regardless of size — measured live on 2026-08-25,
+    /// 38 of 44 compactions ran on sessions holding ~1k tokens, i.e. 0.5% of
+    /// the window. Each paid an LLM call to destroy 22 verbatim messages for
+    /// no memory-pressure reason at all.
+    pub min_token_ratio: f64,
     /// Model context window size in tokens.
     pub context_window_tokens: usize,
 }
@@ -59,6 +68,7 @@ impl Default for CompactionConfig {
             max_chunk_chars: 80_000,
             max_retries: 3,
             token_threshold_ratio: 0.7,
+            min_token_ratio: 0.25,
             context_window_tokens: 200_000,
         }
     }
@@ -126,6 +136,47 @@ pub fn estimate_token_count(
 pub fn needs_compaction_by_tokens(estimated_tokens: usize, config: &CompactionConfig) -> bool {
     let threshold = (config.context_window_tokens as f64 * config.token_threshold_ratio) as usize;
     estimated_tokens > threshold
+}
+
+/// Token floor below which the message-count trigger is suppressed.
+pub fn count_trigger_token_floor(config: &CompactionConfig) -> usize {
+    (config.context_window_tokens as f64 * config.min_token_ratio) as usize
+}
+
+/// Why a session is being compacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionReason {
+    /// Estimated tokens crossed `token_threshold_ratio` of the window.
+    Tokens,
+    /// Message count crossed `threshold` *and* the session is past the token floor.
+    Messages,
+}
+
+/// Decide whether a session should be compacted, and why.
+///
+/// ANAI-243. The two triggers operate on different quantities and the count
+/// trigger used to win unconditionally, so the token trigger was decorative:
+/// any session reached 31 messages long before it reached 140k tokens. The
+/// count trigger is now floored by `min_token_ratio`, which makes it what it
+/// was always meant to be — a backstop for pathological message counts, not
+/// the primary path.
+///
+/// Returns `None` when no compaction is warranted.
+pub fn compaction_reason(
+    session: &Session,
+    estimated_tokens: usize,
+    config: &CompactionConfig,
+) -> Option<CompactionReason> {
+    if needs_compaction_by_tokens(estimated_tokens, config) {
+        return Some(CompactionReason::Tokens);
+    }
+    if session.messages.len() > config.threshold
+        && estimated_tokens >= count_trigger_token_floor(config)
+    {
+        return Some(CompactionReason::Messages);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +883,17 @@ mod tests {
     use super::*;
     use openfang_types::message::TokenUsage;
 
+    /// Session of `n` trivially small user messages.
+    fn make_session(n: usize) -> Session {
+        Session {
+            id: openfang_types::agent::SessionId::new(),
+            agent_id: openfang_types::agent::AgentId::new(),
+            messages: (0..n).map(|i| Message::user(format!("msg {i}"))).collect(),
+            context_window_tokens: 0,
+            label: None,
+        }
+    }
+
     #[test]
     fn test_needs_compaction_below_threshold() {
         let session = Session {
@@ -1476,6 +1538,63 @@ mod tests {
         let tokens_without = estimate_token_count(&messages, None, None);
         let tokens_with = estimate_token_count(&messages, None, Some(&tools));
         assert!(tokens_with > tokens_without);
+    }
+
+    /// ANAI-243: the live pathology — 32 messages, ~1k tokens on a 200k
+    /// window. Old behaviour compacted; new behaviour leaves it alone.
+    #[test]
+    fn test_count_trigger_suppressed_below_token_floor() {
+        let session = make_session(32);
+        let config = CompactionConfig::default();
+        assert!(
+            needs_compaction(&session, &config),
+            "count trigger still true"
+        );
+        assert_eq!(compaction_reason(&session, 1_000, &config), None);
+    }
+
+    /// Same message count, but genuinely large: the count trigger applies.
+    #[test]
+    fn test_count_trigger_applies_above_token_floor() {
+        let session = make_session(32);
+        let config = CompactionConfig::default();
+        assert_eq!(
+            compaction_reason(&session, 60_000, &config),
+            Some(CompactionReason::Messages)
+        );
+    }
+
+    /// Token pressure wins regardless of message count — a handful of huge
+    /// messages must still compact.
+    #[test]
+    fn test_token_trigger_independent_of_count() {
+        let session = make_session(3);
+        let config = CompactionConfig::default();
+        assert!(!needs_compaction(&session, &config));
+        assert_eq!(
+            compaction_reason(&session, 150_000, &config),
+            Some(CompactionReason::Tokens)
+        );
+    }
+
+    /// A small window must scale both thresholds down with it.
+    #[test]
+    fn test_thresholds_track_a_small_window() {
+        let session = make_session(32);
+        let config = CompactionConfig {
+            context_window_tokens: 32_000,
+            ..CompactionConfig::default()
+        };
+        assert_eq!(count_trigger_token_floor(&config), 8_000);
+        assert_eq!(compaction_reason(&session, 4_000, &config), None);
+        assert_eq!(
+            compaction_reason(&session, 9_000, &config),
+            Some(CompactionReason::Messages)
+        );
+        assert_eq!(
+            compaction_reason(&session, 25_000, &config),
+            Some(CompactionReason::Tokens)
+        );
     }
 
     #[test]

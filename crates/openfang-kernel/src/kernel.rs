@@ -2671,24 +2671,22 @@ impl OpenFangKernel {
 
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
         let needs_compact = {
-            use openfang_runtime::compactor::{
-                estimate_token_count, needs_compaction as check_compact,
-                needs_compaction_by_tokens, CompactionConfig,
-            };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
+            use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
+            let config = self.compaction_config_for(&entry.manifest.model.model);
             let estimated = estimate_token_count(
                 &session.messages,
                 Some(&entry.manifest.model.system_prompt),
                 None,
             );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
-            if by_tokens && !by_messages {
+            let reason = compaction_reason(&session, estimated, &config);
+            if let Some(r) = reason {
                 info!(
                     agent_id = %agent_id,
                     estimated_tokens = estimated,
                     messages = session.messages.len(),
-                    "Token-based compaction triggered (messages below threshold but tokens above)"
+                    context_window = config.context_window_tokens,
+                    reason = ?r,
+                    "Compaction trigger (streaming pre-loop)"
                 );
             }
             let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
@@ -2707,16 +2705,13 @@ impl OpenFangKernel {
             } else {
                 false
             };
-            by_messages || by_tokens || by_quota
+            reason.is_some() || by_quota
         };
 
         let driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&entry.manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
+        let ctx_window = self.model_context_window(&entry.manifest.model.model);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
@@ -3072,9 +3067,9 @@ impl OpenFangKernel {
                     // trigger compaction in background for the next call.
                     {
                         use openfang_runtime::compactor::{
-                            estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
+                            estimate_token_count, needs_compaction_by_tokens,
                         };
-                        let config = CompactionConfig::default();
+                        let config = kernel_clone.compaction_config_for(&manifest.model.model);
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -3333,26 +3328,22 @@ impl OpenFangKernel {
 
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
         {
-            use openfang_runtime::compactor::{
-                estimate_token_count, needs_compaction as check_compact,
-                needs_compaction_by_tokens, CompactionConfig,
-            };
-            let config = CompactionConfig::default();
-            let by_messages = check_compact(&session, &config);
+            use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
+            let config = self.compaction_config_for(&entry.manifest.model.model);
             let estimated = estimate_token_count(
                 &session.messages,
                 Some(&entry.manifest.model.system_prompt),
                 None,
             );
-            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            let reason = compaction_reason(&session, estimated, &config);
             let by_quota = if let Some(headroom) = self.scheduler.token_headroom(agent_id) {
                 let threshold = (headroom as f64 * 0.8) as u64;
                 estimated as u64 > threshold && session.messages.len() > 4
             } else {
                 false
             };
-            if by_messages || by_tokens || by_quota {
-                info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, "Pre-emptive compaction before LLM call");
+            if reason.is_some() || by_quota {
+                info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, context_window = config.context_window_tokens, reason = ?reason, by_quota, "Pre-emptive compaction before LLM call");
                 match self.compact_agent_session(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
@@ -3616,10 +3607,7 @@ impl OpenFangKernel {
         let driver = self.resolve_driver(&manifest)?;
 
         // Look up model's actual context window from the catalog
-        let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
-            cat.find_model(&manifest.model.model)
-                .map(|m| m.context_window as usize)
-        });
+        let ctx_window = self.model_context_window(&manifest.model.model);
 
         // skill_snapshot was already built above (before tool list and prompt)
         // with bundled + global + workspace skills. Reuse it for the agent loop.
@@ -4356,12 +4344,43 @@ impl OpenFangKernel {
         }
     }
 
+    /// Look up a model's real context window (in tokens) from the catalog.
+    ///
+    /// Returns `None` when the catalog lock is poisoned, the model is unknown,
+    /// or the entry declares a zero window — callers fall back to the
+    /// compactor's default rather than compacting on every turn.
+    fn model_context_window(&self, model: &str) -> Option<usize> {
+        self.model_catalog
+            .read()
+            .ok()
+            .and_then(|cat| cat.find_model(model).map(|m| m.context_window as usize))
+            .filter(|w| *w > 0)
+    }
+
+    /// Build a `CompactionConfig` whose token trigger is measured against the
+    /// model's *real* context window instead of the hardcoded 200k default.
+    ///
+    /// ANAI-243. Every call site used `CompactionConfig::default()`, which
+    /// pins `context_window_tokens: 200_000`, while the catalog lookup sat
+    /// thirty lines below and was never passed in. An agent on a 32k model
+    /// therefore carried a 140k token trigger it could not reach: the token
+    /// path was dead for every model smaller than Claude's.
+    fn compaction_config_for(&self, model: &str) -> openfang_runtime::compactor::CompactionConfig {
+        let mut config = openfang_runtime::compactor::CompactionConfig::default();
+        if let Some(window) = self.model_context_window(model) {
+            config.context_window_tokens = window;
+        }
+        config
+    }
+
     /// Compact an agent's session using LLM-based summarization.
     ///
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
-        use openfang_runtime::compactor::{compact_session, needs_compaction, CompactionConfig};
+        use openfang_runtime::compactor::{
+            compact_session, compaction_reason, count_trigger_token_floor, estimate_token_count,
+        };
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -4379,15 +4398,28 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = CompactionConfig::default();
+        let config = self.compaction_config_for(&entry.manifest.model.model);
 
-        if !needs_compaction(&session, &config) {
+        // ANAI-243: this gate used to be message-count only, so a session that
+        // tripped the *token* trigger upstream was turned away here. The token
+        // path could fire but never actually compact.
+        let estimated = estimate_token_count(
+            &session.messages,
+            Some(&entry.manifest.model.system_prompt),
+            None,
+        );
+        let Some(reason) = compaction_reason(&session, estimated, &config) else {
             return Ok(format!(
-                "No compaction needed ({} messages, threshold {})",
+                "No compaction needed ({} messages / ~{} tokens; count threshold {} above a {} token floor, token threshold {} of a {} window)",
                 session.messages.len(),
-                config.threshold
+                estimated,
+                config.threshold,
+                count_trigger_token_floor(&config),
+                (config.context_window_tokens as f64 * config.token_threshold_ratio) as usize,
+                config.context_window_tokens,
             ));
-        }
+        };
+        info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, reason = ?reason, "Compacting session");
 
         let driver = self.resolve_driver(&entry.manifest)?;
         let model = entry.manifest.model.model.clone();
@@ -4464,18 +4496,23 @@ impl OpenFangKernel {
         let system_prompt = &entry.manifest.model.system_prompt;
         // Use the agent's actual filtered tools instead of all builtins
         let tools = self.available_tools(agent_id);
-        // Use 200K default or the model's known context window
-        let context_window = if session.context_window_tokens > 0 {
-            session.context_window_tokens
-        } else {
-            200_000
-        };
+        // Catalog first (ANAI-243). `sessions.context_window_tokens` is never
+        // written non-zero anywhere in the tree, so the old `> 0` branch always
+        // fell through to the hardcoded 200k and reported window pressure
+        // against a window the agent may not have.
+        let context_window = self
+            .model_context_window(&entry.manifest.model.model)
+            .or_else(|| {
+                (session.context_window_tokens > 0)
+                    .then_some(session.context_window_tokens as usize)
+            })
+            .unwrap_or(200_000);
 
         Ok(generate_context_report(
             &session.messages,
             Some(system_prompt),
             Some(&tools),
-            context_window as usize,
+            context_window,
         ))
     }
 
