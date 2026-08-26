@@ -20,6 +20,7 @@ pub mod ranking;
 pub mod rehydration;
 pub mod semantic;
 pub mod session;
+pub mod staleness;
 pub mod structured;
 pub mod usage;
 pub mod vocabulary;
