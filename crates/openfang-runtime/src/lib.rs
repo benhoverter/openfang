@@ -29,6 +29,9 @@ pub mod docker_sandbox;
 pub mod drivers;
 pub mod embedding;
 pub mod gatekeeper;
+// ANAI-252: offline corpus replay. Test-only; never in the shipped binary.
+#[cfg(test)]
+mod gatekeeper_replay;
 pub mod graceful_shutdown;
 pub mod history_trim;
 pub mod hooks;
