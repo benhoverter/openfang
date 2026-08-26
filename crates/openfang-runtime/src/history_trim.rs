@@ -64,6 +64,31 @@
 
 use openfang_types::message::Message;
 use openfang_types::tool::ToolDefinition;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// ANAI-245 follow-up. Window utilisation at or above which a *quiet* turn —
+/// one where the valve did not fire — is still logged at `info!`.
+///
+/// Instrumentation that only exists at `debug!` is instrumentation that is
+/// not there: the deployed `RUST_LOG` filter is a module-path list, and a
+/// custom target falls through it to the global default. The interesting
+/// baseline — a session climbing toward the compactor's 70% trigger — must
+/// survive an operator filter nobody remembers to update.
+pub const NOTABLE_WINDOW_PCT: u32 = 40;
+
+/// One quiet turn in every `N` below [`NOTABLE_WINDOW_PCT`] is promoted to
+/// `info!`, so a wholly uneventful fleet still leaves a trickle of evidence
+/// that the axis is alive and where idle sessions actually sit.
+///
+/// Sampled rather than unconditional: quiet turns are the overwhelming
+/// majority, and one line per agent per turn at `info!` is log spam.
+pub const QUIET_SAMPLE_EVERY: usize = 20;
+
+/// Counts quiet turns process-wide for [`QUIET_SAMPLE_EVERY`].
+///
+/// Deliberately global rather than per-agent: the point is a bounded trickle
+/// of baseline lines in the daemon log, not a per-agent guarantee.
+static QUIET_TURNS: AtomicUsize = AtomicUsize::new(0);
 use tracing::{debug, info};
 
 /// Tracing target for every line this module emits.
@@ -381,9 +406,16 @@ pub fn plan_trim(
 
 /// Emit the observation.
 ///
-/// `info!` when the valve fires (that is the event under study), `debug!`
-/// otherwise so a quiet turn still leaves a baseline datum for anyone who
-/// turns the level up, without spamming production logs.
+/// Three tiers, chosen so the axis stays legible under the filter that is
+/// actually deployed rather than the one the author had in mind:
+///
+/// - the valve fired — `info!`. The event under study.
+/// - quiet, but utilisation is at or above [`NOTABLE_WINDOW_PCT`] — `info!`.
+///   The approach to the event is what tells us whether 0.85/0.75 are the
+///   right numbers.
+/// - quiet and unremarkable — `debug!`, except one turn in
+///   [`QUIET_SAMPLE_EVERY`], promoted to `info!` so the axis proves it is
+///   alive even on an idle fleet.
 pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
     if obs.trimmed() {
         info!(
@@ -406,6 +438,21 @@ pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
             preempted_smart_paths = obs.preempted_smart_paths(),
             "context pressure: safety valve firing"
         );
+    } else if quiet_turn_is_loud(obs.window_used_pct) {
+        info!(
+            target: TARGET,
+            agent = %agent,
+            streaming,
+            message_count = obs.message_count,
+            session_messages = obs.session_messages,
+            estimated_tokens = obs.estimated_tokens,
+            context_window = obs.context_window,
+            window_used_pct = obs.window_used_pct,
+            explicit_cap = ?obs.explicit_cap,
+            canonical_context_present = obs.canonical_context_present,
+            over_compactor_token_threshold = obs.over_compactor_token_threshold,
+            "context pressure: under cap"
+        );
     } else {
         debug!(
             target: TARGET,
@@ -422,6 +469,19 @@ pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
             "context pressure: under cap"
         );
     }
+}
+
+/// Should this quiet turn be emitted at `info!`?
+///
+/// True when utilisation is notable, or when the process-wide quiet-turn
+/// counter lands on a sample boundary. Advances that counter as a side
+/// effect, so call it exactly once per quiet turn.
+fn quiet_turn_is_loud(window_used_pct: u32) -> bool {
+    if window_used_pct >= NOTABLE_WINDOW_PCT {
+        return true;
+    }
+    let n = QUIET_TURNS.fetch_add(1, Ordering::Relaxed);
+    n.is_multiple_of(QUIET_SAMPLE_EVERY)
 }
 
 #[cfg(test)]
@@ -595,5 +655,28 @@ mod tests {
         assert!(!big.trimmed());
         assert!(small.trimmed());
         assert_eq!(small.plan.reason, TrimReason::TokenPressure);
+    }
+
+    // --- log tiering (ANAI-245 follow-up) ------------------------------
+
+    /// A session climbing toward the compactor's trigger must reach `info!`
+    /// without consuming a sample slot — that is the datum the 0.85/0.75
+    /// numbers will be judged against.
+    #[test]
+    fn notable_utilisation_is_always_loud() {
+        for pct in [NOTABLE_WINDOW_PCT, NOTABLE_WINDOW_PCT + 1, 99, 100] {
+            assert!(quiet_turn_is_loud(pct));
+        }
+    }
+
+    /// Unremarkable quiet turns are sampled, not silent and not spam:
+    /// exactly one in [`QUIET_SAMPLE_EVERY`], whatever the counter's phase.
+    #[test]
+    fn unremarkable_quiet_turns_are_sampled() {
+        let rounds = 3;
+        let loud = (0..QUIET_SAMPLE_EVERY * rounds)
+            .filter(|_| quiet_turn_is_loud(1))
+            .count();
+        assert_eq!(loud, rounds);
     }
 }
