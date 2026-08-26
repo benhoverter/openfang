@@ -3836,19 +3836,20 @@ impl OpenFangKernel {
         }
     }
 
-    /// Reset an agent's session — auto-saves a summary to memory, then clears messages
-    /// and creates a fresh session ID.
+    /// Reset an agent's session (`/new`) — clears messages and creates a fresh
+    /// session ID.
+    ///
+    /// ANAI-249: this used to write a `save_session_summary` "summary" first —
+    /// a string-slice of the last few user messages, stored under a
+    /// `session_{date}_{slug}` key with no model and no embedding, plus a
+    /// stray markdown file in the agent's workspace. It was never recallable
+    /// and only littered the corpus. Session content is already durable as
+    /// `turn` rows, which is what the consolidating summariser actually reads,
+    /// so nothing is lost by not writing it.
     pub fn reset_session(&self, agent_id: AgentId) -> KernelResult<()> {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
-
-        // Auto-save session context to workspace memory before clearing
-        if let Ok(Some(old_session)) = self.memory.get_session(entry.session_id) {
-            if old_session.messages.len() >= 2 {
-                self.save_session_summary(agent_id, &entry, &old_session);
-            }
-        }
 
         // Delete the old session
         let _ = self.memory.delete_session(entry.session_id);
@@ -3867,7 +3868,7 @@ impl OpenFangKernel {
         // Reset quota tracking so /new clears "token quota exceeded"
         self.scheduler.reset_usage(agent_id);
 
-        info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
+        info!(agent_id = %agent_id, "Session reset (fresh session; no summary written)");
         Ok(())
     }
 
@@ -3922,12 +3923,12 @@ impl OpenFangKernel {
     /// Three deliberate differences from [`Self::reset_session`] (`/new`) and
     /// [`Self::clear_agent_history`]:
     ///
-    /// 1. **No `save_session_summary`.** That path (ANAI-249) writes a
-    ///    string-slice of the last few user messages with no model and no
-    ///    embedding, so it is not recallable. An episode close already routes
-    ///    the agent's wrap-up to a note (ANAI-252) and leaves the episode a
-    ///    consolidation candidate; a second, worse summary would only litter
-    ///    the corpus.
+    /// 1. **No auto-summary.** `/new` used to write one via
+    ///    `save_session_summary` — a string-slice of the last few user
+    ///    messages, no model, no embedding, not recallable. Deleted in
+    ///    ANAI-249. An episode close already routes the agent's wrap-up to a
+    ///    note (ANAI-252) and leaves the episode a consolidation candidate; a
+    ///    second, worse summary would only litter the corpus.
     /// 2. **Re-anchor, not delete, the canonical session.** See
     ///    [`openfang_memory::session::SessionStore::reanchor_canonical`]:
     ///    canonical is cross-channel and holds the compacted summary. "That
@@ -4078,79 +4079,6 @@ impl OpenFangKernel {
 
         info!(agent_id = %agent_id, session_id = %session_id.0, "Switched session");
         Ok(())
-    }
-
-    /// Save a summary of the current session to agent memory before reset.
-    fn save_session_summary(
-        &self,
-        agent_id: AgentId,
-        entry: &AgentEntry,
-        session: &openfang_memory::session::Session,
-    ) {
-        use openfang_types::message::{MessageContent, Role};
-
-        // Take last 10 messages (or all if fewer)
-        let recent = &session.messages[session.messages.len().saturating_sub(10)..];
-
-        // Extract key topics from user messages
-        let topics: Vec<&str> = recent
-            .iter()
-            .filter(|m| m.role == Role::User)
-            .filter_map(|m| match &m.content {
-                MessageContent::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        if topics.is_empty() {
-            return;
-        }
-
-        // Generate a slug from first user message (first 6 words, slugified)
-        let slug: String = topics[0]
-            .split_whitespace()
-            .take(6)
-            .collect::<Vec<_>>()
-            .join("-")
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .take(60)
-            .collect();
-
-        let date = chrono::Utc::now().format("%Y-%m-%d");
-        let summary = format!(
-            "Session on {date}: {slug}\n\nKey exchanges:\n{}",
-            topics
-                .iter()
-                .take(5)
-                .enumerate()
-                .map(|(i, t)| {
-                    let truncated = openfang_types::truncate_str(t, 200);
-                    format!("{}. {}", i + 1, truncated)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        // Save to structured memory store (key = "session_{date}_{slug}")
-        let key = format!("session_{date}_{slug}");
-        let _ =
-            self.memory
-                .structured_set(agent_id, &key, serde_json::Value::String(summary.clone()));
-
-        // Also write to workspace memory/ dir if workspace exists
-        if let Some(ref workspace) = entry.manifest.workspace {
-            let mem_dir = workspace.join("memory");
-            let filename = format!("{date}-{slug}.md");
-            let _ = std::fs::write(mem_dir.join(&filename), &summary);
-        }
-
-        debug!(
-            agent_id = %agent_id,
-            key = %key,
-            "Saved session summary to memory before reset"
-        );
     }
 
     /// Persist an agent's manifest to its `agent.toml` on disk so that
@@ -14524,6 +14452,94 @@ system_prompt = "You are a test agent."
         };
         kernel.registry.register(entry).unwrap();
         agent_id
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-249: `/new` no longer writes a fake session summary.
+    // -----------------------------------------------------------------------
+
+    /// `reset_session` used to slice the last few user messages into a
+    /// `session_{date}_{slug}` KV row plus a stray markdown file in the
+    /// agent's workspace — no model, no embedding, not recallable. Both
+    /// writes are gone. The reset itself must still mint a fresh session.
+    #[test]
+    fn test_reset_session_writes_no_summary() {
+        let (tmp, kernel) = sweep_test_kernel("of-249");
+        let ws = tmp.path().join("ws-249");
+        std::fs::create_dir_all(ws.join("memory")).unwrap();
+
+        let agent_id = AgentId::new();
+        let mut manifest = test_manifest("resetter", "anai-249", vec![]);
+        manifest.workspace = Some(ws.clone());
+        kernel
+            .registry
+            .register(AgentEntry {
+                id: agent_id,
+                name: "resetter".to_string(),
+                manifest,
+                state: AgentState::Running,
+                mode: AgentMode::default(),
+                created_at: chrono::Utc::now(),
+                last_active: chrono::Utc::now(),
+                parent: None,
+                children: vec![],
+                session_id: SessionId::new(),
+                tags: vec![],
+                identity: Default::default(),
+                onboarding_completed: false,
+                onboarding_completed_at: None,
+            })
+            .unwrap();
+
+        // A real session with enough messages to trip the old `>= 2` gate —
+        // otherwise this test would pass for the wrong reason.
+        let session = kernel.memory.create_session(agent_id).unwrap();
+        kernel
+            .registry
+            .update_session_id(agent_id, session.id)
+            .unwrap();
+        let mut session = kernel.memory.get_session(session.id).unwrap().unwrap();
+        session
+            .messages
+            .push(openfang_types::message::Message::user(
+                "Sessions must not be summarised here",
+            ));
+        session
+            .messages
+            .push(openfang_types::message::Message::assistant("ack"));
+        kernel.memory.save_session(&session).unwrap();
+
+        kernel.reset_session(agent_id).unwrap();
+
+        // The reset still does its job.
+        let after = kernel.registry.get(agent_id).unwrap().session_id;
+        assert_ne!(after, session.id, "reset must mint a fresh session");
+
+        // No `session_*` row in the corpus.
+        let keys: Vec<String> = kernel
+            .memory
+            .list_kv(agent_id)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with("session_"))
+            .collect();
+        assert!(
+            keys.is_empty(),
+            "reset must not write a session summary row: {keys:?}"
+        );
+
+        // And no stray markdown in the workspace.
+        let stray: Vec<String> = std::fs::read_dir(ws.join("memory"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "reset must not litter the workspace: {stray:?}"
+        );
+
+        kernel.shutdown();
     }
 
     /// The sweep renders the agent's own KV facts into the managed block and
