@@ -189,6 +189,20 @@ pub trait KernelHandle: Send + Sync {
         prime_for: Option<&str>,
     ) -> Result<(), String>;
 
+    /// ANAI-248: does this agent have a question outstanding to the operator?
+    ///
+    /// Today that means a pending approval request — the agent asked for
+    /// permission and is waiting on a human. It is the one machine-readable
+    /// form of "I am mid-task and blocked on someone else" we have, and it is
+    /// exactly the state in which clearing the window is destructive: the
+    /// answer arrives into an agent that no longer remembers the question.
+    ///
+    /// Defaults to `false` so alternate handles and test doubles are
+    /// unaffected; the kernel overrides it.
+    fn has_pending_operator_question(&self, _caller_agent_id: Option<&str>) -> bool {
+        false
+    }
+
     /// ANAI-194: the CALLER's memory status — open episode, turns captured
     /// into it, and the idle countdown.
     ///

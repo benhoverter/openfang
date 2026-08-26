@@ -10888,6 +10888,29 @@ impl KernelHandle for OpenFangKernel {
         Ok(())
     }
 
+    // ANAI-248: the structural half of the self-amputation guard.
+    //
+    // `ApprovalRequest::agent_id` is whatever string the tool runner passed to
+    // `request_approval` — in practice the same `caller_agent_id` spelling the
+    // close tool sees. We match on the raw spelling AND on the resolved UUID
+    // and name, because a guard that fails to recognise its own agent fails
+    // OPEN, and failing open here means amputating a blocked agent.
+    fn has_pending_operator_question(&self, caller_agent_id: Option<&str>) -> bool {
+        let pending = self.approval_manager.list_pending();
+        if pending.is_empty() {
+            return false;
+        }
+        let raw = caller_agent_id.map(str::to_string);
+        let resolved = resolve_memory_caller(&self.registry, caller_agent_id).ok();
+        let uuid = resolved.map(|a| a.to_string());
+        let name = resolved.and_then(|a| self.registry.get(a)).map(|e| e.name);
+        pending.iter().any(|r| {
+            Some(&r.agent_id) == raw.as_ref()
+                || Some(&r.agent_id) == uuid.as_ref()
+                || Some(&r.agent_id) == name.as_ref()
+        })
+    }
+
     fn memory_status(&self, caller_agent_id: Option<&str>) -> Result<serde_json::Value, String> {
         let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
         let status = self
@@ -14452,6 +14475,85 @@ system_prompt = "You are a test agent."
         };
         kernel.registry.register(entry).unwrap();
         agent_id
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-248: self-amputation guard — the kernel half.
+    // -----------------------------------------------------------------------
+
+    /// The guard is only worth having if the kernel recognises its own agent.
+    /// It fails OPEN by construction (no match ⇒ `false` ⇒ the reset goes
+    /// through), so a spelling mismatch between the approval queue and the
+    /// close tool would silently disarm it — invisible in a diff, invisible
+    /// in production. Hence a live pending request rather than a stub.
+    #[tokio::test]
+    async fn pending_approval_is_visible_as_an_outstanding_operator_question() {
+        use openfang_runtime::kernel_handle::KernelHandle;
+        use openfang_types::approval::{ApprovalRequest, RiskLevel};
+
+        let (tmp, kernel) = sweep_test_kernel("of-248");
+        let ws = tmp.path().join("ws-248");
+        let agent = register_agent_with_state_dir(&kernel, "asker", &ws);
+        let other = register_agent_with_state_dir(&kernel, "bystander", &tmp.path().join("ws-b"));
+
+        assert!(
+            !kernel.has_pending_operator_question(Some("asker")),
+            "nothing is outstanding yet"
+        );
+
+        let kernel = std::sync::Arc::new(kernel);
+        let k = std::sync::Arc::clone(&kernel);
+        let asked = agent.to_string();
+        let pending = tokio::spawn(async move {
+            k.approval_manager
+                .request_approval(ApprovalRequest {
+                    id: uuid::Uuid::new_v4(),
+                    agent_id: asked,
+                    tool_name: "shell_exec".to_string(),
+                    description: "test".to_string(),
+                    action_summary: "rm -rf /".to_string(),
+                    risk_level: RiskLevel::High,
+                    requested_at: chrono::Utc::now(),
+                    timeout_secs: 30,
+                    origin: None,
+                    cache_binary: None,
+                    command: None,
+                    gatekeeper_note: None,
+                })
+                .await
+        });
+
+        // The request is queued from another task; wait for it to land rather
+        // than sleeping a fixed amount and hoping.
+        for _ in 0..200 {
+            if kernel.approval_manager.pending_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(kernel.approval_manager.pending_count(), 1, "request queued");
+
+        // Both spellings the close tool can arrive with.
+        assert!(kernel.has_pending_operator_question(Some("asker")));
+        assert!(kernel.has_pending_operator_question(Some(&agent.to_string())));
+
+        // And it is scoped: one agent's outstanding question must not freeze
+        // another agent's rollover.
+        assert!(
+            !kernel.has_pending_operator_question(Some("bystander")),
+            "the guard must not leak across agents"
+        );
+        let _ = other;
+
+        // Await the abort before reclaiming the kernel: `abort()` only
+        // requests cancellation, so the task's Arc clone is still alive until
+        // it actually stops.
+        pending.abort();
+        let _ = pending.await;
+        std::sync::Arc::try_unwrap(kernel)
+            .ok()
+            .expect("sole owner once the asking task is gone")
+            .shutdown();
     }
 
     // -----------------------------------------------------------------------

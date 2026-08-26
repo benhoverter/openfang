@@ -1377,14 +1377,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // there skews indices silently.
         ToolDefinition {
             name: "memory_episode_close".to_string(),
-            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.".to_string(),
+            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is FINISHED, before you move to something unrelated: a ticket landed, a question answered, a decision made. Never mid-task, never while something is unverified or a question to the operator is outstanding. When you are unsure whether the work is done, do not close - a missed close costs nothing and the idle timeout closes it for you, whereas a close mid-task throws away detail you still need. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
                     "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
-                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need." },
+                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need. If you are weighing it up, the answer is no. Refused outright while you have an approval request outstanding to the operator." },
                     "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang-fork\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Omitting it clears any previous priming." }
                 },
                 "required": ["title"]
@@ -4143,6 +4143,28 @@ async fn tool_memory_episode_close(
         ));
     }
     let reset_context = input["reset_context"].as_bool().unwrap_or(false);
+
+    // ANAI-248: the self-amputation guard, in code rather than prose.
+    //
+    // Prompt language telling an agent "never close mid-task" is a
+    // probabilistic mitigation of a failure that is silent when it happens.
+    // A pending approval is the one machine-readable "I am blocked on a
+    // human" we have: the agent asked, the operator has not answered, and
+    // clearing the window now means the answer lands in an agent that no
+    // longer remembers the question.
+    //
+    // Scoped to `reset_context` deliberately. A close *without* a reset is
+    // bookkeeping — it labels a boundary and costs nothing — and refusing it
+    // would be the tool overriding the agent's judgment on a harmless call.
+    // The reset is the destructive half, so the reset is what is guarded.
+    if reset_context && kh.has_pending_operator_question(caller_agent_id) {
+        return Err(
+            "You have an approval request outstanding to the operator, so this is mid-task: \
+             clearing your window now would drop the context the answer belongs to. Nothing \
+             was closed. Wait for the answer, finish the work, then close."
+                .to_string(),
+        );
+    }
 
     // ANAI-247. Validated here, at the edge, rather than swallowed downstream:
     // a mistyped slug would otherwise prime the next episode for a project
@@ -7945,6 +7967,9 @@ mod tests {
         #[allow(clippy::type_complexity)]
         context_resets: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
         context_reset_fails: std::sync::atomic::AtomicBool,
+        // ANAI-248: pretend the operator has been asked something and has not
+        // answered yet.
+        pending_operator_question: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -7983,6 +8008,7 @@ mod tests {
                 agent_tools: std::sync::Mutex::new(std::collections::HashMap::new()),
                 context_resets: std::sync::Mutex::new(Vec::new()),
                 context_reset_fails: std::sync::atomic::AtomicBool::new(false),
+                pending_operator_question: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -8275,6 +8301,78 @@ mod tests {
         );
     }
 
+    // --- ANAI-248: self-amputation guard -----------------------------------
+
+    /// The whole point: an agent blocked on an operator answer must not be
+    /// able to clear the window that answer belongs to. Refused BEFORE the
+    /// wrap-up note and before the close, so nothing partial survives.
+    #[tokio::test]
+    async fn a_pending_operator_question_refuses_the_reset() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        fake.pending_operator_question
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let err = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "done",
+                "summary": "wrap",
+                "reset_context": true
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("Nothing was closed"), "{err}");
+        assert!(
+            fake.episode_closes.lock().unwrap().is_empty(),
+            "the close must not have happened"
+        );
+        assert!(
+            fake.notes.lock().unwrap().is_empty(),
+            "the wrap-up note must not have been written either — a refusal \
+             that still writes is a half-close"
+        );
+        assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    /// The guard is scoped to the destructive half. A close without a reset
+    /// is bookkeeping — labelling a boundary costs nothing — and refusing it
+    /// would be the tool overriding the agent on a harmless call.
+    #[tokio::test]
+    async fn a_pending_operator_question_still_allows_a_plain_close() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        fake.pending_operator_question
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "done"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("ep-1"), "{out}");
+        assert_eq!(fake.episode_closes.lock().unwrap().len(), 1);
+    }
+
+    /// Negative control: with nothing outstanding the reset goes through, so
+    /// the test above cannot pass for the wrong reason.
+    #[tokio::test]
+    async fn no_pending_question_leaves_the_reset_alone() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_memory_episode_close(
+            &serde_json::json!({"title": "done", "reset_context": true}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.context_resets.lock().unwrap().len(), 1);
+    }
+
     // --- ANAI-247: prime_for -----------------------------------------------
 
     /// The slug must reach the kernel, and the agent must be told what its
@@ -8360,6 +8458,47 @@ mod tests {
         .await
         .expect("a blank slug is an omission, not a refusal");
         assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    /// ANAI-248: the tool description IS the fleet's prompt language for this
+    /// decision — it ships in the binary, reaches every agent that has the
+    /// tool, and needs no manifest edit. Its three load-bearing claims are
+    /// pinned here so a later tidy-up cannot quietly delete the bias against
+    /// firing: close on COMPLETION, never mid-task, and when unsure DON'T.
+    #[test]
+    fn the_close_tool_teaches_the_boundary_discipline() {
+        let def = builtin_tool_definitions()
+            .into_iter()
+            .find(|d| d.name == "memory_episode_close")
+            .expect("the tool exists");
+
+        assert!(
+            def.description.contains("FINISHED"),
+            "fires on completion, not on drift: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("Never mid-task"),
+            "the prohibition has to be explicit: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("do not close") && def.description.contains("idle timeout"),
+            "the tie-break is DON'T, and the timeout is why that is safe: {}",
+            def.description
+        );
+
+        let reset = def.input_schema["properties"]["reset_context"]["description"]
+            .as_str()
+            .expect("reset_context is documented");
+        assert!(
+            reset.contains("the answer is no"),
+            "the destructive parameter carries the tie-break too: {reset}"
+        );
+        assert!(
+            reset.contains("Refused"),
+            "the agent is told the guard exists rather than discovering it: {reset}"
+        );
     }
 
     /// The agent cannot see the episodes table, so asking twice is reasonable.
@@ -9078,6 +9217,10 @@ mod tests {
                 prime_for.map(|p| p.to_string()),
             ));
             Ok(())
+        }
+        fn has_pending_operator_question(&self, _caller: Option<&str>) -> bool {
+            self.pending_operator_question
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
         fn memory_status(&self, _caller: Option<&str>) -> Result<serde_json::Value, String> {
             Ok(self.status.lock().unwrap().clone())
