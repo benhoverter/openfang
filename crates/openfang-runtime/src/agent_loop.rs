@@ -776,36 +776,36 @@ pub async fn run_agent_loop(
     // EndTurn iteration has empty text).
     let mut accumulated_text = String::new();
 
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    // The full compaction system handles sophisticated summarization, but this prevents
-    // the catastrophic case where 200+ messages cause instant context overflow.
-    // Per-agent cap: manifest override -> runtime default (issue #871).
-    let max_history = manifest.effective_max_history_messages();
-    // ANAI-245: log-only measurement of what the valve is about to do, taken
-    // BEFORE the trim so the pre-cut prompt size is what gets recorded.
-    crate::history_trim::log(
-        &manifest.name,
-        &crate::history_trim::observe(
-            &messages,
-            session.messages.len(),
-            &system_prompt,
-            available_tools,
-            context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
-            max_history,
-            canonical_context_present,
-        ),
-        false,
+    // Safety valve (issue #871, rebuilt by ANAI-242): the last line of defence
+    // against context overflow, deliberately behind the compactor rather than
+    // in front of it. An explicit manifest cap is honoured as a message count;
+    // otherwise this fires on real token pressure (85% of the model's actual
+    // window) or on a runaway-loop message ceiling, and never destroys the
+    // canonical-context message at index 0. See `history_trim` for why the old
+    // unconditional cap of 20 was worse than no valve at all.
+    // ANAI-245: measure BEFORE the trim, so the pre-cut prompt size is what
+    // gets recorded. ANAI-242: the same call decides the trim.
+    let pressure = crate::history_trim::observe(
+        &messages,
+        session.messages.len(),
+        &system_prompt,
+        available_tools,
+        context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        manifest.explicit_max_history_messages(),
+        canonical_context_present,
     );
-    if messages.len() > max_history {
-        let trim_count = messages.len() - max_history;
+    crate::history_trim::log(&manifest.name, &pressure, false);
+    if pressure.plan.fires() {
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
-            trimming = trim_count,
-            max_history = max_history,
+            trimming = pressure.plan.drain_count,
+            reason = pressure.plan.reason.as_str(),
+            estimated_tokens = pressure.estimated_tokens,
+            window_used_pct = pressure.window_used_pct,
             "Trimming old messages to prevent context overflow"
         );
-        messages.drain(..trim_count);
+        pressure.plan.apply(&mut messages);
         // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
@@ -2492,34 +2492,33 @@ pub async fn run_agent_loop_streaming(
     let final_response;
     let mut accumulated_text = String::new();
 
-    // Safety valve: trim excessively long message histories to prevent context overflow.
-    // Per-agent cap: manifest override -> runtime default (issue #871).
-    let max_history = manifest.effective_max_history_messages();
-    // ANAI-245: same measurement on the streaming path — the live channel
-    // path, so this is where most of the field data will come from.
-    crate::history_trim::log(
-        &manifest.name,
-        &crate::history_trim::observe(
-            &messages,
-            session.messages.len(),
-            &system_prompt,
-            available_tools,
-            context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
-            max_history,
-            canonical_context_present,
-        ),
-        true,
+    // Safety valve (issue #871, rebuilt by ANAI-242) — see the non-streaming
+    // loop above for the policy. Same call, same decision, same guarantees.
+    // ANAI-245/242: same measurement and the same policy on the streaming
+    // path — the live channel path, and where most field data comes from.
+    // ANAI-128 landed a fix in one loop and not the other once already; the
+    // two move together here.
+    let pressure = crate::history_trim::observe(
+        &messages,
+        session.messages.len(),
+        &system_prompt,
+        available_tools,
+        context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+        manifest.explicit_max_history_messages(),
+        canonical_context_present,
     );
-    if messages.len() > max_history {
-        let trim_count = messages.len() - max_history;
+    crate::history_trim::log(&manifest.name, &pressure, true);
+    if pressure.plan.fires() {
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
-            trimming = trim_count,
-            max_history = max_history,
+            trimming = pressure.plan.drain_count,
+            reason = pressure.plan.reason.as_str(),
+            estimated_tokens = pressure.estimated_tokens,
+            window_used_pct = pressure.window_used_pct,
             "Trimming old messages to prevent context overflow (streaming)"
         );
-        messages.drain(..trim_count);
+        pressure.plan.apply(&mut messages);
         // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
         // pair across the cut boundary, leaving orphaned blocks that cause the LLM
         // to return empty responses (input_tokens=0).
@@ -5045,6 +5044,26 @@ mod tests {
             openfang_types::agent::DEFAULT_MAX_HISTORY_MESSAGES,
             MAX_HISTORY_MESSAGES
         );
+    }
+
+    /// ANAI-242: the accessor that distinguishes inherited default from
+    /// operator intent. Only an explicit, non-zero manifest value earns a
+    /// hard message cap; everything else gets the token-aware safety valve.
+    #[test]
+    fn test_explicit_max_history_reports_only_real_overrides() {
+        let mut manifest = openfang_types::agent::AgentManifest {
+            max_history_messages: Some(6),
+            ..Default::default()
+        };
+        assert_eq!(manifest.explicit_max_history_messages(), Some(6));
+
+        // Absent: NOT a request for a cap of 20 — a request for no cap.
+        manifest.max_history_messages = None;
+        assert_eq!(manifest.explicit_max_history_messages(), None);
+
+        // Zero: a typo, not an instruction to disable history.
+        manifest.max_history_messages = Some(0);
+        assert_eq!(manifest.explicit_max_history_messages(), None);
     }
 
     /// Issue #871: an agent with a manifest override uses that value.

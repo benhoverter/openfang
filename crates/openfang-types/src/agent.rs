@@ -653,6 +653,22 @@ impl AgentManifest {
         }
     }
 
+    /// ANAI-242. The operator's EXPLICIT history cap, or `None`.
+    ///
+    /// The distinction `effective_max_history_messages` cannot make: an
+    /// agent that set `max_history_messages = 6` is expressing intent (keep
+    /// this worker's replies focused) and gets a hard message cap. An agent
+    /// that set nothing is not asking for a cap of 20 — it inherited one,
+    /// and under ANAI-242 it instead gets the token-aware safety valve in
+    /// `openfang_runtime::history_trim`, which fires on real context
+    /// pressure rather than on a message count with no arithmetic behind it.
+    ///
+    /// `Some(0)` is treated as absent, same as the effective accessor: an
+    /// agent must not be able to disable its own history by typo.
+    pub fn explicit_max_history_messages(&self) -> Option<usize> {
+        self.max_history_messages.filter(|n| *n > 0)
+    }
+
     /// ANAI-208. Is this agent a declared member of `project`?
     ///
     /// The whole membership relation, in one predicate. Every consumer — the
