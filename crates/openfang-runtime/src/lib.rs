@@ -30,6 +30,7 @@ pub mod drivers;
 pub mod embedding;
 pub mod gatekeeper;
 pub mod graceful_shutdown;
+pub mod history_trim;
 pub mod hooks;
 pub mod host_functions;
 pub mod image_cache;

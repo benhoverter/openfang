@@ -741,6 +741,9 @@ pub async fn run_agent_loop(
 
     // Inject canonical context as the first user message (not in system prompt)
     // to keep the system prompt stable across turns for provider prompt caching.
+    // ANAI-245: whether this happened is recorded, because index 0 is exactly
+    // what the safety-valve drain below takes first.
+    let mut canonical_context_present = false;
     if let Some(cc_msg) = manifest
         .metadata
         .get("canonical_context_msg")
@@ -748,6 +751,7 @@ pub async fn run_agent_loop(
     {
         if !cc_msg.is_empty() {
             messages.insert(0, Message::user(cc_msg));
+            canonical_context_present = true;
         }
     }
 
@@ -777,6 +781,21 @@ pub async fn run_agent_loop(
     // the catastrophic case where 200+ messages cause instant context overflow.
     // Per-agent cap: manifest override -> runtime default (issue #871).
     let max_history = manifest.effective_max_history_messages();
+    // ANAI-245: log-only measurement of what the valve is about to do, taken
+    // BEFORE the trim so the pre-cut prompt size is what gets recorded.
+    crate::history_trim::log(
+        &manifest.name,
+        &crate::history_trim::observe(
+            &messages,
+            session.messages.len(),
+            &system_prompt,
+            available_tools,
+            context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            max_history,
+            canonical_context_present,
+        ),
+        false,
+    );
     if messages.len() > max_history {
         let trim_count = messages.len() - max_history;
         warn!(
@@ -2442,6 +2461,8 @@ pub async fn run_agent_loop_streaming(
 
     // Inject canonical context as the first user message (not in system prompt)
     // to keep the system prompt stable across turns for provider prompt caching.
+    // ANAI-245: see the non-streaming loop — same reason, same field.
+    let mut canonical_context_present = false;
     if let Some(cc_msg) = manifest
         .metadata
         .get("canonical_context_msg")
@@ -2449,6 +2470,7 @@ pub async fn run_agent_loop_streaming(
     {
         if !cc_msg.is_empty() {
             messages.insert(0, Message::user(cc_msg));
+            canonical_context_present = true;
         }
     }
 
@@ -2473,6 +2495,21 @@ pub async fn run_agent_loop_streaming(
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // Per-agent cap: manifest override -> runtime default (issue #871).
     let max_history = manifest.effective_max_history_messages();
+    // ANAI-245: same measurement on the streaming path — the live channel
+    // path, so this is where most of the field data will come from.
+    crate::history_trim::log(
+        &manifest.name,
+        &crate::history_trim::observe(
+            &messages,
+            session.messages.len(),
+            &system_prompt,
+            available_tools,
+            context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+            max_history,
+            canonical_context_present,
+        ),
+        true,
+    );
     if messages.len() > max_history {
         let trim_count = messages.len() - max_history;
         warn!(
