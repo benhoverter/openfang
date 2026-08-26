@@ -12,6 +12,32 @@ use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
 use openfang_types::tool::ToolDefinition;
 use tracing::{debug, warn};
 
+/// Fraction of the context window at which recovery engages.
+///
+/// ANAI-244. This is the **emergency floor** of the context-pressure ladder,
+/// deliberately **above** `history_trim::TOKEN_TRIM_RATIO` (0.85) and the
+/// compactor's 0.70 token trigger:
+///
+/// | rung | ratio | mechanism | loss |
+/// |------|-------|-----------|------|
+/// | 1 | 0.70 | compactor — an LLM summarises the dropped span | recoverable |
+/// | 2 | 0.85 | `history_trim` safety valve — sheds to 0.75 | lossy, bounded |
+/// | 3 | 0.92 | this pipeline — keep last 10, then 4, then truncate | very lossy |
+///
+/// The ordering used to be violated. This pipeline entered at `0.70` — the
+/// same ratio as the compactor and *below* the valve — and, unlike either of
+/// them, it runs at the top of **every agent-loop iteration** rather than once
+/// per turn. It therefore always fired first, which made both smart paths
+/// decorative.
+pub const RECOVERY_ENTRY_RATIO: f64 = 0.92;
+
+/// Fraction of the window stage 1 must reach for recovery to stop.
+///
+/// Matches `history_trim::TOKEN_RELEASE_RATIO` so both shedding paths land in
+/// the same place, and so a session relieved here does not immediately
+/// re-trip on the next iteration.
+pub const RECOVERY_TARGET_RATIO: f64 = 0.75;
+
 /// Adjust a drain boundary so it does not split a ToolUse/ToolResult pair.
 ///
 /// If the message at `boundary` is a user message containing ToolResult blocks
@@ -119,22 +145,38 @@ pub fn recover_from_overflow(
     system_prompt: &str,
     tools: &[ToolDefinition],
     context_window: usize,
+    protect_head: bool,
 ) -> RecoveryStage {
     let estimated = estimate_tokens(messages, system_prompt, tools);
-    let threshold_70 = (context_window as f64 * 0.70) as usize;
-    let threshold_90 = (context_window as f64 * 0.90) as usize;
+    let entry = (context_window as f64 * RECOVERY_ENTRY_RATIO) as usize;
+    let target = (context_window as f64 * RECOVERY_TARGET_RATIO) as usize;
+    // Index 0 holds the compaction summary when the kernel injected one; the
+    // drainable region starts after it.
+    let head = usize::from(protect_head && !messages.is_empty());
 
-    // No recovery needed
-    if estimated <= threshold_70 {
+    // No recovery needed. Below the entry ratio this is the compactor's or the
+    // safety valve's problem, and both lose less than this path does.
+    if estimated <= entry {
         return RecoveryStage::None;
     }
 
+    warn!(
+        target: crate::history_trim::TARGET,
+        estimated_tokens = estimated,
+        context_window,
+        entry_threshold = entry,
+        total_messages = messages.len(),
+        canonical_context_present = head == 1,
+        "context pressure: emergency overflow recovery engaged"
+    );
+
     // Stage 1: Moderate trim — keep last 10 messages
-    if estimated <= threshold_90 {
-        let keep = 10.min(messages.len());
-        let raw_remove = messages.len() - keep;
+    {
+        let keep = 10.min(messages.len().saturating_sub(head));
+        let raw_boundary = messages.len() - keep;
         // Adjust boundary to avoid splitting ToolUse/ToolResult pairs
-        let remove = safe_drain_boundary(messages, raw_remove);
+        let boundary = safe_drain_boundary(messages, raw_boundary).max(head);
+        let remove = boundary - head;
         if remove > 0 {
             debug!(
                 estimated_tokens = estimated,
@@ -142,10 +184,10 @@ pub fn recover_from_overflow(
                 "Stage 1: moderate trim to last {} messages",
                 messages.len() - remove
             );
-            messages.drain(..remove);
+            messages.drain(head..boundary);
             // Re-check after trim
             let new_est = estimate_tokens(messages, system_prompt, tools);
-            if new_est <= threshold_70 {
+            if new_est <= target {
                 return RecoveryStage::AutoCompaction { removed: remove };
             }
         }
@@ -153,10 +195,11 @@ pub fn recover_from_overflow(
 
     // Stage 2: Aggressive trim — keep last 4 messages + summary marker
     {
-        let keep = 4.min(messages.len());
-        let raw_remove = messages.len() - keep;
+        let keep = 4.min(messages.len().saturating_sub(head));
+        let raw_boundary = messages.len() - keep;
         // Adjust boundary to avoid splitting ToolUse/ToolResult pairs
-        let remove = safe_drain_boundary(messages, raw_remove);
+        let boundary = safe_drain_boundary(messages, raw_boundary).max(head);
+        let remove = boundary - head;
         if remove > 0 {
             warn!(
                 estimated_tokens = estimate_tokens(messages, system_prompt, tools),
@@ -169,11 +212,11 @@ pub fn recover_from_overflow(
                  The conversation continues from here. Use /compact for smarter summarization.]",
                 remove
             ));
-            messages.drain(..remove);
-            messages.insert(0, summary);
+            messages.drain(head..boundary);
+            messages.insert(head, summary);
 
             let new_est = estimate_tokens(messages, system_prompt, tools);
-            if new_est <= threshold_90 {
+            if new_est <= entry {
                 return RecoveryStage::OverflowCompaction { removed: remove };
             }
         }
@@ -207,7 +250,7 @@ pub fn recover_from_overflow(
 
     if truncated > 0 {
         let new_est = estimate_tokens(messages, system_prompt, tools);
-        if new_est <= threshold_90 {
+        if new_est <= entry {
             return RecoveryStage::ToolResultTruncation { truncated };
         }
         warn!(
@@ -246,7 +289,7 @@ mod tests {
     #[test]
     fn test_no_recovery_needed() {
         let mut msgs = make_messages(2, 100);
-        let stage = recover_from_overflow(&mut msgs, "sys", &[], 200_000);
+        let stage = recover_from_overflow(&mut msgs, "sys", &[], 200_000, false);
         assert_eq!(stage, RecoveryStage::None);
     }
 
@@ -256,7 +299,7 @@ mod tests {
         // Context window: 1000 tokens = 4000 chars
         // 70% = 700 tokens = 2800 chars
         let mut msgs = make_messages(20, 150); // ~3000 chars total
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000);
+        let stage = recover_from_overflow(&mut msgs, "system", &[], 800, false);
         match stage {
             RecoveryStage::AutoCompaction { removed } => {
                 assert!(removed > 0);
@@ -273,7 +316,7 @@ mod tests {
     fn test_stage2_aggressive_trim() {
         // Push past 90%: 1000 tokens = 4000 chars, 90% = 3600 chars
         let mut msgs = make_messages(30, 200); // ~6000 chars
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000);
+        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000, false);
         match stage {
             RecoveryStage::OverflowCompaction { removed } => {
                 assert!(removed > 0);
@@ -310,7 +353,7 @@ mod tests {
             },
         ];
         // Tiny context window to force all stages
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
+        let stage = recover_from_overflow(&mut msgs, "system", &[], 500, false);
         // Should at least reach tool truncation
         match stage {
             RecoveryStage::ToolResultTruncation { truncated } => {
@@ -325,7 +368,7 @@ mod tests {
     fn test_cascading_stages() {
         // Ensure stages cascade: if stage 1 isn't enough, stage 2 kicks in
         let mut msgs = make_messages(50, 500);
-        let stage = recover_from_overflow(&mut msgs, "system prompt", &[], 2000);
+        let stage = recover_from_overflow(&mut msgs, "system prompt", &[], 2000, false);
         // With 50 messages of 500 chars each (25000 chars), context of 2000 tokens (8000 chars),
         // we should cascade through stages
         assert_ne!(stage, RecoveryStage::None);
@@ -349,7 +392,7 @@ mod tests {
             },
         ];
         // Tiny context window to force stage 3 tool truncation
-        let stage = recover_from_overflow(&mut msgs, "system", &[], 500);
+        let stage = recover_from_overflow(&mut msgs, "system", &[], 500, false);
         // Must not panic — the truncation at byte boundaries could split a 3-byte char
         assert_ne!(stage, RecoveryStage::None);
     }
@@ -416,5 +459,67 @@ mod tests {
     fn test_safe_drain_boundary_edge_end() {
         let msgs = vec![Message::user("a"), Message::assistant("b")];
         assert_eq!(safe_drain_boundary(&msgs, 2), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // ANAI-244: this pipeline is the emergency floor, not the first
+    // responder. These are the two ways it used to defeat the paths
+    // above it.
+    // ---------------------------------------------------------------
+
+    /// The pathology. At 80% of the window the compactor (0.70) and the
+    /// safety valve (0.85) own the decision; this path ran first because it
+    /// entered at 0.70 *and* ran every loop iteration. It must now decline.
+    #[test]
+    fn recovery_declines_below_the_emergency_ratio() {
+        // 1000-token window. 0.80 of it = 800 tokens = ~3200 chars.
+        let mut msgs = make_messages(20, 155);
+        let est = estimate_tokens(&msgs, "system", &[]);
+        assert!(
+            est > (1000.0 * 0.70) as usize && est < (1000.0 * RECOVERY_ENTRY_RATIO) as usize,
+            "fixture must sit between the compactor trigger and the emergency floor, got {est}"
+        );
+        let stage = recover_from_overflow(&mut msgs, "system", &[], 1000, false);
+        assert_eq!(stage, RecoveryStage::None);
+        assert_eq!(msgs.len(), 20, "nothing may be deleted below the floor");
+    }
+
+    /// The ANAI-242 bug one layer down: index 0 carries the compactor's own
+    /// summary, and every stage here drained from the front.
+    #[test]
+    fn protected_head_survives_every_stage() {
+        let canonical = "CANONICAL CONTEXT SUMMARY";
+        for window in [2000usize, 500, 200] {
+            let mut msgs = vec![Message::user(canonical)];
+            msgs.extend(make_messages(50, 500));
+            let stage = recover_from_overflow(&mut msgs, "system prompt", &[], window, true);
+            assert_ne!(stage, RecoveryStage::None, "window {window} must recover");
+            assert_eq!(
+                msgs[0].content.text_length(),
+                canonical.len(),
+                "window {window}: the compaction summary was destroyed by recovery"
+            );
+        }
+    }
+
+    /// Negative control: without the flag, index 0 is ordinary history.
+    #[test]
+    fn unprotected_head_is_still_drainable() {
+        let mut msgs = make_messages(50, 500);
+        let stage = recover_from_overflow(&mut msgs, "system prompt", &[], 2000, false);
+        assert_ne!(stage, RecoveryStage::None);
+        assert!(msgs.len() < 50);
+    }
+
+    /// The floor must sit above the valve, which sits above the compactor.
+    /// Any future edit that reorders these re-creates today's bug.
+    #[test]
+    fn the_ladder_is_strictly_ordered() {
+        const { assert!(crate::history_trim::TOKEN_TRIM_RATIO < RECOVERY_ENTRY_RATIO) };
+        const { assert!(RECOVERY_TARGET_RATIO < crate::history_trim::TOKEN_TRIM_RATIO) };
+        assert_eq!(
+            RECOVERY_TARGET_RATIO,
+            crate::history_trim::TOKEN_RELEASE_RATIO
+        );
     }
 }

@@ -98,10 +98,12 @@ use tracing::{debug, info};
 /// `context_pressure=off` to mute it.
 pub const TARGET: &str = "context_pressure";
 
-/// Ratio of the context window at which the compactor's token trigger and
-/// the overflow pipeline's first stage both fire. Mirrors
-/// `CompactionConfig::token_threshold_ratio` and the `0.70` in
-/// `context_overflow::recover_from_overflow`.
+/// Ratio of the context window at which the compactor's token trigger fires.
+/// Mirrors `CompactionConfig::token_threshold_ratio`.
+///
+/// ANAI-244: the overflow pipeline's first stage used to fire here too, which
+/// is why it preempted everything. It now enters at
+/// `context_overflow::RECOVERY_ENTRY_RATIO` (0.92).
 const SMART_PATH_RATIO: f64 = 0.70;
 
 /// ANAI-242. Fraction of the context window at which the token-aware valve
@@ -109,9 +111,10 @@ const SMART_PATH_RATIO: f64 = 0.70;
 ///
 /// Deliberately **above** [`SMART_PATH_RATIO`]: the compactor should get the
 /// first attempt at relieving pressure, because it summarises what it
-/// removes and this does not. Deliberately **below** the overflow pipeline's
-/// 0.90 aggressive stage, so the valve is still a valve — it acts before the
-/// emergency path has to.
+/// removes and this does not. Deliberately **below**
+/// `context_overflow::RECOVERY_ENTRY_RATIO` (0.92), so the valve is still a
+/// valve — it acts before the emergency path has to. ANAI-244 made that
+/// second half true; it was aspiration until then.
 pub const TOKEN_TRIM_RATIO: f64 = 0.85;
 
 /// Fraction of the window the valve trims back *to* once it fires.

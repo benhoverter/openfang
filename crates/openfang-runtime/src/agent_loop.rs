@@ -848,8 +848,13 @@ pub async fn run_agent_loop(
         debug!(iteration, "Agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
-        let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
+        let recovery = recover_from_overflow(
+            &mut messages,
+            &system_prompt,
+            available_tools,
+            ctx_window,
+            canonical_context_present,
+        );
         if recovery == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
         }
@@ -2562,8 +2567,13 @@ pub async fn run_agent_loop_streaming(
         debug!(iteration, "Streaming agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
-        let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
+        let recovery = recover_from_overflow(
+            &mut messages,
+            &system_prompt,
+            available_tools,
+            ctx_window,
+            canonical_context_present,
+        );
         match &recovery {
             RecoveryStage::None => {}
             RecoveryStage::FinalError => {
