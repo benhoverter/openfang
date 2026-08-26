@@ -1377,14 +1377,15 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // there skews indices silently.
         ToolDefinition {
             name: "memory_episode_close".to_string(),
-            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window.".to_string(),
+            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
                     "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
-                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need." }
+                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need." },
+                    "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang-fork\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Omitting it clears any previous priming." }
                 },
                 "required": ["title"]
             }),
@@ -4143,6 +4144,29 @@ async fn tool_memory_episode_close(
     }
     let reset_context = input["reset_context"].as_bool().unwrap_or(false);
 
+    // ANAI-247. Validated here, at the edge, rather than swallowed downstream:
+    // a mistyped slug would otherwise prime the next episode for a project
+    // that does not exist and produce a silently empty pack — the agent would
+    // conclude its memory was empty when it was merely misaddressed.
+    //
+    // Refused *before* the close so the agent can simply retry the whole call.
+    let prime_for = match input["prime_for"].as_str().map(str::trim) {
+        Some("") | None => None,
+        Some(slug) => {
+            openfang_types::agent::validate_project_slug(slug).map_err(|e| {
+                format!("prime_for is not a usable project slug: {e}. Nothing was closed.")
+            })?;
+            if !reset_context {
+                return Err(
+                    "prime_for only means something with reset_context: true — the briefing is \
+                     what the fresh window opens with. Nothing was closed."
+                        .to_string(),
+                );
+            }
+            Some(slug.to_string())
+        }
+    };
+
     // Before the close, so it attaches to the episode being closed rather than
     // to the one that opens next. Failure aborts the close rather than
     // dropping the wrap-up silently — closing is idempotent, so a retry costs
@@ -4173,12 +4197,19 @@ async fn tool_memory_episode_close(
     // the agent to retry a close that succeeded, duplicating the note. Say so
     // in the text instead — the agent can see it and so can the log.
     let reset_note = if reset_context {
-        match kh.request_context_reset(caller_agent_id) {
-            Ok(()) => " Your conversation window will be cleared when this turn ends; the running summary of earlier work is kept.",
-            Err(_) => " Note: the context reset could not be scheduled, so your conversation window is unchanged. The close itself succeeded — do not repeat it.",
+        match kh.request_context_reset(caller_agent_id, prime_for.as_deref()) {
+            Ok(()) => match prime_for.as_deref() {
+                Some(slug) => format!(
+                    " Your conversation window will be cleared when this turn ends; the running \
+                     summary of earlier work is kept, and the next episode opens with a briefing \
+                     on {slug}."
+                ),
+                None => " Your conversation window will be cleared when this turn ends; the running summary of earlier work is kept.".to_string(),
+            },
+            Err(_) => " Note: the context reset could not be scheduled, so your conversation window is unchanged. The close itself succeeded — do not repeat it.".to_string(),
         }
     } else {
-        ""
+        String::new()
     };
 
     match closed {
@@ -7909,7 +7940,10 @@ mod tests {
         // ANAI-246: callers that asked for a deferred context reset, plus a
         // switch to make that request fail, since the tool is required to keep
         // the close committed when it does.
-        context_resets: std::sync::Mutex<Vec<Option<String>>>,
+        /// (caller, prime_for) — ANAI-247 records both, so a test can assert
+        /// the slug reached the kernel and not merely that a reset did.
+        #[allow(clippy::type_complexity)]
+        context_resets: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
         context_reset_fails: std::sync::atomic::AtomicBool,
     }
 
@@ -8187,7 +8221,8 @@ mod tests {
         .unwrap();
         let resets = fake.context_resets.lock().unwrap();
         assert_eq!(resets.len(), 1);
-        assert_eq!(resets[0].as_deref(), Some("agent-x"));
+        assert_eq!(resets[0].0.as_deref(), Some("agent-x"));
+        assert_eq!(resets[0].1, None, "an unprimed close must carry no slug");
         assert!(out.contains("ep-1"), "{out}");
         assert!(
             out.contains("when this turn ends"),
@@ -8238,6 +8273,93 @@ mod tests {
             1,
             "exactly one wrap-up note, never two"
         );
+    }
+
+    // --- ANAI-247: prime_for -----------------------------------------------
+
+    /// The slug must reach the kernel, and the agent must be told what its
+    /// fresh window will open with.
+    #[tokio::test]
+    async fn prime_for_rides_along_with_the_reset() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "openfang-fork"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        let resets = fake.context_resets.lock().unwrap();
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].1.as_deref(), Some("openfang-fork"));
+        assert!(out.contains("briefing on openfang-fork"), "{out}");
+    }
+
+    /// A briefing is what the *fresh* window opens with, so priming without a
+    /// reset is a request that cannot be honoured. Refuse it loudly rather
+    /// than closing the episode and silently ignoring half the call — the
+    /// agent would believe it was primed and never find out otherwise.
+    #[tokio::test]
+    async fn prime_for_without_reset_context_is_refused_before_the_close() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let err = tool_memory_episode_close(
+            &serde_json::json!({"title": "done", "prime_for": "openfang-fork"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("reset_context"), "{err}");
+        assert!(
+            fake.episode_closes.lock().unwrap().is_empty(),
+            "refused before the close, so the whole call can simply be retried"
+        );
+    }
+
+    /// A mistyped slug would prime for a project that does not exist and
+    /// produce an empty pack — the agent would conclude its memory was empty
+    /// when it was merely misaddressed. Catch it at the edge.
+    #[tokio::test]
+    async fn a_malformed_slug_is_refused_and_nothing_is_closed() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let err = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "done",
+                "reset_context": true,
+                "prime_for": "OpenFang Fork"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a usable project slug"), "{err}");
+        assert!(fake.episode_closes.lock().unwrap().is_empty());
+        assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    /// An empty or whitespace `prime_for` is an omission, not an error — and
+    /// must not trip the reset_context guard.
+    #[tokio::test]
+    async fn a_blank_prime_for_is_treated_as_absent() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_memory_episode_close(
+            &serde_json::json!({"title": "done", "prime_for": "   "}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .expect("a blank slug is an omission, not a refusal");
+        assert!(fake.context_resets.lock().unwrap().is_empty());
     }
 
     /// The agent cannot see the episodes table, so asking twice is reasonable.
@@ -8940,17 +9062,21 @@ mod tests {
             ));
             Ok(self.open_episode.lock().unwrap().take())
         }
-        fn request_context_reset(&self, caller: Option<&str>) -> Result<(), String> {
+        fn request_context_reset(
+            &self,
+            caller: Option<&str>,
+            prime_for: Option<&str>,
+        ) -> Result<(), String> {
             if self
                 .context_reset_fails
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
                 return Err("reset unavailable".to_string());
             }
-            self.context_resets
-                .lock()
-                .unwrap()
-                .push(caller.map(|c| c.to_string()));
+            self.context_resets.lock().unwrap().push((
+                caller.map(|c| c.to_string()),
+                prime_for.map(|p| p.to_string()),
+            ));
             Ok(())
         }
         fn memory_status(&self, _caller: Option<&str>) -> Result<serde_json::Value, String> {

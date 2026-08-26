@@ -722,6 +722,56 @@ impl FactStore {
         .transpose()
     }
 
+    /// ANAI-247: every live claim about one subject, open loops first.
+    ///
+    /// The rehydration pack's whole "what is currently true about X" section.
+    /// Ordering is deliberate and not chronological: an unfinished loop is the
+    /// thing an agent resuming work most needs to see, and a pack that is
+    /// truncated by `limit` should lose settled background rather than the
+    /// open question it was assembled to surface.
+    ///
+    /// Author-blind, like [`Self::get`]: the slot belongs to the subject, not
+    /// to whoever last wrote it, so a pack shows what the *fleet* believes
+    /// about a project rather than what this agent happens to remember.
+    pub fn list_for_scope(
+        &self,
+        scope: &str,
+        scope_ref: &str,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, authored_by, scope, scope_ref, claim_key, content, status, confidence,
+                        episode_id, created_at, last_affirmed_at, metadata
+                 FROM memories
+                 WHERE scope = ?1 AND scope_ref = ?2 AND kind = ?3 AND deleted = 0
+                 ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,
+                          COALESCE(last_affirmed_at, created_at) DESC
+                 LIMIT ?4",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![scope, scope_ref, KIND_FACT, limit as i64],
+                row_to_fact,
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row.map_err(|e| OpenFangError::Memory(e.to_string()))? {
+                Ok(fact) => out.push(fact),
+                // One unreadable status must not blank the whole pack. Skip
+                // the row; `get` still errors loudly for a direct read.
+                Err(_) => continue,
+            }
+        }
+        Ok(out)
+    }
+
     /// Every claim that has occupied a slot, newest supersession first.
     ///
     /// This is the audit path and the only reader of `fact_history`. It is
@@ -877,6 +927,92 @@ mod tests {
     /// a slot the same way the writer addressed it.
     fn aref(a: AgentId) -> String {
         a.0.to_string()
+    }
+
+    // --- ANAI-247: list_for_scope ------------------------------------------
+
+    /// Open loops sort ahead of settled background regardless of write order.
+    /// A pack truncated by `limit` must lose the background, never the
+    /// unfinished question it was assembled to surface.
+    #[test]
+    fn list_for_scope_puts_open_loops_first() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "main is the trunk")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "build.rebuild", "waiting on Ben")
+                    .with_scope_ref("openfang-fork")
+                    .with_status(FactStatus::Open),
+            )
+            .unwrap();
+
+        let facts = store
+            .list_for_scope("project", "openfang-fork", 10)
+            .unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].claim_key, "build.rebuild", "open loop leads");
+        assert_eq!(facts[1].claim_key, "repo.trunk_model");
+    }
+
+    /// The slot belongs to the subject, not the author. A pack must show what
+    /// the fleet believes about a project, not the subset this agent wrote —
+    /// that was the ANAI-204 amendment's whole point.
+    #[test]
+    fn list_for_scope_is_author_blind() {
+        let (store, _c) = store();
+        store
+            .upsert(
+                FactWrite::new(agent(), "project", "repo.trunk_model", "main is the trunk")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(agent(), "project", "deploy.schema", "v15")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_for_scope("project", "openfang-fork", 10)
+                .unwrap()
+                .len(),
+            2,
+            "both agents' claims about the project are the project's"
+        );
+    }
+
+    /// A different subject is a different slot address. This is the isolation
+    /// the pack relies on to stay small.
+    #[test]
+    fn list_for_scope_does_not_cross_subjects() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "ours")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "theirs")
+                    .with_scope_ref("other-thing"),
+            )
+            .unwrap();
+
+        let facts = store
+            .list_for_scope("project", "openfang-fork", 10)
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].claim, "ours");
     }
 
     fn write(a: AgentId, key: &str, claim: &str) -> FactWrite {

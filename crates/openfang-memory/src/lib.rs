@@ -17,6 +17,7 @@ pub mod knowledge;
 pub mod memory_md;
 pub mod migration;
 pub mod ranking;
+pub mod rehydration;
 pub mod semantic;
 pub mod session;
 pub mod structured;

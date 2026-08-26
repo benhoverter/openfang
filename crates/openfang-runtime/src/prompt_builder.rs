@@ -147,6 +147,15 @@ pub struct PromptContext {
     pub memory_md: Option<String>,
     /// Cross-channel canonical context summary.
     pub canonical_context: Option<String>,
+    /// ANAI-247: the rehydration pack, when this agent was primed for a
+    /// project at its last episode boundary.
+    ///
+    /// Rides in the same message as the canonical context rather than the
+    /// system prompt, for the same two reasons: the system prompt must stay
+    /// byte-stable for provider prompt caching, and the canonical message is
+    /// the index-0 slot that ANAI-242/244 protect from the trim ladder — the
+    /// one place a briefing survives a session under pressure.
+    pub rehydration_pack: Option<String>,
     /// Known user name (from shared memory).
     pub user_name: Option<String>,
     /// Channel type (telegram, discord, web, etc.).
@@ -442,7 +451,8 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
     if ctx.is_subagent {
         return None;
     }
-    ctx.canonical_context
+    let previous = ctx
+        .canonical_context
         .as_ref()
         .filter(|c| !c.is_empty())
         .map(|c| {
@@ -450,7 +460,20 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
                 "[Previous conversation context]\n{}",
                 cap_str(c, BUDGET_CANONICAL_CONTEXT, "canonical context")
             )
-        })
+        });
+
+    // ANAI-247. The pack goes FIRST: it is the briefing for the episode that
+    // is starting, while the canonical summary is background from the one that
+    // ended. Both may be present — a re-anchor keeps the compacted summary on
+    // purpose (ANAI-246) — and reading the briefing before the background is
+    // the order a person would want.
+    let pack = ctx.rehydration_pack.as_ref().filter(|p| !p.is_empty());
+
+    match (pack, previous) {
+        (None, prev) => prev,
+        (Some(pack), None) => Some(pack.clone()),
+        (Some(pack), Some(prev)) => Some(format!("{pack}\n\n{prev}")),
+    }
 }
 
 /// Build the memory section (Section 4).
@@ -1312,6 +1335,62 @@ mod tests {
         let msg = build_canonical_context_message(&ctx);
         assert!(msg.is_some());
         assert!(msg.unwrap().contains("Rust async patterns"));
+    }
+
+    // --- ANAI-247: the rehydration pack ------------------------------------
+
+    /// The briefing for the episode starting must precede the background from
+    /// the episode that ended. A re-anchor keeps the compacted summary on
+    /// purpose (ANAI-246), so both being present is the normal primed case,
+    /// and order is the only thing that makes it readable.
+    #[test]
+    fn the_pack_precedes_the_previous_context() {
+        let mut ctx = basic_ctx();
+        ctx.canonical_context = Some("older background".to_string());
+        ctx.rehydration_pack = Some("[Rehydration pack — primed for openfang-fork]".to_string());
+
+        let msg = build_canonical_context_message(&ctx).unwrap();
+        let pack_at = msg.find("Rehydration pack").unwrap();
+        let prev_at = msg.find("[Previous conversation context]").unwrap();
+        assert!(pack_at < prev_at, "briefing before background: {msg}");
+    }
+
+    /// After a reset the canonical summary may legitimately be absent. The
+    /// pack must still reach the model — that case is precisely the one it
+    /// was built for.
+    #[test]
+    fn a_pack_alone_still_produces_a_message() {
+        let mut ctx = basic_ctx();
+        ctx.canonical_context = None;
+        ctx.rehydration_pack = Some("primed briefing".to_string());
+        assert_eq!(
+            build_canonical_context_message(&ctx).as_deref(),
+            Some("primed briefing")
+        );
+    }
+
+    /// Subagents get no canonical context by design; the pack rides the same
+    /// slot and must inherit the same exclusion rather than becoming a side
+    /// door into it.
+    #[test]
+    fn a_subagent_gets_no_pack_either() {
+        let mut ctx = basic_ctx();
+        ctx.is_subagent = true;
+        ctx.rehydration_pack = Some("primed briefing".to_string());
+        assert!(build_canonical_context_message(&ctx).is_none());
+    }
+
+    /// An unprimed agent's message must be byte-identical to what it was
+    /// before this feature existed. Every turn of every agent takes this path.
+    #[test]
+    fn an_unprimed_context_is_unchanged() {
+        let mut ctx = basic_ctx();
+        ctx.canonical_context = Some("older background".to_string());
+        ctx.rehydration_pack = None;
+        assert_eq!(
+            build_canonical_context_message(&ctx).as_deref(),
+            Some("[Previous conversation context]\nolder background")
+        );
     }
 
     #[test]

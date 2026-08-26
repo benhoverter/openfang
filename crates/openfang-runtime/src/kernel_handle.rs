@@ -178,7 +178,16 @@ pub trait KernelHandle: Send + Sync {
     /// Scoped to the caller with no `shared:` escape, for the same reason
     /// `memory_episode_close` is: resetting someone else's context is
     /// amnesia inflicted on an agent that did not ask for it.
-    fn request_context_reset(&self, caller_agent_id: Option<&str>) -> Result<(), String>;
+    ///
+    /// ANAI-247: `prime_for` names the project the next episode should be
+    /// rehydrated for. `None` is a plain clean slate, and also *clears* any
+    /// prior priming — a boundary drawn without a slug means the agent has
+    /// stopped working on the old thing, and a stale pack is worse than none.
+    fn request_context_reset(
+        &self,
+        caller_agent_id: Option<&str>,
+        prime_for: Option<&str>,
+    ) -> Result<(), String>;
 
     /// ANAI-194: the CALLER's memory status — open episode, turns captured
     /// into it, and the idle countdown.

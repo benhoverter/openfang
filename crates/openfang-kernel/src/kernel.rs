@@ -159,7 +159,13 @@ pub struct OpenFangKernel {
     /// is the exact failure class that already cost us the allowlist miss, the
     /// log-filter miss and the `apply_patch` no-op. So the tool records intent
     /// here and the kernel honours it after the loop has returned.
-    pub pending_context_resets: dashmap::DashSet<AgentId>,
+    ///
+    /// ANAI-247: the value is the optional `prime_for` project slug — what the
+    /// next episode should be rehydrated for. A set became a map rather than
+    /// gaining a parallel map because the two are one decision: a reset with a
+    /// slug and a reset without one must never be able to disagree about
+    /// whether a reset was requested at all.
+    pub pending_context_resets: dashmap::DashMap<AgentId, Option<String>>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1471,7 +1477,7 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
-            pending_context_resets: dashmap::DashSet::new(),
+            pending_context_resets: dashmap::DashMap::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
@@ -2852,6 +2858,11 @@ impl OpenFangKernel {
                     .canonical_context(agent_id, None)
                     .ok()
                     .and_then(|(s, _)| s),
+                // ANAI-247. `ok().flatten()`, not `unwrap_or_default()` on an
+                // error: a pack that could not be read must leave the turn
+                // unprimed and otherwise untouched. This runs before every
+                // turn, so a failure here has to be inert, never fatal.
+                rehydration_pack: self.memory.rehydration_pack(agent_id).ok().flatten(),
                 user_name,
                 channel_type: None,
                 channel_binding: self.agent_channel_binding_summary(&manifest.name),
@@ -3518,6 +3529,11 @@ impl OpenFangKernel {
                     .canonical_context(agent_id, None)
                     .ok()
                     .and_then(|(s, _)| s),
+                // ANAI-247. `ok().flatten()`, not `unwrap_or_default()` on an
+                // error: a pack that could not be read must leave the turn
+                // unprimed and otherwise untouched. This runs before every
+                // turn, so a failure here has to be inert, never fatal.
+                rehydration_pack: self.memory.rehydration_pack(agent_id).ok().flatten(),
                 user_name,
                 channel_type: None,
                 channel_binding: self.agent_channel_binding_summary(&manifest.name),
@@ -3863,8 +3879,11 @@ impl OpenFangKernel {
     /// agent *name* and resolves it. Inherent methods win that lookup
     /// silently, which is exactly the kind of quiet wrong-call this codebase
     /// has been bitten by twice this week.
-    pub fn queue_context_reset(&self, agent_id: AgentId) {
-        self.pending_context_resets.insert(agent_id);
+    ///
+    /// ANAI-247: `prime_for` names the project the next episode should be
+    /// rehydrated for, or `None` for a plain clean slate.
+    pub fn queue_context_reset(&self, agent_id: AgentId, prime_for: Option<String>) {
+        self.pending_context_resets.insert(agent_id, prime_for);
     }
 
     /// ANAI-246: honour a deferred context reset if one was requested.
@@ -3877,14 +3896,15 @@ impl OpenFangKernel {
     ///
     /// Returns true if a reset was applied.
     pub fn apply_pending_context_reset(&self, agent_id: AgentId) -> bool {
-        if self.pending_context_resets.remove(&agent_id).is_none() {
+        let Some((_, prime_for)) = self.pending_context_resets.remove(&agent_id) else {
             return false;
-        }
-        match self.reset_context_at_episode_boundary(agent_id) {
+        };
+        match self.reset_context_at_episode_boundary(agent_id, prime_for.as_deref()) {
             Ok(dropped) => {
                 info!(
                     agent_id = %agent_id,
                     canonical_messages_dropped = dropped,
+                    prime_for = prime_for.as_deref().unwrap_or("-"),
                     "Context reset at episode boundary (canonical re-anchored, summary kept)"
                 );
                 true
@@ -3917,7 +3937,11 @@ impl OpenFangKernel {
     ///    token quota by closing an episode.
     ///
     /// Returns the number of verbatim canonical messages dropped.
-    pub fn reset_context_at_episode_boundary(&self, agent_id: AgentId) -> KernelResult<usize> {
+    pub fn reset_context_at_episode_boundary(
+        &self,
+        agent_id: AgentId,
+        prime_for: Option<&str>,
+    ) -> KernelResult<usize> {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
@@ -3933,7 +3957,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         self.memory
-            .reanchor_canonical(agent_id)
+            .reanchor_canonical(agent_id, prime_for)
             .map_err(KernelError::OpenFang)
     }
 
@@ -10926,9 +10950,13 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Episode close failed: {e}"))
     }
 
-    fn request_context_reset(&self, caller_agent_id: Option<&str>) -> Result<(), String> {
+    fn request_context_reset(
+        &self,
+        caller_agent_id: Option<&str>,
+        prime_for: Option<&str>,
+    ) -> Result<(), String> {
         let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
-        self.queue_context_reset(agent_id);
+        self.queue_context_reset(agent_id, prime_for.map(str::to_string));
         Ok(())
     }
 

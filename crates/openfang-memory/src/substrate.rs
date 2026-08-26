@@ -8,6 +8,7 @@ use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore};
 use crate::fact::{FactOutcome, FactStore, FactWrite};
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
+use crate::rehydration;
 use crate::semantic::SemanticStore;
 use crate::session::{Session, SessionStore};
 use crate::structured::StructuredStore;
@@ -521,8 +522,59 @@ impl MemorySubstrate {
     /// ANAI-246: re-anchor the canonical session at an episode boundary —
     /// drop the pre-boundary verbatim messages, keep the compacted summary.
     /// Returns the number of messages dropped.
-    pub fn reanchor_canonical(&self, agent_id: AgentId) -> OpenFangResult<usize> {
-        self.sessions.reanchor_canonical(agent_id)
+    ///
+    /// ANAI-247: `prime_for` is recorded in the same write — `Some(slug)` to
+    /// prime the next episode for that project, `None` to clear any prior
+    /// priming.
+    pub fn reanchor_canonical(
+        &self,
+        agent_id: AgentId,
+        prime_for: Option<&str>,
+    ) -> OpenFangResult<usize> {
+        self.sessions.reanchor_canonical(agent_id, prime_for)
+    }
+
+    /// ANAI-247: the project slug this agent is currently primed for, if any.
+    pub fn prime_for(&self, agent_id: AgentId) -> OpenFangResult<Option<String>> {
+        Ok(self.sessions.load_canonical(agent_id)?.prime_for)
+    }
+
+    /// ANAI-247: assemble the rehydration pack for a primed agent.
+    ///
+    /// `Ok(None)` when the agent is not primed, or when it is primed but
+    /// nothing durable has anything to say — both are ordinary states, not
+    /// faults, so neither is an error.
+    ///
+    /// The pack **retires itself**. `reanchor_canonical` empties the canonical
+    /// message vector, so its length is exactly "verbatim messages since the
+    /// boundary" — once the new episode has accumulated
+    /// [`rehydration::PACK_TTL_MESSAGES`] of its own, the real conversation
+    /// carries the thread and the pack stops being emitted. No timer, no
+    /// cleanup write, and nothing to forget to clear: the expiry is a
+    /// consequence of the same state the reset already maintains.
+    ///
+    /// Read on the prompt-build path, so it is two indexed queries and no
+    /// model call. Nothing here spawns a process: repo state is deferred to a
+    /// follow-up precisely because a `git` shell-out does not belong in the
+    /// path that runs before every turn.
+    pub fn rehydration_pack(&self, agent_id: AgentId) -> OpenFangResult<Option<String>> {
+        let canonical = self.sessions.load_canonical(agent_id)?;
+        let Some(slug) = canonical.prime_for else {
+            return Ok(None);
+        };
+        if canonical.messages.len() > rehydration::PACK_TTL_MESSAGES {
+            return Ok(None);
+        }
+        // Over-fetch episodes: `render_pack` drops any that are still open or
+        // carry neither a title nor a summary, and asking for exactly
+        // MAX_EPISODES would let one open episode cost us a closed one.
+        let episodes = self
+            .episodes()
+            .list_for_agent(agent_id, rehydration::MAX_EPISODES + 2)?;
+        let facts = self
+            .facts()
+            .list_for_scope("project", &slug, rehydration::MAX_FACTS)?;
+        Ok(rehydration::render_pack(&slug, &episodes, &facts))
     }
 
     /// Set or clear a session label.
@@ -1450,6 +1502,100 @@ impl Memory for MemorySubstrate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- ANAI-247: the rehydration pack ------------------------------------
+
+    fn prime_and_seed(substrate: &MemorySubstrate, agent_id: AgentId, slug: &str) {
+        substrate
+            .facts()
+            .upsert(
+                crate::fact::FactWrite::new(
+                    agent_id,
+                    "project",
+                    "repo.trunk_model",
+                    "main is the trunk",
+                )
+                .with_scope_ref(slug),
+            )
+            .unwrap();
+        substrate.reanchor_canonical(agent_id, Some(slug)).unwrap();
+    }
+
+    /// The overwhelmingly common case: nobody primed anything. This runs on
+    /// the prompt-build path before every turn, so "not primed" has to be a
+    /// cheap, silent `None` rather than anything an agent has to read past.
+    #[tokio::test]
+    async fn an_unprimed_agent_gets_no_pack() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        assert!(substrate
+            .rehydration_pack(AgentId::new())
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_primed_agent_gets_the_projects_live_claims() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang-fork");
+
+        let pack = substrate
+            .rehydration_pack(agent_id)
+            .unwrap()
+            .expect("a primed agent with live claims gets a pack");
+        assert!(pack.contains("primed for openfang-fork"), "{pack}");
+        assert!(pack.contains("main is the trunk"), "{pack}");
+    }
+
+    /// Priming for one project must not leak another's claims. The pack is
+    /// declared, not swept — that is the entire reason it stays small.
+    #[tokio::test]
+    async fn the_pack_carries_only_the_primed_projects_claims() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        substrate
+            .facts()
+            .upsert(
+                crate::fact::FactWrite::new(
+                    agent_id,
+                    "project",
+                    "repo.trunk_model",
+                    "SOMEBODY ELSES PROJECT",
+                )
+                .with_scope_ref("other-thing"),
+            )
+            .unwrap();
+        prime_and_seed(&substrate, agent_id, "openfang-fork");
+
+        let pack = substrate.rehydration_pack(agent_id).unwrap().unwrap();
+        assert!(!pack.contains("SOMEBODY ELSES PROJECT"), "{pack}");
+    }
+
+    /// The pack retires itself. Once the primed episode has its own
+    /// conversation, that conversation is the better context and the pack is
+    /// just rent on the protected index-0 slot. No timer, no cleanup write —
+    /// which means no cleanup path anyone can forget to call.
+    #[tokio::test]
+    async fn the_pack_stops_once_the_new_episode_has_its_own_context() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang-fork");
+        assert!(substrate.rehydration_pack(agent_id).unwrap().is_some());
+
+        let chatter: Vec<openfang_types::message::Message> = (0
+            ..crate::rehydration::PACK_TTL_MESSAGES + 1)
+            .map(|i| openfang_types::message::Message::user(format!("turn {i}")))
+            .collect();
+        substrate
+            .sessions
+            .append_canonical(agent_id, &chatter, None)
+            .unwrap();
+
+        assert!(
+            substrate.rehydration_pack(agent_id).unwrap().is_none(),
+            "the briefing must retire once real context exists"
+        );
+    }
 
     #[tokio::test]
     async fn test_substrate_kv() {

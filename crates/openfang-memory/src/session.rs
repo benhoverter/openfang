@@ -370,16 +370,31 @@ impl SessionStore {
     /// would hand the ladder the amnesia it was hardened against.
     ///
     /// Returns the number of verbatim messages dropped, for the caller's log.
-    pub fn reanchor_canonical(&self, agent_id: AgentId) -> OpenFangResult<usize> {
+    ///
+    /// ANAI-247: `prime_for` is set in the same write. `Some(slug)` primes the
+    /// next episode for that project; `None` clears any prior priming. It is
+    /// deliberately not "leave it alone on `None`" — a boundary drawn without
+    /// a slug means the agent is no longer working on the old thing, and a
+    /// stale pack is worse than no pack.
+    pub fn reanchor_canonical(
+        &self,
+        agent_id: AgentId,
+        prime_for: Option<&str>,
+    ) -> OpenFangResult<usize> {
         let mut canonical = self.load_canonical(agent_id)?;
         let dropped = canonical.messages.len();
-        if dropped == 0 {
-            // Nothing to re-anchor. Return without a write so a double close
-            // does not churn `updated_at` for no reason.
+        let prime_for = prime_for.map(str::to_string);
+        if dropped == 0 && canonical.prime_for == prime_for {
+            // Nothing to re-anchor and nothing to prime. Return without a
+            // write so a double close does not churn `updated_at` for no
+            // reason. The `prime_for` half of the guard matters: a close that
+            // drops no messages may still be the one that primes the next
+            // episode, and skipping that write would lose the pack silently.
             return Ok(0);
         }
         canonical.messages.clear();
         canonical.compaction_cursor = 0;
+        canonical.prime_for = prime_for;
         canonical.updated_at = Utc::now().to_rfc3339();
         self.save_canonical(&canonical)?;
         Ok(dropped)
@@ -407,6 +422,13 @@ pub struct CanonicalSession {
     pub compaction_cursor: usize,
     /// Summary of compacted (older) messages.
     pub compacted_summary: Option<String>,
+    /// ANAI-247: the project slug this agent was primed for at the last
+    /// episode boundary, or `None` when it is not primed.
+    ///
+    /// Control state, not a claim — see `migration::migrate_v15`. Read at
+    /// prompt-build time to assemble the rehydration pack; written only by
+    /// [`SessionStore::reanchor_canonical`].
+    pub prime_for: Option<String>,
     /// Last update time.
     pub updated_at: String,
 }
@@ -420,7 +442,7 @@ impl SessionStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT messages, compaction_cursor, compacted_summary, updated_at \
+                "SELECT messages, compaction_cursor, compacted_summary, updated_at, prime_for \
                  FROM canonical_sessions WHERE agent_id = ?1",
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -430,11 +452,12 @@ impl SessionStore {
             let cursor: i64 = row.get(1)?;
             let summary: Option<String> = row.get(2)?;
             let updated_at: String = row.get(3)?;
-            Ok((messages_blob, cursor, summary, updated_at))
+            let prime_for: Option<String> = row.get(4)?;
+            Ok((messages_blob, cursor, summary, updated_at, prime_for))
         });
 
         match result {
-            Ok((messages_blob, cursor, summary, updated_at)) => {
+            Ok((messages_blob, cursor, summary, updated_at, prime_for)) => {
                 let messages: Vec<Message> = rmp_serde::from_slice(&messages_blob)
                     .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
                 Ok(CanonicalSession {
@@ -442,6 +465,7 @@ impl SessionStore {
                     messages,
                     compaction_cursor: cursor as usize,
                     compacted_summary: summary,
+                    prime_for,
                     updated_at,
                 })
             }
@@ -452,6 +476,7 @@ impl SessionStore {
                     messages: Vec::new(),
                     compaction_cursor: 0,
                     compacted_summary: None,
+                    prime_for: None,
                     updated_at: now,
                 })
             }
@@ -551,15 +576,16 @@ impl SessionStore {
         let messages_blob = rmp_serde::to_vec_named(&canonical.messages)
             .map_err(|e| OpenFangError::Serialization(e.to_string()))?;
         conn.execute(
-            "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(agent_id) DO UPDATE SET messages = ?2, compaction_cursor = ?3, compacted_summary = ?4, updated_at = ?5",
+            "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at, prime_for)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(agent_id) DO UPDATE SET messages = ?2, compaction_cursor = ?3, compacted_summary = ?4, updated_at = ?5, prime_for = ?6",
             rusqlite::params![
                 canonical.agent_id.0.to_string(),
                 messages_blob,
                 canonical.compaction_cursor as i64,
                 canonical.compacted_summary,
                 canonical.updated_at,
+                canonical.prime_for,
             ],
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -1000,7 +1026,7 @@ mod tests {
             )
             .unwrap();
 
-        let dropped = store.reanchor_canonical(agent_id).unwrap();
+        let dropped = store.reanchor_canonical(agent_id, None).unwrap();
         assert_eq!(dropped, 2);
 
         let canonical = store.load_canonical(agent_id).unwrap();
@@ -1026,8 +1052,85 @@ mod tests {
         store
             .append_canonical(agent_id, &[Message::user("one")], None)
             .unwrap();
-        assert_eq!(store.reanchor_canonical(agent_id).unwrap(), 1);
-        assert_eq!(store.reanchor_canonical(agent_id).unwrap(), 0);
+        assert_eq!(store.reanchor_canonical(agent_id, None).unwrap(), 1);
+        assert_eq!(store.reanchor_canonical(agent_id, None).unwrap(), 0);
+    }
+
+    /// ANAI-247: the slug is persisted by the re-anchor and survives a
+    /// reload. It has to be durable, not in-process: the amnesia event this
+    /// pack exists to soften is most often a daemon restart.
+    #[test]
+    fn test_reanchor_canonical_records_and_clears_prime_for() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .append_canonical(agent_id, &[Message::user("one")], None)
+            .unwrap();
+
+        store
+            .reanchor_canonical(agent_id, Some("openfang-fork"))
+            .unwrap();
+        assert_eq!(
+            store.load_canonical(agent_id).unwrap().prime_for.as_deref(),
+            Some("openfang-fork")
+        );
+
+        // A later boundary drawn without a slug must CLEAR the old one. A
+        // stale pack is worse than no pack: it briefs the agent on work it
+        // has already moved off.
+        store.reanchor_canonical(agent_id, None).unwrap();
+        assert_eq!(store.load_canonical(agent_id).unwrap().prime_for, None);
+    }
+
+    /// The idempotence shortcut must not swallow a priming. A close that
+    /// drops nothing — an agent whose window is already empty — is exactly
+    /// the case where the pack is the only context the next turn will get.
+    #[test]
+    fn test_a_reanchor_that_drops_nothing_still_primes() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        assert_eq!(
+            store
+                .reanchor_canonical(agent_id, Some("openfang-fork"))
+                .unwrap(),
+            0,
+            "nothing verbatim to drop"
+        );
+        assert_eq!(
+            store.load_canonical(agent_id).unwrap().prime_for.as_deref(),
+            Some("openfang-fork"),
+            "the priming is the whole point of this call; it must still be written"
+        );
+    }
+
+    /// `prime_for` must round-trip through the paths that rewrite canonical
+    /// for other reasons, or the pack would evaporate on the first compaction
+    /// of the primed episode.
+    #[test]
+    fn test_prime_for_survives_append_and_compaction() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .reanchor_canonical(agent_id, Some("openfang-fork"))
+            .unwrap();
+
+        store
+            .append_canonical(agent_id, &[Message::user("back to work")], None)
+            .unwrap();
+        assert_eq!(
+            store.load_canonical(agent_id).unwrap().prime_for.as_deref(),
+            Some("openfang-fork")
+        );
+
+        store
+            .store_llm_summary(agent_id, "we did a thing", vec![Message::user("tail")])
+            .unwrap();
+        assert_eq!(
+            store.load_canonical(agent_id).unwrap().prime_for.as_deref(),
+            Some("openfang-fork"),
+            "compaction rewrites canonical; it must not drop the priming"
+        );
     }
 
     #[test]

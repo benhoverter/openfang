@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -65,6 +65,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 14 {
         migrate_v14(conn)?;
+    }
+
+    if current_version < 15 {
+        migrate_v15(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -700,9 +704,85 @@ fn migrate_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 15 (ANAI-247): record which project an agent is primed for.
+///
+/// One additive, nullable column on `canonical_sessions`. It lives there
+/// rather than in the memory corpus for two reasons:
+///
+/// 1. It is *control state*, not a claim. A `prime_for` row in `memories`
+///    would reach ordinary recall and read as something the agent believes.
+/// 2. Its lifetime is exactly the canonical session's. The episode boundary
+///    that re-anchors canonical is the same event that sets or clears it, so
+///    co-locating them makes the two impossible to leave inconsistent.
+///
+/// Additive and nullable by design: an older binary reading a v15 database
+/// selects the columns it knows and is unaffected, which is the only rollback
+/// story worth having for a table holding every agent's cross-channel memory.
+fn migrate_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "canonical_sessions", "prime_for") {
+        conn.execute(
+            "ALTER TABLE canonical_sessions ADD COLUMN prime_for TEXT",
+            [],
+        )?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (15, datetime('now'), 'Add canonical_sessions.prime_for for the rehydration pack (ANAI-247)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v15 must be additive on a database that already carries canonical
+    /// sessions. This table holds every agent's cross-channel memory, so the
+    /// only acceptable migration is one that adds a nullable column and
+    /// touches no row.
+    #[test]
+    fn v15_adds_prime_for_without_disturbing_existing_canonical_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Stand up the schema through v5, where `canonical_sessions` is
+        // created, then plant a row the way a live pre-v15 database would
+        // have.
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO canonical_sessions (agent_id, messages, compaction_cursor, compacted_summary, updated_at)
+             VALUES ('agent-1', X'80', 0, 'earlier work', '2026-08-25T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "canonical_sessions", "prime_for"));
+
+        run_migrations(&conn).unwrap();
+
+        assert!(column_exists(&conn, "canonical_sessions", "prime_for"));
+        let (summary, prime_for): (String, Option<String>) = conn
+            .query_row(
+                "SELECT compacted_summary, prime_for FROM canonical_sessions WHERE agent_id = 'agent-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summary, "earlier work", "no existing row may be rewritten");
+        assert_eq!(prime_for, None, "the new column defaults to unprimed");
+    }
+
+    /// Re-running is a no-op. A daemon that boots twice must not fail on the
+    /// second ALTER.
+    #[test]
+    fn v15_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        migrate_v15(&conn).unwrap();
+        assert!(column_exists(&conn, "canonical_sessions", "prime_for"));
+    }
 
     /// v13 must move `kind` from the metadata JSON into the column for rows
     /// that already had it. Without this lift, `semantic.rs`'s column-only
