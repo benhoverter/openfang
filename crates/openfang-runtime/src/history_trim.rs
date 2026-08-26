@@ -404,6 +404,18 @@ pub fn plan_trim(
     }
 }
 
+/// Provenance label for a kernel-resolved context window (ANAI-253).
+///
+/// `Some` means the model catalog answered; `None` means it did not and the
+/// caller substituted [`DEFAULT_CONTEXT_WINDOW`](crate::agent_loop::DEFAULT_CONTEXT_WINDOW).
+pub fn window_source(resolved: Option<usize>) -> &'static str {
+    if resolved.is_some() {
+        "catalog"
+    } else {
+        "fallback"
+    }
+}
+
 /// Emit the observation.
 ///
 /// Three tiers, chosen so the axis stays legible under the filter that is
@@ -416,7 +428,14 @@ pub fn plan_trim(
 /// - quiet and unremarkable — `debug!`, except one turn in
 ///   [`QUIET_SAMPLE_EVERY`], promoted to `info!` so the axis proves it is
 ///   alive even on an idle fleet.
-pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
+///
+/// `window_source` records where `obs.context_window` came from — `catalog`
+/// when the kernel resolved a real entry, `fallback` when it could not and
+/// [`DEFAULT_CONTEXT_WINDOW`](crate::agent_loop::DEFAULT_CONTEXT_WINDOW) was
+/// substituted. ANAI-253: a hit and a miss used to produce byte-identical
+/// lines, so no observation could be audited for whether the window it
+/// measured against was real.
+pub fn log(agent: &str, obs: &PressureObservation, streaming: bool, window_source: &str) {
     if obs.trimmed() {
         info!(
             target: TARGET,
@@ -426,6 +445,7 @@ pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
             session_messages = obs.session_messages,
             estimated_tokens = obs.estimated_tokens,
             context_window = obs.context_window,
+            window_source,
             window_used_pct = obs.window_used_pct,
             explicit_cap = ?obs.explicit_cap,
             trim_count = obs.plan.drain_count,
@@ -447,6 +467,8 @@ pub fn log(agent: &str, obs: &PressureObservation, streaming: bool) {
             session_messages = obs.session_messages,
             estimated_tokens = obs.estimated_tokens,
             context_window = obs.context_window,
+            window_source,
+            window_source,
             window_used_pct = obs.window_used_pct,
             explicit_cap = ?obs.explicit_cap,
             canonical_context_present = obs.canonical_context_present,
@@ -490,6 +512,19 @@ mod tests {
 
     fn msgs(n: usize, chars: usize) -> Vec<Message> {
         (0..n).map(|_| Message::user("x".repeat(chars))).collect()
+    }
+
+    // --- window provenance (ANAI-253) ---------------------------------
+
+    #[test]
+    fn a_resolved_window_is_labelled_catalog_and_an_unresolved_one_fallback() {
+        // The whole point of the field: before it, a catalog hit and a
+        // catalog miss produced byte-identical `context_pressure` lines, so
+        // `context_window=200000` could not be read as evidence of anything.
+        // `None` is the kernel saying it could not answer, not a window.
+        assert_eq!(window_source(Some(32_000)), "catalog");
+        assert_eq!(window_source(Some(200_000)), "catalog");
+        assert_eq!(window_source(None), "fallback");
     }
 
     // --- measurement (ANAI-245) ---------------------------------------

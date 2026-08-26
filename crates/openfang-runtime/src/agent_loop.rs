@@ -785,6 +785,8 @@ pub async fn run_agent_loop(
     // unconditional cap of 20 was worse than no valve at all.
     // ANAI-245: measure BEFORE the trim, so the pre-cut prompt size is what
     // gets recorded. ANAI-242: the same call decides the trim.
+    // ANAI-253: record whether the window is a catalog answer or a fallback.
+    let window_source = crate::history_trim::window_source(context_window_tokens);
     let pressure = crate::history_trim::observe(
         &messages,
         session.messages.len(),
@@ -794,7 +796,7 @@ pub async fn run_agent_loop(
         manifest.explicit_max_history_messages(),
         canonical_context_present,
     );
-    crate::history_trim::log(&manifest.name, &pressure, false);
+    crate::history_trim::log(&manifest.name, &pressure, false, window_source);
     if pressure.plan.fires() {
         warn!(
             agent = %manifest.name,
@@ -2498,6 +2500,7 @@ pub async fn run_agent_loop_streaming(
     // path — the live channel path, and where most field data comes from.
     // ANAI-128 landed a fix in one loop and not the other once already; the
     // two move together here.
+    let window_source = crate::history_trim::window_source(context_window_tokens);
     let pressure = crate::history_trim::observe(
         &messages,
         session.messages.len(),
@@ -2507,7 +2510,7 @@ pub async fn run_agent_loop_streaming(
         manifest.explicit_max_history_messages(),
         canonical_context_present,
     );
-    crate::history_trim::log(&manifest.name, &pressure, true);
+    crate::history_trim::log(&manifest.name, &pressure, true, window_source);
     if pressure.plan.fires() {
         warn!(
             agent = %manifest.name,

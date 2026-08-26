@@ -2672,7 +2672,8 @@ impl OpenFangKernel {
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
         let needs_compact = {
             use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
-            let config = self.compaction_config_for(&entry.manifest.model.model);
+            let config = self
+                .compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
             let estimated = estimate_token_count(
                 &session.messages,
                 Some(&entry.manifest.model.system_prompt),
@@ -2711,7 +2712,8 @@ impl OpenFangKernel {
         let driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
-        let ctx_window = self.model_context_window(&entry.manifest.model.model);
+        let ctx_window =
+            self.model_context_window(&entry.manifest.model.model, &entry.manifest.model.provider);
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
@@ -3069,7 +3071,8 @@ impl OpenFangKernel {
                         use openfang_runtime::compactor::{
                             estimate_token_count, needs_compaction_by_tokens,
                         };
-                        let config = kernel_clone.compaction_config_for(&manifest.model.model);
+                        let config = kernel_clone
+                            .compaction_config_for(&manifest.model.model, &manifest.model.provider);
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -3329,7 +3332,8 @@ impl OpenFangKernel {
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
         {
             use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
-            let config = self.compaction_config_for(&entry.manifest.model.model);
+            let config = self
+                .compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
             let estimated = estimate_token_count(
                 &session.messages,
                 Some(&entry.manifest.model.system_prompt),
@@ -3607,7 +3611,7 @@ impl OpenFangKernel {
         let driver = self.resolve_driver(&manifest)?;
 
         // Look up model's actual context window from the catalog
-        let ctx_window = self.model_context_window(&manifest.model.model);
+        let ctx_window = self.model_context_window(&manifest.model.model, &manifest.model.provider);
 
         // skill_snapshot was already built above (before tool list and prompt)
         // with bundled + global + workspace skills. Reuse it for the agent loop.
@@ -4344,17 +4348,81 @@ impl OpenFangKernel {
         }
     }
 
-    /// Look up a model's real context window (in tokens) from the catalog.
+    /// Policy ceiling on the usable context window, in tokens (ANAI-253).
     ///
-    /// Returns `None` when the catalog lock is poisoned, the model is unknown,
-    /// or the entry declares a zero window — callers fall back to the
-    /// compactor's default rather than compacting on every turn.
-    fn model_context_window(&self, model: &str) -> Option<usize> {
-        self.model_catalog
+    /// Every rung of the ladder is a *fraction* of the window, so a 1M
+    /// physical window would price the compactor's 0.70 trigger at 700k input
+    /// tokens per turn, per agent. Capacity says what fits; policy says what
+    /// we are willing to pay for. Two different numbers that happen to be
+    /// equal today — this constant keeps them distinguishable when they stop
+    /// being equal.
+    pub const POLICY_MAX_CONTEXT_TOKENS: usize = 200_000;
+
+    /// Clamp a model's physical window to the policy ceiling.
+    ///
+    /// Applied inside the resolver so every downstream consumer — compactor,
+    /// trim valve, context report — inherits it without knowing it exists.
+    pub fn apply_policy_ceiling(physical: usize) -> usize {
+        physical.min(Self::POLICY_MAX_CONTEXT_TOKENS)
+    }
+
+    /// Resolve the *effective* context window for a model, with provenance.
+    ///
+    /// Returns `(window, source)`, where `window` is
+    /// `min(physical, POLICY_MAX_CONTEXT_TOKENS)` and `source` is one of
+    /// `catalog`, `catalog-unscoped` or `fallback`.
+    ///
+    /// ANAI-253. Two defects live here. The lookup used `find_model`, which
+    /// ignores the provider, so an agent on `claude-code/opus` resolved
+    /// against the *anthropic* entry purely because the bare alias hangs
+    /// there — invisible only because both entries currently declare the same
+    /// window. And a catalog miss produced output byte-identical to a hit,
+    /// because every caller ends in `unwrap_or(200_000)`; no log line could be
+    /// audited for whether the catalog actually knew the answer.
+    ///
+    /// `None` still means "catalog cannot answer" — callers keep their
+    /// existing fallback rather than compacting on every turn.
+    fn resolve_context_window(&self, model: &str, provider: &str) -> (Option<usize>, &'static str) {
+        let looked_up = self
+            .model_catalog
             .read()
             .ok()
-            .and_then(|cat| cat.find_model(model).map(|m| m.context_window as usize))
-            .filter(|w| *w > 0)
+            .and_then(|cat| {
+                cat.find_model_for_provider(model, provider)
+                    .map(|m| (m.context_window as usize, "catalog"))
+                    .or_else(|| {
+                        cat.find_model(model)
+                            .map(|m| (m.context_window as usize, "catalog-unscoped"))
+                    })
+            })
+            .filter(|(w, _)| *w > 0);
+
+        match looked_up {
+            Some((physical, source)) => {
+                if source == "catalog-unscoped" {
+                    debug!(
+                        model,
+                        provider,
+                        physical_window = physical,
+                        "Context window resolved from a catalog entry outside the agent's provider"
+                    );
+                }
+                (Some(Self::apply_policy_ceiling(physical)), source)
+            }
+            None => {
+                warn!(
+                    model,
+                    provider,
+                    "Model not in catalog; context window falls back to the compactor default"
+                );
+                (None, "fallback")
+            }
+        }
+    }
+
+    /// The effective context window only, discarding provenance.
+    fn model_context_window(&self, model: &str, provider: &str) -> Option<usize> {
+        self.resolve_context_window(model, provider).0
     }
 
     /// Build a `CompactionConfig` whose token trigger is measured against the
@@ -4365,9 +4433,13 @@ impl OpenFangKernel {
     /// thirty lines below and was never passed in. An agent on a 32k model
     /// therefore carried a 140k token trigger it could not reach: the token
     /// path was dead for every model smaller than Claude's.
-    fn compaction_config_for(&self, model: &str) -> openfang_runtime::compactor::CompactionConfig {
+    fn compaction_config_for(
+        &self,
+        model: &str,
+        provider: &str,
+    ) -> openfang_runtime::compactor::CompactionConfig {
         let mut config = openfang_runtime::compactor::CompactionConfig::default();
-        if let Some(window) = self.model_context_window(model) {
+        if let Some(window) = self.model_context_window(model, provider) {
             config.context_window_tokens = window;
         }
         config
@@ -4398,7 +4470,8 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = self.compaction_config_for(&entry.manifest.model.model);
+        let config =
+            self.compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
 
         // ANAI-243: this gate used to be message-count only, so a session that
         // tripped the *token* trigger upstream was turned away here. The token
@@ -4501,12 +4574,12 @@ impl OpenFangKernel {
         // fell through to the hardcoded 200k and reported window pressure
         // against a window the agent may not have.
         let context_window = self
-            .model_context_window(&entry.manifest.model.model)
+            .model_context_window(&entry.manifest.model.model, &entry.manifest.model.provider)
             .or_else(|| {
                 (session.context_window_tokens > 0)
                     .then_some(session.context_window_tokens as usize)
             })
-            .unwrap_or(200_000);
+            .unwrap_or(Self::POLICY_MAX_CONTEXT_TOKENS);
 
         Ok(generate_context_report(
             &session.messages,
@@ -12077,6 +12150,31 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    // -----------------------------------------------------------------------
+    // ANAI-253: the policy ceiling on the context window
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_physical_window_larger_than_policy_is_clamped() {
+        // Opus/Sonnet 5 declare 1M. Every rung of the ladder is a fraction of
+        // the window, so an unclamped 1M would price the compactor's 0.70
+        // trigger at 700k input tokens per turn, per agent. Capacity is not
+        // the same decision as spend.
+        assert_eq!(OpenFangKernel::apply_policy_ceiling(1_000_000), 200_000);
+    }
+
+    #[test]
+    fn a_physical_window_smaller_than_policy_is_left_alone() {
+        // The ceiling is a cap, not a floor. A 32k model must keep its 32k
+        // window or ANAI-243's whole point — thresholds that scale down —
+        // is undone by the thing meant to bound them from above.
+        assert_eq!(OpenFangKernel::apply_policy_ceiling(32_000), 32_000);
+        assert_eq!(
+            OpenFangKernel::apply_policy_ceiling(OpenFangKernel::POLICY_MAX_CONTEXT_TOKENS),
+            OpenFangKernel::POLICY_MAX_CONTEXT_TOKENS
+        );
+    }
 
     // -----------------------------------------------------------------------
     // ANAI-166: note shape and kind filtering
