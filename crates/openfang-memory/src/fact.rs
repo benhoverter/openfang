@@ -94,8 +94,9 @@
 //! This layer is the backstop that makes the vocabulary a property of the
 //! store rather than a habit of its callers.
 
+use crate::staleness::{self, PersistenceClass, Staleness};
 use crate::vocabulary::{nearest_keys, resolve_scope_ref, ClaimKey, FactScope};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryId, MemorySource};
@@ -216,6 +217,12 @@ pub struct FactWrite {
     pub metadata: HashMap<String, serde_json::Value>,
     /// Embedding of `claim`, if the caller has one.
     pub embedding: Option<Vec<f32>>,
+    /// How fast this claim is expected to rot (ANAI-259).
+    ///
+    /// Defaults to [`PersistenceClass::Active`] rather than `Permanent`: an
+    /// un-thought-about claim must be doubted eventually, because the
+    /// dangerous direction is under-flagging.
+    pub persistence_class: PersistenceClass,
 }
 
 impl FactWrite {
@@ -238,6 +245,7 @@ impl FactWrite {
             episode_id: None,
             metadata: HashMap::new(),
             embedding: None,
+            persistence_class: PersistenceClass::Active,
         }
     }
 
@@ -282,6 +290,17 @@ impl FactWrite {
     /// Attach an embedding of the claim text.
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
+        self
+    }
+
+    /// Declare how fast this claim rots (ANAI-259).
+    ///
+    /// A semantic judgment about the *kind* of claim, which is why it lives in
+    /// the write rather than in config — "is this permanent or does it rot in
+    /// a day" is a call a writer can make, unlike "how many days is stable",
+    /// which is an operator's.
+    pub fn with_persistence_class(mut self, class: PersistenceClass) -> Self {
+        self.persistence_class = class;
         self
     }
 }
@@ -346,8 +365,55 @@ pub struct Fact {
     pub created_at: String,
     /// When this claim was last re-asserted.
     pub last_affirmed_at: Option<String>,
+    /// How fast this claim is expected to rot. `active` for any row written
+    /// before v16, which had no column to say otherwise.
+    pub persistence_class: PersistenceClass,
     /// Sidecar metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+impl Fact {
+    /// When this claim was last checked against the world (ANAI-259).
+    ///
+    /// **Not** when it was last read. A read spreads a claim; it does not
+    /// confirm it. Only the three writing outcomes move this: `created_at` is
+    /// stamped on create and re-stamped on supersession, `last_affirmed_at`
+    /// moves on affirmation. `last_affirmed_at` is preferred because an
+    /// affirmation is strictly later than the create that preceded it.
+    pub fn last_verified_at(&self) -> &str {
+        self.last_affirmed_at
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.created_at)
+    }
+
+    /// Whole days since [`Self::last_verified_at`], or `None` if the stored
+    /// timestamp will not parse.
+    ///
+    /// An unparseable stamp yields `None` rather than `0`: pretending a row we
+    /// cannot date is fresh is exactly the confident lie this feature exists
+    /// to stop.
+    pub fn age_days(&self, now: DateTime<Utc>) -> Option<f64> {
+        let verified = DateTime::parse_from_rfc3339(self.last_verified_at()).ok()?;
+        Some((now - verified.with_timezone(&Utc)).num_seconds() as f64 / 86_400.0)
+    }
+
+    /// Whether a reader should be told to re-verify this claim.
+    ///
+    /// A row with an unreadable timestamp is reported as needing verification
+    /// with an age of `-1`: it cannot be vouched for, and the honest answer to
+    /// "how old is this" is "unknown", not "new".
+    pub fn staleness_at(&self, now: DateTime<Utc>) -> Staleness {
+        match self.age_days(now) {
+            Some(age) => staleness::judge(self.persistence_class, age, staleness::policy()),
+            None => Staleness::ShouldVerify { age_days: -1 },
+        }
+    }
+
+    /// [`Self::staleness_at`] against the wall clock.
+    pub fn staleness(&self) -> Staleness {
+        self.staleness_at(Utc::now())
+    }
 }
 
 /// A claim that used to occupy a slot.
@@ -572,9 +638,10 @@ impl FactStore {
                     "INSERT INTO memories (id, agent_id, content, source, scope, confidence,
                                            metadata, created_at, accessed_at, access_count,
                                            deleted, embedding, episode_id, kind, claim_key,
-                                           status, last_affirmed_at, scope_ref, authored_by)
+                                           status, last_affirmed_at, scope_ref, authored_by,
+                                           persistence_class)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, 0, 0, ?9, ?10, ?11, ?12, ?13,
-                             ?8, ?14, ?2)",
+                             ?8, ?14, ?2, ?15)",
                     rusqlite::params![
                         id.0.to_string(),
                         agent,
@@ -590,6 +657,7 @@ impl FactStore {
                         claim_key,
                         write.status.as_str(),
                         scope_ref,
+                        write.persistence_class.as_str(),
                     ],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -615,9 +683,22 @@ impl FactStore {
                 tx.execute(
                     "UPDATE memories
                      SET last_affirmed_at = ?2, accessed_at = ?2, confidence = ?3,
-                         metadata = ?4, episode_id = COALESCE(?5, episode_id)
+                         metadata = ?4, episode_id = COALESCE(?5, episode_id),
+                         persistence_class = ?6
                      WHERE id = ?1",
-                    rusqlite::params![row.id, now, write.confidence, meta_str, write.episode_id,],
+                    rusqlite::params![
+                        row.id,
+                        now,
+                        write.confidence,
+                        meta_str,
+                        write.episode_id,
+                        // A current-state attribute of an unchanged claim,
+                        // same as confidence: an affirmation is the moment to
+                        // correct a misjudged class, and refusing to move it
+                        // would leave a caller no way to fix one short of
+                        // faking a claim edit.
+                        write.persistence_class.as_str(),
+                    ],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
                 FactOutcome::Affirmed { id }
@@ -669,7 +750,7 @@ impl FactStore {
                      SET content = ?2, source = ?3, confidence = ?4, metadata = ?5,
                          embedding = ?6, episode_id = ?7, status = ?8,
                          created_at = ?9, accessed_at = ?9, last_affirmed_at = ?9,
-                         agent_id = ?10, authored_by = ?10
+                         agent_id = ?10, authored_by = ?10, persistence_class = ?11
                      WHERE id = ?1",
                     rusqlite::params![
                         row.id,
@@ -682,6 +763,7 @@ impl FactStore {
                         write.status.as_str(),
                         now,
                         agent,
+                        write.persistence_class.as_str(),
                     ],
                 )
                 .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -710,7 +792,7 @@ impl FactStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         conn.query_row(
             "SELECT id, authored_by, scope, scope_ref, claim_key, content, status, confidence,
-                    episode_id, created_at, last_affirmed_at, metadata
+                    episode_id, created_at, last_affirmed_at, metadata, persistence_class
              FROM memories
              WHERE scope = ?1 AND scope_ref = ?2 AND claim_key = ?3
                AND kind = ?4 AND deleted = 0",
@@ -746,7 +828,7 @@ impl FactStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, authored_by, scope, scope_ref, claim_key, content, status, confidence,
-                        episode_id, created_at, last_affirmed_at, metadata
+                        episode_id, created_at, last_affirmed_at, metadata, persistence_class
                  FROM memories
                  WHERE scope = ?1 AND scope_ref = ?2 AND kind = ?3 AND deleted = 0
                  ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END,
@@ -857,6 +939,7 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenFangResult<Fact>
     let id: String = row.get(0)?;
     let status: Option<String> = row.get(6)?;
     let metadata: String = row.get(11)?;
+    let persistence_class: Option<String> = row.get(12).unwrap_or_default();
     Ok((|| {
         Ok(Fact {
             id: parse_memory_id(&id)?,
@@ -873,6 +956,7 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpenFangResult<Fact>
             episode_id: row.get::<_, Option<String>>(8).unwrap_or_default(),
             created_at: row.get::<_, String>(9).unwrap_or_default(),
             last_affirmed_at: row.get::<_, Option<String>>(10).unwrap_or_default(),
+            persistence_class: PersistenceClass::from_stored(persistence_class.as_deref()),
             metadata: serde_json::from_str(&metadata).unwrap_or_default(),
         })
     })())
@@ -930,6 +1014,124 @@ mod tests {
     }
 
     // --- ANAI-247: list_for_scope ------------------------------------------
+
+    /// A class survives the round trip, and a row written before v16 — which
+    /// has no column to say otherwise — reads back as `active` rather than
+    /// being silently promoted to `permanent`.
+    #[test]
+    fn persistence_class_round_trips_and_defaults_to_active() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "main is the trunk")
+                    .with_scope_ref("openfang-fork")
+                    .with_persistence_class(PersistenceClass::Stable),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "build.rebuild", "pending")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+
+        let stable = store
+            .get("project", "openfang-fork", "repo.trunk_model")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stable.persistence_class, PersistenceClass::Stable);
+
+        let unstated = store
+            .get("project", "openfang-fork", "build.rebuild")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unstated.persistence_class,
+            PersistenceClass::Active,
+            "an unstated class must be doubted eventually, not treated as permanent"
+        );
+    }
+
+    /// An affirmation is the moment to correct a misjudged class, exactly as
+    /// it is for confidence. Freezing it would leave a caller no way to fix
+    /// one short of faking a claim edit.
+    #[test]
+    fn an_affirmation_can_correct_the_class() {
+        let (store, _c) = store();
+        let a = agent();
+        let w = || {
+            FactWrite::new(a, "project", "repo.trunk_head", "main @ abb0f4b")
+                .with_scope_ref("openfang-fork")
+        };
+        store.upsert(w()).unwrap();
+        let outcome = store
+            .upsert(w().with_persistence_class(PersistenceClass::Volatile))
+            .unwrap();
+        assert!(
+            matches!(outcome, FactOutcome::Affirmed { .. }),
+            "the claim did not change, so this is an affirmation"
+        );
+        assert_eq!(
+            store
+                .get("project", "openfang-fork", "repo.trunk_head")
+                .unwrap()
+                .unwrap()
+                .persistence_class,
+            PersistenceClass::Volatile
+        );
+    }
+
+    /// The verification clock is a *write* clock. A claim just written is
+    /// fresh whatever its class; a claim last written long ago is not, and a
+    /// `permanent` one never is.
+    #[test]
+    fn a_fresh_write_is_never_stale_and_the_clock_is_the_write_clock() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "main @ abb0f4b")
+                    .with_scope_ref("openfang-fork")
+                    .with_persistence_class(PersistenceClass::Volatile),
+            )
+            .unwrap();
+        let fact = store
+            .get("project", "openfang-fork", "repo.trunk_head")
+            .unwrap()
+            .unwrap();
+        assert!(!fact.staleness().should_verify());
+        // Ten days on, the same volatile claim is well past its window.
+        let later = Utc::now() + chrono::Duration::days(10);
+        assert!(fact.staleness_at(later).should_verify());
+        // ...but the same age under `permanent` is not stale at all.
+        let mut permanent = fact.clone();
+        permanent.persistence_class = PersistenceClass::Permanent;
+        assert!(!permanent.staleness_at(later).should_verify());
+    }
+
+    /// A row we cannot date is reported as needing verification, not as new.
+    /// Pretending an undateable claim is fresh is the confident lie this
+    /// feature exists to stop.
+    #[test]
+    fn an_undateable_row_asks_to_be_verified() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "main is the trunk")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+        let mut fact = store
+            .get("project", "openfang-fork", "repo.trunk_model")
+            .unwrap()
+            .unwrap();
+        fact.created_at = "not a timestamp".to_string();
+        fact.last_affirmed_at = None;
+        assert_eq!(fact.age_days(Utc::now()), None);
+        assert!(fact.staleness().should_verify());
+    }
 
     /// Open loops sort ahead of settled background regardless of write order.
     /// A pack truncated by `limit` must lose the background, never the

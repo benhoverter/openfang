@@ -682,7 +682,7 @@ pub fn built_in_tools() -> Vec<Tool> {
         // other bridge tool.
         Tool::new(
             "memory_fact",
-            "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate.",
+            "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate. When you write, say how fast the claim rots with 'persistence_class' - a claim that goes unchecked past its class is surfaced later marked 'verify', so future readers ask instead of assert.",
             obj(json!({
                 "type": "object",
                 "properties": {
@@ -691,7 +691,8 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "key": { "type": "string", "description": "The slot name, 'namespace.slot', e.g. \"repo.trunk_model\". Up to 7 dot-separated segments." },
                     "claim": { "type": "string", "description": "The claim itself, in plain words. Omit to READ the slot instead of writing it." },
                     "status": { "type": "string", "enum": ["open", "settled"], "description": "'settled' (default) for a stable belief; 'open' for an unfinished loop." },
-                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." }
+                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." },
+                    "persistence_class": { "type": "string", "enum": ["permanent", "stable", "active", "volatile"], "description": "How fast this claim rots, so a reader knows when to re-check it. 'permanent' never goes stale (a name, a table's name); 'stable' is good for months (architecture, ownership); 'active' is the default and is doubted after about a week; 'volatile' is doubted within a day (deploy state, a commit hash). Writing your own re-verification command into the claim text makes the marker actionable. If a claim rots in hours it is probably an event, not a slot - use memory_note." }
                 },
                 "required": ["scope", "key"]
             })),

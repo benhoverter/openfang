@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -69,6 +69,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 15 {
         migrate_v15(conn)?;
+    }
+
+    if current_version < 16 {
+        migrate_v16(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -733,6 +737,31 @@ fn migrate_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 16: `memories.persistence_class` — how fast a tier-3 claim rots
+/// (ANAI-259).
+///
+/// One nullable column and no backfill, which is the whole migration. NULL is
+/// read as `active` by [`crate::staleness::PersistenceClass::from_stored`], so
+/// every pre-v16 slot lands on the middling clock rather than being silently
+/// promoted to `permanent`.
+///
+/// Note what is *not* here: a `last_verified_at` column. The verification
+/// clock already exists — `created_at` is re-stamped on create and
+/// supersession and `last_affirmed_at` moves on affirmation, and no read path
+/// touches either — so the timestamp half of this feature was already in the
+/// schema and only the classification was missing.
+fn migrate_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "persistence_class") {
+        conn.execute("ALTER TABLE memories ADD COLUMN persistence_class TEXT", [])?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (16, datetime('now'), 'Add memories.persistence_class for fact staleness marking (ANAI-259)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,6 +772,46 @@ mod tests {
     /// touches no row.
     #[test]
     fn v15_adds_prime_for_without_disturbing_existing_canonical_rows() {
+        v15_body();
+    }
+
+    /// v16 must be additive on a live `memories` table. This is the fleet's
+    /// entire durable corpus; the only acceptable migration is one nullable
+    /// column and no backfill. NULL is read as `active` at the read path, so
+    /// no row needs touching to be correctly classified.
+    #[test]
+    fn v16_adds_persistence_class_without_touching_a_single_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata,
+                                   created_at, accessed_at, access_count, deleted)
+             VALUES ('m1', 'a1', 'a claim', '\"inference\"', 'agent', 1.0, '{}',
+                     '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Re-running is a no-op: `column_exists` guards the ALTER, so a
+        // second boot on an already-migrated database must not error.
+        migrate_v16(&conn).unwrap();
+
+        let class: Option<String> = conn
+            .query_row(
+                "SELECT persistence_class FROM memories WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(class, None, "no backfill: a pre-v16 row keeps its NULL");
+        assert_eq!(
+            crate::staleness::PersistenceClass::from_stored(class.as_deref()),
+            crate::staleness::PersistenceClass::Active,
+            "and reads back as the middling clock, not as permanent"
+        );
+    }
+
+    fn v15_body() {
         let conn = Connection::open_in_memory().unwrap();
         // Stand up the schema through v5, where `canonical_sessions` is
         // created, then plant a row the way a live pre-v15 database would

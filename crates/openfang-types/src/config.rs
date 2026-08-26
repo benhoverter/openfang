@@ -24,6 +24,45 @@ where
         .collect())
 }
 
+/// Class-to-duration mapping for tier-3 fact staleness (`[fact_staleness]`,
+/// ANAI-259).
+///
+/// Durations live here rather than on the row because "how long is stable"
+/// is an operator's judgment and "is this claim stable" is the writer's. Held
+/// symbolically on the row, retuned in one place — the same split as
+/// [`ContextConfig::working_set_ratio`].
+///
+/// There is deliberately no `permanent_days`: `permanent` means *never
+/// doubted*, and a duration for it would be a contradiction with a number
+/// attached.
+///
+/// Must be a ladder — `volatile_days <= active_days <= stable_days`. An
+/// inverted config is refused at install time (the compiled defaults stay
+/// live and an error is logged) rather than quietly making `stable` the
+/// twitchiest class in the system.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FactStalenessConfig {
+    /// Days before a `stable` claim is marked for re-verification.
+    /// Architecture, process, team ownership.
+    pub stable_days: f64,
+    /// Days before an `active` claim is marked. Also the class every
+    /// unclassified claim is read as, so this is the fleet's default clock.
+    pub active_days: f64,
+    /// Days before a `volatile` claim is marked. Deploy state, `HEAD`.
+    pub volatile_days: f64,
+}
+
+impl Default for FactStalenessConfig {
+    fn default() -> Self {
+        Self {
+            stable_days: 90.0,
+            active_days: 7.0,
+            volatile_days: 1.0,
+        }
+    }
+}
+
 /// Context-window policy exposed in the `[context]` config section (ANAI-260).
 ///
 /// Fleet-wide, deliberately not per-agent. A per-agent working-set target
@@ -1622,6 +1661,11 @@ pub struct KernelConfig {
     /// via `openfang_runtime::compactor::install_working_set_ratio`.
     #[serde(default)]
     pub context: ContextConfig,
+    /// How long a tier-3 fact is believed before it is marked for
+    /// re-verification ([fact_staleness], ANAI-259). Global, installed at boot
+    /// via `openfang_memory::staleness::install_policy`.
+    #[serde(default)]
+    pub fact_staleness: FactStalenessConfig,
 }
 
 /// Per-turn context envelope settings exposed in the `[turn_context]` config
@@ -2024,6 +2068,7 @@ impl Default for KernelConfig {
             skills: HashMap::new(),
             turn_context: TurnContextConfig::default(),
             context: ContextConfig::default(),
+            fact_staleness: FactStalenessConfig::default(),
         }
     }
 }

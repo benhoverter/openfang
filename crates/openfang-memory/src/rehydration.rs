@@ -21,6 +21,8 @@
 
 use crate::episode::Episode;
 use crate::fact::{Fact, FactStatus};
+use crate::staleness::Staleness;
+use chrono::{DateTime, Utc};
 
 /// Closed episodes to recall. Three is a session's worth of recent history
 /// without turning the pack into a changelog.
@@ -66,6 +68,20 @@ pub const PACK_BUDGET: usize = 3_000;
 /// recent history. `facts` are the live claims about the primed project,
 /// author-blind, open loops first.
 pub fn render_pack(prime_for: &str, episodes: &[Episode], facts: &[Fact]) -> Option<String> {
+    render_pack_at(prime_for, episodes, facts, Utc::now())
+}
+
+/// [`render_pack`] against a caller-supplied clock.
+///
+/// Exists so the staleness markers (ANAI-259) can be tested at a fixed instant
+/// instead of by writing rows dated relative to a wall clock that moves while
+/// the test runs.
+pub fn render_pack_at(
+    prime_for: &str,
+    episodes: &[Episode],
+    facts: &[Fact],
+    now: DateTime<Utc>,
+) -> Option<String> {
     let episodes: Vec<&Episode> = episodes
         .iter()
         .filter(|e| !e.is_open())
@@ -108,13 +124,39 @@ pub fn render_pack(prime_for: &str, episodes: &[Episode], facts: &[Fact]) -> Opt
         out.push_str(&format!(
             "\nWhat is currently true about {prime_for} (fleet-wide, newest first):\n"
         ));
-        for fact in facts.iter().take(MAX_FACTS) {
+        let shown: Vec<&Fact> = facts.iter().take(MAX_FACTS).collect();
+        // Said once, above the list, rather than appended to every marked
+        // line: the explanation is the same each time and the pack pays for
+        // its own length out of the protected index-0 slot.
+        if shown.iter().any(|f| f.staleness_at(now).should_verify()) {
+            out.push_str(
+                "(A claim marked `verify` is still what we believe — it has just gone longer \
+                 than its kind should without being checked. Treat it as a question to ask, \
+                 not a fact to assert.)\n",
+            );
+        }
+        for fact in shown {
             let marker = match fact.status {
                 FactStatus::Open => "[open] ",
                 FactStatus::Settled => "",
             };
+            // Advisory, never withholding. A stale slot the agent cannot see
+            // is a slot the agent cannot re-verify, and an absent claim reads
+            // as "nothing is known" rather than "this needs checking".
+            let age = match fact.staleness_at(now) {
+                Staleness::Fresh => String::new(),
+                Staleness::ShouldVerify { age_days } if age_days < 0 => {
+                    format!(" [{} · age unknown · verify]", fact.persistence_class)
+                }
+                Staleness::ShouldVerify { age_days } => {
+                    format!(
+                        " [{} · last verified {age_days}d ago · verify]",
+                        fact.persistence_class
+                    )
+                }
+            };
             out.push_str(&format!(
-                "- {marker}{}: {}\n",
+                "- {marker}{}: {}{age}\n",
                 fact.claim_key,
                 cap(&fact.claim, CLAIM_BUDGET)
             ));
@@ -180,6 +222,7 @@ mod tests {
             episode_id: None,
             created_at: Utc::now().to_rfc3339(),
             last_affirmed_at: None,
+            persistence_class: crate::staleness::PersistenceClass::Active,
             metadata: HashMap::new(),
         }
     }
@@ -189,6 +232,64 @@ mod tests {
     #[test]
     fn an_empty_pack_is_no_pack() {
         assert!(render_pack("openfang-fork", &[], &[]).is_none());
+    }
+
+    // --- ANAI-259: staleness markers ---------------------------------------
+
+    /// Ben's Jim case, in the pack: a stale claim is surfaced *with* its age,
+    /// never withheld. Withholding is the failure mode — an agent that cannot
+    /// see the slot cannot re-verify it, and silence reads as "nothing is
+    /// known" rather than "this needs checking".
+    #[test]
+    fn a_stale_claim_is_shown_with_its_age_not_withheld() {
+        let mut stale = fact(
+            "deploy.live_binary",
+            "pid 94341, v0.6.9",
+            FactStatus::Settled,
+        );
+        stale.persistence_class = crate::staleness::PersistenceClass::Volatile;
+        let now = Utc::now() + chrono::Duration::days(3);
+
+        let pack = render_pack_at("openfang-fork", &[], &[stale], now).unwrap();
+        assert!(
+            pack.contains("pid 94341"),
+            "the claim itself must still be there: {pack}"
+        );
+        assert!(pack.contains("verify"), "and marked: {pack}");
+        assert!(pack.contains("3d ago"), "with its age: {pack}");
+    }
+
+    /// A fresh claim carries no marker and no explanatory preamble — the
+    /// pack rides in the protected index-0 slot and must not pay rent for a
+    /// warning nobody needs.
+    #[test]
+    fn a_fresh_claim_costs_no_marker() {
+        let fresh = fact("repo.trunk_model", "main is the trunk", FactStatus::Settled);
+        let pack = render_pack("openfang-fork", &[], &[fresh]).unwrap();
+        assert!(
+            !pack.contains("verify"),
+            "no marker on a fresh pack: {pack}"
+        );
+    }
+
+    /// `permanent` is the class with no clock. An old name is not a doubtful
+    /// name.
+    #[test]
+    fn a_permanent_claim_never_earns_a_marker() {
+        let mut permanent = fact(
+            "memory.table_name",
+            "the table is `memories`",
+            FactStatus::Settled,
+        );
+        permanent.persistence_class = crate::staleness::PersistenceClass::Permanent;
+        let pack = render_pack_at(
+            "openfang-fork",
+            &[],
+            &[permanent],
+            Utc::now() + chrono::Duration::days(3650),
+        )
+        .unwrap();
+        assert!(!pack.contains("verify"), "{pack}");
     }
 
     /// An agent with no closed episodes but live project claims is the normal

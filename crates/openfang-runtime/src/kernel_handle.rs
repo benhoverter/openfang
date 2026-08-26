@@ -58,6 +58,10 @@ pub struct FactWriteRequest {
     pub status: Option<String>,
     /// 0.0..=1.0. `None` means 1.0.
     pub confidence: Option<f64>,
+    /// ANAI-259: `permanent` / `stable` / `active` / `volatile`. `None` means
+    /// `active`, the middling clock — an un-thought-about claim must be
+    /// doubted eventually.
+    pub persistence_class: Option<String>,
 }
 
 /// Handle to kernel operations, passed into the agent loop so agents

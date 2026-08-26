@@ -1407,7 +1407,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // vec.
         ToolDefinition {
             name: "memory_fact".to_string(),
-            description: "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate.".to_string(),
+            description: "Read or write one durable claim slot - a named box holding the CURRENT truth about something, overwritten in place when it changes. Pass 'claim' to write; omit it to read what is already there. Keys are 'namespace.slot', e.g. 'repo.trunk_model' or 'project.tttb.promotion_status'; the namespaces are agent, build, deploy, delivery, memory, project, repo, tool and user. Store state that gets updated, not events that happened - a ticket id or a date in the key means it belongs in memory_note instead. Read a slot before you write it: prefer a key that already exists over minting a near-duplicate. When you write, say how fast the claim rots with 'persistence_class' - a claim that goes unchecked past its class is surfaced later marked 'verify', so future readers ask instead of assert.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1416,7 +1416,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The slot name, 'namespace.slot', e.g. \"repo.trunk_model\". Up to 7 dot-separated segments." },
                     "claim": { "type": "string", "description": "The claim itself, in plain words. Omit to READ the slot instead of writing it." },
                     "status": { "type": "string", "enum": ["open", "settled"], "description": "'settled' (default) for a stable belief; 'open' for an unfinished loop." },
-                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." }
+                    "confidence": { "type": "number", "description": "How sure you are, 0.0 to 1.0. Defaults to 1.0." },
+                    "persistence_class": { "type": "string", "enum": ["permanent", "stable", "active", "volatile"], "description": "How fast this claim rots, so a reader knows when to re-check it. 'permanent' never goes stale (a name, a table's name); 'stable' is good for months (architecture, ownership); 'active' is the default and is doubted after about a week; 'volatile' is doubted within a day (deploy state, a commit hash). Writing your own re-verification command into the claim text makes the marker actionable. If a claim rots in hours it is probably an event, not a slot - use memory_note." }
                 },
                 "required": ["scope", "key"]
             }),
@@ -3973,6 +3974,11 @@ async fn tool_memory_fact(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         confidence: input["confidence"].as_f64(),
+        persistence_class: input["persistence_class"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
 
     let payload = kh.memory_fact_write(caller_agent_id, request).await?;
@@ -4033,6 +4039,25 @@ fn render_fact_read(payload: &serde_json::Value) -> String {
     }
     if let Some(affirmed) = fact["last_affirmed_at"].as_str() {
         out.push_str(&format!("  last re-affirmed: {affirmed}\n"));
+    }
+    // ANAI-259. The class is stated on every read, not just a stale one, so a
+    // reader can see a claim is *deliberately* permanent rather than merely
+    // unmarked. The warning is a separate line because it is the part that
+    // should change what the reader does next.
+    if let Some(class) = fact["persistence_class"].as_str() {
+        out.push_str(&format!("  persistence: {class}\n"));
+    }
+    if fact["should_verify"].as_bool().unwrap_or(false) {
+        let age = match fact["age_days"].as_f64() {
+            Some(d) => format!("{} days", d as i64),
+            None => "an unknown length of time".to_string(),
+        };
+        out.push_str(&format!(
+            "  VERIFY: unchecked for {age}, longer than a '{}' claim should go. This is \
+             still what we believe — treat it as a question to confirm, not a fact to \
+             assert, and re-write the slot once you have checked it.\n",
+            fact["persistence_class"].as_str().unwrap_or("active")
+        ));
     }
     out.push_str(
         "\nRead only: no 'claim' was given, so nothing was written. Pass 'claim' to \

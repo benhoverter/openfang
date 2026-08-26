@@ -5609,6 +5609,31 @@ impl OpenFangKernel {
             ),
         }
 
+        // Install the operator-configured fact staleness durations
+        // ([fact_staleness], ANAI-259). Same trade as the ratio above: a
+        // refused value leaves the compiled 90/7/1 ladder live rather than
+        // failing the boot over a tuning typo.
+        {
+            let cfg = self.config.fact_staleness;
+            let policy = openfang_memory::staleness::StalenessPolicy {
+                stable_days: cfg.stable_days,
+                active_days: cfg.active_days,
+                volatile_days: cfg.volatile_days,
+            };
+            match openfang_memory::staleness::install_policy(policy) {
+                Ok(()) => info!(
+                    stable_days = cfg.stable_days,
+                    active_days = cfg.active_days,
+                    volatile_days = cfg.volatile_days,
+                    "Fact staleness policy installed"
+                ),
+                Err(e) => error!(
+                    "Refusing [fact_staleness], keeping the compiled defaults \
+                     (stable 90d / active 7d / volatile 1d): {e}"
+                ),
+            }
+        }
+
         // Install operator-configured agent-wake limits ([agent_wake] config,
         // ANAI-111) so the producer's rate backstops and the wake-consumer's
         // concurrency cap resolve them. Idempotent; must precede
@@ -10999,6 +11024,28 @@ impl KernelHandle for OpenFangKernel {
             ));
         }
 
+        // ANAI-259. An omitted class is `active`, not `permanent`: the failure
+        // modes are not symmetric. Over-flagging is noise a reader ignores;
+        // under-flagging is a confident lie told at rehydration time, when a
+        // claim carries more authority than usual because it is one of the few
+        // things the agent has. A *supplied* value is parsed strictly, so a
+        // typo is corrected rather than silently absorbed into the default.
+        let persistence_class = match request.persistence_class.as_deref() {
+            None => openfang_memory::staleness::PersistenceClass::Active,
+            Some(s) => openfang_memory::staleness::PersistenceClass::parse(s)?,
+        };
+        if persistence_class.is_smell() {
+            // Legal, but visible. A claim that rots in hours is usually
+            // episode material wearing a slot; `repo.trunk_head` is the honest
+            // exception. Logged so the pattern is noticed before it is a
+            // habit.
+            info!(
+                agent_id = %agent_id,
+                claim_key = %request.claim_key,
+                "Volatile fact written: check this is durable state and not episode material"
+            );
+        }
+
         // A fact write is activity: it opens an episode if none is open and
         // extends one that is. Same reasoning as `memory_note` — the write
         // establishes the state, which is why ADR 0002 §2.6 refuses a separate
@@ -11036,7 +11083,8 @@ impl KernelHandle for OpenFangKernel {
         .with_status(status)
         .with_confidence(confidence)
         .with_source(openfang_types::memory::MemorySource::Conversation)
-        .with_episode(episode_id.to_string());
+        .with_episode(episode_id.to_string())
+        .with_persistence_class(persistence_class);
         if let Some(ref given) = request.scope_ref {
             write = write.with_scope_ref(given.clone());
         }
@@ -11114,6 +11162,13 @@ impl KernelHandle for OpenFangKernel {
                 "created_at": f.created_at,
                 "last_affirmed_at": f.last_affirmed_at,
                 "episode_id": f.episode_id,
+                // ANAI-259: the age of the belief travels with it. Advisory,
+                // never withholding — a stale slot the reader cannot see is a
+                // slot the reader cannot re-verify.
+                "persistence_class": f.persistence_class.as_str(),
+                "last_verified_at": f.last_verified_at(),
+                "age_days": f.age_days(chrono::Utc::now()).map(|d| d.floor()),
+                "should_verify": f.staleness().should_verify(),
             })),
         }))
     }
