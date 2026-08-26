@@ -518,6 +518,13 @@ impl MemorySubstrate {
         self.sessions.delete_canonical_session(agent_id)
     }
 
+    /// ANAI-246: re-anchor the canonical session at an episode boundary —
+    /// drop the pre-boundary verbatim messages, keep the compacted summary.
+    /// Returns the number of messages dropped.
+    pub fn reanchor_canonical(&self, agent_id: AgentId) -> OpenFangResult<usize> {
+        self.sessions.reanchor_canonical(agent_id)
+    }
+
     /// Set or clear a session label.
     pub fn set_session_label(
         &self,

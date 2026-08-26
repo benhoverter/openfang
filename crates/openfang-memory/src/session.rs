@@ -357,6 +357,35 @@ impl SessionStore {
     }
 }
 
+impl SessionStore {
+    /// ANAI-246: re-anchor the canonical session at an episode boundary.
+    ///
+    /// Drops the verbatim cross-channel messages accumulated before the
+    /// boundary and **keeps `compacted_summary`**. This is deliberately not
+    /// [`Self::delete_canonical_session`]: an episode close means "that topic
+    /// ended", not "forget you have a past". The summary is the agent's only
+    /// durable, cheap account of everything before the boundary, and it is the
+    /// source of the index-0 `canonical_context_msg` that ANAI-242/244 spend
+    /// real effort protecting from the trim ladder. Deleting it on every close
+    /// would hand the ladder the amnesia it was hardened against.
+    ///
+    /// Returns the number of verbatim messages dropped, for the caller's log.
+    pub fn reanchor_canonical(&self, agent_id: AgentId) -> OpenFangResult<usize> {
+        let mut canonical = self.load_canonical(agent_id)?;
+        let dropped = canonical.messages.len();
+        if dropped == 0 {
+            // Nothing to re-anchor. Return without a write so a double close
+            // does not churn `updated_at` for no reason.
+            return Ok(0);
+        }
+        canonical.messages.clear();
+        canonical.compaction_cursor = 0;
+        canonical.updated_at = Utc::now().to_rfc3339();
+        self.save_canonical(&canonical)?;
+        Ok(dropped)
+    }
+}
+
 /// Default number of recent messages to include from canonical session.
 const DEFAULT_CANONICAL_WINDOW: usize = 50;
 
@@ -954,6 +983,51 @@ mod tests {
         let all_text: String = recent.iter().map(|m| m.content.text_content()).collect();
         assert!(all_text.contains("Jaber"));
         assert!(summary.is_none()); // Only 2 messages, no compaction
+    }
+
+    /// ANAI-246: the re-anchor drops the verbatim messages and KEEPS the
+    /// compacted summary. If this ever inverts, every episode close becomes
+    /// the amnesia `delete_canonical_session` would have caused.
+    #[test]
+    fn test_reanchor_canonical_keeps_the_summary_and_drops_the_messages() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .store_llm_summary(
+                agent_id,
+                "earlier: we retired the octopus",
+                vec![Message::user("still here"), Message::assistant("indeed")],
+            )
+            .unwrap();
+
+        let dropped = store.reanchor_canonical(agent_id).unwrap();
+        assert_eq!(dropped, 2);
+
+        let canonical = store.load_canonical(agent_id).unwrap();
+        assert!(canonical.messages.is_empty(), "verbatim history is dropped");
+        assert_eq!(
+            canonical.compacted_summary.as_deref(),
+            Some("earlier: we retired the octopus"),
+            "the summary is the agent's memory of everything before the boundary"
+        );
+        assert_eq!(canonical.compaction_cursor, 0);
+
+        // And it still reaches the prompt path.
+        let (summary, recent) = store.canonical_context(agent_id, None).unwrap();
+        assert_eq!(summary.as_deref(), Some("earlier: we retired the octopus"));
+        assert!(recent.is_empty());
+    }
+
+    /// A second close with nothing to drop is a no-op, not a write.
+    #[test]
+    fn test_reanchor_canonical_is_idempotent() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .append_canonical(agent_id, &[Message::user("one")], None)
+            .unwrap();
+        assert_eq!(store.reanchor_canonical(agent_id).unwrap(), 1);
+        assert_eq!(store.reanchor_canonical(agent_id).unwrap(), 0);
     }
 
     #[test]

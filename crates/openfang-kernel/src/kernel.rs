@@ -148,6 +148,18 @@ pub struct OpenFangKernel {
     >,
     /// Tracks running agent tasks for cancellation support.
     pub running_tasks: dashmap::DashMap<AgentId, tokio::task::AbortHandle>,
+    /// ANAI-246: agents that asked for their context to be reset at the end of
+    /// the current turn, via `memory_episode_close(reset_context: true)`.
+    ///
+    /// The reset is **deferred**, not immediate, and that is the whole point.
+    /// The tool runs mid-turn while `agent_loop` holds a live `Session` it
+    /// re-persists with `save_session_async` several times before the turn
+    /// ends. Clearing the row from inside the tool would be overwritten by the
+    /// loop's own next write — a silent no-op that tests could not see, which
+    /// is the exact failure class that already cost us the allowlist miss, the
+    /// log-filter miss and the `apply_patch` no-op. So the tool records intent
+    /// here and the kernel honours it after the loop has returned.
+    pub pending_context_resets: dashmap::DashSet<AgentId>,
     /// MCP server connections (lazily initialized at start_background_agents).
     pub mcp_connections: tokio::sync::Mutex<Vec<openfang_runtime::mcp::McpConnection>>,
     /// MCP tool definitions cache (populated after connections are established).
@@ -1459,6 +1471,7 @@ impl OpenFangKernel {
             skill_registry: std::sync::RwLock::new(skill_registry),
             skill_config_overrides: std::sync::RwLock::new(None),
             running_tasks: dashmap::DashMap::new(),
+            pending_context_resets: dashmap::DashSet::new(),
             mcp_connections: tokio::sync::Mutex::new(Vec::new()),
             mcp_tools: std::sync::Mutex::new(Vec::new()),
             a2a_task_store: openfang_runtime::a2a::A2aTaskStore::default(),
@@ -3022,6 +3035,12 @@ impl OpenFangKernel {
                         }
                     }
 
+                    // ANAI-246: honour a mid-turn `reset_context` request now
+                    // that the loop has returned and this turn is in canonical
+                    // memory. Doing it inside the tool would be overwritten by
+                    // the loop's own `save_session_async`.
+                    kernel_clone.apply_pending_context_reset(agent_id);
+
                     // Write JSONL session mirror and daily memory log to the
                     // agent's private state directory, not the user-facing
                     // workspace. See issue #1097.
@@ -3735,6 +3754,10 @@ impl OpenFangKernel {
             }
         }
 
+        // ANAI-246: honour a mid-turn `reset_context` request now that the
+        // loop has returned and this turn is in canonical memory.
+        self.apply_pending_context_reset(agent_id);
+
         // Write JSONL session mirror and daily memory log to the agent's
         // private state directory, not the user-facing workspace. See #1097.
         if let Some(ref state_dir) = manifest.state_dir {
@@ -3830,6 +3853,88 @@ impl OpenFangKernel {
 
         info!(agent_id = %agent_id, "Session reset (summary saved to memory)");
         Ok(())
+    }
+
+    /// ANAI-246: record that the agent asked, mid-turn, for its context to be
+    /// reset once this turn finishes. Idempotent.
+    ///
+    /// Named `queue_` rather than `request_` so it does not shadow the
+    /// `KernelHandle::request_context_reset` trait method, which takes an
+    /// agent *name* and resolves it. Inherent methods win that lookup
+    /// silently, which is exactly the kind of quiet wrong-call this codebase
+    /// has been bitten by twice this week.
+    pub fn queue_context_reset(&self, agent_id: AgentId) {
+        self.pending_context_resets.insert(agent_id);
+    }
+
+    /// ANAI-246: honour a deferred context reset if one was requested.
+    ///
+    /// Called once per turn from both agent-run paths, **after** the agent
+    /// loop has returned and after the canonical append — so the turn that
+    /// asked for the reset is itself carried into canonical memory before the
+    /// boundary is drawn. Best-effort: a failure here must not fail the turn
+    /// the agent already completed, so it warns rather than propagating.
+    ///
+    /// Returns true if a reset was applied.
+    pub fn apply_pending_context_reset(&self, agent_id: AgentId) -> bool {
+        if self.pending_context_resets.remove(&agent_id).is_none() {
+            return false;
+        }
+        match self.reset_context_at_episode_boundary(agent_id) {
+            Ok(dropped) => {
+                info!(
+                    agent_id = %agent_id,
+                    canonical_messages_dropped = dropped,
+                    "Context reset at episode boundary (canonical re-anchored, summary kept)"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(agent_id = %agent_id, "Deferred context reset failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// ANAI-246: draw a context boundary — fresh session, re-anchored
+    /// canonical, compacted summary preserved.
+    ///
+    /// Three deliberate differences from [`Self::reset_session`] (`/new`) and
+    /// [`Self::clear_agent_history`]:
+    ///
+    /// 1. **No `save_session_summary`.** That path (ANAI-249) writes a
+    ///    string-slice of the last few user messages with no model and no
+    ///    embedding, so it is not recallable. An episode close already routes
+    ///    the agent's wrap-up to a note (ANAI-252) and leaves the episode a
+    ///    consolidation candidate; a second, worse summary would only litter
+    ///    the corpus.
+    /// 2. **Re-anchor, not delete, the canonical session.** See
+    ///    [`openfang_memory::session::SessionStore::reanchor_canonical`]:
+    ///    canonical is cross-channel and holds the compacted summary. "That
+    ///    topic ended" is not "forget you have a past".
+    /// 3. **No quota reset.** `/new` clears usage tracking because a human
+    ///    asked for a clean slate. An agent must not be able to clear its own
+    ///    token quota by closing an episode.
+    ///
+    /// Returns the number of verbatim canonical messages dropped.
+    pub fn reset_context_at_episode_boundary(&self, agent_id: AgentId) -> KernelResult<usize> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+
+        let _ = self.memory.delete_session(entry.session_id);
+
+        let new_session = self
+            .memory
+            .create_session(agent_id)
+            .map_err(KernelError::OpenFang)?;
+        self.registry
+            .update_session_id(agent_id, new_session.id)
+            .map_err(KernelError::OpenFang)?;
+
+        self.memory
+            .reanchor_canonical(agent_id)
+            .map_err(KernelError::OpenFang)
     }
 
     /// Clear ALL conversation history for an agent (sessions + canonical).
@@ -10819,6 +10924,12 @@ impl KernelHandle for OpenFangKernel {
             .close_episode(agent_id, reason, title, summary)
             .map(|id| id.map(|i| i.to_string()))
             .map_err(|e| format!("Episode close failed: {e}"))
+    }
+
+    fn request_context_reset(&self, caller_agent_id: Option<&str>) -> Result<(), String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        self.queue_context_reset(agent_id);
+        Ok(())
     }
 
     fn memory_status(&self, caller_agent_id: Option<&str>) -> Result<serde_json::Value, String> {

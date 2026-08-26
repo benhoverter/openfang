@@ -166,6 +166,20 @@ pub trait KernelHandle: Send + Sync {
         summary: Option<&str>,
     ) -> Result<Option<String>, String>;
 
+    /// ANAI-246: ask for the CALLER's conversation context to be reset at the
+    /// end of the current turn — fresh session, canonical re-anchored, the
+    /// compacted summary kept.
+    ///
+    /// Deferred by design. The tool that calls this runs mid-turn, while the
+    /// agent loop holds a live `Session` it re-persists several more times
+    /// before the turn ends; an immediate clear would be silently overwritten.
+    /// So this records intent and the kernel applies it once the loop returns.
+    ///
+    /// Scoped to the caller with no `shared:` escape, for the same reason
+    /// `memory_episode_close` is: resetting someone else's context is
+    /// amnesia inflicted on an agent that did not ask for it.
+    fn request_context_reset(&self, caller_agent_id: Option<&str>) -> Result<(), String>;
+
     /// ANAI-194: the CALLER's memory status — open episode, turns captured
     /// into it, and the idle countdown.
     ///

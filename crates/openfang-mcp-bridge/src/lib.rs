@@ -623,13 +623,16 @@ pub fn built_in_tools() -> Vec<Tool> {
             "Close the current episode - the stretch of turns your recent work \
              is grouped into - and label it. Call this when a piece of work is \
              finished, before you move to something unrelated. A new episode \
-             opens on your next turn. Harmless to call when nothing is open.",
+             opens on your next turn. Harmless to call when nothing is open. \
+             Pass reset_context to also start the next episode with a clean \
+             conversation window.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
-                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
+                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
+                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need." }
                 },
                 "required": ["title"]
             })),

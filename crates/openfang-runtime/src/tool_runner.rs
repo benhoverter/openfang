@@ -1377,13 +1377,14 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // there skews indices silently.
         ToolDefinition {
             name: "memory_episode_close".to_string(),
-            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open.".to_string(),
+            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is finished, before you move to something unrelated. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
-                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." }
+                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
+                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need." }
                 },
                 "required": ["title"]
             }),
@@ -4140,6 +4141,7 @@ async fn tool_memory_episode_close(
             AGENT_CLOSE_REASONS.join(", ")
         ));
     }
+    let reset_context = input["reset_context"].as_bool().unwrap_or(false);
 
     // Before the close, so it attaches to the episode being closed rather than
     // to the one that opens next. Failure aborts the close rather than
@@ -4159,14 +4161,36 @@ async fn tool_memory_episode_close(
 
     // `None`, always: see this function's doc comment. The summary column is
     // the daemon consolidator's to fill.
-    match kh.memory_episode_close(caller_agent_id, reason, Some(title), None)? {
+    let closed = kh.memory_episode_close(caller_agent_id, reason, Some(title), None)?;
+
+    // ANAI-246. Requested AFTER the close, so a close that fails takes the
+    // reset down with it rather than clearing the window of an episode still
+    // open. Honoured whether or not an episode was open: "clear my window" is
+    // a coherent ask on its own, and the reset itself is idempotent.
+    //
+    // A reset failure does NOT fail the tool. The close has already committed
+    // and the wrap-up note is already written; returning `Err` here would tell
+    // the agent to retry a close that succeeded, duplicating the note. Say so
+    // in the text instead — the agent can see it and so can the log.
+    let reset_note = if reset_context {
+        match kh.request_context_reset(caller_agent_id) {
+            Ok(()) => " Your conversation window will be cleared when this turn ends; the running summary of earlier work is kept.",
+            Err(_) => " Note: the context reset could not be scheduled, so your conversation window is unchanged. The close itself succeeded — do not repeat it.",
+        }
+    } else {
+        ""
+    };
+
+    match closed {
         Some(id) => Ok(format!(
-            "Closed episode {id} as '{title}'. The next captured turn starts a new one."
+            "Closed episode {id} as '{title}'. The next captured turn starts a new one.{reset_note}"
         )),
         // Not an error: the agent cannot see the episode table, so a double
         // wrap-up is a reasonable thing to do and a failure here would read as
         // "your memory is broken" when nothing is.
-        None => Ok("No episode was open, so nothing was closed.".to_string()),
+        None => Ok(format!(
+            "No episode was open, so nothing was closed.{reset_note}"
+        )),
     }
 }
 
@@ -7882,6 +7906,11 @@ mod tests {
         // "cannot determine" answer the pre-flight must fail open on.
         agents: std::sync::Mutex<Vec<crate::kernel_handle::AgentInfo>>,
         agent_tools: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+        // ANAI-246: callers that asked for a deferred context reset, plus a
+        // switch to make that request fail, since the tool is required to keep
+        // the close committed when it does.
+        context_resets: std::sync::Mutex<Vec<Option<String>>>,
+        context_reset_fails: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -7918,6 +7947,8 @@ mod tests {
                 fact_history: std::sync::Mutex::new(std::collections::HashMap::new()),
                 agents: std::sync::Mutex::new(Vec::new()),
                 agent_tools: std::sync::Mutex::new(std::collections::HashMap::new()),
+                context_resets: std::sync::Mutex::new(Vec::new()),
+                context_reset_fails: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -8118,6 +8149,95 @@ mod tests {
         .unwrap();
         assert_eq!(fake.episode_closes.lock().unwrap().len(), 1);
         assert!(fake.notes.lock().unwrap().is_empty());
+    }
+
+    // --- ANAI-246: reset_context -------------------------------------------
+
+    /// Absent `reset_context`, nothing is scheduled. The old two-argument
+    /// close must keep behaving exactly as it did.
+    #[tokio::test]
+    async fn episode_close_does_not_reset_context_unless_asked() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "done"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fake.context_resets.lock().unwrap().is_empty(),
+            "a plain close must never touch the conversation window"
+        );
+        assert!(!out.contains("cleared"), "{out}");
+    }
+
+    /// `reset_context: true` schedules the reset for the CALLER, and says so.
+    #[tokio::test]
+    async fn episode_close_with_reset_context_schedules_it_for_the_caller() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "done", "reset_context": true}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        let resets = fake.context_resets.lock().unwrap();
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].as_deref(), Some("agent-x"));
+        assert!(out.contains("ep-1"), "{out}");
+        assert!(
+            out.contains("when this turn ends"),
+            "the agent must be told the reset is deferred, not immediate: {out}"
+        );
+    }
+
+    /// A refused reason must take the reset down with it. Otherwise an agent
+    /// could clear its window on a close the kernel rejected.
+    #[tokio::test]
+    async fn a_refused_close_never_schedules_a_reset() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_memory_episode_close(
+            &serde_json::json!({"title": "t", "reason": "timer", "reset_context": true}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    /// The close has already committed and the wrap-up note is already
+    /// written, so a failed reset must NOT return `Err` — that would tell the
+    /// agent to retry a close that succeeded and duplicate the note. It has to
+    /// be visible in the text instead.
+    #[tokio::test]
+    async fn a_failed_reset_keeps_the_close_and_says_so() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        fake.context_reset_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "done", "summary": "wrap", "reset_context": true}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("ep-1"), "the close still happened: {out}");
+        assert!(
+            out.contains("could not be scheduled") && out.contains("do not repeat it"),
+            "a silent failure here is the amnesia this epic exists to prevent: {out}"
+        );
+        assert_eq!(
+            fake.notes.lock().unwrap().len(),
+            1,
+            "exactly one wrap-up note, never two"
+        );
     }
 
     /// The agent cannot see the episodes table, so asking twice is reasonable.
@@ -8819,6 +8939,19 @@ mod tests {
                 summary.map(|s| s.to_string()),
             ));
             Ok(self.open_episode.lock().unwrap().take())
+        }
+        fn request_context_reset(&self, caller: Option<&str>) -> Result<(), String> {
+            if self
+                .context_reset_fails
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("reset unavailable".to_string());
+            }
+            self.context_resets
+                .lock()
+                .unwrap()
+                .push(caller.map(|c| c.to_string()));
+            Ok(())
         }
         fn memory_status(&self, _caller: Option<&str>) -> Result<serde_json::Value, String> {
             Ok(self.status.lock().unwrap().clone())
