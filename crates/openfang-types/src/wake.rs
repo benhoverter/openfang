@@ -354,6 +354,9 @@ impl WakeEnvelope {
              You MUST end this turn by calling `agent_reply_async` with your answer. It \
              takes no target — the reply is routed back to '{sender}' automatically, and \
              it is available on this turn even if it is not in your usual tool list.\n\n\
+             `channel_send` does NOT discharge this: it posts to a human channel and \
+             never reaches '{sender}'. Use it only if you also have something to say to \
+             a human — it is never a substitute for the reply.\n\n\
              You have {secs}s. If you end the turn without calling it, the kernel closes \
              the correlation on your behalf and '{sender}' receives your turn text \
              labelled as evidence rather than as an answer — a strictly worse outcome \
@@ -795,6 +798,48 @@ mod tests {
         let directive = prompt.find("agent_reply_async").expect("directive present");
         let body = prompt.rfind("BODY").expect("body present");
         assert!(directive < body, "the obligation must lead: {prompt}");
+    }
+
+    /// ANAI-262: the directive must rule OUT the wrong tool, not merely name the
+    /// right one.
+    ///
+    /// The observed failure is a callee that answers via `channel_send`: the
+    /// human sees a reply (ANAI-125 routes the surfacing to the originator's own
+    /// channel), the initiating AGENT gets nothing, and the correlation closes
+    /// on an ANAI-198 auto-close whose body is "I posted it to Discord" — a
+    /// receipt, not an answer. Saying what to call was not enough while the
+    /// phantom-action guard was recommending `channel_send` in the same turn.
+    #[test]
+    fn the_directive_rules_out_channel_send() {
+        let prompt = origination("run the migration").turn_prompt("corr-1");
+        assert!(
+            prompt.contains("channel_send"),
+            "the wrong tool must be named to be ruled out: {prompt}"
+        );
+        assert!(
+            prompt.contains("never reaches 'orchestrator'"),
+            "the directive must say WHY channel_send fails — that it does not \
+             reach the initiator: {prompt}"
+        );
+        // Still ahead of the payload: the exclusion is part of the directive,
+        // not a footnote after an arbitrarily long delegated body.
+        let exclusion = prompt.find("channel_send").expect("exclusion present");
+        let body = prompt.rfind("run the migration").expect("body present");
+        assert!(exclusion < body, "the exclusion must lead: {prompt}");
+    }
+
+    /// The exclusion must not leak onto a reply wake either — leg-4 turns get
+    /// the body verbatim, and `channel_send` is frequently the CORRECT tool
+    /// there (surfacing the answer to a human is exactly leg 4's job).
+    #[test]
+    fn a_reply_wake_is_not_told_to_avoid_channel_send() {
+        let mut env = origination("here is your answer");
+        env.is_reply = true;
+        let prompt = env.turn_prompt("corr-1");
+        assert!(
+            !prompt.contains("channel_send"),
+            "a reply wake must carry no tool steering at all: {prompt}"
+        );
     }
 
     #[test]

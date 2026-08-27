@@ -116,6 +116,50 @@ fn phantom_action_detected(text: &str) -> bool {
     has_action && has_channel
 }
 
+/// ANAI-262: the phantom-action re-prompt, with a turn-appropriate worked
+/// example.
+///
+/// The historical text named `channel_send` first — sound advice on an origin
+/// turn, and actively wrong on a woken one. A woken turn owes its initiator
+/// exactly one `agent_reply_async`; `channel_send` posts to a HUMAN channel and
+/// never reaches the calling agent. Because ANAI-125 defaults the surfacing
+/// route to the originator's own binding, the human sees an answer either way,
+/// so the mistake looks like a success and only the initiating agent goes
+/// unpaid. The kernel told the callee it owed a reply (ANAI-215) and then this
+/// guard re-prompted it with the wrong tool: the contract contradicting itself
+/// inside one turn.
+///
+/// `reply_to` is the initiator named by a NON-CONSUMING
+/// [`KernelHandle::peek_reply_right`](crate::kernel_handle::KernelHandle::peek_reply_right)
+/// — `Some` only while an unpaid reply-right is in scope. Reading it through
+/// `take_reply_right` instead would discharge the debt to ask a question and
+/// silently downgrade the callee's explicit answer to an ANAI-198 auto-close.
+///
+/// Keyed on the reply-right rather than on `TurnPolicy` deliberately:
+/// `TurnPolicy::woken()` and `::autonomous()` both carry
+/// `suppress_phantom_guard: false`, so a policy-keyed branch would fire
+/// identically on sync `agent_send`, cron, API-direct and heartbeat turns —
+/// none of which owe anyone an async reply. Sync `agent_send`'s own
+/// receipt-instead-of-answer defect is tracked separately (ANAI-261); it needs
+/// its own signal, not this one widened.
+fn phantom_action_reprompt(reply_to: Option<&str>) -> String {
+    match reply_to {
+        Some(sender) => format!(
+            "[System: You claimed to perform an action but did not call any tools. \
+             This turn was woken by an async request from '{sender}' and still owes it \
+             exactly one reply: end the turn by calling `agent_reply_async` with your \
+             answer. It takes no target — it routes back to '{sender}' automatically. \
+             `channel_send` posts to a human channel and does NOT reach '{sender}', so \
+             it cannot discharge this obligation. Call whatever other tools the work \
+             actually needs, then reply. Do not claim completion without executing tools.]"
+        ),
+        None => "[System: You claimed to perform an action but did not call any tools. \
+             You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
+             to actually perform the action. Do not claim completion without executing tools.]"
+            .to_string(),
+    }
+}
+
 /// Returns true when the agent response text indicates an intentional silent completion.
 /// Matches `NO_REPLY` (exact) and `[SILENT]` (case-insensitive).
 fn is_silent_token(text: &str) -> bool {
@@ -1074,11 +1118,12 @@ pub async fn run_agent_loop(
                 {
                     warn!(agent = %manifest.name, "Phantom action detected — re-prompting for real tool use");
                     messages.push(Message::assistant(text));
-                    messages.push(Message::user(
-                        "[System: You claimed to perform an action but did not call any tools. \
-                         You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
-                         to actually perform the action. Do not claim completion without executing tools.]"
-                    ));
+                    messages.push(Message::user(phantom_action_reprompt(
+                        kernel
+                            .as_ref()
+                            .and_then(|k| k.peek_reply_right(&agent_id_str))
+                            .as_deref(),
+                    )));
                     continue;
                 } else {
                     text
@@ -2814,11 +2859,12 @@ pub async fn run_agent_loop_streaming(
                 {
                     warn!(agent = %manifest.name, "Phantom action detected (streaming) — re-prompting for real tool use");
                     messages.push(Message::assistant(text));
-                    messages.push(Message::user(
-                        "[System: You claimed to perform an action but did not call any tools. \
-                         You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
-                         to actually perform the action. Do not claim completion without executing tools.]"
-                    ));
+                    messages.push(Message::user(phantom_action_reprompt(
+                        kernel
+                            .as_ref()
+                            .and_then(|k| k.peek_reply_right(&agent_id_str))
+                            .as_deref(),
+                    )));
                     continue;
                 } else {
                     text
@@ -7384,6 +7430,64 @@ mod tests {
             "REPROMPTED-FALLBACK",
             "streaming phantom guard must re-prompt when suppress_phantom_guard=false; got {:?}",
             result.response
+        );
+    }
+
+    /// ANAI-262: on a turn holding an unpaid reply-right, the phantom re-prompt
+    /// must point at the tool that actually pays the debt.
+    ///
+    /// The old text opened with `channel_send` — which posts to a HUMAN channel
+    /// and never reaches the initiating agent. Combined with ANAI-125's default
+    /// surfacing route, following that advice produces an outcome that LOOKS
+    /// right (the human sees an answer) while the initiator's correlation closes
+    /// on an auto-close receipt. This asserts the re-prompt names the reply tool,
+    /// names the counterparty, and explicitly rules `channel_send` out.
+    #[test]
+    fn phantom_reprompt_on_an_unpaid_woken_turn_points_at_the_reply_tool() {
+        let text = phantom_action_reprompt(Some("orchestrator"));
+
+        assert!(
+            text.contains("agent_reply_async"),
+            "the re-prompt must name the discharging tool: {text}"
+        );
+        assert!(
+            text.contains("orchestrator"),
+            "the re-prompt must name the counterparty: {text}"
+        );
+        assert!(
+            text.contains("does NOT reach 'orchestrator'"),
+            "the re-prompt must rule channel_send out by saying it misses the \
+             initiator: {text}"
+        );
+        // The reply tool must be the FIRST tool the turn is pointed at; a
+        // re-prompt that leads with channel_send and qualifies it later is the
+        // bug, not the fix.
+        let reply_at = text.find("agent_reply_async").expect("reply tool named");
+        let channel_at = text.find("channel_send").expect("channel_send mentioned");
+        assert!(
+            reply_at < channel_at,
+            "the reply tool must lead the exemplar: {text}"
+        );
+        // And the turn must not be told to skip its real work — the guard exists
+        // because no tools ran at all.
+        assert!(text.contains("Do not claim completion without executing tools."));
+    }
+
+    /// Off the wake path — origin, cron, API-direct, heartbeat, and sync
+    /// `agent_send` callee turns — the re-prompt is BYTE-IDENTICAL to the
+    /// pre-ANAI-262 text. `TurnPolicy` cannot discriminate here (`woken()` and
+    /// `autonomous()` both carry `suppress_phantom_guard: false`), so this pins
+    /// that the reply-right is what gates the new wording. Sync `agent_send`'s
+    /// own receipt-instead-of-answer defect is ANAI-261 and needs its own
+    /// signal, not this branch widened.
+    #[test]
+    fn phantom_reprompt_off_the_wake_path_is_unchanged() {
+        assert_eq!(
+            phantom_action_reprompt(None),
+            "[System: You claimed to perform an action but did not call any tools. \
+             You must use the appropriate tool (e.g., channel_send, web_fetch, file_write) \
+             to actually perform the action. Do not claim completion without executing tools.]",
+            "a turn that owes no async reply must see the historical re-prompt verbatim"
         );
     }
 
