@@ -239,6 +239,29 @@ pub fn needs_compaction_by_tokens(estimated_tokens: usize, config: &CompactionCo
     estimated_tokens > threshold
 }
 
+/// The floor at which compaction stops being a background optimisation and
+/// becomes a blocking necessity — ANAI-263.
+///
+/// Post-turn compaction runs off the critical path, so the *policy* trigger
+/// (`working_set_ratio`, as low as 0.10) never makes a user wait. But a session
+/// can grow faster than the background task compacts it, so the in-band check
+/// before the LLM call stays as a safety trigger.
+///
+/// Derived from the valve rather than written as a second literal, and set a
+/// hair *below* it deliberately: at exactly [`history_trim::TOKEN_TRIM_RATIO`]
+/// the smart path (summarise) and the dumb path (drain the front) would tie,
+/// and the winner would be decided by call ordering. The gap gives compaction
+/// first refusal, with the drain as the fallback when it fails.
+///
+/// [`history_trim::TOKEN_TRIM_RATIO`]: crate::history_trim::TOKEN_TRIM_RATIO
+pub const BLOCKING_COMPACTION_RATIO: f64 = crate::history_trim::TOKEN_TRIM_RATIO - 0.05;
+
+/// Is this session large enough that compaction must happen *now*, in front of
+/// the LLM call, rather than in the background after the turn?
+pub fn needs_blocking_compaction(estimated_tokens: usize, config: &CompactionConfig) -> bool {
+    estimated_tokens > (config.context_window_tokens as f64 * BLOCKING_COMPACTION_RATIO) as usize
+}
+
 /// Token floor below which the message-count trigger is suppressed.
 pub fn count_trigger_token_floor(config: &CompactionConfig) -> usize {
     (config.context_window_tokens as f64 * config.min_token_ratio) as usize
@@ -1681,6 +1704,77 @@ mod tests {
         let tokens_without = estimate_token_count(&messages, None, None);
         let tokens_with = estimate_token_count(&messages, None, Some(&tools));
         assert!(tokens_with > tokens_without);
+    }
+
+    /// ANAI-263 step 1: estimate parity between the two compaction gates.
+    ///
+    /// The streaming post-loop gate used to call `estimate_token_count` with
+    /// `None` for the system prompt while the in-band gate in
+    /// `execute_llm_agent` passed `Some(..)`. Fleet system prompts are >10k
+    /// tokens, so the two gates disagreed about the size of the *same* session
+    /// and the streaming path fired late. This pins the consequence: a session
+    /// sitting between the two estimates trips the trigger only when the
+    /// prompt is counted.
+    #[test]
+    fn system_prompt_omission_can_hide_a_compaction_trigger() {
+        let config = CompactionConfig {
+            context_window_tokens: 10_000,
+            token_threshold_ratio: 0.40,
+            ..CompactionConfig::default()
+        };
+        // ~3k tokens of conversation against a 4k threshold: under on its own.
+        let messages: Vec<Message> = (0..12)
+            .map(|i| Message::user(format!("{i}: {}", "x".repeat(1000))))
+            .collect();
+        // ~2.5k tokens of system prompt: enough to cross it.
+        let system = "y".repeat(10_000);
+
+        let without = estimate_token_count(&messages, None, None);
+        let with = estimate_token_count(&messages, Some(&system), None);
+
+        assert!(
+            !needs_compaction_by_tokens(without, &config),
+            "the omitting estimate ({without}) should sit under the threshold"
+        );
+        assert!(
+            needs_compaction_by_tokens(with, &config),
+            "the prompt-inclusive estimate ({with}) should trip the threshold"
+        );
+    }
+
+    /// ANAI-263 step 4: the blocking floor is a *safety* rung and must sit
+    /// strictly between the policy trigger and the dumb drain — close enough to
+    /// the valve that it rarely fires, far enough that it never ties with it.
+    #[test]
+    fn blocking_floor_sits_between_policy_and_valve() {
+        const _: () = assert!(BLOCKING_COMPACTION_RATIO < crate::history_trim::TOKEN_TRIM_RATIO);
+        const _: () = assert!(BLOCKING_COMPACTION_RATIO > MIN_WORKING_SET_RATIO);
+        const _: () =
+            assert!(BLOCKING_COMPACTION_RATIO < crate::context_overflow::RECOVERY_ENTRY_RATIO);
+    }
+
+    /// A session over the policy ratio but under the floor compacts in the
+    /// background only — it must not block the turn. That separation is the
+    /// whole point of moving compaction off the critical path.
+    #[test]
+    fn policy_trigger_does_not_imply_a_blocking_compaction() {
+        let config = CompactionConfig {
+            context_window_tokens: 100_000,
+            token_threshold_ratio: 0.40,
+            ..CompactionConfig::default()
+        };
+        let estimated = 50_000; // over 0.40, well under 0.80
+        assert!(
+            needs_compaction_by_tokens(estimated, &config),
+            "background compaction should be due"
+        );
+        assert!(
+            !needs_blocking_compaction(estimated, &config),
+            "the turn should not wait for it"
+        );
+
+        let urgent = 85_000; // over the 0.80 floor
+        assert!(needs_blocking_compaction(urgent, &config));
     }
 
     /// ANAI-243: the live pathology — 32 messages, ~1k tokens on a 200k

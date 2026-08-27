@@ -250,6 +250,16 @@ pub struct OpenFangKernel {
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    /// ANAI-263: agents with a background compaction in flight.
+    ///
+    /// Single-flight guard. Both turn paths now call
+    /// `spawn_background_compaction` at the tail of every turn, so without this
+    /// a burst of turns would each spawn a compaction of the same session; they
+    /// would then queue on `agent_msg_locks` and pay an LLM call apiece to
+    /// re-compact an already-compacted session. Insert-or-skip is atomic in
+    /// dashmap, so the check and the claim are one operation. Cleared by a drop
+    /// guard, including on panic.
+    compacting: dashmap::DashSet<AgentId>,
     /// ANAI-197: per-agent **wake-turn** lock. Serializes the whole woken-turn
     /// critical section — mint reply-right -> run turn -> cleanup — so the
     /// mint cannot be clobbered by a second wake for the same target.
@@ -1510,6 +1520,7 @@ impl OpenFangKernel {
             fallback_providers_override: std::sync::RwLock::new(None),
             model_override: std::sync::RwLock::new(boot_model_override),
             agent_msg_locks: dashmap::DashMap::new(),
+            compacting: dashmap::DashSet::new(),
             wake_turn_locks: dashmap::DashMap::new(),
             reply_rights: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
@@ -2688,9 +2699,14 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
+        // Blocking compaction floor for the streaming path (ANAI-263 step 4).
+        // Same rule as `execute_llm_agent`: policy compaction happens in the
+        // background at the tail of the previous turn, so this gate only has to
+        // catch a session that outgrew it.
         let needs_compact = {
-            use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
+            use openfang_runtime::compactor::{
+                compaction_reason, estimate_token_count, needs_blocking_compaction,
+            };
             let config = self
                 .compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
             let estimated = estimate_token_count(
@@ -2699,6 +2715,7 @@ impl OpenFangKernel {
                 None,
             );
             let reason = compaction_reason(&session, estimated, &config);
+            let over_floor = needs_blocking_compaction(estimated, &config);
             if let Some(r) = reason {
                 info!(
                     agent_id = %agent_id,
@@ -2725,7 +2742,7 @@ impl OpenFangKernel {
             } else {
                 false
             };
-            reason.is_some() || by_quota
+            over_floor || by_quota
         };
 
         let driver = self.resolve_driver(&entry.manifest)?;
@@ -2937,12 +2954,36 @@ impl OpenFangKernel {
             message.to_string()
         };
         let kernel_clone = Arc::clone(self);
+        let turn_lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
 
         let handle = tokio::spawn(async move {
+            // ANAI-263 step 3: serialize streaming turns against every other
+            // turn for this agent. The channel path has taken this lock since
+            // ANAI-125; the streaming path never did, so two TUI/WS/SSE streams
+            // (or a stream and a background compaction) could interleave writes
+            // to the same session and lose one wholesale.
+            //
+            // Acquired here rather than in `send_message_streaming`: that
+            // function returns the receiver synchronously and cannot await.
+            // Held for the whole turn, so anything below that already holds it
+            // must use the `_locked` compaction entry.
+            let _turn_guard = turn_lock.lock().await;
+
+            // The session snapshot was taken before the lock. Re-read it: a
+            // turn that was in flight while we waited has already saved.
+            if let Ok(Some(reloaded)) = memory.get_session(session.id) {
+                session = reloaded;
+            }
+
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
-                match kernel_clone.compact_agent_session(agent_id).await {
+                // `_locked`: we hold the turn lock above.
+                match kernel_clone.compact_agent_session_locked(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
@@ -3095,25 +3136,11 @@ impl OpenFangKernel {
                         .registry
                         .set_state(agent_id, AgentState::Running);
 
-                    // Post-loop compaction check: if session now exceeds token threshold,
-                    // trigger compaction in background for the next call.
-                    {
-                        use openfang_runtime::compactor::{
-                            estimate_token_count, needs_compaction_by_tokens,
-                        };
-                        let config = kernel_clone
-                            .compaction_config_for(&manifest.model.model, &manifest.model.provider);
-                        let estimated = estimate_token_count(&session.messages, None, None);
-                        if needs_compaction_by_tokens(estimated, &config) {
-                            let kc = kernel_clone.clone();
-                            tokio::spawn(async move {
-                                info!(agent_id = %agent_id, estimated_tokens = estimated, "Post-loop compaction triggered");
-                                if let Err(e) = kc.compact_agent_session(agent_id).await {
-                                    warn!(agent_id = %agent_id, "Post-loop compaction failed: {e}");
-                                }
-                            });
-                        }
-                    }
+                    // Post-turn compaction, off the critical path. Shared with
+                    // the channel path so the two gates cannot drift again
+                    // (ANAI-263). Spawned while we still hold the turn lock; the
+                    // task waits for it.
+                    kernel_clone.spawn_background_compaction(agent_id, &manifest, &session);
 
                     Ok(result)
                 }
@@ -3359,9 +3386,18 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
+        // Blocking compaction floor (ANAI-263 step 4). This used to be the
+        // *policy* trigger — it fired at `working_set_ratio` and made the user
+        // wait for an LLM summarisation in front of their reply, which at 0.40
+        // on a 200k window is a latency bill on every crossing. Policy moved to
+        // `spawn_background_compaction` at the tail of the turn; what stays here
+        // is the safety trigger, for a session growing faster than the
+        // background task compacts it. Quota headroom stays blocking too — it is
+        // a quota check, not a window check, and it is cheap.
         {
-            use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
+            use openfang_runtime::compactor::{
+                compaction_reason, estimate_token_count, needs_blocking_compaction,
+            };
             let config = self
                 .compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
             let estimated = estimate_token_count(
@@ -3376,9 +3412,12 @@ impl OpenFangKernel {
             } else {
                 false
             };
-            if reason.is_some() || by_quota {
+            if needs_blocking_compaction(estimated, &config) || by_quota {
                 info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, context_window = config.context_window_tokens, reason = ?reason, by_quota, "Pre-emptive compaction before LLM call");
-                match self.compact_agent_session(agent_id).await {
+                // `_locked`: we are inside the turn's `agent_msg_locks` guard,
+                // taken in `send_message_with_handle_and_blocks`. The public
+                // entry would try to re-acquire it and deadlock (ANAI-263).
+                match self.compact_agent_session_locked(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
@@ -3819,6 +3858,11 @@ impl OpenFangKernel {
                 result.cost_usd = None;
             }
         }
+
+        // ANAI-263 step 4: compact for the *next* turn, in the background,
+        // instead of making the *next* user wait for it in front of their reply.
+        // Spawned while we still hold the turn lock; the task waits for it.
+        self.spawn_background_compaction(agent_id, &manifest, &session);
 
         Ok(result)
     }
@@ -4506,7 +4550,36 @@ impl OpenFangKernel {
     ///
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
+    ///
+    /// Takes the per-agent turn lock (`agent_msg_locks`) for the whole
+    /// operation. ANAI-263 step 2: compaction reads the session, spends seconds
+    /// in an LLM call, then blind-writes `messages` back. Unlocked, that write
+    /// can land on top of a turn that completed in the meantime and lose it
+    /// wholesale — last writer wins. Every external caller (API `/compact`, the
+    /// WS `compact` command, the channel bridge) went through the unlocked path
+    /// before this; they all inherit the lock now without changing.
+    ///
+    /// # Deadlock hazard
+    ///
+    /// `tokio::sync::Mutex` is **not** reentrant. Callers that already hold the
+    /// agent's turn lock — anything downstream of
+    /// `send_message_with_handle_and_blocks` — must call
+    /// [`Self::compact_agent_session_locked`] instead. Calling this one there
+    /// deadlocks instantly, and the compiler cannot see it.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        self.compact_agent_session_locked(agent_id).await
+    }
+
+    /// Compaction body. **The caller must already hold `agent_msg_locks` for
+    /// this agent.** See [`Self::compact_agent_session`] for the locking
+    /// contract and the reentrancy hazard.
+    async fn compact_agent_session_locked(&self, agent_id: AgentId) -> KernelResult<String> {
         use openfang_runtime::compactor::{
             compact_session, compaction_reason, count_trigger_token_floor, estimate_token_count,
         };
@@ -4598,6 +4671,72 @@ impl OpenFangKernel {
         }
 
         Ok(msg)
+    }
+
+    /// Post-turn compaction, off the critical path (ANAI-263 step 4).
+    ///
+    /// Both turn paths call this at the tail of a turn. It gates cheaply on the
+    /// same estimate the in-band check uses — system prompt included — and only
+    /// spawns when the session actually needs compacting, so the common case
+    /// costs one token estimate and nothing else.
+    ///
+    /// The spawned task takes the public (locking) compaction entry. The caller
+    /// still holds the turn lock when this returns, so the task simply waits for
+    /// the turn to finish; the caller never awaits the task, so this cannot
+    /// deadlock. The task takes exactly one lock and nothing else, so it cannot
+    /// invert against `wake_turn_locks`.
+    ///
+    /// Why a single helper rather than a check at each site: the two paths each
+    /// hand-rolled their own gate, and they drifted — one of them omitted the
+    /// system prompt from its estimate for as long as it existed. One gate
+    /// cannot disagree with itself.
+    fn spawn_background_compaction(
+        &self,
+        agent_id: AgentId,
+        manifest: &AgentManifest,
+        session: &openfang_memory::session::Session,
+    ) {
+        use openfang_runtime::compactor::{compaction_reason, estimate_token_count};
+
+        let config = self.compaction_config_for(&manifest.model.model, &manifest.model.provider);
+        let estimated =
+            estimate_token_count(&session.messages, Some(&manifest.model.system_prompt), None);
+        let Some(reason) = compaction_reason(session, estimated, &config) else {
+            return;
+        };
+        let message_count = session.messages.len();
+
+        let Some(kernel) = self.self_handle.get().and_then(|w| w.upgrade()) else {
+            debug!(agent_id = %agent_id, "No kernel handle; skipping background compaction");
+            return;
+        };
+
+        // Atomic claim: `insert` returns false when the key was already there.
+        if !kernel.compacting.insert(agent_id) {
+            debug!(agent_id = %agent_id, "Background compaction already in flight; skipping");
+            return;
+        }
+
+        struct InFlightGuard(Arc<OpenFangKernel>, AgentId);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.compacting.remove(&self.1);
+            }
+        }
+
+        tokio::spawn(async move {
+            let _in_flight = InFlightGuard(Arc::clone(&kernel), agent_id);
+            info!(
+                agent_id = %agent_id,
+                estimated_tokens = estimated,
+                messages = message_count,
+                reason = ?reason,
+                "Background compaction queued behind the turn lock"
+            );
+            if let Err(e) = kernel.compact_agent_session(agent_id).await {
+                warn!(agent_id = %agent_id, "Background compaction failed: {e}");
+            }
+        });
     }
 
     /// Generate a context window usage report for an agent.
