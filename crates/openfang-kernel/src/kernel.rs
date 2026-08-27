@@ -10736,6 +10736,25 @@ impl KernelHandle for OpenFangKernel {
         self.reply_rights.remove(&id).map(|(_, right)| right)
     }
 
+    /// ANAI-262: read the calling agent's reply-right WITHOUT consuming it,
+    /// yielding the initiator this turn owes an answer to.
+    ///
+    /// `get` where [`Self::take_reply_right`] uses `remove`: this is the
+    /// question, not the discharge. Every caller that needs to know whether a
+    /// debt is outstanding — the phantom-guard exemplar, diagnostics — routes
+    /// here, because reaching for `take_reply_right` to answer a question
+    /// would settle the debt as a side effect and silently downgrade the
+    /// callee's explicit reply to an ANAI-198 auto-close.
+    ///
+    /// Same keying and same failure modes as the take: a malformed id or a
+    /// turn with no minted right both yield `None`.
+    fn peek_reply_right(&self, agent_id: &str) -> Option<String> {
+        let id: AgentId = agent_id.parse().ok()?;
+        self.reply_rights
+            .get(&id)
+            .map(|right| right.reply_to().to_string())
+    }
+
     /// ANAI-125: expose the originator's own channel binding as a `surface_to`
     /// route so `agent_send_async` can default the surfacing route to the
     /// caller's home channel. `agent_name`-keyed to match the binding table;
@@ -15115,6 +15134,72 @@ system_prompt = "You are a test agent."
             kernel.reply_rights.is_empty(),
             "no reply-right may survive turn end"
         );
+
+        kernel.shutdown();
+    }
+
+    /// ANAI-262: `peek_reply_right` must ASK without ANSWERING.
+    ///
+    /// The guard-exemplar work needs to know "does this turn owe a reply?"
+    /// mid-turn. If that question is asked through `take_reply_right`, the
+    /// registry entry is removed and the callee's later `agent_reply_async`
+    /// finds nothing — the explicit answer silently degrades to an ANAI-198
+    /// auto-close. This pins the distinction: peek is idempotent and leaves
+    /// the take intact.
+    #[tokio::test]
+    async fn peek_reply_right_does_not_consume_the_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-anai262");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+        let handle: std::sync::Arc<dyn openfang_runtime::kernel_handle::KernelHandle> =
+            kernel.clone();
+
+        let target: AgentId = AgentId(uuid::Uuid::new_v4());
+        let target_str = target.to_string();
+
+        // No debt yet: peek must not invent one.
+        assert_eq!(
+            handle.peek_reply_right(&target_str),
+            None,
+            "an origin turn holds no reply-right; peek must report none"
+        );
+
+        kernel.reply_rights.insert(
+            target,
+            openfang_runtime::tool_runner::ReplyRight::new("initiator-x", "corr-x", None),
+        );
+
+        // Repeated peeks are idempotent and name the initiator.
+        for _ in 0..3 {
+            assert_eq!(
+                handle.peek_reply_right(&target_str).as_deref(),
+                Some("initiator-x"),
+                "peek must report the outstanding debt every time it is asked"
+            );
+        }
+
+        // The take still finds the token — i.e. peeking did not spend it.
+        let right = handle
+            .take_reply_right(&target_str)
+            .expect("peeking must not consume the one-shot reply-right");
+        assert_eq!(right.reply_to(), "initiator-x");
+
+        // And after the discharge, peek reports the debt settled.
+        assert_eq!(
+            handle.peek_reply_right(&target_str),
+            None,
+            "a spent right must read as no debt"
+        );
+
+        // A malformed agent id is "no evidence", never a panic.
+        assert_eq!(handle.peek_reply_right("not-a-uuid"), None);
 
         kernel.shutdown();
     }

@@ -392,6 +392,28 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// ANAI-262: NON-CONSUMING look at this agent's reply-right — "does this
+    /// turn owe an answer, and to whom?" — returning the initiator's id.
+    ///
+    /// [`Self::take_reply_right`] is consume-on-read: it is the *discharge*
+    /// path, and calling it settles the debt. Anything that merely wants to
+    /// ASK about the debt (the phantom-action guard's exemplar choice, a
+    /// `channel_send` nudge, diagnostics) must use this instead. Calling
+    /// `take_reply_right` to answer a question would silently discharge the
+    /// obligation and convert an explicit reply into an ANAI-198 auto-close —
+    /// a one-line regression of the entire ANAI-196 guarantee, invisible
+    /// except as degraded reply bodies.
+    ///
+    /// `Some(initiator)` means an UNPAID right is in scope right now. `None`
+    /// means no debt: an origin turn (channel/cron/API — never minted), a
+    /// reply-woken terminal turn (leg 4 — no right minted), or a right already
+    /// spent this turn. The default returns `None`, so mock/test handles read
+    /// exactly like an origin turn.
+    fn peek_reply_right(&self, agent_id: &str) -> Option<String> {
+        let _ = agent_id;
+        None
+    }
+
     /// ANAI-125: resolve `agent_name`'s channel binding into a `surface_to`
     /// route (`"<channel>:<recipient>"`) so an async wake that omits an
     /// explicit route can default to the ORIGINATOR's own home channel — the
