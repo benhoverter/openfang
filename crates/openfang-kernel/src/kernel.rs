@@ -2937,12 +2937,36 @@ impl OpenFangKernel {
             message.to_string()
         };
         let kernel_clone = Arc::clone(self);
+        let turn_lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
 
         let handle = tokio::spawn(async move {
+            // ANAI-263 step 3: serialize streaming turns against every other
+            // turn for this agent. The channel path has taken this lock since
+            // ANAI-125; the streaming path never did, so two TUI/WS/SSE streams
+            // (or a stream and a background compaction) could interleave writes
+            // to the same session and lose one wholesale.
+            //
+            // Acquired here rather than in `send_message_streaming`: that
+            // function returns the receiver synchronously and cannot await.
+            // Held for the whole turn, so anything below that already holds it
+            // must use the `_locked` compaction entry.
+            let _turn_guard = turn_lock.lock().await;
+
+            // The session snapshot was taken before the lock. Re-read it: a
+            // turn that was in flight while we waited has already saved.
+            if let Ok(Some(reloaded)) = memory.get_session(session.id) {
+                session = reloaded;
+            }
+
             // Auto-compact if the session is large before running the loop
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
-                match kernel_clone.compact_agent_session(agent_id).await {
+                // `_locked`: we hold the turn lock above.
+                match kernel_clone.compact_agent_session_locked(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
