@@ -3387,7 +3387,10 @@ impl OpenFangKernel {
             };
             if reason.is_some() || by_quota {
                 info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, context_window = config.context_window_tokens, reason = ?reason, by_quota, "Pre-emptive compaction before LLM call");
-                match self.compact_agent_session(agent_id).await {
+                // `_locked`: we are inside the turn's `agent_msg_locks` guard,
+                // taken in `send_message_with_handle_and_blocks`. The public
+                // entry would try to re-acquire it and deadlock (ANAI-263).
+                match self.compact_agent_session_locked(agent_id).await {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
@@ -4515,7 +4518,36 @@ impl OpenFangKernel {
     ///
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
+    ///
+    /// Takes the per-agent turn lock (`agent_msg_locks`) for the whole
+    /// operation. ANAI-263 step 2: compaction reads the session, spends seconds
+    /// in an LLM call, then blind-writes `messages` back. Unlocked, that write
+    /// can land on top of a turn that completed in the meantime and lose it
+    /// wholesale — last writer wins. Every external caller (API `/compact`, the
+    /// WS `compact` command, the channel bridge) went through the unlocked path
+    /// before this; they all inherit the lock now without changing.
+    ///
+    /// # Deadlock hazard
+    ///
+    /// `tokio::sync::Mutex` is **not** reentrant. Callers that already hold the
+    /// agent's turn lock — anything downstream of
+    /// `send_message_with_handle_and_blocks` — must call
+    /// [`Self::compact_agent_session_locked`] instead. Calling this one there
+    /// deadlocks instantly, and the compiler cannot see it.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
+        let lock = self
+            .agent_msg_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        self.compact_agent_session_locked(agent_id).await
+    }
+
+    /// Compaction body. **The caller must already hold `agent_msg_locks` for
+    /// this agent.** See [`Self::compact_agent_session`] for the locking
+    /// contract and the reentrancy hazard.
+    async fn compact_agent_session_locked(&self, agent_id: AgentId) -> KernelResult<String> {
         use openfang_runtime::compactor::{
             compact_session, compaction_reason, count_trigger_token_floor, estimate_token_count,
         };
