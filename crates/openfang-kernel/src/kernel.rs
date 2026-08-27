@@ -3103,7 +3103,16 @@ impl OpenFangKernel {
                         };
                         let config = kernel_clone
                             .compaction_config_for(&manifest.model.model, &manifest.model.provider);
-                        let estimated = estimate_token_count(&session.messages, None, None);
+                        // ANAI-263 step 1: the system prompt is part of every request we
+                        // send, so it must be part of every estimate. Omitting it made this
+                        // gate under-measure by the whole prompt (>10k tokens on the fleet
+                        // default) and fire late relative to the in-band gate in
+                        // `execute_llm_agent`, which has always passed it.
+                        let estimated = estimate_token_count(
+                            &session.messages,
+                            Some(&manifest.model.system_prompt),
+                            None,
+                        );
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
                             tokio::spawn(async move {

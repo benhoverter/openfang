@@ -1683,6 +1683,42 @@ mod tests {
         assert!(tokens_with > tokens_without);
     }
 
+    /// ANAI-263 step 1: estimate parity between the two compaction gates.
+    ///
+    /// The streaming post-loop gate used to call `estimate_token_count` with
+    /// `None` for the system prompt while the in-band gate in
+    /// `execute_llm_agent` passed `Some(..)`. Fleet system prompts are >10k
+    /// tokens, so the two gates disagreed about the size of the *same* session
+    /// and the streaming path fired late. This pins the consequence: a session
+    /// sitting between the two estimates trips the trigger only when the
+    /// prompt is counted.
+    #[test]
+    fn system_prompt_omission_can_hide_a_compaction_trigger() {
+        let config = CompactionConfig {
+            context_window_tokens: 10_000,
+            token_threshold_ratio: 0.40,
+            ..CompactionConfig::default()
+        };
+        // ~3k tokens of conversation against a 4k threshold: under on its own.
+        let messages: Vec<Message> = (0..12)
+            .map(|i| Message::user(format!("{i}: {}", "x".repeat(1000))))
+            .collect();
+        // ~2.5k tokens of system prompt: enough to cross it.
+        let system = "y".repeat(10_000);
+
+        let without = estimate_token_count(&messages, None, None);
+        let with = estimate_token_count(&messages, Some(&system), None);
+
+        assert!(
+            !needs_compaction_by_tokens(without, &config),
+            "the omitting estimate ({without}) should sit under the threshold"
+        );
+        assert!(
+            needs_compaction_by_tokens(with, &config),
+            "the prompt-inclusive estimate ({with}) should trip the threshold"
+        );
+    }
+
     /// ANAI-243: the live pathology — 32 messages, ~1k tokens on a 200k
     /// window. Old behaviour compacted; new behaviour leaves it alone.
     #[test]
