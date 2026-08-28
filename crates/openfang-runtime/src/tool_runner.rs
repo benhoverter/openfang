@@ -1385,7 +1385,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
                     "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
                     "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need. If you are weighing it up, the answer is no. Refused outright while you have an approval request outstanding to the operator." },
-                    "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang-fork\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Omitting it clears any previous priming." }
+                    "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Use dots to name a sub-project, \"openfang.memory\": the briefing then carries the sub-project's claims AND everything the parent knows, so being more specific never costs you facts. This is the project's slug, not your own agent name. Omitting it clears any previous priming." }
                 },
                 "required": ["title"]
             }),
@@ -1412,7 +1412,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "Whose truth this is: 'agent' (about you), 'project', or 'user'." },
-                    "scope_ref": { "type": "string", "description": "What the claim is about - the project or user slug, e.g. \"openfang-fork\". Required for 'project' and 'user'; ignored for 'agent', which is always you." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about - the project or user slug, e.g. \"openfang\", or \"openfang.memory\" for a sub-project. Dots nest: a reader primed for \"openfang.memory\" also sees \"openfang\"'s claims, and the more specific slot wins where both hold the same key. File a claim at the level it is true of, and use the project's slug, not your own agent name. Required for 'project' and 'user'; ignored for 'agent', which is always you." },
                     "key": { "type": "string", "description": "The slot name, 'namespace.slot', e.g. \"repo.trunk_model\". Up to 7 dot-separated segments." },
                     "claim": { "type": "string", "description": "The claim itself, in plain words. Omit to READ the slot instead of writing it." },
                     "status": { "type": "string", "enum": ["open", "settled"], "description": "'settled' (default) for a stable belief; 'open' for an unfinished loop." },
@@ -1429,7 +1429,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "scope": { "type": "string", "enum": ["agent", "project", "user"], "description": "The slot's scope, same value you would pass to memory_fact." },
-                    "scope_ref": { "type": "string", "description": "What the claim is about. Required for 'project' and 'user'; ignored for 'agent'." },
+                    "scope_ref": { "type": "string", "description": "What the claim is about - the exact slug the claim was filed under, e.g. \"openfang\" or \"openfang.memory\". History is per-slot, so a parent's slug does not show a child's versions. Required for 'project' and 'user'; ignored for 'agent'." },
                     "key": { "type": "string", "description": "The slot name, e.g. \"repo.trunk_model\"." },
                     "limit": { "type": "integer", "description": "Maximum versions to return (default 5, maximum 20)." }
                 },
@@ -4246,11 +4246,40 @@ async fn tool_memory_episode_close(
     let reset_note = if reset_context {
         match kh.request_context_reset(caller_agent_id, prime_for.as_deref()) {
             Ok(()) => match prime_for.as_deref() {
-                Some(slug) => format!(
-                    " Your conversation window will be cleared when this turn ends; the running \
-                     summary of earlier work is kept, and the next episode opens with a briefing \
-                     on {slug}."
-                ),
+                Some(slug) => {
+                    // ANAI-264: say what the briefing actually resolved.
+                    //
+                    // The pack is assembled a turn later, and by then the only
+                    // entity that could recognise a mistyped slug — the agent
+                    // that typed it — has been reset and is not consulted. A
+                    // slug naming no project renders a pack that looks healthy
+                    // with its "what is true" half silently empty; that is the
+                    // 2026-08-26 bug, and it went unnoticed because nothing
+                    // ever reported the number.
+                    //
+                    // Advisory, never blocking: an unfamiliar slug may simply
+                    // be a project no one has written a fact about yet. We
+                    // report, the agent judges.
+                    let resolved = match kh.rehydration_preview(caller_agent_id, slug) {
+                        Some((episodes, 0)) => format!(
+                            " That briefing resolves {episodes} closed episode(s) and no facts \
+                             about {slug} — which usually means the slug is misaddressed rather \
+                             than the project unknown. Check the spelling before you rely on it."
+                        ),
+                        Some((episodes, facts)) => format!(
+                            " That briefing resolves {episodes} closed episode(s) and {facts} \
+                             live fact(s) about {slug}."
+                        ),
+                        // "Cannot say" is not "nothing found": stay silent
+                        // rather than report a zero we did not measure.
+                        None => String::new(),
+                    };
+                    format!(
+                        " Your conversation window will be cleared when this turn ends; the \
+                         running summary of earlier work is kept, and the next episode opens \
+                         with a briefing on {slug}.{resolved}"
+                    )
+                }
                 None => " Your conversation window will be cleared when this turn ends; the running summary of earlier work is kept.".to_string(),
             },
             Err(_) => " Note: the context reset could not be scheduled, so your conversation window is unchanged. The close itself succeeded — do not repeat it.".to_string(),
@@ -7949,6 +7978,11 @@ mod tests {
             std::sync::Mutex<Vec<(Option<String>, String, Option<String>, Option<String>)>>,
         // The id the next close returns. `None` models "nothing was open".
         open_episode: std::sync::Mutex<Option<String>>,
+        // ANAI-264: what a pack primed for the requested slug would resolve,
+        // as `(closed episodes, project facts)`. `None` is the trait default
+        // — "cannot say" — and is what every pre-existing test sees, so the
+        // preview stays invisible unless a test asks for it.
+        rehydration_preview: std::sync::Mutex<Option<(usize, usize)>>,
         status: std::sync::Mutex<serde_json::Value>,
         // ANAI-166: every (caller, query, scope, kind, limit) handed to
         // `memory_search`, and the canned payload it returns. The tool layer's
@@ -8021,6 +8055,7 @@ mod tests {
                 memory_calls: std::sync::Mutex::new(Vec::new()),
                 episode_closes: std::sync::Mutex::new(Vec::new()),
                 open_episode: std::sync::Mutex::new(None),
+                rehydration_preview: std::sync::Mutex::new(None),
                 status: std::sync::Mutex::new(serde_json::json!({})),
                 searches: std::sync::Mutex::new(Vec::new()),
                 search_result: std::sync::Mutex::new(
@@ -8079,6 +8114,12 @@ mod tests {
         // returns an id instead of the nothing-was-open path.
         fn with_open_episode(self, id: &str) -> Self {
             *self.open_episode.lock().unwrap() = Some(id.to_string());
+            self
+        }
+
+        // ANAI-264: pretend the primed slug resolves this much.
+        fn with_rehydration_preview(self, episodes: usize, facts: usize) -> Self {
+            *self.rehydration_preview.lock().unwrap() = Some((episodes, facts));
             self
         }
 
@@ -8467,6 +8508,92 @@ mod tests {
         assert!(err.contains("not a usable project slug"), "{err}");
         assert!(fake.episode_closes.lock().unwrap().is_empty());
         assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    // --- ANAI-264: say what the prime resolved ------------------------------
+
+    /// The 2026-08-26 bug: a well-formed slug that names no project passes
+    /// validation, renders a pack from episodes alone, and reads as healthy.
+    /// The close is the last moment the agent that typed the slug is still
+    /// listening, so the zero has to be reported here or nowhere.
+    #[tokio::test]
+    async fn a_prime_that_resolves_no_facts_says_so() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_open_episode("ep-1")
+                .with_rehydration_preview(3, 0),
+        );
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "openfang-fork"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("no facts about openfang-fork"), "{out}");
+        assert!(out.contains("misaddressed"), "{out}");
+        // Advisory, not blocking: the close and the reset still happened.
+        assert_eq!(fake.episode_closes.lock().unwrap().len(), 1);
+        assert_eq!(fake.context_resets.lock().unwrap().len(), 1);
+    }
+
+    /// Negative control: a prime that resolves something reports the counts
+    /// and does NOT cry misaddressed, so the test above cannot pass by the
+    /// warning being unconditional.
+    #[tokio::test]
+    async fn a_prime_that_resolves_facts_reports_the_counts() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_open_episode("ep-1")
+                .with_rehydration_preview(2, 4),
+        );
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "openfang"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("2 closed episode(s)"), "{out}");
+        assert!(out.contains("4 live fact(s) about openfang"), "{out}");
+        assert!(!out.contains("misaddressed"), "{out}");
+    }
+
+    /// "Cannot say" is not "nothing found". A handle that cannot preview must
+    /// leave the close text alone rather than report a zero it never
+    /// measured — an invented zero would send an agent hunting a typo in a
+    /// slug that was correct.
+    #[tokio::test]
+    async fn an_unavailable_preview_reports_nothing_rather_than_zero() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "openfang"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("briefing on openfang"), "{out}");
+        assert!(!out.contains("resolves"), "{out}");
+        assert!(!out.contains("misaddressed"), "{out}");
     }
 
     /// An empty or whitespace `prime_for` is an omission, not an error — and
@@ -9226,6 +9353,15 @@ mod tests {
             ));
             Ok(self.open_episode.lock().unwrap().take())
         }
+
+        fn rehydration_preview(
+            &self,
+            _caller: Option<&str>,
+            _slug: &str,
+        ) -> Option<(usize, usize)> {
+            *self.rehydration_preview.lock().unwrap()
+        }
+
         fn request_context_reset(
             &self,
             caller: Option<&str>,

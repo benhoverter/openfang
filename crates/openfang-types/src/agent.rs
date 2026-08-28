@@ -474,6 +474,15 @@ pub fn validate_agent_name(name: &str) -> Result<(), String> {
 /// rejects is a member who cannot address its own project's claims.
 pub const MAX_PROJECT_SLUG_LEN: usize = 48;
 
+/// ANAI-264. How many dot-delimited segments a project slug may carry.
+///
+/// `openfang.memory.index.embeddings` is four and is the deepest thing anyone
+/// has proposed; the cap exists because every hierarchical fact read walks the
+/// lineage root-ward, so depth is queries-per-prompt-build. Four is generous
+/// against a corpus whose slugs are all depth one today, and low enough that a
+/// pathological slug cannot turn one read into forty.
+pub const MAX_PROJECT_SLUG_DEPTH: usize = 4;
+
 /// ANAI-208. Validate one project slug.
 ///
 /// This grammar is deliberately identical to the `scope_ref` grammar in
@@ -500,12 +509,48 @@ pub fn validate_project_slug(slug: &str) -> Result<(), String> {
             slug.len()
         ));
     }
-    let mut chars = slug.chars();
+    // ANAI-264. `.` separates segments; it is never part of one. Splitting
+    // first and validating each piece is what makes the separator a boundary
+    // rather than a character: `openfang..memory` and `openfang.` produce an
+    // empty segment here and are refused by the segment rule below, without
+    // needing their own special cases.
+    let segments: Vec<&str> = slug.split('.').collect();
+    if segments.len() > MAX_PROJECT_SLUG_DEPTH {
+        return Err(format!(
+            "project slug {slug:?} is {} segments deep; the maximum is \
+             {MAX_PROJECT_SLUG_DEPTH}. Depth is capped because every read walks the \
+             lineage root-ward, so each segment is one more query on the prompt-build path.",
+            segments.len()
+        ));
+    }
+    for segment in segments {
+        validate_project_slug_segment(slug, segment)?;
+    }
+    Ok(())
+}
+
+/// One dot-delimited segment of a project slug.
+///
+/// This is the grammar `scope_ref` segments have always had — lowercase start,
+/// then `a-z 0-9 _ -`. ANAI-264 did not loosen it; it only stopped applying it
+/// to the whole string at once. `-` therefore stays legal *inside* a segment,
+/// which is the reason the separator had to be `.`: `openfang-memory` and
+/// `researcher-aquilae-ops` already spend hyphens on names, so prefix-matching
+/// on `-` would be guessing where a name ends.
+fn validate_project_slug_segment(slug: &str, segment: &str) -> Result<(), String> {
+    if segment.is_empty() {
+        return Err(format!(
+            "project slug {slug:?} has an empty segment; '.' separates segments and \
+             cannot lead, trail, or double"
+        ));
+    }
+    let mut chars = segment.chars();
     match chars.next() {
         Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
         _ => {
             return Err(format!(
-                "project slug {slug:?} must start with a lowercase letter or digit"
+                "project slug {slug:?}: segment {segment:?} must start with a \
+                 lowercase letter or digit"
             ));
         }
     }
@@ -513,12 +558,44 @@ pub fn validate_project_slug(slug: &str) -> Result<(), String> {
         chars.find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '-'))
     {
         return Err(format!(
-            "project slug {slug:?} contains {bad:?}; allowed: a-z, 0-9, '_' and '-'. \
-             Project slugs are addresses, not labels — they are half the uniqueness key \
-             of a project-scoped memory slot."
+            "project slug {slug:?}: segment {segment:?} contains {bad:?}; allowed: \
+             a-z, 0-9, '_' and '-'. Project slugs are addresses, not labels — they are \
+             half the uniqueness key of a project-scoped memory slot."
         ));
     }
     Ok(())
+}
+
+/// ANAI-264. A slug and every ancestor of it, most specific first.
+///
+/// `"openfang.memory.index"` → `["openfang.memory.index", "openfang.memory",
+/// "openfang"]`. A flat slug is its own lineage of one, which is why callers
+/// can use this unconditionally: on today's corpus — six facts, four
+/// project-scoped, all at root `openfang` — it returns exactly what
+/// `list_for_scope` returned before it existed.
+///
+/// The walk order **is** the precedence order: most specific wins. A reader
+/// unioning facts along the lineage keeps the first claim it sees for a given
+/// `claim_key`, so `openfang.memory`'s answer displaces `openfang`'s rather
+/// than the other way round.
+///
+/// Returns an empty vector for an empty slug rather than `[""]`: an empty
+/// `scope_ref` addresses nothing, and handing a store a blank ref to query is
+/// how a NULL-ish address ends up matching rows it should not.
+pub fn project_slug_lineage(slug: &str) -> Vec<String> {
+    if slug.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![slug.to_string()];
+    let mut rest = slug;
+    while let Some(cut) = rest.rfind('.') {
+        rest = &rest[..cut];
+        if rest.is_empty() {
+            break;
+        }
+        out.push(rest.to_string());
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1045,6 +1122,12 @@ mod tests {
             "kimiya_spike05",
             "a",
             "9lives",
+            // ANAI-264: dotted sub-projects. The hyphen stays legal inside a
+            // segment, which is exactly why the separator had to be '.'.
+            "openfang.memory",
+            "openfang.memory.index",
+            "openfang.memory.index.embeddings",
+            "tttb.ops-2",
         ] {
             assert!(
                 validate_project_slug(ok).is_ok(),
@@ -1063,8 +1146,18 @@ mod tests {
             "-leading-hyphen",
             "_leading_underscore",
             "has space",
-            "has.dot",
             "inject\nnewline",
+            // ANAI-264: '.' is a separator, so it may not lead, trail, or
+            // double — each of those is an empty segment.
+            ".leading-dot",
+            "trailing-dot.",
+            "openfang..memory",
+            ".",
+            "openfang.MEMORY",
+            "openfang.-memory",
+            "openfang.mem ory",
+            // Depth cap: five segments.
+            "a.b.c.d.e",
         ] {
             assert!(
                 validate_project_slug(bad).is_err(),
@@ -1074,6 +1167,37 @@ mod tests {
         let long = "a".repeat(MAX_PROJECT_SLUG_LEN + 1);
         assert!(validate_project_slug(&long).is_err());
         assert!(validate_project_slug(&"a".repeat(MAX_PROJECT_SLUG_LEN)).is_ok());
+    }
+
+    /// ANAI-264. The walk order *is* the precedence order: a reader unioning
+    /// along the lineage keeps the first claim it sees per key, so
+    /// most-specific-first is what makes a sub-project's answer beat its
+    /// parent's rather than the reverse.
+    #[test]
+    fn a_slug_lineage_walks_most_specific_to_root() {
+        assert_eq!(
+            project_slug_lineage("openfang.memory.index"),
+            vec![
+                "openfang.memory.index".to_string(),
+                "openfang.memory".to_string(),
+                "openfang".to_string(),
+            ]
+        );
+    }
+
+    /// The no-op case, and the reason this shipped without a migration: every
+    /// project-scoped fact on disk is depth one, so a flat slug must resolve to
+    /// exactly the single-element lineage that reproduces the old flat read.
+    #[test]
+    fn a_flat_slug_is_its_own_lineage_of_one() {
+        assert_eq!(
+            project_slug_lineage("openfang"),
+            vec!["openfang".to_string()]
+        );
+        // An empty ref addresses nothing. Returning `[""]` would hand a store a
+        // blank scope_ref to query, which is how a NULL-ish address ends up
+        // matching rows it has no business matching.
+        assert!(project_slug_lineage("").is_empty());
     }
 
     #[test]

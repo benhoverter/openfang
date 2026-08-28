@@ -101,7 +101,7 @@ use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryId, MemorySource};
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -854,6 +854,98 @@ impl FactStore {
         Ok(out)
     }
 
+    /// ANAI-264: every `scope_ref` that currently holds at least one live
+    /// project-scoped claim.
+    ///
+    /// Diagnostic only, and deliberately so: it exists to make a *misaddressed*
+    /// pack legible. `prime_for` is free text, so a slug that names no project
+    /// resolves zero facts and renders a pack that looks healthy — which is
+    /// exactly the 2026-08-26 failure. Naming the slugs that *do* resolve turns
+    /// "your memory is empty" into "you asked for the wrong address".
+    ///
+    /// Not a project registry and must not be mistaken for one: a project with
+    /// no facts yet is absent from this list and is not thereby invalid.
+    pub fn known_project_scopes(&self) -> OpenFangResult<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT scope_ref
+                 FROM memories
+                 WHERE scope = 'project' AND kind = ?1 AND deleted = 0
+                 ORDER BY scope_ref",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![KIND_FACT], |row| row.get::<_, String>(0))
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// ANAI-264: every live claim about `scope_ref` **or any ancestor of it**,
+    /// most specific first, open loops first.
+    ///
+    /// The hierarchical read. `scope_ref` is dot-delimited
+    /// (`openfang.memory`), and a reader primed for a sub-project must still
+    /// see what the fleet believes about the parent — otherwise the precise
+    /// slug is *worse* than the vague one, and an agent is punished for saying
+    /// exactly what it is working on. So: walk the lineage root-ward, union,
+    /// **most specific wins per `claim_key`**.
+    ///
+    /// The precedence is the point of walking in that order. If
+    /// `openfang.memory` and `openfang` both hold `repo.trunk_head`, the
+    /// sub-project's answer is the one about *this* subject and the parent's is
+    /// background. Without the ordering the union is non-deterministic, which
+    /// is worse than flat refs were.
+    ///
+    /// Flat slugs are unaffected: a lineage of one is one query, the same query
+    /// [`Self::list_for_scope`] runs. Deliberate — the entire live corpus is
+    /// depth one, so this must be a no-op on it or the change is not the
+    /// zero-migration change it claims to be.
+    ///
+    /// `limit` bounds the *result*, not each level. Levels are fetched at
+    /// `limit` apiece and the union is truncated once, so a parent's facts
+    /// cannot crowd the child's out of a truncated pack.
+    pub fn list_for_scope_lineage(
+        &self,
+        scope: &str,
+        scope_ref: &str,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
+        let lineage = openfang_types::agent::project_slug_lineage(scope_ref);
+        // Non-project scopes have no hierarchy: an agent id is an opaque UUID
+        // and a user slug names a person, neither of which owns anything
+        // "below" it. Splitting those on '.' would invent ancestors.
+        if scope != "project" || lineage.len() <= 1 {
+            return self.list_for_scope(scope, scope_ref, limit);
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<Fact> = Vec::new();
+        for ancestor in &lineage {
+            for fact in self.list_for_scope(scope, ancestor, limit)? {
+                // First writer wins, and the walk is most-specific-first, so
+                // "first" means "closest to the subject asked about".
+                if seen.insert(fact.claim_key.clone()) {
+                    out.push(fact);
+                }
+            }
+        }
+        // Re-apply `list_for_scope`'s ordering across the union: each level
+        // arrived sorted, but concatenating sorted runs is not sorted, and
+        // open-loops-first is the reason a truncated pack keeps the unfinished
+        // question instead of settled background. Stable, so specificity still
+        // breaks ties within a status.
+        out.sort_by_key(|f| !matches!(f.status, FactStatus::Open));
+        out.truncate(limit);
+        Ok(out)
+    }
+
     /// Every claim that has occupied a slot, newest supersession first.
     ///
     /// This is the audit path and the only reader of `fact_history`. It is
@@ -1215,6 +1307,171 @@ mod tests {
             .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].claim, "ours");
+    }
+
+    // --- ANAI-264: hierarchical scope refs ---------------------------------
+
+    /// The reason the hierarchy exists: naming the sub-project must never
+    /// resolve *fewer* facts than naming its parent would have, or an agent is
+    /// punished for saying precisely what it works on.
+    #[test]
+    fn a_child_scope_inherits_its_parents_claims() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "main is the trunk")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "memory.schema_version", "v16")
+                    .with_scope_ref("openfang.memory"),
+            )
+            .unwrap();
+
+        let facts = store
+            .list_for_scope_lineage("project", "openfang.memory", 10)
+            .unwrap();
+        let keys: Vec<&str> = facts.iter().map(|f| f.claim_key.as_str()).collect();
+        assert_eq!(facts.len(), 2, "child + inherited parent claim");
+        assert!(keys.contains(&"memory.schema_version"));
+        assert!(keys.contains(&"repo.trunk_model"));
+
+        // ...and inheritance is one-way. The parent does not acquire its
+        // children's claims, or `openfang` would mean "everything anyone has
+        // ever said about any part of OpenFang" and the pack would stop being
+        // a briefing.
+        let parent = store
+            .list_for_scope_lineage("project", "openfang", 10)
+            .unwrap();
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].claim_key, "repo.trunk_model");
+    }
+
+    /// Most specific wins. Both levels hold the same key; the answer about the
+    /// subject asked about is the one that survives, and the parent's is
+    /// background that must not shadow it.
+    #[test]
+    fn the_most_specific_claim_wins_the_key() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "parent answer")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "child answer")
+                    .with_scope_ref("openfang.memory"),
+            )
+            .unwrap();
+
+        let facts = store
+            .list_for_scope_lineage("project", "openfang.memory", 10)
+            .unwrap();
+        assert_eq!(facts.len(), 1, "one slot per claim key, not two");
+        assert_eq!(facts[0].claim, "child answer");
+    }
+
+    /// Open loops still lead after the union. Each level arrives sorted, but
+    /// concatenating sorted runs is not sorted — without the re-sort a
+    /// truncated pack could drop the unfinished question and keep the parent's
+    /// settled background.
+    #[test]
+    fn the_union_keeps_open_loops_ahead_of_inherited_background() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(
+                    a,
+                    "project",
+                    "repo.trunk_model",
+                    "settled, and the parent's",
+                )
+                .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "build.rebuild", "waiting on Ben")
+                    .with_scope_ref("openfang.memory")
+                    .with_status(FactStatus::Open),
+            )
+            .unwrap();
+
+        let facts = store
+            .list_for_scope_lineage("project", "openfang.memory", 10)
+            .unwrap();
+        assert_eq!(facts[0].claim_key, "build.rebuild", "open loop leads");
+        assert_eq!(facts.len(), 2);
+
+        // `limit` bounds the result, not each level: truncation keeps the open
+        // loop and drops the inherited settled claim.
+        let one = store
+            .list_for_scope_lineage("project", "openfang.memory", 1)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].claim_key, "build.rebuild");
+    }
+
+    /// The no-op guarantee. Every project-scoped row on disk is depth one, so
+    /// the hierarchical read must return exactly what the flat read returns for
+    /// a flat slug — otherwise this was not the zero-migration change it
+    /// claimed to be.
+    #[test]
+    fn a_flat_slug_reads_identically_through_both_paths() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_model", "ours")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "memory.schema_version", "v16")
+                    .with_scope_ref("openfang-fork"),
+            )
+            .unwrap();
+
+        let flat = store
+            .list_for_scope("project", "openfang-fork", 10)
+            .unwrap();
+        let lineage = store
+            .list_for_scope_lineage("project", "openfang-fork", 10)
+            .unwrap();
+        let a: Vec<&str> = flat.iter().map(|f| f.claim_key.as_str()).collect();
+        let b: Vec<&str> = lineage.iter().map(|f| f.claim_key.as_str()).collect();
+        assert_eq!(a, b);
+        // `openfang-fork` is one segment: the hyphen is not a separator, so
+        // this must NOT have been read as a child of `openfang`.
+        assert!(!a.is_empty());
+    }
+
+    /// Hierarchy is a property of project scope only. An agent ref is an
+    /// opaque UUID and a user slug names a person; neither owns anything
+    /// "below" it, so a dotted ref under another scope must not invent an
+    /// ancestor to inherit from. (A dotted `user` ref is not even writable —
+    /// `check_scope_ref` refuses it — which is why this asserts on the read.)
+    #[test]
+    fn non_project_scopes_have_no_lineage() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(FactWrite::new(a, "user", "user.timezone", "PDT").with_scope_ref("ben"))
+            .unwrap();
+
+        let facts = store.list_for_scope_lineage("user", "ben.h", 10).unwrap();
+        assert!(
+            facts.is_empty(),
+            "'ben.h' must not resolve to 'ben' — user slugs have no children"
+        );
     }
 
     fn write(a: AgentId, key: &str, claim: &str) -> FactWrite {

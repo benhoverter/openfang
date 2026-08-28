@@ -11091,6 +11091,19 @@ impl KernelHandle for OpenFangKernel {
         Ok(())
     }
 
+    // ANAI-264. Read-only and best-effort: this rides inside a tool result the
+    // agent is about to read, and a failed count must not turn a successful
+    // close into an error. `None` on any failure, which the caller renders as
+    // silence rather than as a zero.
+    fn rehydration_preview(
+        &self,
+        caller_agent_id: Option<&str>,
+        slug: &str,
+    ) -> Option<(usize, usize)> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id).ok()?;
+        self.memory.rehydration_preview(agent_id, slug).ok()
+    }
+
     // ANAI-248: the structural half of the self-amputation guard.
     //
     // `ApprovalRequest::agent_id` is whatever string the tool runner passed to
