@@ -4210,6 +4210,20 @@ async fn tool_memory_episode_close(
                         .to_string(),
                 );
             }
+            // ANAI-264. Membership, checked at the same edge as shape and for
+            // the same reason: refused before the close, so the agent can
+            // retry the whole call rather than discover a half-done boundary.
+            //
+            // This became checkable only with dotted slugs. Against flat
+            // slugs the rule would have rejected the legitimate case — an
+            // agent declaring `openfang` priming for the corner of it it is
+            // actually working on — since nothing could tell "more specific
+            // than my declaration" from "a different project". Segment
+            // coverage tells them apart, which is why the guard I withdrew in
+            // design lands here now.
+            if let Some(refusal) = kh.project_membership_error(caller_agent_id, slug) {
+                return Err(format!("prime_for: {refusal} Nothing was closed."));
+            }
             Some(slug.to_string())
         }
     };
@@ -7983,6 +7997,10 @@ mod tests {
         // — "cannot say" — and is what every pre-existing test sees, so the
         // preview stays invisible unless a test asks for it.
         rehydration_preview: std::sync::Mutex<Option<(usize, usize)>>,
+        // ANAI-264: the membership refusal the kernel would return for the
+        // requested `prime_for` slug. `None` is the trait default — "no
+        // objection" — so every pre-existing close test is untouched.
+        membership_error: std::sync::Mutex<Option<String>>,
         status: std::sync::Mutex<serde_json::Value>,
         // ANAI-166: every (caller, query, scope, kind, limit) handed to
         // `memory_search`, and the canned payload it returns. The tool layer's
@@ -8056,6 +8074,7 @@ mod tests {
                 episode_closes: std::sync::Mutex::new(Vec::new()),
                 open_episode: std::sync::Mutex::new(None),
                 rehydration_preview: std::sync::Mutex::new(None),
+                membership_error: std::sync::Mutex::new(None),
                 status: std::sync::Mutex::new(serde_json::json!({})),
                 searches: std::sync::Mutex::new(Vec::new()),
                 search_result: std::sync::Mutex::new(
@@ -8120,6 +8139,12 @@ mod tests {
         // ANAI-264: pretend the primed slug resolves this much.
         fn with_rehydration_preview(self, episodes: usize, facts: usize) -> Self {
             *self.rehydration_preview.lock().unwrap() = Some((episodes, facts));
+            self
+        }
+
+        // ANAI-264: pretend the caller is not a member of the primed project.
+        fn with_membership_error(self, refusal: &str) -> Self {
+            *self.membership_error.lock().unwrap() = Some(refusal.to_string());
             self
         }
 
@@ -8594,6 +8619,65 @@ mod tests {
         assert!(out.contains("briefing on openfang"), "{out}");
         assert!(!out.contains("resolves"), "{out}");
         assert!(!out.contains("misaddressed"), "{out}");
+    }
+
+    /// ANAI-264 step 3. A prime for a project the caller is not a member of is
+    /// refused BEFORE the close, so the agent can retry the whole call rather
+    /// than find itself past a half-drawn boundary: episode closed, window
+    /// intact, wrap-up already written.
+    #[tokio::test]
+    async fn a_prime_outside_declared_membership_is_refused_before_the_close() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_open_episode("ep-1")
+                .with_membership_error(
+                    "agent 'x' is not a member of project 'tttb' — it declares: openfang.",
+                ),
+        );
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let err = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "tttb"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .expect_err("a non-member prime must be refused");
+
+        // The refusal names what the agent could have meant — the useful half.
+        assert!(err.contains("it declares: openfang"), "{err}");
+        assert!(err.contains("Nothing was closed"), "{err}");
+        // And nothing was: not the close, not the reset.
+        assert!(fake.episode_closes.lock().unwrap().is_empty());
+        assert!(fake.context_resets.lock().unwrap().is_empty());
+    }
+
+    /// Negative control for the guard: with no membership objection the close
+    /// proceeds, so the test above cannot pass by the gate being unconditional.
+    #[tokio::test]
+    async fn a_prime_within_declared_membership_closes_normally() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({
+                "title": "epic 240",
+                "reset_context": true,
+                "prime_for": "openfang.memory"
+            }),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("briefing on openfang.memory"), "{out}");
+        assert_eq!(
+            fake.context_resets.lock().unwrap()[0].1.as_deref(),
+            Some("openfang.memory")
+        );
     }
 
     /// An empty or whitespace `prime_for` is an omission, not an error — and
@@ -9360,6 +9444,10 @@ mod tests {
             _slug: &str,
         ) -> Option<(usize, usize)> {
             *self.rehydration_preview.lock().unwrap()
+        }
+
+        fn project_membership_error(&self, _caller: Option<&str>, _slug: &str) -> Option<String> {
+            self.membership_error.lock().unwrap().clone()
         }
 
         fn request_context_reset(

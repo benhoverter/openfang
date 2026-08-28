@@ -11104,6 +11104,45 @@ impl KernelHandle for OpenFangKernel {
         self.memory.rehydration_preview(agent_id, slug).ok()
     }
 
+    // ANAI-264. The same gate `memory_fact` applies to project-scoped slots,
+    // applied to `prime_for` — the one project address that was never checked.
+    //
+    // Deliberately the SAME function, not a parallel rule: two membership
+    // checks that could disagree is how an agent ends up able to prime for a
+    // project whose facts it is then refused when it tries to read them.
+    //
+    // One carve-out, and it is not the default-deny posture leaking: an agent
+    // that declares NO projects is not refused here. Roughly half the fleet
+    // declares nothing, and a prime buys two things — the project's facts and
+    // the agent's own recently closed episode summaries. Refusing an
+    // undeclared agent would cost it the summaries, which are agent-scoped and
+    // have no membership relation at all, to enforce a rule about facts it was
+    // already going to be denied by `list_for_scope_lineage`. So: silence when
+    // there is nothing to check against, refusal only on a positive
+    // contradiction — the agent named a project outside a world it did
+    // declare. That contradiction is exactly the `openfang-fork` typo.
+    fn project_membership_error(
+        &self,
+        caller_agent_id: Option<&str>,
+        slug: &str,
+    ) -> Option<String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id).ok()?;
+        if self
+            .registry
+            .get(agent_id)
+            .is_none_or(|e| e.manifest.projects.is_empty())
+        {
+            return None;
+        }
+        require_project_membership(
+            &self.registry,
+            agent_id,
+            openfang_memory::vocabulary::FactScope::Project,
+            slug,
+        )
+        .err()
+    }
+
     // ANAI-248: the structural half of the self-amputation guard.
     //
     // `ApprovalRequest::agent_id` is whatever string the tool runner passed to

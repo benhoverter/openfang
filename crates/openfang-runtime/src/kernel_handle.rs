@@ -228,6 +228,35 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// ANAI-264: why the caller may not prime for `slug`, or `None` if it may.
+    ///
+    /// The membership gate `memory_fact` has always applied to project-scoped
+    /// reads and writes, applied to the one project-scoped address that was
+    /// never checked. `prime_for` is free text: the 2026-08-26 reset primed
+    /// for `openfang-fork` while every fact lived under `openfang`, resolved
+    /// zero facts, and rendered a pack that looked healthy.
+    ///
+    /// This is only checkable now. Before dotted slugs, a membership test
+    /// would have rejected the legitimate case — an agent declaring `openfang`
+    /// priming for the sub-project it is actually working on — because
+    /// `openfang-memory` is not `openfang` by any rule the system could state.
+    /// With segment-boundary coverage, "more specific than my declaration" and
+    /// "a different project entirely" are finally distinguishable.
+    ///
+    /// Returns the refusal *text*, not a bool, because the useful part is the
+    /// list of slugs the agent could have meant — same shape as the
+    /// `memory_fact` refusal, which already gets this right.
+    ///
+    /// Defaults to `None` so alternate handles and test doubles are
+    /// unaffected; the kernel overrides it.
+    fn project_membership_error(
+        &self,
+        _caller_agent_id: Option<&str>,
+        _slug: &str,
+    ) -> Option<String> {
+        None
+    }
+
     /// ANAI-194: the CALLER's memory status — open episode, turns captured
     /// into it, and the idle countdown.
     ///
