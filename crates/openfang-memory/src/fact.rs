@@ -854,6 +854,40 @@ impl FactStore {
         Ok(out)
     }
 
+    /// ANAI-264: every `scope_ref` that currently holds at least one live
+    /// project-scoped claim.
+    ///
+    /// Diagnostic only, and deliberately so: it exists to make a *misaddressed*
+    /// pack legible. `prime_for` is free text, so a slug that names no project
+    /// resolves zero facts and renders a pack that looks healthy — which is
+    /// exactly the 2026-08-26 failure. Naming the slugs that *do* resolve turns
+    /// "your memory is empty" into "you asked for the wrong address".
+    ///
+    /// Not a project registry and must not be mistaken for one: a project with
+    /// no facts yet is absent from this list and is not thereby invalid.
+    pub fn known_project_scopes(&self) -> OpenFangResult<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT scope_ref
+                 FROM memories
+                 WHERE scope = 'project' AND kind = ?1 AND deleted = 0
+                 ORDER BY scope_ref",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![KIND_FACT], |row| row.get::<_, String>(0))
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| OpenFangError::Memory(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
     /// Every claim that has occupied a slot, newest supersession first.
     ///
     /// This is the audit path and the only reader of `fact_history`. It is

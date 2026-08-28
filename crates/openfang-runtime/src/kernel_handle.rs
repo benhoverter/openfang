@@ -207,6 +207,27 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// ANAI-264: what a pack primed for `slug` would resolve right now —
+    /// `(closed episodes, project facts)`.
+    ///
+    /// The pack is assembled a turn later, on the next prompt build. By then
+    /// the only entity that could recognise a mistyped slug — the agent that
+    /// typed it — has already been reset and is not being asked. So the close
+    /// path reports the counts back while someone is still listening.
+    ///
+    /// `None` means "cannot say", not "nothing found": the caller must omit
+    /// the report rather than claim a zero it did not measure.
+    ///
+    /// Defaults to `None` so alternate handles and test doubles are
+    /// unaffected; the kernel overrides it.
+    fn rehydration_preview(
+        &self,
+        _caller_agent_id: Option<&str>,
+        _slug: &str,
+    ) -> Option<(usize, usize)> {
+        None
+    }
+
     /// ANAI-194: the CALLER's memory status — open episode, turns captured
     /// into it, and the idle countdown.
     ///

@@ -574,7 +574,63 @@ impl MemorySubstrate {
         let facts = self
             .facts()
             .list_for_scope("project", &slug, rehydration::MAX_FACTS)?;
+        // ANAI-264: a primed pack that resolves no facts is the 2026-08-26
+        // failure — `prime_for` is free text, so a slug naming no project
+        // renders a pack that looks healthy while its "what is true" half is
+        // silently empty. `render_pack` returns `Some` if EITHER list has
+        // content, so nothing downstream can notice.
+        //
+        // Gated on an empty message vector so this fires once, on the first
+        // render after the reset, rather than once per turn for the whole
+        // pack TTL. A misaddressed prime is a one-line fact, not a drumbeat.
+        if facts.is_empty() && canonical.messages.is_empty() {
+            let known = self.facts().known_project_scopes().unwrap_or_default();
+            warn!(
+                agent_id = %agent_id,
+                prime_for = %slug,
+                known_project_scopes = ?known,
+                "Rehydration pack resolved zero project facts for the primed slug; \
+                 the briefing carries episode summaries only. If the slug is a typo the \
+                 pack is misaddressed, not empty."
+            );
+        }
         Ok(rehydration::render_pack(&slug, &episodes, &facts))
+    }
+
+    /// ANAI-264: what a pack primed for `slug` would currently resolve —
+    /// `(closed episodes, project facts)`.
+    ///
+    /// Exists so the agent that *asks* for a prime is told what it bought.
+    /// The pack itself is assembled later, on the next prompt build, by which
+    /// point the only entity that could recognise a wrong slug — the agent
+    /// that typed it — is no longer being consulted.
+    ///
+    /// Counts, not content: this runs inside a tool call whose result the
+    /// agent reads immediately, and the pack itself arrives one turn later.
+    /// Rendering it twice would just spend the window twice.
+    pub fn rehydration_preview(
+        &self,
+        agent_id: AgentId,
+        slug: &str,
+    ) -> OpenFangResult<(usize, usize)> {
+        let episodes = self
+            .episodes()
+            .list_for_agent(agent_id, rehydration::MAX_EPISODES + 2)?;
+        let closed = episodes
+            .iter()
+            // The same predicate `rehydration::render_pack` applies, so the
+            // number the agent is told is the number it will get. Duplicated
+            // deliberately rather than exported: the render is pure and reads
+            // no store, and a shared helper would drag `Episode` filtering
+            // into two crates to save one line.
+            .filter(|e| !e.is_open())
+            .filter(|e| e.title.is_some() || e.summary.is_some())
+            .take(rehydration::MAX_EPISODES)
+            .count();
+        let facts = self
+            .facts()
+            .list_for_scope("project", slug, rehydration::MAX_FACTS)?;
+        Ok((closed, facts.len()))
     }
 
     /// Set or clear a session label.
@@ -1595,6 +1651,83 @@ mod tests {
             substrate.rehydration_pack(agent_id).unwrap().is_none(),
             "the briefing must retire once real context exists"
         );
+    }
+
+    // --- ANAI-264: is the prime addressed at anything? ---------------------
+
+    /// The 2026-08-26 bug, reproduced. A slug that names no project is not
+    /// rejected and is not empty-looking: the pack renders from episodes
+    /// alone and reads as healthy. The preview is the only place the zero
+    /// becomes visible.
+    #[tokio::test]
+    async fn a_misaddressed_prime_previews_zero_facts() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang");
+
+        let (_, facts) = substrate.rehydration_preview(agent_id, "openfang").unwrap();
+        assert_eq!(facts, 1, "the slug that was actually written must resolve");
+
+        let (_, facts) = substrate
+            .rehydration_preview(agent_id, "openfang-fork")
+            .unwrap();
+        assert_eq!(
+            facts, 0,
+            "a slug nobody has written a fact under resolves nothing"
+        );
+    }
+
+    /// The count the agent is told must be the count it gets. An episode the
+    /// render would drop — still open, or carrying neither title nor summary
+    /// — must not be promised.
+    #[tokio::test]
+    async fn the_preview_counts_only_episodes_the_pack_would_show() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang");
+
+        // One closed-and-titled episode: countable.
+        substrate.ensure_open_episode(agent_id).unwrap();
+        substrate
+            .close_episode(agent_id, CloseReason::Explicit, Some("landed 264"), None)
+            .unwrap();
+        // One still open: not countable, and the pack would drop it.
+        substrate.ensure_open_episode(agent_id).unwrap();
+
+        let (episodes, _) = substrate.rehydration_preview(agent_id, "openfang").unwrap();
+        assert_eq!(episodes, 1, "the open episode must not be promised");
+
+        let pack = substrate.rehydration_pack(agent_id).unwrap().unwrap();
+        // Count bullets in the episode section only — the fact section uses
+        // the same bullet, and counting both would let a fact paper over a
+        // missing episode.
+        let episode_section = pack.split("\nWhat is currently true").next().unwrap();
+        assert_eq!(
+            episode_section.matches("\n- ").count(),
+            episodes,
+            "the preview and the render must agree: {pack}"
+        );
+    }
+
+    /// The diagnostic that turns "your memory is empty" into "you asked for
+    /// the wrong address". Agent-scoped claims must not appear — they are
+    /// addressed by a UUID, not a project slug, and offering one as a
+    /// suggestion would be worse than offering none.
+    #[tokio::test]
+    async fn known_project_scopes_lists_project_slugs_only() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang");
+        substrate
+            .facts()
+            .upsert(
+                crate::fact::FactWrite::new(agent_id, "agent", "tool.status", "fine")
+                    .with_scope_ref(agent_id.to_string()),
+            )
+            .unwrap();
+
+        let known = substrate.facts().known_project_scopes().unwrap();
+        assert_eq!(known, vec!["openfang".to_string()]);
     }
 
     #[tokio::test]
