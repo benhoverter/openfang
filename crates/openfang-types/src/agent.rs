@@ -598,6 +598,29 @@ pub fn project_slug_lineage(slug: &str) -> Vec<String> {
     out
 }
 
+/// ANAI-264. Does `ancestor` name `descendant`, or an ancestor of it?
+///
+/// The segment-boundary test the whole dotted scheme rests on. Equality is
+/// covered (`openfang` covers `openfang`); a bare character prefix is not
+/// (`openfang` does **not** cover `openfangevil`, and `openfang-fork` is a
+/// different project rather than a child), because the only way past the
+/// prefix is a literal `.`.
+///
+/// Empty on either side covers nothing. An empty ref addresses no project, and
+/// treating it as a universal ancestor would make one blank string in one
+/// manifest a grant over the entire fleet's claim space.
+pub fn slug_covers(ancestor: &str, descendant: &str) -> bool {
+    if ancestor.is_empty() || descendant.is_empty() {
+        return false;
+    }
+    if ancestor == descendant {
+        return true;
+    }
+    descendant
+        .strip_prefix(ancestor)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentManifest {
@@ -762,8 +785,47 @@ impl AgentManifest {
     /// fact about the world. Reading absent membership as universal membership
     /// would make all 71 undeclared agents members of every project on the
     /// first daemon start after this lands.
+    ///
+    /// ANAI-264: **a declared slug grants itself and everything beneath it.**
+    /// `projects = ["openfang"]` is a member of `openfang.memory` and of
+    /// `openfang.memory.index`; it is *not* a member of `openfang-fork` or
+    /// `openfangevil`, because the match is on whole dot-delimited segments,
+    /// not on characters. That boundary is the reason the separator had to be
+    /// `.` — hyphens are already spent inside names, so prefix-matching on `-`
+    /// would be guessing where a name ends.
+    ///
+    /// The grant runs one way only. Declaring `openfang.memory` does **not**
+    /// make an agent a member of `openfang`: a parent's claim space spans
+    /// every sibling sub-project, and inheriting upward would hand a
+    /// narrowly-scoped agent write access to all of them. Downward is the safe
+    /// direction, and it is the one that matches how the declaration reads —
+    /// "I work on openfang" plainly covers a corner of openfang.
+    ///
+    /// Reads are the mirror image and are deliberately *not* symmetric with
+    /// this: `FactStore::list_for_scope_lineage` walks root-ward, so an agent
+    /// addressing `openfang.memory` also sees `openfang`'s facts. A descendant
+    /// seeing its parent's shared background is the feature; a descendant
+    /// *writing* into that shared background is not, which is why the grant
+    /// stops here.
     pub fn is_member_of(&self, project: &str) -> bool {
-        self.projects.iter().any(|p| p == project)
+        self.projects
+            .iter()
+            .any(|declared| slug_covers(declared, project))
+    }
+
+    /// ANAI-264. Does this agent's work touch `project`, in either direction?
+    ///
+    /// The *roster* question, not the authorization question. "Who is on
+    /// openfang" should list an agent that declares only `openfang.memory` —
+    /// it plainly is — even though that declaration grants it nothing at
+    /// `openfang`. `is_member_of` cannot answer both: authorization needs
+    /// declared-covers-requested, a roster needs either direction, and
+    /// collapsing them would either hide sub-project agents from the roster or
+    /// hand them their parent's claim space. Two questions, two predicates.
+    pub fn works_on(&self, project: &str) -> bool {
+        self.projects
+            .iter()
+            .any(|declared| slug_covers(declared, project) || slug_covers(project, declared))
     }
 
     /// Validate every declared slug, returning each rejection with its index.
@@ -1250,6 +1312,58 @@ mod tests {
         // Reported, but still present and still matchable: load must not
         // silently rewrite what an operator declared.
         assert!(manifest.is_member_of("Bad Slug"));
+    }
+
+    /// ANAI-264. The grant a declaration makes, and where it stops.
+    ///
+    /// The `openfang-fork` row is the 2026-08-26 production bug: that slug was
+    /// primed for, resolved zero facts, and nothing said so. Under segment
+    /// matching it is refused at the source instead.
+    #[test]
+    fn a_declared_slug_grants_its_descendants_and_nothing_else() {
+        let manifest = AgentManifest {
+            projects: vec!["openfang".into()],
+            ..Default::default()
+        };
+        assert!(manifest.is_member_of("openfang"));
+        assert!(manifest.is_member_of("openfang.memory"));
+        assert!(manifest.is_member_of("openfang.memory.index"));
+
+        // Segment boundaries, not characters.
+        assert!(!manifest.is_member_of("openfangevil"));
+        assert!(!manifest.is_member_of("openfang-fork"));
+        assert!(!manifest.is_member_of("openfang-memory"));
+    }
+
+    /// The grant is one-way. A parent's claim space spans every sibling
+    /// sub-project, so inheriting upward would hand a narrowly-scoped agent
+    /// write access to all of them.
+    #[test]
+    fn a_sub_project_declaration_does_not_grant_the_parent() {
+        let manifest = AgentManifest {
+            projects: vec!["openfang.memory".into()],
+            ..Default::default()
+        };
+        assert!(manifest.is_member_of("openfang.memory"));
+        assert!(manifest.is_member_of("openfang.memory.index"));
+        assert!(!manifest.is_member_of("openfang"));
+        assert!(!manifest.is_member_of("openfang.tools"));
+
+        // ...but the roster still finds it, which is the whole reason
+        // `works_on` exists as a second predicate.
+        assert!(manifest.works_on("openfang"));
+        assert!(manifest.works_on("openfang.memory"));
+        assert!(!manifest.works_on("openfang-fork"));
+    }
+
+    /// An empty slug on either side covers nothing: one blank string in one
+    /// manifest must not become a grant over the whole fleet's claim space.
+    #[test]
+    fn an_empty_slug_covers_nothing() {
+        assert!(!slug_covers("", "openfang"));
+        assert!(!slug_covers("openfang", ""));
+        assert!(!slug_covers("", ""));
+        assert!(slug_covers("openfang", "openfang"));
     }
 
     #[test]

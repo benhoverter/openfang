@@ -106,10 +106,17 @@ impl AgentRegistry {
     /// The fleet query "which agents are on tttb", answered from declarations
     /// instead of from Ben's memory. Order is registry order, which is
     /// unspecified — callers that render this should sort.
+    ///
+    /// ANAI-264: matched with `works_on`, not `is_member_of`. A roster wants
+    /// both directions — an agent declaring `openfang.memory` is on `openfang`
+    /// by any honest reading, and an agent declaring `openfang` is on
+    /// `openfang.memory` — whereas membership grants strictly downward. Using
+    /// the authorization predicate here would silently hide every
+    /// sub-project agent from its parent's roster.
     pub fn agents_in_project(&self, project: &str) -> Vec<AgentEntry> {
         self.agents
             .iter()
-            .filter(|e| e.value().manifest.is_member_of(project))
+            .filter(|e| e.value().manifest.works_on(project))
             .map(|e| e.value().clone())
             .collect()
     }
@@ -533,6 +540,44 @@ mod tests {
     fn projects_of_unknown_agent_is_empty_not_a_panic() {
         let registry = AgentRegistry::new();
         assert!(registry.projects_of(AgentId::new()).is_empty());
+    }
+
+    /// ANAI-264. The roster reads both directions of the hierarchy, which is
+    /// why it does not use the authorization predicate: an agent that declares
+    /// only `openfang.memory` is on `openfang` by any honest reading, even
+    /// though that declaration grants it nothing at `openfang`.
+    #[test]
+    fn the_roster_sees_a_sub_project_agent_under_its_parent() {
+        let registry = AgentRegistry::new();
+
+        let mut parent = test_entry("openfang-alpha");
+        parent.manifest.projects = vec!["openfang".into()];
+        let mut child = test_entry("openfang-memory");
+        child.manifest.projects = vec!["openfang.memory".into()];
+        let mut neighbour = test_entry("tttb-ben");
+        neighbour.manifest.projects = vec!["openfang-fork".into()];
+
+        registry.register(parent).unwrap();
+        registry.register(child).unwrap();
+        registry.register(neighbour).unwrap();
+
+        let mut on_parent: Vec<String> = registry
+            .agents_in_project("openfang")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        on_parent.sort();
+        // `openfang-fork` is a different project, not a child: segment
+        // boundaries, not character prefixes.
+        assert_eq!(on_parent, vec!["openfang-alpha", "openfang-memory"]);
+
+        let mut on_child: Vec<String> = registry
+            .agents_in_project("openfang.memory")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        on_child.sort();
+        assert_eq!(on_child, vec!["openfang-alpha", "openfang-memory"]);
     }
 
     #[test]
