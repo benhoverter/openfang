@@ -571,9 +571,13 @@ impl MemorySubstrate {
         let episodes = self
             .episodes()
             .list_for_agent(agent_id, rehydration::MAX_EPISODES + 2)?;
-        let facts = self
-            .facts()
-            .list_for_scope("project", &slug, rehydration::MAX_FACTS)?;
+        // ANAI-264: hierarchical. A pack primed for `openfang.memory` carries
+        // `openfang`'s facts too, most-specific slot winning per claim key, so
+        // naming the sub-project can never resolve *fewer* facts than naming
+        // its parent would have.
+        let facts =
+            self.facts()
+                .list_for_scope_lineage("project", &slug, rehydration::MAX_FACTS)?;
         // ANAI-264: a primed pack that resolves no facts is the 2026-08-26
         // failure — `prime_for` is free text, so a slug naming no project
         // renders a pack that looks healthy while its "what is true" half is
@@ -627,9 +631,12 @@ impl MemorySubstrate {
             .filter(|e| e.title.is_some() || e.summary.is_some())
             .take(rehydration::MAX_EPISODES)
             .count();
+        // Same resolution the pack itself will use — a preview that counted
+        // differently from the render would be a second source of truth about
+        // what the agent is about to get.
         let facts = self
             .facts()
-            .list_for_scope("project", slug, rehydration::MAX_FACTS)?;
+            .list_for_scope_lineage("project", slug, rehydration::MAX_FACTS)?;
         Ok((closed, facts.len()))
     }
 
