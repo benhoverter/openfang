@@ -224,6 +224,7 @@ fn prompt_request() -> GateRequest {
         allowed_commands: vec!["rm".into()],
         flags: GateFlags::default(),
         policy: DEFAULT_POLICY.to_string(),
+        posture: GatePosture::Strict,
         path_facts: crate::path_facts::PathFactSheet::default(),
     }
 }

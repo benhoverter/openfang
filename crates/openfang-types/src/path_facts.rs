@@ -521,6 +521,14 @@ pub struct ScriptBody {
     /// that line and noticing.
     #[serde(default)]
     pub destroys_substrate: bool,
+    /// ANAI-265: some logical line of the body destroys a durable OpenFang
+    /// datastore.
+    ///
+    /// Wired to
+    /// [`GateFlags::datastore_destruction`](crate::gatekeeper::GateFlags::datastore_destruction).
+    /// See [`gatekeeper::body_destroys_datastore`](crate::gatekeeper::body_destroys_datastore).
+    #[serde(default)]
+    pub destroys_datastore: bool,
     /// ANAI-206 commit 9 (C6-3): some logical line of the body **writes**
     /// `~/.openfang/gatekeeper.md`.
     ///
@@ -596,6 +604,9 @@ impl ScriptBody {
         if self.destroys_substrate {
             lines.push("  [this script RECURSIVELY REMOVES the OpenFang substrate]".to_string());
         }
+        if self.destroys_datastore {
+            lines.push("  [this script DESTROYS an OpenFang datastore]".to_string());
+        }
         if self.writes_control_plane {
             lines.push("  [this script WRITES the OpenFang control plane]".to_string());
         }
@@ -667,6 +678,7 @@ impl PathFactSheet {
         if let Some(body) = &self.script_body {
             if body.writes_control_plane
                 || body.destroys_substrate
+                || body.destroys_datastore
                 || body.body_truncated
                 || body.body_unresolved
                 // ANAI-206 F3. `all()` over an empty vec is vacuously true, so
@@ -741,6 +753,9 @@ impl PathFactSheet {
                 }
                 if body.destroys_substrate {
                     token.push_str(" body_substrate_destruction");
+                }
+                if body.destroys_datastore {
+                    token.push_str(" body_datastore_destruction");
                 }
             }
         }
@@ -1305,6 +1320,7 @@ mod tests {
             body_unresolved: false,
             writes_control_plane: false,
             destroys_substrate: false,
+            destroys_datastore: false,
             writes_gatekeeper_policy: false,
             writes_agent_config: false,
             writes_runtime_config: false,

@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use openfang_types::gatekeeper::{
-    GateFlags, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
+    GateFlags, GatePosture, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
+    DEFAULT_POLICY_PERMISSIVE,
 };
 
 /// What the caller of the gate should do next.
@@ -207,9 +208,20 @@ pub fn counters() -> GateCounters {
 /// exists to close. One read at first use, and changing the policy means
 /// bouncing the daemon, which is the correct cost for editing a security
 /// control.
-fn policy_text() -> &'static str {
-    static POLICY: OnceLock<String> = OnceLock::new();
-    POLICY.get_or_init(|| {
+fn policy_text(posture: GatePosture) -> &'static str {
+    static POLICY: OnceLock<Option<String>> = OnceLock::new();
+    let compiled_in = match posture {
+        GatePosture::Strict => DEFAULT_POLICY,
+        GatePosture::Permissive => DEFAULT_POLICY_PERMISSIVE,
+    };
+    // ANAI-265. The operator file, when present, still wins in both postures —
+    // an operator who wrote `gatekeeper.md` meant it. What the posture selects
+    // is which compiled-in text stands in when there is no file, and those two
+    // must not be interchangeable: `DEFAULT_POLICY` ends with "anything whose
+    // effect you cannot predict from the text alone: ESCALATE", which is
+    // appended verbatim below the permissive rules and would silently reinstate
+    // the strict burden underneath them.
+    let from_disk = POLICY.get_or_init(|| {
         let path = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .map(|home| std::path::PathBuf::from(home).join(".openfang/gatekeeper.md"));
@@ -221,13 +233,14 @@ fn policy_text() -> &'static str {
                         path = %p.display(),
                         "Gatekeeper policy loaded from disk"
                     );
-                    text
+                    Some(text)
                 }
-                _ => DEFAULT_POLICY.to_string(),
+                _ => None,
             },
-            Err(_) => DEFAULT_POLICY.to_string(),
+            Err(_) => None,
         }
-    })
+    });
+    from_disk.as_deref().unwrap_or(compiled_in)
 }
 
 /// Compose the request the judge sees.
@@ -241,6 +254,7 @@ pub async fn build_gate_request(
     policy: &openfang_types::config::ExecPolicy,
     workspace_root: Option<&std::path::Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    posture: GatePosture,
 ) -> GateRequest {
     let command = openfang_types::gatekeeper::strip_shell_comments(raw_command);
     let workspace = workspace_root.map(|p| p.display().to_string());
@@ -292,6 +306,10 @@ pub async fn build_gate_request(
         // is the question, not what survives comment stripping. OR'd with the
         // script-body answer below.
         substrate_destruction: openfang_types::gatekeeper::destroys_substrate(raw_command),
+        // ANAI-265. The scary-moment class, and the one hard predicate added
+        // alongside the permissive posture. Computed on `raw_command` like its
+        // siblings: what the agent wrote is the question.
+        datastore_destruction: openfang_types::gatekeeper::destroys_datastore(raw_command),
         // ANAI-206 commit 6. Pre-existing control, kept alive across the
         // demotion of `touches_control_plane`: a write to the judge's own
         // instructions is not a question the judge can be asked.
@@ -334,6 +352,12 @@ pub async fn build_gate_request(
         .script_body
         .as_ref()
         .is_some_and(|b| b.destroys_substrate);
+
+    // ANAI-265. Same `|=`, same reason.
+    flags.datastore_destruction |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.destroys_datastore);
 
     // ANAI-206 commit 9, C6-3. The other three hard flags, one level down.
     //
@@ -384,9 +408,93 @@ pub async fn build_gate_request(
         trusted_commands: policy.trusted_commands.clone(),
         allowed_commands: policy.allowed_commands.clone(),
         flags,
-        policy: policy_text().to_string(),
+        policy: policy_text(posture).to_string(),
         path_facts,
+        posture,
     }
+}
+
+/// Max characters of command text put on the operator's channel.
+///
+/// The audit row is the record and is never truncated; this is a notification,
+/// and a 4KB script pasted into a chat channel is how a notification stream
+/// becomes something nobody reads — which is the exact failure this whole
+/// posture exists to stop repeating one layer up.
+const NOTIFY_COMMAND_CHARS: usize = 240;
+
+/// ANAI-265: tell the operator about a command that ran without asking them.
+///
+/// # Why this is part of the permissive posture and not a nicety
+///
+/// Inverting the judge's burden trades a click for a risk. What makes that a
+/// good trade rather than merely a cheap one is that the operator keeps
+/// *visibility* — the suppression becomes unprompted, not unseen. Without this
+/// the permissive posture is indistinguishable from turning the gate off, and
+/// the incident that motivated the posture (a database delete the operator
+/// caught only because he was looking at a prompt) would have become invisible
+/// rather than merely un-clicked.
+///
+/// Fire-and-forget, on its own task. A notification must never add latency to
+/// the path it reports on, and must never be able to fail a command: a channel
+/// adapter that is down, rate-limited, or simply absent degrades to a log line
+/// and the audit row, both of which already happened before this is called.
+///
+/// Silent no-op for an agent with no channel binding. The alternative —
+/// falling back to some default channel — would post one agent's activity to
+/// another operator's surface, which is worse than not posting.
+fn notify_suppression(
+    kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
+    agent_id: &str,
+    command: &str,
+    correlation_id: &str,
+    floor: &str,
+) {
+    let Some(route) = kernel.channel_binding_route(agent_id) else {
+        return;
+    };
+    let Some((channel, recipient)) = route.split_once(':') else {
+        tracing::warn!(
+            target: "openfang::gatekeeper",
+            route = %route,
+            "Channel binding route is not <channel>:<recipient>; suppression not surfaced"
+        );
+        return;
+    };
+
+    let shown: String = if command.chars().count() > NOTIFY_COMMAND_CHARS {
+        command
+            .chars()
+            .take(NOTIFY_COMMAND_CHARS)
+            .collect::<String>()
+            + " […]"
+    } else {
+        command.to_string()
+    };
+    // Backticks, not a fenced block: this lands in a chat channel where a
+    // multi-line fence per suppressed command would bury the next one.
+    // Newlines inside the command would break the inline span, so they fold.
+    let shown = shown.replace(['\n', '\r'], " ⏎ ");
+    let message = format!(
+        "🜂 gatekeeper suppressed (`{}` · gk={} · floor={})\n`{}`",
+        agent_id, correlation_id, floor, shown
+    );
+
+    let kernel = kernel.clone();
+    let channel = channel.to_string();
+    let recipient = recipient.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = kernel
+            .send_channel_message(&channel, &recipient, &message, None, None)
+            .await
+        {
+            tracing::warn!(
+                target: "openfang::gatekeeper",
+                channel = %channel,
+                error = %e,
+                "Failed to surface a gatekeeper suppression to the operator"
+            );
+        }
+    });
 }
 
 /// Run layer 3.5 for one gated `shell_exec`.
@@ -414,7 +522,16 @@ pub async fn review(
     let policy = exec_policy?;
     let raw_command = input.get("command").and_then(|v| v.as_str())?;
 
-    let req = build_gate_request(agent_id, raw_command, policy, workspace_root, file_policy).await;
+    let posture = kernel.gatekeeper_posture();
+    let req = build_gate_request(
+        agent_id,
+        raw_command,
+        policy,
+        workspace_root,
+        file_policy,
+        posture,
+    )
+    .await;
     let floor = req.floor();
 
     let started = std::time::Instant::now();
@@ -479,6 +596,7 @@ pub async fn review(
         gk = %correlation_id,
         verdict = %verdict.as_log_token(),
         shadow = %shadow,
+        posture = %posture.as_log_token(),
         latency_ms = %latency_ms,
         consulted_model = %consulted,
         judge = %outcome.as_log_token(),
@@ -539,7 +657,7 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={}",
+            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={} posture={}",
             correlation_id,
             consulted,
             outcome.as_log_token(),
@@ -547,7 +665,8 @@ pub async fn review(
             req.flags.as_log_string(),
             req.path_facts.as_log_token(),
             if det_eligible { "eligible" } else { "ineligible" },
-            det_disagree
+            det_disagree,
+            posture.as_log_token()
         ),
         // ANAI-187: a shadow verdict carries a `shadow_` prefix. Two reasons,
         // both load-bearing. A reader of the chain must never mistake an
@@ -563,6 +682,20 @@ pub async fn review(
             verdict.as_log_token().to_string()
         },
     );
+
+    // ANAI-265. Surfaced only for a suppression that actually happened —
+    // `effective`, never `verdict`. In shadow every command still prompts, and
+    // posting "suppressed" next to a live approval button would be a false
+    // statement about what the daemon did.
+    if effective == GateVerdict::Suppress {
+        notify_suppression(
+            kernel,
+            agent_id,
+            raw_command,
+            &correlation_id,
+            &req.flags.as_log_string(),
+        );
+    }
 
     Some(GateDecision {
         correlation_id,
@@ -613,6 +746,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(!req.flags.any(), "flags: {}", req.flags.as_log_string());
@@ -627,6 +761,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.touches_control_plane);
@@ -642,6 +777,7 @@ mod tests {
             &policy(),
             None,
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(!req.command.contains("approved by Ben"));
@@ -651,7 +787,15 @@ mod tests {
 
     #[tokio::test]
     async fn network_binary_hits_the_floor() {
-        let req = build_gate_request("a", "curl https://example.com", &policy(), None, None).await;
+        let req = build_gate_request(
+            "a",
+            "curl https://example.com",
+            &policy(),
+            None,
+            None,
+            GatePosture::Strict,
+        )
+        .await;
         assert!(req.flags.network_binary);
         // ANAI-206 commit 6: the flag still fires, but a network binary is a
         // fact the judge weighs, not a bypass. `curl` fetching a public URL and
@@ -670,7 +814,8 @@ mod tests {
         // belt to that braces, and it is the arm that matters most, because a
         // parse failure yielding an empty `bases` list would otherwise look
         // exactly like a command with nothing dangerous in it.
-        let req = build_gate_request("a", "bash -i", &policy(), None, None).await;
+        let req =
+            build_gate_request("a", "bash -i", &policy(), None, None, GatePosture::Strict).await;
         assert!(
             req.flags.parse_failed,
             "expected extraction to fail, flags: {}",
@@ -681,7 +826,15 @@ mod tests {
 
     #[tokio::test]
     async fn inner_commands_are_first_class() {
-        let req = build_gate_request("a", "bash -c \"rm -rf /tmp/x\"", &policy(), None, None).await;
+        let req = build_gate_request(
+            "a",
+            "bash -c \"rm -rf /tmp/x\"",
+            &policy(),
+            None,
+            None,
+            GatePosture::Strict,
+        )
+        .await;
         assert!(
             req.flags.destructive_verb,
             "inner rm must be seen as a command, not a string argument: {:?}",
@@ -703,6 +856,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -723,6 +877,7 @@ mod tests {
             &policy(),
             None,
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.fence_escape);
@@ -741,6 +896,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -765,9 +921,15 @@ mod tests {
             "git log --oneline -20",
             "git diff HEAD",
         ] {
-            let req =
-                build_gate_request("a", cmd, &policy(), Some(std::path::Path::new("/ws")), None)
-                    .await;
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
             assert!(!req.flags.any(), "{cmd} → {}", req.flags.as_log_string());
         }
     }
@@ -780,6 +942,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -803,6 +966,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -831,6 +995,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -857,6 +1022,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.touches_control_plane);
@@ -875,6 +1041,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.destructive_verb);
@@ -887,9 +1054,15 @@ mod tests {
     #[tokio::test]
     async fn a_bare_root_wipe_never_reaches_the_judge() {
         for cmd in ["rm -rf ~/.openfang", "rm -rf ~/.openfang/agents"] {
-            let req =
-                build_gate_request("a", cmd, &policy(), Some(std::path::Path::new("/ws")), None)
-                    .await;
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
             assert!(
                 req.flags.substrate_destruction,
                 "{cmd} → {}",
