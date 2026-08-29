@@ -9948,6 +9948,31 @@ fn require_project_membership(
     ))
 }
 
+/// One live claim, rendered for a tool payload.
+///
+/// ANAI-266: shared by the exact read and the inherited read so the two cannot
+/// describe a fact differently. An inherited claim that quietly dropped its
+/// staleness marker would be the worst of both worlds — a fact the reader did
+/// not address, presented with more confidence than the one they did.
+fn fact_read_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
+    serde_json::json!({
+        "claim": f.claim,
+        "status": f.status.as_str(),
+        "confidence": f.confidence,
+        "authored_by": f.authored_by,
+        "created_at": f.created_at,
+        "last_affirmed_at": f.last_affirmed_at,
+        "episode_id": f.episode_id,
+        // ANAI-259: the age of the belief travels with it. Advisory, never
+        // withholding — a stale slot the reader cannot see is a slot the
+        // reader cannot re-verify.
+        "persistence_class": f.persistence_class.as_str(),
+        "last_verified_at": f.last_verified_at(),
+        "age_days": f.age_days(chrono::Utc::now()).map(|d| d.floor()),
+        "should_verify": f.staleness().should_verify(),
+    })
+}
+
 /// How many closed episodes `memory_status` reports. Enough to orient, few
 /// enough that the tool result stays a status line rather than a log dump.
 const MEMORY_STATUS_RECENT_LIMIT: usize = 3;
@@ -11352,7 +11377,6 @@ impl KernelHandle for OpenFangKernel {
         let scope_ref =
             resolve_scope_ref(scope, &agent_ref, scope_ref).map_err(|e| e.to_string())?;
         require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
-        require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
 
         let fact = self
             .memory
@@ -11360,26 +11384,48 @@ impl KernelHandle for OpenFangKernel {
             .get(scope.as_str(), &scope_ref, claim_key)
             .map_err(|e| format!("Fact read failed: {e}"))?;
 
+        // ANAI-266: an empty child slot is not the same claim as "nobody
+        // believes anything about this". The pack already inherits along the
+        // lineage, so a point read that answers "empty" while a primed pack
+        // hands over the parent's claim is two answers to one question — and
+        // "empty" is the one that invites a duplicate write into the child
+        // scope, which then shadows the parent for every future lineage read.
+        //
+        // Only consulted when the exact slot is empty: an exact hit is the
+        // answer, and an inherited claim shown beside it would be background
+        // the reader did not ask for.
+        let inherited = match fact {
+            Some(_) => None,
+            None => self
+                .memory
+                .facts()
+                .get_inherited(scope.as_str(), &scope_ref, claim_key)
+                .map_err(|e| format!("Fact read failed: {e}"))?
+                // Membership grants downward only, so an ancestor is strictly
+                // broader than the slug the caller was cleared for. Re-check
+                // rather than assume: inheriting a claim from a project the
+                // caller cannot address would be a read gate that leaks
+                // upward through the very hierarchy ANAI-264 added.
+                .filter(|(ancestor, _)| {
+                    require_project_membership(&self.registry, agent_id, scope, ancestor).is_ok()
+                }),
+        };
+
         Ok(serde_json::json!({
             "scope": scope.as_str(),
             "scope_ref": scope_ref,
             "claim_key": claim_key,
-            "fact": fact.map(|f| serde_json::json!({
-                "claim": f.claim,
-                "status": f.status.as_str(),
-                "confidence": f.confidence,
-                "authored_by": f.authored_by,
-                "created_at": f.created_at,
-                "last_affirmed_at": f.last_affirmed_at,
-                "episode_id": f.episode_id,
-                // ANAI-259: the age of the belief travels with it. Advisory,
-                // never withholding — a stale slot the reader cannot see is a
-                // slot the reader cannot re-verify.
-                "persistence_class": f.persistence_class.as_str(),
-                "last_verified_at": f.last_verified_at(),
-                "age_days": f.age_days(chrono::Utc::now()).map(|d| d.floor()),
-                "should_verify": f.staleness().should_verify(),
-            })),
+            "fact": fact.as_ref().map(fact_read_json),
+            "inherited": inherited.as_ref().map(|(ancestor, f)| {
+                let mut value = fact_read_json(f);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "from_scope_ref".to_string(),
+                        serde_json::Value::String(ancestor.clone()),
+                    );
+                }
+                value
+            }),
         }))
     }
 
@@ -11399,6 +11445,15 @@ impl KernelHandle for OpenFangKernel {
         let scope_ref =
             resolve_scope_ref(scope, &agent_ref, scope_ref).map_err(|e| e.to_string())?;
         let limit = limit.clamp(1, MEMORY_HISTORY_MAX_LIMIT);
+
+        // ANAI-266: history was the one fact path with no membership gate — a
+        // 204-era omission, not a 264 regression, but dotted slugs made
+        // sibling project names guessable, so an agent could read the
+        // superseded claim text of any project it could name. Gated with the
+        // same function the read and write paths use: two membership rules
+        // that can disagree is how an agent gets refused a slot whose whole
+        // audit trail it can already recite.
+        require_project_membership(&self.registry, agent_id, scope, &scope_ref)?;
 
         let entries = self
             .memory

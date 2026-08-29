@@ -804,6 +804,54 @@ impl FactStore {
         .transpose()
     }
 
+    /// ANAI-266: the nearest **ancestor** claim for a slot that is empty here.
+    ///
+    /// Deliberately a second call rather than a flag on [`Self::get`], because
+    /// `get` is the address function the *write* path depends on: `upsert`
+    /// decides Created / Affirmed / Superseded with the identical
+    /// `(scope, scope_ref, claim_key)` query, and the v14 unique index scopes
+    /// that triple to `deleted = 0` precisely so it behaves as a slot address.
+    ///
+    /// If `get` inherited, a reader at `openfang.memory` would see `openfang`'s
+    /// claim, write a correction, and `upsert` would silently *create* a forked
+    /// child slot while the agent believed it had superseded the one it read.
+    /// Read and write would disagree about which slot they were discussing —
+    /// and the pack's most-specific-wins precedence would then hide the parent
+    /// from every future lineage read. That is corpus fragmentation, and it is
+    /// worse than the asymmetry this method exists to explain.
+    ///
+    /// So the lineage walk lives here, for **presentation only**: "no claim at
+    /// `openfang.memory`; `openfang` says X" is honest about both facts, while
+    /// the write path still sees an empty child slot, because it *is* one.
+    ///
+    /// Returns the ancestor `scope_ref` that actually holds the claim, not just
+    /// the claim: an inherited fact without its source is worse than none,
+    /// since the reader cannot tell which slot to go correct.
+    ///
+    /// Only `project` scope has a hierarchy (see [`Self::list_for_scope_lineage`]);
+    /// every other scope returns `None` without touching the database.
+    pub fn get_inherited(
+        &self,
+        scope: &str,
+        scope_ref: &str,
+        claim_key: &str,
+    ) -> OpenFangResult<Option<(String, Fact)>> {
+        if scope != "project" {
+            return Ok(None);
+        }
+        // `skip(1)` drops the slug itself: the exact slot is the caller's own
+        // `get`, and re-reading it here would report an exact hit as inherited.
+        for ancestor in openfang_types::agent::project_slug_lineage(scope_ref)
+            .into_iter()
+            .skip(1)
+        {
+            if let Some(fact) = self.get(scope, &ancestor, claim_key)? {
+                return Ok(Some((ancestor, fact)));
+            }
+        }
+        Ok(None)
+    }
+
     /// ANAI-247: every live claim about one subject, open loops first.
     ///
     /// The rehydration pack's whole "what is currently true about X" section.
@@ -1417,6 +1465,86 @@ mod tests {
             .unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].claim_key, "build.rebuild");
+    }
+
+    // --- ANAI-266: inherited point reads ------------------------------------
+
+    /// The asymmetry this method exists to explain: `get` stays exact so the
+    /// write path keeps its address, and the ancestor's claim is reachable
+    /// beside it rather than instead of it.
+    #[test]
+    fn an_empty_child_slot_reports_the_ancestor_and_names_it() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "main @ 2de3b31")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .get("project", "openfang.memory", "repo.trunk_head")
+                .unwrap()
+                .is_none(),
+            "the exact slot is still empty — that is what the write path must see"
+        );
+
+        let (from, fact) = store
+            .get_inherited("project", "openfang.memory", "repo.trunk_head")
+            .unwrap()
+            .expect("the parent holds the claim");
+        assert_eq!(from, "openfang", "the source scope travels with the claim");
+        assert_eq!(fact.claim, "main @ 2de3b31");
+    }
+
+    /// `skip(1)` is load-bearing: without it an exact hit would be reported as
+    /// inherited from itself, which reads as "go correct the parent" when the
+    /// slot the caller addressed is the one holding the claim.
+    #[test]
+    fn an_occupied_slot_is_never_its_own_ancestor() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "child answer")
+                    .with_scope_ref("openfang.memory"),
+            )
+            .unwrap();
+
+        assert!(store
+            .get_inherited("project", "openfang.memory", "repo.trunk_head")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Flat slugs and non-project scopes have no ancestors to inherit from —
+    /// the whole live corpus is depth one, so this is the common path.
+    #[test]
+    fn a_flat_slug_and_a_non_project_scope_inherit_nothing() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "repo.trunk_head", "ours").with_scope_ref("openfang"),
+            )
+            .unwrap();
+        store
+            // Dots are legal in a *project* ref only — a user slug names a
+            // person and has nothing below it, which is the same reason
+            // `get_inherited` refuses to walk one.
+            .upsert(FactWrite::new(a, "user", "user.timezone", "PDT").with_scope_ref("ben"))
+            .unwrap();
+
+        assert!(store
+            .get_inherited("project", "openfang", "repo.trunk_head")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_inherited("user", "ben", "user.timezone")
+            .unwrap()
+            .is_none());
     }
 
     /// The no-op guarantee. Every project-scoped row on disk is depth one, so

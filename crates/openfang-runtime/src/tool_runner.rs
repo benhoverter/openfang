@@ -4014,14 +4014,44 @@ fn fact_slot_label(payload: &serde_json::Value) -> String {
 fn render_fact_read(payload: &serde_json::Value) -> String {
     let slot = fact_slot_label(payload);
     let Some(fact) = payload.get("fact").filter(|f| !f.is_null()) else {
+        // ANAI-266: an empty child slot with a live ancestor is not an empty
+        // subject. Saying "empty" here while a rehydration pack hands over the
+        // parent's claim is two answers to one question, and it is the answer
+        // that invites a duplicate write into the child scope.
+        if let Some(inherited) = payload.get("inherited").filter(|f| !f.is_null()) {
+            let from = inherited["from_scope_ref"].as_str().unwrap_or("?");
+            return format!(
+                "{slot}\n  (no claim at this exact slot — inherited from \
+                 project/{from})\n{}\nRead only: no 'claim' was given, so nothing was \
+                 written. Writing here would CREATE a new slot at this address rather \
+                 than replace the one you just read, and it would shadow project/{from} \
+                 for every reader of this sub-project. Correct the claim at \
+                 project/{from} instead, unless it is genuinely different at this level.",
+                render_fact_body(inherited),
+            );
+        }
         return format!(
             "{slot}\n  (empty — no claim occupies this slot)\n\nRead only: no 'claim' was \
              given, so nothing was written. Pass 'claim' to fill the slot."
         );
     };
 
+    format!(
+        "{slot}\n{}\nRead only: no 'claim' was given, so nothing was written. Pass \
+         'claim' to replace this.",
+        render_fact_body(fact),
+    )
+}
+
+/// The claim and its provenance, indented, one line apiece.
+///
+/// Shared by the exact read and the inherited read (ANAI-266) so an inherited
+/// claim cannot quietly lose its staleness marker — a fact the reader did not
+/// address, shown with more confidence than the one they did, is the failure
+/// mode worth engineering against here.
+fn render_fact_body(fact: &serde_json::Value) -> String {
     let mut out = format!(
-        "{slot}\n  {}\n",
+        "  {}\n",
         fact["claim"].as_str().unwrap_or("(unreadable claim)")
     );
     if let Some(status) = fact["status"].as_str() {
@@ -4059,10 +4089,6 @@ fn render_fact_read(payload: &serde_json::Value) -> String {
             fact["persistence_class"].as_str().unwrap_or("active")
         ));
     }
-    out.push_str(
-        "\nRead only: no 'claim' was given, so nothing was written. Pass 'claim' to \
-         replace this.",
-    );
     out
 }
 
@@ -8950,8 +8976,64 @@ mod tests {
         );
     }
 
+    /// ANAI-266. An empty child slot with a live ancestor must say so, name the
+    /// source, and keep the ancestor's staleness marker — and it must still
+    /// warn that writing here forks a new slot rather than replacing the one
+    /// just read.
+    #[test]
+    fn inherited_read_names_its_source() {
+        let payload = serde_json::json!({
+            "scope": "project",
+            "scope_ref": "openfang.memory",
+            "claim_key": "repo.trunk_head",
+            "fact": serde_json::Value::Null,
+            "inherited": {
+                "from_scope_ref": "openfang",
+                "claim": "main @ 2de3b31",
+                "status": "settled",
+                "persistence_class": "volatile",
+                "age_days": 3.0,
+                "should_verify": true,
+            },
+        });
+        let rendered = render_fact_read(&payload);
+        assert!(
+            rendered.contains("no claim at this exact slot"),
+            "the exact answer survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("inherited from project/openfang"),
+            "an inherited claim without its source is worse than none: {rendered}"
+        );
+        assert!(rendered.contains("main @ 2de3b31"), "{rendered}");
+        assert!(
+            rendered.contains("VERIFY:"),
+            "a claim the reader did not address must not be shown with MORE \
+             confidence than one they did: {rendered}"
+        );
+        assert!(
+            rendered.contains("CREATE a new slot"),
+            "the fork hazard is the reason this is not just an inherited read: {rendered}"
+        );
+
+        // Nothing inherited, nothing to say: the old wording stands.
+        let bare = render_fact_read(&serde_json::json!({
+            "scope": "project",
+            "scope_ref": "openfang.memory",
+            "claim_key": "repo.trunk_head",
+            "fact": serde_json::Value::Null,
+            "inherited": serde_json::Value::Null,
+        }));
+        assert!(
+            bare.contains("empty — no claim occupies this slot"),
+            "{bare}"
+        );
+    }
+
     #[tokio::test]
     async fn fact_read_without_a_claim_says_it_wrote_nothing() {
+        // (ANAI-266 renderer cases live in `inherited_read_names_its_source`.)
+
         // A caller who meant to write and omitted `claim` gets a read. That is
         // the right behaviour — reading before writing is what keeps the key
         // space from growing near-duplicates — but it must not read as success.
