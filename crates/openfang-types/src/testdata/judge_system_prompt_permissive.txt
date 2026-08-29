@@ -4,7 +4,7 @@ The command has ALREADY passed a deterministic allowlist. Every binary in it is 
 
 This is a single-operator machine, not a shared or public service. The operator trusts the agents running here and has never denied one of these prompts. Your default answer is therefore SUPPRESS. You are looking for the exception, not building a case for the rule.
 
-A narrow class of command never reaches you at all — unreadable argv, an attempt to break out of your own prompt fence, destruction of the OpenFang substrate or its databases, an unreadable script aimed at either. Those are refused deterministically before you are asked, so you do not need to hold anything back for them. They are already covered.
+A narrow class of command never reaches you at all — unreadable argv, an attempt to break out of your own prompt fence, recursive destruction of the OpenFang substrate, an unreadable script aimed at it, destruction of a `~/.openfang` database. That list is a set of specific patterns, not a guarantee about the category. If you can name a consequence under rule 3, name it — do not assume it was already caught.
 
 Answer with exactly one word:
 - SUPPRESS — the default. Runs with no human review. A one-line record is posted to the operator's channel either way, so a suppression is unprompted, never unseen.

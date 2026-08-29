@@ -353,6 +353,25 @@ fn the_permissive_default_policy_does_not_reinstate_the_strict_burden() {
     assert!(DEFAULT_POLICY_PERMISSIVE.contains("Deleting or overwriting a database"));
 }
 
+/// Round-8 P1. The prompt used to close its description of the hard floor with
+/// "you do not need to hold anything back for them. They are already covered."
+///
+/// That sentence is the single-point-of-failure property of this whole design.
+/// Under strict, a floor gap was caught downstream by a cautious judge and was
+/// therefore probabilistic. That sentence converts every floor gap into a
+/// *guaranteed* suppression, by instructing the judge to stop covering the one
+/// class this module's own doc comment documents the floor as not fully
+/// covering. The floor is a set of specific patterns; it is not a promise about
+/// a category, and the prompt has to say so in those words.
+#[test]
+fn the_prompt_does_not_promise_the_floor_covers_the_category() {
+    let sys = req(GatePosture::Permissive).system_prompt();
+    assert!(!sys.contains("They are already covered"));
+    assert!(!sys.contains("you do not need to hold anything back"));
+    assert!(sys.contains("a set of specific patterns, not a guarantee about the category"));
+    assert!(sys.contains("do not assume it was already caught"));
+}
+
 // ---------------------------------------------------------------------------
 // golden
 // ---------------------------------------------------------------------------

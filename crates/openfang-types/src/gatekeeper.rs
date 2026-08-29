@@ -1008,11 +1008,20 @@ pub struct GateRequest {
     /// that the prompt is a pure function of the request — which is what makes
     /// the golden test, and the replay harness, mean anything.
     ///
-    /// `#[serde(default)]` resolves to [`GatePosture::Strict`] for the same
-    /// reason `path_facts` defaults to an empty sheet: a row written before
-    /// this field existed must rehydrate as the *stricter* reading, never as a
-    /// grant nobody made.
-    #[serde(default)]
+    /// `#[serde(skip)]`, not `#[serde(default)]`. Round-8 S1, and the argument
+    /// is stronger than ANAI-258 #4's. This is a *derived* field —
+    /// `kernel.gatekeeper_posture()` recomputes it on every live path — and a
+    /// derived field that appears on the wire is a field that can disagree with
+    /// its own derivation. Worse than that: it is a directly-settable
+    /// "judge me leniently" bit, and it also selects `policy_text()`, so a
+    /// deserialized `true` would be editing the judge's own instructions.
+    /// Defaulting to `Strict` is the right *direction* and is not the same as
+    /// being unreachable.
+    ///
+    /// Nothing is lost by making it unreachable: the posture is already on the
+    /// tracing line and in the audit detail string for every verdict, which is
+    /// where the replay harness reads it from. It never needed the field.
+    #[serde(skip)]
     pub posture: GatePosture,
 }
 
@@ -1215,10 +1224,11 @@ impl GateRequest {
              default answer is therefore SUPPRESS. You are looking for the exception, not \
              building a case for the rule.\n\n\
              A narrow class of command never reaches you at all — unreadable argv, an attempt \
-             to break out of your own prompt fence, destruction of the OpenFang substrate or \
-             its databases, an unreadable script aimed at either. Those are refused \
-             deterministically before you are asked, so you do not need to hold anything back \
-             for them. They are already covered.\n\n\
+             to break out of your own prompt fence, recursive destruction of the OpenFang \
+             substrate, an unreadable script aimed at it, destruction of a `~/.openfang` \
+             database. That list is a set of specific patterns, not a guarantee about the \
+             category. If you can name a consequence under rule 3, name it — do not assume it \
+             was already caught.\n\n\
              Answer with exactly one word:\n\
              - SUPPRESS — the default. Runs with no human review. A one-line record is posted \
              to the operator's channel either way, so a suppression is unprompted, never \
