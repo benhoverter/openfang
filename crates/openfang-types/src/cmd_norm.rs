@@ -178,17 +178,74 @@ fn strip_escapes(s: &str) -> String {
     out
 }
 
+/// The normalization chain, in order, shared by [`deny_variants`] and
+/// [`canonical`].
+///
+/// One list so the two cannot drift. [`deny_variants`] publishes every
+/// intermediate form because it does not know which spelling is real;
+/// [`canonical`] publishes only the last, because its caller needs a single
+/// string to walk in order. If those were two hand-written chains, a step added
+/// to one and not the other would be invisible in both — the predicate would
+/// stop matching and the tests, written against the canonicalizer's own output,
+/// would still pass. Round-9 note 1.
+const NORMALIZE_STEPS: &[fn(&str) -> String] = &[
+    strip_invisibles,
+    fold_homoglyphs,
+    strip_empty_quote_pairs,
+    strip_quotes,
+    strip_escapes,
+];
+
+/// `command` clipped to [`MAX_NORMALIZE_INPUT`] chars.
+///
+/// Counted in `chars()`, not bytes, so every caller's above-cap guard can be
+/// written in the same units and a multi-byte input cannot clear the guard and
+/// then be silently truncated in here.
+fn clipped(command: &str) -> String {
+    if command.chars().count() > MAX_NORMALIZE_INPUT {
+        command.chars().take(MAX_NORMALIZE_INPUT).collect()
+    } else {
+        command.to_string()
+    }
+}
+
+/// The single maximally-deobfuscated form of `command` — every step of
+/// [`NORMALIZE_STEPS`] applied, cumulatively.
+///
+/// # When this is the wrong tool
+///
+/// [`deny_variants`] returns a *set* precisely because this module cannot know
+/// which spelling is the real one; testing a predicate against all of them is
+/// order-independent and cheap. Prefer it. This function makes a *decision*
+/// about which spelling is real, and every predicate that shares it shares one
+/// failure.
+///
+/// It exists for the one caller that cannot use a set:
+/// [`crate::gatekeeper`]'s `cd`-frame walk is order-dependent — frames and the
+/// taint set carry forward across lines — so evaluating it once per variant
+/// would be a cross-product, and evaluating it on raw text is what let
+/// `cd ~/.open""fang/data` launder a hard floor predicate (round-8 E1).
+///
+/// The relationship that keeps this honest is pinned as an invariant, not as
+/// cases: whatever any member of `deny_variants` names, `canonical` must name
+/// too. See `canonical_names_whatever_any_variant_names` in `gatekeeper`.
+///
+/// Truncates at [`MAX_NORMALIZE_INPUT`] exactly like [`deny_variants`], so a
+/// caller feeding it a long line needs the same above-cap chunking.
+#[must_use]
+pub fn canonical(command: &str) -> String {
+    NORMALIZE_STEPS
+        .iter()
+        .fold(clipped(command), |acc, step| step(&acc))
+}
+
 /// Deobfuscated variants of `command`, for **deny** matching only.
 ///
 /// Returns the raw input first, then progressively normalized forms, deduped
 /// and order-preserving. Callers must test a deny rule against every entry and
 /// deny on any match (see the module docs on union semantics).
 pub fn deny_variants(command: &str) -> Vec<String> {
-    let raw: String = if command.chars().count() > MAX_NORMALIZE_INPUT {
-        command.chars().take(MAX_NORMALIZE_INPUT).collect()
-    } else {
-        command.to_string()
-    };
+    let raw: String = clipped(command);
 
     let mut out: Vec<String> = Vec::with_capacity(MAX_VARIANTS);
     let push = |v: String, out: &mut Vec<String>| {
@@ -201,16 +258,11 @@ pub fn deny_variants(command: &str) -> Vec<String> {
 
     // Cumulative: each step layers onto the previous, so an obfuscation that
     // stacks tricks (`ba\"\"sh` with a zero-width space inside) still folds.
-    let v = strip_invisibles(&raw);
-    push(v.clone(), &mut out);
-    let v = fold_homoglyphs(&v);
-    push(v.clone(), &mut out);
-    let v = strip_empty_quote_pairs(&v);
-    push(v.clone(), &mut out);
-    let v = strip_quotes(&v);
-    push(v.clone(), &mut out);
-    let v = strip_escapes(&v);
-    push(v, &mut out);
+    let mut v = raw;
+    for step in NORMALIZE_STEPS {
+        v = step(&v);
+        push(v.clone(), &mut out);
+    }
 
     out
 }
@@ -227,6 +279,33 @@ mod tests {
     fn raw_is_always_first_variant() {
         let v = deny_variants("git push --force");
         assert_eq!(v[0], "git push --force");
+    }
+
+    /// The two chains share [`NORMALIZE_STEPS`], and this pins that they stay
+    /// the same fold: `canonical` is the last cumulative form `deny_variants`
+    /// produces, for any input. Dedup can drop a repeat, never reorder, so the
+    /// last surviving entry is always equal to the fully-folded string.
+    #[test]
+    fn canonical_is_the_last_variant() {
+        for input in [
+            "rm -rf ~/.openfang/agents",
+            "r\"\"m -rf ~/.open\u{200b}fang",
+            "cd ~/.open''fang/data",
+            "plain",
+            "",
+        ] {
+            let v = deny_variants(input);
+            assert_eq!(
+                v.last().map(String::as_str),
+                Some(canonical(input).as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_truncates_like_deny_variants() {
+        let long = "a".repeat(MAX_NORMALIZE_INPUT + 100);
+        assert_eq!(canonical(&long).chars().count(), MAX_NORMALIZE_INPUT);
     }
 
     #[test]

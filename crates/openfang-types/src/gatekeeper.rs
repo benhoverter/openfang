@@ -332,28 +332,58 @@ pub enum GateVerdict {
     Deny,
 }
 
-/// True if `token`'s own name says it is a datastore, saying nothing about
+/// `token` with the punctuation that is not part of a filename trimmed off.
+///
+/// Trailing only. Interior quoting (`openfang.d"b"`) is not this function's
+/// problem and must not be: every caller reads text that
+/// [`crate::cmd_norm`] has already deobfuscated — [`names_datastore`] through
+/// [`crate::cmd_norm::deny_variants`], the frame walk through
+/// [`crate::cmd_norm::canonical`]. Round-8 E5 was this trim being the *only*
+/// defence on the walker's side; the fix was upstream, not here.
+fn datastore_stem(token: &str) -> String {
+    let lowered = token.to_ascii_lowercase();
+    lowered
+        .trim_end_matches(['"', '\'', ',', ';', ')'])
+        .to_string()
+}
+
+/// True if `token`'s own extension says it is a datastore, saying nothing about
 /// *where* it lives.
 ///
 /// Split out of [`names_datastore`] for ANAI-265 D1: the `cd`-relative and
 /// tainted-variable arms in [`cwd_relative_hits`] have already established the
 /// directory, so re-demanding `~/.openfang` in the token is exactly the test
 /// that let `rm openfang.db` through.
+fn has_datastore_extension(token: &str) -> bool {
+    let trimmed = datastore_stem(token);
+    DATASTORE_SUFFIXES.iter().any(|s| trimmed.ends_with(s))
+}
+
+/// True if `token`'s last component is a glob.
 ///
-/// ANAI-265 D2: the glob arm. A glob is always at end-of-token, so a suffix
-/// test alone is blind to `rm ~/.openfang/data/*`, `openfang.*` and
-/// `openfang.db-*` — three spellings of the same deletion, none of them
-/// obfuscation. A glob names whatever its prefix directory holds and we cannot
-/// prove that is not the database. This over-fires on control-plane globs that
-/// hold no datastore; the cost of that is one approval prompt.
-fn has_datastore_suffix(token: &str) -> bool {
-    let lowered = token.to_ascii_lowercase();
-    // A trailing quote or comma is not part of the name.
-    let trimmed = lowered.trim_end_matches(['"', '\'', ',', ';', ')']);
-    if DATASTORE_SUFFIXES.iter().any(|s| trimmed.ends_with(s)) {
-        return true;
-    }
-    trimmed
+/// ANAI-265 D2. A glob is always at end-of-token, so an extension test alone is
+/// blind to `rm ~/.openfang/data/*`, `openfang.*` and `openfang.db-*` — three
+/// spellings of the same deletion, none of them obfuscation. A glob names
+/// whatever its prefix directory holds and we cannot prove that is not the
+/// database.
+///
+/// # Why callers must gate this and cannot just call it
+///
+/// This half carries no evidence about *what* it matches, so its cost is
+/// entirely a function of how tight the caller's other conjunct is. On a
+/// command line [`names_datastore`] pairs it with a literal `~/.openfang` in
+/// the same token, which bounds it to one directory tree and costs at most an
+/// approval prompt.
+///
+/// Inside [`cwd_relative_hits`] there is no such token — the directory comes
+/// from a `cd` frame — so pairing it with `Cwd::ControlPlane` would reduce the
+/// whole test to "any relative glob anywhere under `~/.openfang`", and
+/// `~/.openfang/scripts` is the single most-walked directory this floor reads.
+/// `cd ~/.openfang/scripts` then `rm -f *.log` would hard-floor. Round-8 E3:
+/// the walker gates this arm on [`Cwd::Substrate`], which is the frame the D2
+/// case actually names.
+fn has_datastore_glob(token: &str) -> bool {
+    datastore_stem(token)
         .rsplit('/')
         .next()
         .is_some_and(|c| !c.is_empty() && c.contains(['*', '?', '[', '{']))
@@ -393,7 +423,7 @@ fn overcap_chunks(text: &str) -> Vec<String> {
 }
 
 /// Where a script body's working directory sits, as far as this floor can tell.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cwd {
     /// Unknown, or somewhere outside the control plane. The default, and the
     /// assumption for everything except a `cd` we could read.
@@ -455,48 +485,98 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
         destroys_datastore: false,
     };
     for line in lines {
-        let lowered = fold_clobber_redirect(&line.text.to_ascii_lowercase());
-        for segment in split_segments(&lowered) {
-            let tokens: Vec<&str> = segment.split_whitespace().collect();
-            if tokens.is_empty() {
-                continue;
-            }
-            // ANAI-265 D1. One walker, three hits. The datastore arm has to see
-            // the same `cd` frames and the same taint set as the substrate arm;
-            // the first version of it read raw tokens and saw neither, so
-            // `cd ~/.openfang/data` then `rm openfang.db` cleared a *hard*
-            // predicate in two lines of ordinary shell.
-            //
-            // Ordered before the `cd` arm and before the `Elsewhere` bail on
-            // purpose: the tainted-variable half is live from any frame, because
-            // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
-            taint_from_segment(&tokens, &mut tainted);
-            let inside = cwd != Cwd::Elsewhere;
-            if segment_ends_datastore(&tokens, &|t: &str| {
-                has_datastore_suffix(t)
-                    && ((inside && is_relative_operand(t)) || references_tainted(t, &tainted))
-            }) {
-                hits.destroys_datastore = true;
-            }
-            if let Some(next) = cd_target(&tokens, cwd) {
-                cwd = next;
-                continue;
-            }
-            if cwd == Cwd::Elsewhere {
-                continue;
-            }
-            if !tokens.iter().skip(1).any(|t| is_relative_operand(t)) {
-                continue;
-            }
-            if segment_writes(&tokens) {
-                hits.writes = true;
-            }
-            if cwd == Cwd::Substrate && segment_destroys_tree(&tokens) {
-                hits.destroys = true;
+        for unit in walk_units(&line.text) {
+            let lowered = lower_for_segments(&unit);
+            for segment in split_segments(&lowered) {
+                let tokens: Vec<&str> = segment.split_whitespace().collect();
+                if tokens.is_empty() {
+                    continue;
+                }
+                // ANAI-265 D1. One walker, three hits. The datastore arm has to see
+                // the same `cd` frames and the same taint set as the substrate arm;
+                // the first version of it read raw tokens and saw neither, so
+                // `cd ~/.openfang/data` then `rm openfang.db` cleared a *hard*
+                // predicate in two lines of ordinary shell.
+                //
+                // Ordered before the `cd` arm and before the `Elsewhere` bail on
+                // purpose: the tainted-variable half is live from any frame, because
+                // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
+                taint_from_segment(&tokens, &mut tainted);
+                let inside = cwd != Cwd::Elsewhere;
+                let substrate = cwd == Cwd::Substrate;
+                if segment_ends_datastore(&tokens, &|t: &str| {
+                    // Round-8 E3. The extension arm carries its own evidence and is
+                    // frame-agnostic; the glob arm carries none and is gated on the
+                    // substrate frame. See [`has_datastore_glob`].
+                    (has_datastore_extension(t) || (substrate && has_datastore_glob(t)))
+                        && ((inside && is_relative_operand(t)) || references_tainted(t, &tainted))
+                }) {
+                    hits.destroys_datastore = true;
+                }
+                if let Some(next) = cd_target(&tokens, cwd) {
+                    cwd = next;
+                    continue;
+                }
+                if cwd == Cwd::Elsewhere {
+                    continue;
+                }
+                if !tokens.iter().skip(1).any(|t| is_relative_operand(t)) {
+                    continue;
+                }
+                if segment_writes(&tokens) {
+                    hits.writes = true;
+                }
+                if cwd == Cwd::Substrate && segment_destroys_tree(&tokens) {
+                    hits.destroys = true;
+                }
             }
         }
     }
     hits
+}
+
+/// The text [`cwd_relative_hits`] actually walks: deobfuscated, in order, and
+/// never longer than the normalizer will read.
+///
+/// # Round-8 E1 — one canonical form, not a variant set
+///
+/// Every other predicate in this module iterates
+/// [`crate::cmd_norm::deny_variants`] and matches on any member, because it is
+/// order-independent: the answer for a line does not depend on the answer for
+/// the line before it. The frame walk is not. It carries `cd` frames and a
+/// taint set forward, so running it once per variant would either lose that
+/// state or cost a cross-product over the whole body.
+///
+/// It therefore reads one string — and before this fix that string was raw
+/// text, so every test the walk depends on was quote-naive:
+///
+/// ```text
+///   cd ~/.open""fang/data      # cd_target sees no control plane -> Elsewhere
+///   rm openfang.db             # relative, no frame -> clean
+/// ```
+///
+/// Two quote characters cleared a *hard* predicate under a posture with no
+/// cautious judge behind it. [`crate::cmd_norm::canonical`] is the deliberate
+/// concentration that fixes it; the invariant tying it back to the variant set
+/// is pinned in `canonical_names_whatever_any_variant_names`.
+///
+/// # Round-8 E2 — the above-cap branch has to land in the same commit
+///
+/// `canonical` truncates at [`crate::cmd_norm::MAX_NORMALIZE_INPUT`] exactly as
+/// `deny_variants` does. The old raw walk had no cap and needed none; the
+/// moment it reads a normalizer, everything past the cap stops being examined —
+/// ANAI-206 F7 for the third time. Chunking keeps the walk evaluating rather
+/// than silently ending mid-body. The chunks overlap and are yielded in order,
+/// so a `cd` and the command it laundered cannot be separated by a boundary and
+/// re-walking the overlap only re-applies frames that were already correct.
+fn walk_units(text: &str) -> Vec<String> {
+    if text.chars().count() <= crate::cmd_norm::MAX_NORMALIZE_INPUT {
+        return vec![crate::cmd_norm::canonical(text)];
+    }
+    overcap_chunks(text)
+        .iter()
+        .map(|chunk| crate::cmd_norm::canonical(chunk))
+        .collect()
 }
 
 /// The frame this segment moves to, or `None` if it is not a `cd`.
@@ -1632,7 +1712,7 @@ fn strip_line_comment(line: &str) -> &str {
 /// path" and the judge would be guessing blind.
 pub fn touches_control_plane(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
-        let lowered = v.to_ascii_lowercase();
+        let lowered = lower_for_segments(v);
         if !names_control_plane(&lowered) {
             return false;
         }
@@ -1750,7 +1830,7 @@ fn line_writes_control_plane(line: &LogicalLine) -> bool {
     }
     match &line.heredoc_payload {
         Some(payload) if names_control_plane(payload) => {
-            let lowered = line.text.to_ascii_lowercase();
+            let lowered = lower_for_segments(&line.text);
             split_segments(&lowered).into_iter().any(|segment| {
                 let tokens: Vec<&str> = segment.split_whitespace().collect();
                 !tokens.is_empty() && segment_writes(&tokens)
@@ -1967,7 +2047,7 @@ fn terminates_heredoc(raw: &str, open: &HeredocOpen) -> bool {
 fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
     let mut tainted: Vec<String> = Vec::new();
     for line in lines {
-        let lowered = line.text.to_ascii_lowercase();
+        let lowered = lower_for_segments(&line.text);
         for segment in split_segments(&lowered) {
             let tokens: Vec<&str> = segment.split_whitespace().collect();
             if tokens.is_empty() {
@@ -2267,7 +2347,7 @@ fn control_root_tails(s: &str) -> Vec<RootTail> {
 #[must_use]
 pub fn destroys_substrate(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
-        let lowered = v.to_ascii_lowercase();
+        let lowered = lower_for_segments(v);
         if !names_substrate(&lowered) {
             return false;
         }
@@ -2312,7 +2392,8 @@ const FILE_ENDING_BINS: &[&str] = &["rm", "rmdir", "shred", "truncate", "mv", "m
 #[must_use]
 pub fn names_datastore(token: &str) -> bool {
     let lowered = token.to_ascii_lowercase();
-    lowered.contains(CONTROL_PLANE_ROOT_BARE) && has_datastore_suffix(&lowered)
+    lowered.contains(CONTROL_PLANE_ROOT_BARE)
+        && (has_datastore_extension(&lowered) || has_datastore_glob(&lowered))
 }
 
 /// ANAI-265: the second member of the hard floor's destructive set —
@@ -2348,7 +2429,7 @@ pub fn names_datastore(token: &str) -> bool {
 #[must_use]
 pub fn destroys_datastore(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
-        let lowered = fold_clobber_redirect(&v.to_ascii_lowercase());
+        let lowered = lower_for_segments(v);
         if !lowered.contains(CONTROL_PLANE_ROOT_BARE) {
             return false;
         }
@@ -2371,6 +2452,30 @@ fn fold_clobber_redirect(lowered: &str) -> String {
     } else {
         lowered.to_string()
     }
+}
+
+/// Lowercase and fold `>|`, in one place, for every predicate that is about to
+/// call [`split_segments`].
+///
+/// # The finding was the count, not the fold
+///
+/// Round-8 E4 reported `>|` tearing two hard predicates in half:
+/// `cat x >| ~/.openfang/config.toml` segments into `cat x >` and a bare path,
+/// so `segment_writes`' conjunction never sees both halves. One character, no
+/// obfuscation, and nothing the exec policy blocks.
+///
+/// The fold existed; it was reachable from two of the nine places that lower a
+/// string before segmenting it. Fixing those two would have closed the case and
+/// left the seam — nine independent lowering decisions, of which only the
+/// author knew the count. So the deliverable is this function plus the
+/// enumeration in the commit body: every `split_segments` caller lowers here,
+/// and a new predicate inherits both properties instead of remembering them.
+///
+/// Callers that need the lowered string for a `names_*` test as well as for
+/// segmenting should use this one string for both. Folding `>|` to `> ` cannot
+/// change what a path names.
+fn lower_for_segments(s: &str) -> String {
+    fold_clobber_redirect(&s.to_ascii_lowercase())
 }
 
 fn segment_destroys_datastore(segment: &str) -> bool {
@@ -2638,7 +2743,7 @@ fn logical_line_destroys_substrate(line: &LogicalLine) -> bool {
     }
     chunks.iter().any(|chunk| {
         crate::cmd_norm::deny_variants(chunk).iter().any(|v| {
-            let lowered = v.to_ascii_lowercase();
+            let lowered = lower_for_segments(v);
             split_segments(&lowered).into_iter().any(|segment| {
                 let tokens: Vec<&str> = segment.split_whitespace().collect();
                 segment_destroys_tree(&tokens)
@@ -3135,6 +3240,199 @@ impl Default for GatekeeperConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- round 8: the frame walk reads deobfuscated text ----------------------
+
+    /// Bases and spellings for the E1 invariant, kept next to the test that
+    /// uses them so a new obfuscation gets added in one place.
+    const OBFUSCATED_BASES: &[&str] = &[
+        "rm -rf ~/.openfang/agents",
+        "rm ~/.openfang/openfang.db",
+        "cd ~/.openfang/data",
+        "d=~/.openfang/data",
+        "cat x > ~/.openfang/config.toml",
+    ];
+
+    /// One name-predicate under test, with its name for the failure message.
+    type NamedPredicate = (&'static str, fn(&str) -> bool);
+
+    fn obfuscations(base: &str) -> Vec<String> {
+        vec![
+            base.to_string(),
+            base.replace(".openfang", ".open\"\"fang"),
+            base.replace(".openfang", ".open''fang"),
+            base.replace(".openfang", ".open\\fang"),
+            base.replace(".openfang", ".open\u{200b}fang"),
+            base.replace(".openfang", "'.openfang'"),
+            base.replace(".openfang", "\".open\"\"f\\ang\""),
+        ]
+    }
+
+    /// Round-8 E1, and the thing that keeps the fix honest.
+    ///
+    /// [`crate::cmd_norm::canonical`] is a *decision* about which spelling is
+    /// real, shared by the whole frame walk. Testing it case by case tests the
+    /// canonicalizer that was written, not the one that was meant: a spelling
+    /// it does not fold is invisible to the predicates and to the suite at the
+    /// same time, which is exactly how E1 survived four review rounds one level
+    /// up.
+    ///
+    /// So the assertion is a *relationship over every spelling*, not a list of
+    /// cases: obfuscating a command must not change what the canonical form
+    /// says about it. Add a normalization step to one chain and not the other,
+    /// or drop one from the cumulative fold, and this fails loudly on whichever
+    /// spelling stopped folding — including spellings nobody enumerated,
+    /// because the assertion is quantified over the generator and not over a
+    /// table of expected outputs.
+    ///
+    /// # The invariant review asked for is *false*, and the counterexample is
+    /// benign
+    ///
+    /// Round 9 asked for "if any member of `deny_variants(s)` names X, so does
+    /// `canonical(s)`". Written that way it fails on the first spelling this
+    /// generator produces:
+    ///
+    /// ```text
+    ///   rm ~/'.openfang'/openfang.db
+    /// ```
+    ///
+    /// `names_substrate` matches the **raw** variant and not the canonical one
+    /// — because the quote makes `control_root_tails` read the tail as the bare
+    /// root rather than as `openfang.db`, and a bare root *is* the substrate.
+    /// The raw form over-matches on punctuation; the canonical form is right.
+    /// That direction is fail-closed and is the raw variant doing its job, so
+    /// the honest statement of the property is agreement across spellings,
+    /// which is what E1 was actually about.
+    #[test]
+    fn canonical_folds_every_spelling_to_the_same_answer() {
+        let predicates: [NamedPredicate; 3] = [
+            ("names_control_plane", names_control_plane),
+            ("names_substrate", names_substrate),
+            ("names_datastore", names_datastore),
+        ];
+        for base in OBFUSCATED_BASES {
+            let plain = crate::cmd_norm::canonical(base);
+            for spelling in obfuscations(base) {
+                let canon = crate::cmd_norm::canonical(&spelling);
+                for (name, predicate) in predicates {
+                    assert_eq!(
+                        predicate(&canon),
+                        predicate(&plain),
+                        "{name}: spelling {spelling:?} canonicalized to {canon:?} and disagreed \
+                         with the plain form {plain:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// E1 proper: two quote characters used to clear a *hard* predicate.
+    ///
+    /// The `cd` names the substrate only after deobfuscation, and the `rm`
+    /// names the datastore only relative to that frame. Neither line is
+    /// reachable by the command-line predicate, which is the point — this is
+    /// the walk or it is nothing.
+    #[test]
+    fn quoted_cd_no_longer_launders_the_datastore_floor() {
+        assert!(body_destroys_datastore(
+            "cd ~/.open\"\"fang/data\nrm openfang.db\n"
+        ));
+        // The variable form never changes directory at all: the taint set has
+        // to read the same deobfuscated text the frames do.
+        assert!(body_destroys_datastore(
+            "d=~/.open\"\"fang/data\nrm \"$d/openfang.db\"\n"
+        ));
+        // E5: an interior quote in the *operand*, which the trailing-only trim
+        // in `datastore_stem` never saw and is not asked to see.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nrm openfang.d\"b\"\n"
+        ));
+    }
+
+    /// E2. The walk reads a normalizer now, so it inherits the normalizer's
+    /// cap; without chunking, everything past 8192 chars stops being examined
+    /// and a hard flag silently does not evaluate. ANAI-206 F7, third instance.
+    ///
+    /// Deliberately shaped so the command-line and per-line predicates cannot
+    /// rescue it: the `rm` operand is relative and carries no `~/.openfang`, so
+    /// only the frame walk can reach it.
+    #[test]
+    fn the_frame_walk_evaluates_above_the_normalizer_cap() {
+        let padding = "a".repeat(crate::cmd_norm::MAX_NORMALIZE_INPUT + 800);
+        let body = format!("{padding} ; cd ~/.openfang/data ; rm openfang.db\n");
+        assert!(body.chars().count() > crate::cmd_norm::MAX_NORMALIZE_INPUT);
+        assert!(body_destroys_datastore(&body));
+    }
+
+    /// E3, asserted at the frame and not at the verdict.
+    ///
+    /// The glob arm is gated on `Cwd::Substrate`, which makes it silently
+    /// load-bearing on `cd ~/.openfang/data` resolving to `Substrate` and not
+    /// `ControlPlane`. If `names_substrate` stopped matching that path — a
+    /// trailing slash, a `..` pop, any of the C6-2 family — the arm would
+    /// become dead code and every verdict-level test would still pass, because
+    /// the command-line path fires independently. This asserts the frame.
+    #[test]
+    fn cd_frames_resolve_where_the_glob_arm_assumes_they_do() {
+        assert_eq!(
+            cd_target(&["cd", "~/.openfang/data"], Cwd::Elsewhere),
+            Some(Cwd::Substrate)
+        );
+        assert_eq!(
+            cd_target(&["cd", "~/.openfang/data/"], Cwd::Elsewhere),
+            Some(Cwd::Substrate)
+        );
+        assert_eq!(
+            cd_target(&["cd", "\"~/.openfang/agents\""], Cwd::Elsewhere),
+            Some(Cwd::Substrate)
+        );
+        assert_eq!(
+            cd_target(&["cd", "~/.openfang/scripts"], Cwd::Elsewhere),
+            Some(Cwd::ControlPlane)
+        );
+        // Walking upwards leaves the frame; the glob arm must not survive it.
+        assert_eq!(
+            cd_target(&["cd", "../.."], Cwd::Substrate),
+            Some(Cwd::Elsewhere)
+        );
+    }
+
+    /// E3's cost, from both directions.
+    ///
+    /// `~/.openfang/scripts` is the most-walked directory this floor reads and
+    /// holds no datastore, so a frame-agnostic glob arm hard-floored the
+    /// fleet's own script maintenance. The substrate frame still fires, which
+    /// is the D2 case the arm was written for.
+    #[test]
+    fn the_glob_arm_is_scoped_to_the_substrate_frame() {
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/scripts\nrm -f *.log\n"
+        ));
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/scripts\nmv *.sh archive/\n"
+        ));
+        assert!(body_destroys_datastore("cd ~/.openfang/data\nrm *\n"));
+        // The extension arm carries its own evidence and stays frame-agnostic.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/scripts\nrm openfang.db\n"
+        ));
+    }
+
+    /// E4. `>|` is never a pipe, and `split_segments` splits on `|`, so an
+    /// unfolded lowering tore the verb off its target and the conjunction in
+    /// `segment_writes` never saw both halves. Two hard predicates, one
+    /// character, no obfuscation.
+    #[test]
+    fn clobber_redirect_no_longer_tears_the_write_predicates() {
+        assert!(writes_runtime_config("cat x >| ~/.openfang/config.toml"));
+        assert!(writes_agent_config(
+            "cat x >| ~/.openfang/agents/openfang-alpha.toml"
+        ));
+        assert!(destroys_datastore(": >| ~/.openfang/openfang.db"));
+        assert!(body_writes_runtime_config(
+            "#!/bin/sh\ncat x >| ~/.openfang/config.toml\n"
+        ));
+    }
 
     // -- config --------------------------------------------------------------
 
@@ -4215,7 +4513,7 @@ pub fn writes_runtime_config(command: &str) -> bool {
 /// defeats a raw `contains`.
 fn writes_where(command: &str, names: impl Fn(&str) -> bool) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
-        let lowered = v.to_ascii_lowercase();
+        let lowered = lower_for_segments(v);
         if !names(&lowered) {
             return false;
         }
@@ -4280,17 +4578,17 @@ fn line_writes_where(line: &LogicalLine, names: &dyn Fn(&str) -> bool) -> bool {
         return overcap_chunks(&line.text)
             .iter()
             .any(|chunk| writes_where(chunk, names))
-            || names(&line.text.to_ascii_lowercase());
+            || names(&lower_for_segments(&line.text));
     }
     if writes_where(&line.text, names) {
         return true;
     }
-    let lowered = line.text.to_ascii_lowercase();
+    let lowered = lower_for_segments(&line.text);
     if names(&lowered) && runs_opaque_source(&line.text) {
         return true;
     }
     match &line.heredoc_payload {
-        Some(payload) if names(&payload.to_ascii_lowercase()) => {
+        Some(payload) if names(&lower_for_segments(payload)) => {
             split_segments(&lowered).into_iter().any(|segment| {
                 let tokens: Vec<&str> = segment.split_whitespace().collect();
                 !tokens.is_empty() && segment_writes(&tokens)
@@ -4306,7 +4604,10 @@ fn line_writes_where(line: &LogicalLine, names: &dyn Fn(&str) -> bool) -> bool {
 /// ordinary characters inside a quoted `-c` payload, so segmenting an opaque
 /// invocation splits the very thing that makes it opaque.
 fn runs_opaque_source(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
+    // Not a segmenting caller, but the same fold applies for the same reason:
+    // `x>|python3 -c ...` tokenizes as one word and hides the interpreter from
+    // `basename`. Widening only, and in the fail-closed direction.
+    let lowered = lower_for_segments(text);
     let tokens: Vec<&str> = lowered.split_whitespace().collect();
     tokens
         .iter()
