@@ -121,6 +121,33 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// ANAI-264 step 4. Every project **root** any agent declares, sorted.
+    ///
+    /// The fleet's project namespace, derived rather than registered. There is
+    /// no such thing as a valid root nobody declares: a project no agent
+    /// belongs to has no readers, so the union of declarations *is* the
+    /// authoritative set and a separate registry file would only be a second
+    /// copy to drift.
+    ///
+    /// Roots only. Sub-projects are deliberately absent — `openfang.memory`
+    /// appears in no manifest and exists because someone wrote a fact there.
+    /// Enumerating descendants would mean pre-registering every sub-scope
+    /// before first use, which is the ceremony that makes people file claims
+    /// at the root instead. Shape (ANAI-264 step 2) plus segment coverage
+    /// (step 3) already judge descendants correctly.
+    ///
+    /// Derived live, not snapshotted at boot: roughly a third of the fleet is
+    /// spawned at runtime with manifests that never touch disk, and a boot
+    /// snapshot would refuse the projects those agents brought with them.
+    pub fn project_roots(&self) -> std::collections::BTreeSet<String> {
+        self.agents
+            .iter()
+            .flat_map(|e| e.value().manifest.projects.clone())
+            .filter_map(|p| p.split('.').next().map(str::to_string))
+            .filter(|root| !root.is_empty())
+            .collect()
+    }
+
     /// ANAI-208. The projects one agent declares, or an empty vector if the
     /// agent is unknown.
     ///

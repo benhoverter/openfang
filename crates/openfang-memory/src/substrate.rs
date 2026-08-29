@@ -29,6 +29,21 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+/// ANAI-264 step 4. The lineage of `slug`, most specific first, keeping only
+/// the levels the reader may address.
+///
+/// Filtering rather than refusing: membership grants strictly downward, so the
+/// levels a reader loses are always *above* the one it asked about. Dropping
+/// them narrows the briefing to what the agent could have read by hand; hard
+/// refusal would instead cost it the episode summaries in the same pack, which
+/// are agent-scoped and have no membership relation at all.
+fn readable_lineage(slug: &str, may_read_project: &dyn Fn(&str) -> bool) -> Vec<String> {
+    openfang_types::agent::project_slug_lineage(slug)
+        .into_iter()
+        .filter(|ancestor| may_read_project(ancestor))
+        .collect()
+}
+
 /// One wake row failed closed by [`MemorySubstrate::reap_in_flight_wakes`].
 ///
 /// ## Why the payload rides along (ANAI-217)
@@ -557,7 +572,17 @@ impl MemorySubstrate {
     /// model call. Nothing here spawns a process: repo state is deferred to a
     /// follow-up precisely because a `git` shell-out does not belong in the
     /// path that runs before every turn.
-    pub fn rehydration_pack(&self, agent_id: AgentId) -> OpenFangResult<Option<String>> {
+    /// `may_read_project` gates each ancestor of the primed slug (ANAI-264
+    /// step 4). The pack was the one fact reader with no membership check at
+    /// all: the point read re-checks every inherited ancestor (ANAI-266) and
+    /// the tool paths gate on the requested ref, but a pack simply walked the
+    /// lineage. Passing the predicate in keeps the registry — and therefore
+    /// the gate — in the kernel, where it lives for every other reader.
+    pub fn rehydration_pack(
+        &self,
+        agent_id: AgentId,
+        may_read_project: &dyn Fn(&str) -> bool,
+    ) -> OpenFangResult<Option<String>> {
         let canonical = self.sessions.load_canonical(agent_id)?;
         let Some(slug) = canonical.prime_for else {
             return Ok(None);
@@ -575,9 +600,10 @@ impl MemorySubstrate {
         // `openfang`'s facts too, most-specific slot winning per claim key, so
         // naming the sub-project can never resolve *fewer* facts than naming
         // its parent would have.
-        let facts =
-            self.facts()
-                .list_for_scope_lineage("project", &slug, rehydration::MAX_FACTS)?;
+        let readable = readable_lineage(&slug, may_read_project);
+        let facts = self
+            .facts()
+            .list_for_scopes("project", &readable, rehydration::MAX_FACTS)?;
         // ANAI-264: a primed pack that resolves no facts is the 2026-08-26
         // failure — `prime_for` is free text, so a slug naming no project
         // renders a pack that looks healthy while its "what is true" half is
@@ -592,10 +618,12 @@ impl MemorySubstrate {
             warn!(
                 agent_id = %agent_id,
                 prime_for = %slug,
+                readable_scopes = ?readable,
                 known_project_scopes = ?known,
                 "Rehydration pack resolved zero project facts for the primed slug; \
                  the briefing carries episode summaries only. If the slug is a typo the \
-                 pack is misaddressed, not empty."
+                 pack is misaddressed, not empty; if `readable_scopes` is empty the agent \
+                 declares no membership covering it and the facts were withheld, not absent."
             );
         }
         Ok(rehydration::render_pack(&slug, &episodes, &facts))
@@ -616,6 +644,7 @@ impl MemorySubstrate {
         &self,
         agent_id: AgentId,
         slug: &str,
+        may_read_project: &dyn Fn(&str) -> bool,
     ) -> OpenFangResult<(usize, usize)> {
         let episodes = self
             .episodes()
@@ -634,9 +663,11 @@ impl MemorySubstrate {
         // Same resolution the pack itself will use — a preview that counted
         // differently from the render would be a second source of truth about
         // what the agent is about to get.
-        let facts = self
-            .facts()
-            .list_for_scope_lineage("project", slug, rehydration::MAX_FACTS)?;
+        let facts = self.facts().list_for_scopes(
+            "project",
+            &readable_lineage(slug, may_read_project),
+            rehydration::MAX_FACTS,
+        )?;
         Ok((closed, facts.len()))
     }
 
@@ -1591,7 +1622,7 @@ mod tests {
     async fn an_unprimed_agent_gets_no_pack() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         assert!(substrate
-            .rehydration_pack(AgentId::new())
+            .rehydration_pack(AgentId::new(), &|_: &str| true)
             .unwrap()
             .is_none());
     }
@@ -1603,7 +1634,7 @@ mod tests {
         prime_and_seed(&substrate, agent_id, "openfang-fork");
 
         let pack = substrate
-            .rehydration_pack(agent_id)
+            .rehydration_pack(agent_id, &|_: &str| true)
             .unwrap()
             .expect("a primed agent with live claims gets a pack");
         assert!(pack.contains("primed for openfang-fork"), "{pack}");
@@ -1630,7 +1661,10 @@ mod tests {
             .unwrap();
         prime_and_seed(&substrate, agent_id, "openfang-fork");
 
-        let pack = substrate.rehydration_pack(agent_id).unwrap().unwrap();
+        let pack = substrate
+            .rehydration_pack(agent_id, &|_: &str| true)
+            .unwrap()
+            .unwrap();
         assert!(!pack.contains("SOMEBODY ELSES PROJECT"), "{pack}");
     }
 
@@ -1643,7 +1677,10 @@ mod tests {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let agent_id = AgentId::new();
         prime_and_seed(&substrate, agent_id, "openfang-fork");
-        assert!(substrate.rehydration_pack(agent_id).unwrap().is_some());
+        assert!(substrate
+            .rehydration_pack(agent_id, &|_: &str| true)
+            .unwrap()
+            .is_some());
 
         let chatter: Vec<openfang_types::message::Message> = (0
             ..crate::rehydration::PACK_TTL_MESSAGES + 1)
@@ -1655,12 +1692,76 @@ mod tests {
             .unwrap();
 
         assert!(
-            substrate.rehydration_pack(agent_id).unwrap().is_none(),
+            substrate
+                .rehydration_pack(agent_id, &|_: &str| true)
+                .unwrap()
+                .is_none(),
             "the briefing must retire once real context exists"
         );
     }
 
     // --- ANAI-264: is the prime addressed at anything? ---------------------
+
+    /// ANAI-264 step 4. The pack is a fact reader, so it obeys the fact gate.
+    ///
+    /// Before this the pack walked the lineage unconditionally — the only
+    /// reader of project claims with no membership check at all. An agent
+    /// could prime for a project it would be refused by name and be handed its
+    /// claims anyway, one turn later, in the block that carries the most
+    /// authority it will ever have.
+    #[tokio::test]
+    async fn the_pack_withholds_facts_the_reader_may_not_address() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang");
+
+        let (_, facts) = substrate
+            .rehydration_preview(agent_id, "openfang", &|_: &str| false)
+            .unwrap();
+        assert_eq!(facts, 0, "a denied reader resolves no project facts");
+
+        // Episodes are agent-scoped and have no membership relation, so the
+        // briefing survives — narrowed, not refused. Withholding those too
+        // would punish an undeclared agent for a rule about facts. Give it
+        // one closed episode so the pack has non-fact material to carry;
+        // without it an empty pack would prove nothing, since a pack with
+        // nothing in either list is correctly no pack at all.
+        substrate.ensure_open_episode(agent_id).unwrap();
+        substrate
+            .close_episode(agent_id, CloseReason::Explicit, Some("landed 264"), None)
+            .unwrap();
+        let pack = substrate
+            .rehydration_pack(agent_id, &|_: &str| false)
+            .unwrap();
+        assert!(
+            pack.is_some(),
+            "the summaries must still arrive when only the facts are gated"
+        );
+        let pack = pack.unwrap();
+        assert!(
+            !pack.contains("main is the trunk"),
+            "the withheld claim must not reach the briefing: {pack}"
+        );
+    }
+
+    /// The filter is per-level, not all-or-nothing: a reader cleared for the
+    /// parent but not the child keeps the parent's background. Guards against
+    /// "any denial empties the pack", which would make one narrow grant cost
+    /// an agent everything it legitimately has.
+    #[tokio::test]
+    async fn the_pack_keeps_the_ancestors_the_reader_may_address() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        prime_and_seed(&substrate, agent_id, "openfang");
+
+        let (_, facts) = substrate
+            .rehydration_preview(agent_id, "openfang.memory", &|a: &str| a == "openfang")
+            .unwrap();
+        assert_eq!(
+            facts, 1,
+            "the parent's claim must survive a denial of the child level"
+        );
+    }
 
     /// The 2026-08-26 bug, reproduced. A slug that names no project is not
     /// rejected and is not empty-looking: the pack renders from episodes
@@ -1672,11 +1773,13 @@ mod tests {
         let agent_id = AgentId::new();
         prime_and_seed(&substrate, agent_id, "openfang");
 
-        let (_, facts) = substrate.rehydration_preview(agent_id, "openfang").unwrap();
+        let (_, facts) = substrate
+            .rehydration_preview(agent_id, "openfang", &|_: &str| true)
+            .unwrap();
         assert_eq!(facts, 1, "the slug that was actually written must resolve");
 
         let (_, facts) = substrate
-            .rehydration_preview(agent_id, "openfang-fork")
+            .rehydration_preview(agent_id, "openfang-fork", &|_: &str| true)
             .unwrap();
         assert_eq!(
             facts, 0,
@@ -1701,10 +1804,15 @@ mod tests {
         // One still open: not countable, and the pack would drop it.
         substrate.ensure_open_episode(agent_id).unwrap();
 
-        let (episodes, _) = substrate.rehydration_preview(agent_id, "openfang").unwrap();
+        let (episodes, _) = substrate
+            .rehydration_preview(agent_id, "openfang", &|_: &str| true)
+            .unwrap();
         assert_eq!(episodes, 1, "the open episode must not be promised");
 
-        let pack = substrate.rehydration_pack(agent_id).unwrap().unwrap();
+        let pack = substrate
+            .rehydration_pack(agent_id, &|_: &str| true)
+            .unwrap()
+            .unwrap();
         // Count bullets in the episode section only — the fact section uses
         // the same bullet, and counting both would let a fact paper over a
         // missing episode.
