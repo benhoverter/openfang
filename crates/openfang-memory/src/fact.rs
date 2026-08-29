@@ -973,9 +973,40 @@ impl FactStore {
         if scope != "project" || lineage.len() <= 1 {
             return self.list_for_scope(scope, scope_ref, limit);
         }
+        self.list_for_scopes(scope, &lineage, limit)
+    }
+
+    /// ANAI-264 step 4. The union above, over an **explicitly supplied** list
+    /// of refs in precedence order.
+    ///
+    /// Exists because the caller sometimes knows something this store does
+    /// not: which ancestors the reader is *allowed* to see. `rehydration_pack`
+    /// assembles a briefing for one agent, and walking the full lineage there
+    /// would hand it claims from a project it would be refused if it asked for
+    /// them by name — a read gate leaking upward through the hierarchy, the
+    /// same shape ANAI-266 closed on the point read. So the gate stays in the
+    /// kernel, where the registry is, and the store takes the answer.
+    ///
+    /// Order is precedence: first claim seen for a `claim_key` wins, so pass
+    /// most-specific first. An empty list resolves to no facts, which is the
+    /// honest answer for a reader cleared for nothing.
+    pub fn list_for_scopes(
+        &self,
+        scope: &str,
+        scope_refs: &[String],
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
+        match scope_refs {
+            [] => return Ok(Vec::new()),
+            // A lineage of one is one query — the same query `list_for_scope`
+            // runs. The entire live corpus is depth one, so this path must
+            // stay a no-op on it.
+            [only] => return self.list_for_scope(scope, only, limit),
+            _ => {}
+        }
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<Fact> = Vec::new();
-        for ancestor in &lineage {
+        for ancestor in scope_refs {
             for fact in self.list_for_scope(scope, ancestor, limit)? {
                 // First writer wins, and the walk is most-specific-first, so
                 // "first" means "closest to the subject asked about".

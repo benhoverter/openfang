@@ -2879,7 +2879,16 @@ impl OpenFangKernel {
                 // error: a pack that could not be read must leave the turn
                 // unprimed and otherwise untouched. This runs before every
                 // turn, so a failure here has to be inert, never fatal.
-                rehydration_pack: self.memory.rehydration_pack(agent_id).ok().flatten(),
+                rehydration_pack: self
+                    .memory
+                    // ANAI-264 step 4: the pack was the one fact reader with no
+                    // membership gate at all. It filters rather than refuses —
+                    // there is no caller here to tell.
+                    .rehydration_pack(agent_id, &|ancestor: &str| {
+                        may_read_project(&self.registry, agent_id, ancestor)
+                    })
+                    .ok()
+                    .flatten(),
                 user_name,
                 channel_type: None,
                 channel_binding: self.agent_channel_binding_summary(&manifest.name),
@@ -3572,7 +3581,16 @@ impl OpenFangKernel {
                 // error: a pack that could not be read must leave the turn
                 // unprimed and otherwise untouched. This runs before every
                 // turn, so a failure here has to be inert, never fatal.
-                rehydration_pack: self.memory.rehydration_pack(agent_id).ok().flatten(),
+                rehydration_pack: self
+                    .memory
+                    // ANAI-264 step 4: the pack was the one fact reader with no
+                    // membership gate at all. It filters rather than refuses —
+                    // there is no caller here to tell.
+                    .rehydration_pack(agent_id, &|ancestor: &str| {
+                        may_read_project(&self.registry, agent_id, ancestor)
+                    })
+                    .ok()
+                    .flatten(),
                 user_name,
                 channel_type: None,
                 channel_binding: self.agent_channel_binding_summary(&manifest.name),
@@ -5746,6 +5764,27 @@ impl OpenFangKernel {
                 fallback = openfang_runtime::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO,
                 "Refusing [context] working_set_ratio, keeping the compiled default: {e}"
             ),
+        }
+
+        // ANAI-264 step 4. The fleet's project namespace, logged once so an
+        // operator can see what `prime_for` and project-scoped facts will
+        // accept without reading 100 manifests. Derived, not configured —
+        // there is no list to edit and nothing here can drift out of sync with
+        // the declarations it is computed from. Descendants are absent by
+        // design: `openfang.memory` is legal because `openfang` is declared.
+        {
+            let roots = self.registry.project_roots();
+            if roots.is_empty() {
+                info!(
+                    "No agent declares a project; project-slug root checking is inert \
+                     (nothing to check against)"
+                );
+            } else {
+                info!(
+                    project_roots = ?roots,
+                    "Declared project roots (ANAI-264): sub-projects of these need no registration"
+                );
+            }
         }
 
         // Install the operator-configured fact staleness durations
@@ -9948,6 +9987,74 @@ fn require_project_membership(
     ))
 }
 
+/// ANAI-264 step 4. Is `scope_ref` rooted in a project this fleet declares?
+///
+/// The namespace check, as distinct from the membership check above.
+/// `require_project_membership` asks "may *this agent* address this project";
+/// this asks "is this a project at all". The two are independent, and the
+/// 2026-08-26 bug lived in the gap: `prime_for = "openfang-fork"` was
+/// unanswerable by membership alone for an agent that declares nothing, so it
+/// sailed through and resolved zero facts in silence.
+///
+/// **Roots only.** `openfang.memory` passes because `openfang` is declared;
+/// nobody has to pre-register a sub-project before writing the first claim
+/// about it, which is the ceremony that would push everything back to the
+/// root. `openfang-fork` fails, because a hyphen is inside a segment and
+/// therefore names a different project rather than a child of one
+/// (`slug_covers`, ANAI-264 step 3, on the same rule).
+///
+/// **Empty root set is silence, not refusal.** A daemon whose agents declare
+/// nothing has no namespace to check against, and refusing every project slug
+/// on a fresh install would make project scope unreachable until someone
+/// edited a manifest they had no reason to think was load-bearing. Nothing to
+/// compare against means no contradiction to find.
+fn require_known_project_root(
+    registry: &AgentRegistry,
+    scope: openfang_memory::vocabulary::FactScope,
+    scope_ref: &str,
+) -> Result<(), String> {
+    use openfang_memory::vocabulary::FactScope;
+
+    if !matches!(scope, FactScope::Project) {
+        return Ok(());
+    }
+    let roots = registry.project_roots();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let root = scope_ref.split('.').next().unwrap_or_default();
+    if roots.contains(root) {
+        return Ok(());
+    }
+    Err(format!(
+        "'{scope_ref}' names no project this fleet knows: its root segment '{root}' \
+         is declared by no agent. Declared roots: {}. A sub-project needs no \
+         registration — '{root}.something' is legal once '{root}' is declared — but a \
+         root nobody declares has no readers, so this is a typo far more often than \
+         it is a new project. Use the project's slug, not your own agent name.",
+        roots.iter().cloned().collect::<Vec<_>>().join(", ")
+    ))
+}
+
+/// ANAI-264 step 4. [`require_project_membership`] as a predicate, for the
+/// readers that filter rather than refuse.
+///
+/// The rehydration pack cannot return an error to anyone — it is assembled on
+/// the prompt-build path, before a turn, with no caller to tell. So it drops
+/// the levels it may not read instead of failing, and this is the same rule
+/// the tool paths enforce, spelled as a bool. Same function underneath on
+/// purpose: a pack that inherited from a project its agent would be refused by
+/// name is a read gate leaking upward through the hierarchy.
+fn may_read_project(registry: &AgentRegistry, agent_id: AgentId, scope_ref: &str) -> bool {
+    require_project_membership(
+        registry,
+        agent_id,
+        openfang_memory::vocabulary::FactScope::Project,
+        scope_ref,
+    )
+    .is_ok()
+}
+
 /// One live claim, rendered for a tool payload.
 ///
 /// ANAI-266: shared by the exact read and the inherited read so the two cannot
@@ -11126,7 +11233,11 @@ impl KernelHandle for OpenFangKernel {
         slug: &str,
     ) -> Option<(usize, usize)> {
         let agent_id = resolve_memory_caller(&self.registry, caller_agent_id).ok()?;
-        self.memory.rehydration_preview(agent_id, slug).ok()
+        self.memory
+            .rehydration_preview(agent_id, slug, &|ancestor: &str| {
+                may_read_project(&self.registry, agent_id, ancestor)
+            })
+            .ok()
     }
 
     // ANAI-264. The same gate `memory_fact` applies to project-scoped slots,
@@ -11136,36 +11247,36 @@ impl KernelHandle for OpenFangKernel {
     // checks that could disagree is how an agent ends up able to prime for a
     // project whose facts it is then refused when it tries to read them.
     //
-    // One carve-out, and it is not the default-deny posture leaking: an agent
-    // that declares NO projects is not refused here. Roughly half the fleet
-    // declares nothing, and a prime buys two things — the project's facts and
-    // the agent's own recently closed episode summaries. Refusing an
-    // undeclared agent would cost it the summaries, which are agent-scoped and
-    // have no membership relation at all, to enforce a rule about facts it was
-    // already going to be denied by `list_for_scope_lineage`. So: silence when
-    // there is nothing to check against, refusal only on a positive
-    // contradiction — the agent named a project outside a world it did
-    // declare. That contradiction is exactly the `openfang-fork` typo.
+    // One carve-out on the MEMBERSHIP rule, and it is not the default-deny
+    // posture leaking: an agent that declares NO projects is not refused by
+    // membership here. Roughly half the fleet declares nothing, and a prime
+    // buys two things — the project's facts and the agent's own recently
+    // closed episode summaries. Refusing an undeclared agent outright would
+    // cost it the summaries, which are agent-scoped and have no membership
+    // relation at all, to enforce a rule about facts it was already going to
+    // be denied downstream.
+    //
+    // ANAI-264 step 4 closes the hole that carve-out left. An undeclared agent
+    // has no membership to contradict, so until now it could prime for any
+    // string at all — including `openfang-fork`, the original bug. It is now
+    // checked against the FLEET's declared roots instead of its own: a
+    // different question ("is this a project"), answered by a different set,
+    // so the undeclared agent keeps its summaries and loses only its typos.
     fn project_membership_error(
         &self,
         caller_agent_id: Option<&str>,
         slug: &str,
     ) -> Option<String> {
         let agent_id = resolve_memory_caller(&self.registry, caller_agent_id).ok()?;
+        let scope = openfang_memory::vocabulary::FactScope::Project;
         if self
             .registry
             .get(agent_id)
             .is_none_or(|e| e.manifest.projects.is_empty())
         {
-            return None;
+            return require_known_project_root(&self.registry, scope, slug).err();
         }
-        require_project_membership(
-            &self.registry,
-            agent_id,
-            openfang_memory::vocabulary::FactScope::Project,
-            slug,
-        )
-        .err()
+        require_project_membership(&self.registry, agent_id, scope, slug).err()
     }
 
     // ANAI-248: the structural half of the self-amputation guard.
@@ -13276,6 +13387,77 @@ mod tests {
                 .is_err(),
             "an unknown caller must not pass the gate"
         );
+    }
+
+    /// ANAI-264 step 4. The namespace check, which is a different question
+    /// from membership: "is this a project" rather than "may I address it".
+    #[test]
+    fn a_project_root_must_be_declared_by_someone() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        register_with_projects(&registry, "mem", vec!["openfang".into()]);
+        register_with_projects(&registry, "toy", vec!["tabletop-toybox".into()]);
+
+        for good in ["openfang", "openfang.memory", "openfang.memory.index"] {
+            assert!(
+                require_known_project_root(&registry, FactScope::Project, good).is_ok(),
+                "{good} is rooted in a declared project"
+            );
+        }
+
+        // The 2026-08-26 bug. A hyphen lives inside a segment, so this names
+        // a different project rather than a child of `openfang` — the same
+        // rule `slug_covers` applies, asked of the namespace instead of of a
+        // grant.
+        let denied = require_known_project_root(&registry, FactScope::Project, "openfang-fork")
+            .expect_err("an undeclared root must be refused");
+        assert!(denied.contains("openfang-fork"), "{denied}");
+        assert!(
+            denied.contains("tabletop-toybox"),
+            "the refusal must name the declared roots so the caller can correct it"
+        );
+
+        assert!(
+            require_known_project_root(&registry, FactScope::Project, "openfangevil").is_err(),
+            "a bare character prefix is not a root"
+        );
+
+        // Non-project scopes have no namespace to check.
+        for scope in [FactScope::Agent, FactScope::User, FactScope::Global] {
+            assert!(
+                require_known_project_root(&registry, scope, "anything").is_ok(),
+                "{scope} must not be namespace-checked"
+            );
+        }
+    }
+
+    /// Empty root set is silence, not refusal. A daemon whose agents declare
+    /// nothing has nothing to contradict, and refusing every slug there would
+    /// make project scope unreachable on a fresh install.
+    #[test]
+    fn the_root_check_is_inert_when_nobody_declares_a_project() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        register_with_projects(&registry, "undecl", vec![]);
+        assert!(
+            require_known_project_root(&registry, FactScope::Project, "anything.at.all").is_ok()
+        );
+    }
+
+    /// Roots only: a sub-project is legal without ever being declared, which
+    /// is what keeps the scheme from needing a registry file.
+    #[test]
+    fn project_roots_unions_declarations_and_keeps_only_roots() {
+        let registry = AgentRegistry::new();
+        register_with_projects(&registry, "a", vec!["openfang".into()]);
+        register_with_projects(&registry, "b", vec!["openfang.memory".into()]);
+        register_with_projects(&registry, "c", vec!["kimiya".into(), "aquilae".into()]);
+        register_with_projects(&registry, "d", vec![]);
+
+        let roots: Vec<String> = registry.project_roots().into_iter().collect();
+        assert_eq!(roots, vec!["aquilae", "kimiya", "openfang"]);
     }
 
     /// ANAI-208, precedence. For an agent that has an `agent.toml`, the file is
