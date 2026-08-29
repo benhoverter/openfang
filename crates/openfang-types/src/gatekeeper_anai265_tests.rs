@@ -121,6 +121,107 @@ fn the_flag_is_hard_and_names_itself_in_the_log() {
 }
 
 // ---------------------------------------------------------------------------
+// Round-8 security review: D1, D2, D3, D6
+//
+// Every one of these is the same defect wearing a different hat. The datastore
+// predicate was written against the incident command, and the laundering
+// machinery four earlier commits built to close the *class* — `cd` frames, the
+// taint set, glob-shaped tails, an above-cap branch that evaluates — was not
+// carried across to it. The fix is one walker and one target test, not four
+// more special cases.
+// ---------------------------------------------------------------------------
+
+/// D1, the headline: two lines of ordinary shell cleared a *hard* predicate.
+///
+/// Line 2's token is `openfang.db`, which does not contain `.openfang`, so the
+/// command-line predicate never fired; and the body walker did not follow `cd`,
+/// so nothing else did either.
+#[test]
+fn cd_into_the_datastore_directory_does_not_launder_the_delete() {
+    assert!(body_destroys_datastore(
+        "#!/usr/bin/env bash\ncd ~/.openfang/data\nrm openfang.db\n"
+    ));
+    assert!(body_destroys_datastore(
+        "#!/usr/bin/env bash\ncd /Users/rlyeh/.openfang\nrm openfang.db-wal\n"
+    ));
+    // The frame is load-bearing in both directions: the same delete from
+    // somewhere else is somebody else's database.
+    assert!(!body_destroys_datastore(
+        "#!/usr/bin/env bash\ncd /tmp/fixtures\nrm openfang.db\n"
+    ));
+}
+
+/// D1's other half: a variable holding the control-plane path is live from any
+/// frame, because this shape never changes directory at all.
+#[test]
+fn a_datastore_laundered_through_a_variable_still_fires() {
+    assert!(body_destroys_datastore(
+        "#!/usr/bin/env bash\nd=~/.openfang/data\nrm \"$d/openfang.db\"\n"
+    ));
+    assert!(!body_destroys_datastore(
+        "#!/usr/bin/env bash\nd=/tmp/fixtures\nrm \"$d/openfang.db\"\n"
+    ));
+}
+
+/// D2: a glob is always at end-of-token, so a suffix test alone never sees it.
+/// Three spellings of the same deletion, none of them obfuscation.
+#[test]
+fn a_glob_under_the_control_plane_names_what_it_expands_to() {
+    for cmd in [
+        "rm ~/.openfang/data/*",
+        "rm ~/.openfang/data/openfang.*",
+        "rm ~/.openfang/data/openfang.db-*",
+        "rm ~/.openfang/data/openfang.db?",
+    ] {
+        assert!(destroys_datastore(cmd), "{cmd}");
+    }
+    // The control-plane half is still required: an ordinary checkout full of
+    // fixtures is not the fleet's substrate.
+    assert!(!destroys_datastore("rm ~/GitHub/Repos/openfang/target/*"));
+}
+
+/// D3: the redirect scan keyed on a `>` *prefix*, which matched `>`, `>>` and
+/// `>file` and missed five spellings that cost no extra characters.
+#[test]
+fn every_redirect_spelling_names_its_target() {
+    for cmd in [
+        "echo x > ~/.openfang/openfang.db",
+        "echo x >> ~/.openfang/openfang.db",
+        "echo x >~/.openfang/openfang.db",
+        "echo x 1> ~/.openfang/openfang.db",
+        "echo x 2> ~/.openfang/openfang.db",
+        "echo x &> ~/.openfang/openfang.db",
+        "echo x >| ~/.openfang/openfang.db",
+        "echo x>| ~/.openfang/openfang.db",
+        "echo x> ~/.openfang/openfang.db",
+        ": > ~/.openfang/openfang.db",
+    ] {
+        assert!(destroys_datastore(cmd), "{cmd}");
+    }
+    // A redirect that merely mentions the database as a *source* is a read.
+    assert!(!destroys_datastore(
+        "cat ~/.openfang/openfang.db > /tmp/backup.db"
+    ));
+    // And a stderr dup is not a target.
+    assert!(!destroys_datastore("cargo test 2>&1"));
+}
+
+/// D6: the predicate declined to have an above-cap branch on the argument that
+/// the chunking attack had no conjunction to pull apart. True, and irrelevant —
+/// `deny_variants` truncates, so everything past the cap was never read.
+/// ANAI-206 F7, one function over.
+#[test]
+fn an_over_cap_line_is_scanned_in_chunks_not_truncated() {
+    let padding = "a".repeat(crate::cmd_norm::MAX_NORMALIZE_INPUT + 2_000);
+    let body = format!("echo {padding} ; rm ~/.openfang/openfang.db\n");
+    assert!(body.chars().count() > crate::cmd_norm::MAX_NORMALIZE_INPUT);
+    assert!(body_destroys_datastore(&body));
+    // No false positive from the chunking itself.
+    let clean = format!("echo {padding} ; cargo test --workspace\n");
+    assert!(!body_destroys_datastore(&clean));
+}
+
+// ---------------------------------------------------------------------------
 // Posture
 // ---------------------------------------------------------------------------
 

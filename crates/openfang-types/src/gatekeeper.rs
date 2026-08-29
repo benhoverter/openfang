@@ -332,6 +332,33 @@ pub enum GateVerdict {
     Deny,
 }
 
+/// True if `token`'s own name says it is a datastore, saying nothing about
+/// *where* it lives.
+///
+/// Split out of [`names_datastore`] for ANAI-265 D1: the `cd`-relative and
+/// tainted-variable arms in [`cwd_relative_hits`] have already established the
+/// directory, so re-demanding `~/.openfang` in the token is exactly the test
+/// that let `rm openfang.db` through.
+///
+/// ANAI-265 D2: the glob arm. A glob is always at end-of-token, so a suffix
+/// test alone is blind to `rm ~/.openfang/data/*`, `openfang.*` and
+/// `openfang.db-*` — three spellings of the same deletion, none of them
+/// obfuscation. A glob names whatever its prefix directory holds and we cannot
+/// prove that is not the database. This over-fires on control-plane globs that
+/// hold no datastore; the cost of that is one approval prompt.
+fn has_datastore_suffix(token: &str) -> bool {
+    let lowered = token.to_ascii_lowercase();
+    // A trailing quote or comma is not part of the name.
+    let trimmed = lowered.trim_end_matches(['"', '\'', ',', ';', ')']);
+    if DATASTORE_SUFFIXES.iter().any(|s| trimmed.ends_with(s)) {
+        return true;
+    }
+    trimmed
+        .rsplit('/')
+        .next()
+        .is_some_and(|c| !c.is_empty() && c.contains(['*', '?', '[', '{']))
+}
+
 /// Overlap between adjacent [`overcap_chunks`], in characters.
 ///
 /// Comfortably longer than any path or verb this floor matches, so a control
@@ -387,6 +414,12 @@ struct CwdHits {
     /// the substrate. Feeds [`GateFlags::substrate_destruction`] — hard, so
     /// this half is deliberately the tighter of the two.
     destroys: bool,
+    /// ANAI-265 D1: destruction of a durable datastore named *relatively* —
+    /// either against a `cd`ed frame inside the control plane, or through a
+    /// variable holding a control-plane path. Feeds the datastore half of the
+    /// hard floor, which is why it walks the same frames the substrate half
+    /// does instead of reading tokens on its own.
+    destroys_datastore: bool,
 }
 
 /// ANAI-206 F3: follow `cd` so a relative operand cannot launder its target.
@@ -415,16 +448,35 @@ struct CwdHits {
 /// cannot evaluate leaves the frame `Elsewhere`. This closes the shape.
 fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
     let mut cwd = Cwd::Elsewhere;
+    let mut tainted: Vec<String> = Vec::new();
     let mut hits = CwdHits {
         writes: false,
         destroys: false,
+        destroys_datastore: false,
     };
     for line in lines {
-        let lowered = line.text.to_ascii_lowercase();
+        let lowered = fold_clobber_redirect(&line.text.to_ascii_lowercase());
         for segment in split_segments(&lowered) {
             let tokens: Vec<&str> = segment.split_whitespace().collect();
             if tokens.is_empty() {
                 continue;
+            }
+            // ANAI-265 D1. One walker, three hits. The datastore arm has to see
+            // the same `cd` frames and the same taint set as the substrate arm;
+            // the first version of it read raw tokens and saw neither, so
+            // `cd ~/.openfang/data` then `rm openfang.db` cleared a *hard*
+            // predicate in two lines of ordinary shell.
+            //
+            // Ordered before the `cd` arm and before the `Elsewhere` bail on
+            // purpose: the tainted-variable half is live from any frame, because
+            // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
+            taint_from_segment(&tokens, &mut tainted);
+            let inside = cwd != Cwd::Elsewhere;
+            if segment_ends_datastore(&tokens, &|t: &str| {
+                has_datastore_suffix(t)
+                    && ((inside && is_relative_operand(t)) || references_tainted(t, &tainted))
+            }) {
+                hits.destroys_datastore = true;
             }
             if let Some(next) = cd_target(&tokens, cwd) {
                 cwd = next;
@@ -2250,12 +2302,7 @@ const FILE_ENDING_BINS: &[&str] = &["rm", "rmdir", "shred", "truncate", "mv", "m
 #[must_use]
 pub fn names_datastore(token: &str) -> bool {
     let lowered = token.to_ascii_lowercase();
-    if !lowered.contains(CONTROL_PLANE_ROOT_BARE) {
-        return false;
-    }
-    // A trailing quote or comma is not part of the name.
-    let trimmed = lowered.trim_end_matches(['"', '\'', ',', ';', ')']);
-    DATASTORE_SUFFIXES.iter().any(|s| trimmed.ends_with(s))
+    lowered.contains(CONTROL_PLANE_ROOT_BARE) && has_datastore_suffix(&lowered)
 }
 
 /// ANAI-265: the second member of the hard floor's destructive set —
@@ -2291,7 +2338,7 @@ pub fn names_datastore(token: &str) -> bool {
 #[must_use]
 pub fn destroys_datastore(command: &str) -> bool {
     crate::cmd_norm::deny_variants(command).iter().any(|v| {
-        let lowered = v.to_ascii_lowercase();
+        let lowered = fold_clobber_redirect(&v.to_ascii_lowercase());
         if !lowered.contains(CONTROL_PLANE_ROOT_BARE) {
             return false;
         }
@@ -2301,18 +2348,54 @@ pub fn destroys_datastore(command: &str) -> bool {
     })
 }
 
+/// Rewrite `>|` as `>` before segmentation.
+///
+/// [`split_segments`] splits on `|`, which is right for pipes and wrong for
+/// bash's clobber-redirect: `: >| ~/.openfang/openfang.db` segments into a bare
+/// `>` with nothing after it and a target with nothing before it, and the
+/// redirect scan sees neither half. `>|` is never a pipe, so folding it is
+/// lossless. Round-8 D3.
+fn fold_clobber_redirect(lowered: &str) -> String {
+    if lowered.contains(">|") {
+        lowered.replace(">|", "> ")
+    } else {
+        lowered.to_string()
+    }
+}
+
 fn segment_destroys_datastore(segment: &str) -> bool {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
+    segment_ends_datastore(&tokens, &names_datastore)
+}
+
+/// The shape of "this segment ends a file", with the question of *which* files
+/// count left to the caller.
+///
+/// Two callers, one body: [`segment_destroys_datastore`] passes
+/// [`names_datastore`] and reads absolute tokens off a command line;
+/// [`cwd_relative_hits`] passes a frame-aware and taint-aware test and reads
+/// relative ones out of a script. Parameterising the target rather than
+/// duplicating the verb handling is the whole ANAI-265 D1 fix: the duplicate
+/// was where the `cd` bypass lived.
+fn segment_ends_datastore(tokens: &[&str], is_target: &dyn Fn(&str) -> bool) -> bool {
     // Redirect targets first: attributable by position regardless of the verb,
     // and the only destruction primitive with no binary behind it at all.
+    //
+    // ANAI-265 D3: keyed on the token's *last* `>`, not on a `>` prefix. The
+    // prefix form matched `>`, `>>` and `>file` and missed `1>`, `2>`, `&>`,
+    // `>|` and the glued `echo x> file` — five spellings, none of them longer
+    // than the one it caught.
     for (i, tok) in tokens.iter().enumerate() {
-        if let Some(glued) = tok.strip_prefix(">>").or_else(|| tok.strip_prefix('>')) {
-            if !glued.is_empty() && names_datastore(glued) {
+        let Some(pos) = tok.rfind('>') else {
+            continue;
+        };
+        let glued = tok[pos + 1..].trim_start_matches('|');
+        if glued.is_empty() {
+            if tokens.get(i + 1).is_some_and(|t| is_target(t)) {
                 return true;
             }
-            if glued.is_empty() && tokens.get(i + 1).is_some_and(|t| names_datastore(t)) {
-                return true;
-            }
+        } else if is_target(glued) {
+            return true;
         }
     }
 
@@ -2322,17 +2405,17 @@ fn segment_destroys_datastore(segment: &str) -> bool {
     let operands = || tokens.iter().skip(1).filter(|t| !t.starts_with('-'));
 
     if FILE_ENDING_BINS.contains(&base.as_str()) {
-        return operands().any(|t| names_datastore(t));
+        return operands().any(|t| is_target(t));
     }
     if base == "dd" {
         return tokens
             .iter()
             .filter_map(|t| t.strip_prefix("of="))
-            .any(names_datastore);
+            .any(is_target);
     }
     if base == "cp" || base == "install" {
         // Destination only — the last operand.
-        return operands().next_back().is_some_and(|t| names_datastore(t));
+        return operands().next_back().is_some_and(|t| is_target(t));
     }
     false
 }
@@ -2481,16 +2564,37 @@ pub fn body_destroys_substrate(body: &str) -> bool {
 /// the line is "put it in the file instead". A floor predicate that the fleet's
 /// own build wrappers could sidestep by construction is not a floor.
 ///
-/// No over-cap branch, unlike [`logical_line_destroys_substrate`]. That branch
-/// exists because `destroys_substrate` is a per-segment conjunction of a verb
-/// and a target that an attacker can pull apart across an 8KB chunk boundary.
-/// This predicate's target — a `~/.openfang/*.db`-shaped token — is decidable
-/// from the token alone, so the chunking attack has nothing to separate.
+/// ANAI-265 D1 and D6: this routes through the same machinery
+/// [`body_destroys_substrate`] does — folded logical lines, an above-cap branch
+/// that evaluates, [`cwd_relative_hits`] for `cd` frames, and the taint set —
+/// because the first version routed through none of it.
+///
+/// The rationale that version gave for having no above-cap branch argued the
+/// wrong thing. It is true that the chunking attack has no conjunction to pull
+/// apart here, and irrelevant: [`crate::cmd_norm::deny_variants`] truncates at
+/// [`crate::cmd_norm::MAX_NORMALIZE_INPUT`], so everything past the cap on a
+/// folded line was never examined at all. Padding plus a plain
+/// `rm ~/.openfang/openfang.db` at the tail cleared a hard flag with no
+/// obfuscation — ANAI-206 F7, one function over.
 #[must_use]
 pub fn body_destroys_datastore(body: &str) -> bool {
-    logical_lines(body)
+    let lines = logical_lines(body);
+    if lines.iter().any(logical_line_destroys_datastore) {
+        return true;
+    }
+    cwd_relative_hits(&lines).destroys_datastore
+}
+
+/// [`destroys_datastore`] against one folded logical line, with an above-cap
+/// branch that evaluates instead of skipping. See [`overcap_chunks`]; the
+/// chunks overlap, so a verb and its target cannot be separated by a boundary.
+fn logical_line_destroys_datastore(line: &LogicalLine) -> bool {
+    if line.text.chars().count() <= crate::cmd_norm::MAX_NORMALIZE_INPUT {
+        return destroys_datastore(&line.text);
+    }
+    overcap_chunks(&line.text)
         .iter()
-        .any(|line| destroys_datastore(&line.text))
+        .any(|chunk| destroys_datastore(chunk))
 }
 
 /// [`destroys_substrate`] against one folded logical line, with an above-cap
