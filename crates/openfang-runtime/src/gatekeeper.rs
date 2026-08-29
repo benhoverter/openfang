@@ -178,12 +178,22 @@ pub struct GateCounters {
     pub escalate: u64,
     pub deny: u64,
     pub shadow_deny: u64,
+    /// ANAI-265 N1: suppressions the judge wanted, counted while `shadow` is
+    /// still on, that had a channel route to post to. This is the volume the
+    /// operator would have received per day had the posture been live.
+    pub shadow_notify_would_post: u64,
+    /// ANAI-265 N1: the same, for an agent with **no** route. Every one of
+    /// these is a suppression that would have happened with no human-visible
+    /// artifact, which is the number N2 exists to hold at zero.
+    pub shadow_notify_no_route: u64,
 }
 
 static SUPPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 static ESCALATE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DENY_COUNT: AtomicU64 = AtomicU64::new(0);
 static SHADOW_DENY_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHADOW_NOTIFY_WOULD_POST_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHADOW_NOTIFY_NO_ROUTE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot the gate counters.
 ///
@@ -196,6 +206,8 @@ pub fn counters() -> GateCounters {
         escalate: ESCALATE_COUNT.load(Ordering::Relaxed),
         deny: DENY_COUNT.load(Ordering::Relaxed),
         shadow_deny: SHADOW_DENY_COUNT.load(Ordering::Relaxed),
+        shadow_notify_would_post: SHADOW_NOTIFY_WOULD_POST_COUNT.load(Ordering::Relaxed),
+        shadow_notify_no_route: SHADOW_NOTIFY_NO_ROUTE_COUNT.load(Ordering::Relaxed),
     }
 }
 
@@ -439,17 +451,23 @@ const NOTIFY_COMMAND_CHARS: usize = 240;
 /// adapter that is down, rate-limited, or simply absent degrades to a log line
 /// and the audit row, both of which already happened before this is called.
 ///
-/// Silent no-op for an agent with no channel binding. The alternative —
-/// falling back to some default channel — would post one agent's activity to
-/// another operator's surface, which is worse than not posting.
+/// The route is resolved by the caller, not here. ANAI-265 N2: `review()` needs
+/// the answer *before* it picks a posture, because an agent with no route does
+/// not get the permissive posture at all. Taking it as a parameter is what
+/// keeps the two decisions reading the same binding.
+///
+/// Still a no-op with no route, but that is now a belt rather than the policy:
+/// under the permissive posture it is unreachable, and under strict a
+/// suppression only happens if the model asked for one.
 fn notify_suppression(
     kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
+    route: Option<&str>,
     agent_id: &str,
     command: &str,
     correlation_id: &str,
     floor: &str,
 ) {
-    let Some(route) = kernel.channel_binding_route(agent_id) else {
+    let Some(route) = route else {
         return;
     };
     let Some((channel, recipient)) = route.split_once(':') else {
@@ -497,11 +515,73 @@ fn notify_suppression(
     });
 }
 
+/// `notify=` tokens for the §5 log line and the audit row. ANAI-265 N1.
+pub(crate) const NOTIFY_POSTED: &str = "posted";
+pub(crate) const NOTIFY_NO_ROUTE: &str = "no-route";
+pub(crate) const NOTIFY_SHADOW_WOULD_POST: &str = "shadow-would-post";
+pub(crate) const NOTIFY_SHADOW_NO_ROUTE: &str = "shadow-no-route";
+pub(crate) const NOTIFY_NA: &str = "n/a";
+
+/// ANAI-265 N2: which posture this review actually runs under.
+///
+/// The permissive posture's justification is that a suppression becomes
+/// unprompted, never *unseen*. For an agent with no channel binding —
+/// cron-triggered, daemon-spawned, unbound — there is nothing to see, and the
+/// notification degraded to a silent no-op for exactly the agents nobody is
+/// watching. An unroutable agent therefore does not get the permissive posture
+/// at all: one line, and the invariant becomes true rather than aspirational.
+fn resolve_posture(configured: GatePosture, has_route: bool) -> GatePosture {
+    if has_route {
+        configured
+    } else {
+        GatePosture::Strict
+    }
+}
+
+/// ANAI-265 N1: what happened, or would have happened, to the notification.
+///
+/// `review()` reaches `notify_suppression` only on `effective == Suppress`, and
+/// in shadow `effective` is never `Suppress`. So a shadow validation run
+/// exercises the notification path zero times and tells the flip decision
+/// nothing about the one control that makes this posture better than turning
+/// the gate off. This is the counting half.
+///
+/// `shadow-no-route` is the row worth watching: `resolve_posture` holds it at
+/// zero for the permissive posture by construction, so a non-zero count is
+/// either a strict-posture suppression or a bug in that downgrade — and either
+/// way it is a suppression that would have left no human-visible artifact.
+fn notify_state(
+    effective: GateVerdict,
+    verdict: GateVerdict,
+    shadow: bool,
+    has_route: bool,
+) -> &'static str {
+    if effective == GateVerdict::Suppress {
+        if has_route {
+            NOTIFY_POSTED
+        } else {
+            NOTIFY_NO_ROUTE
+        }
+    } else if shadow && verdict == GateVerdict::Suppress {
+        if has_route {
+            NOTIFY_SHADOW_WOULD_POST
+        } else {
+            NOTIFY_SHADOW_NO_ROUTE
+        }
+    } else {
+        NOTIFY_NA
+    }
+}
+
 /// Run layer 3.5 for one gated `shell_exec`.
 ///
 /// Returns `None` when the gate does not apply (disabled, non-shell tool, no
 /// exec policy, no command) — the caller then behaves exactly as it did before
 /// ANAI-154.
+//
+// (Helpers for N1/N2 live immediately above so they can be unit-tested without
+// a `KernelHandle`; `review()` itself has no mock and is exercised end-to-end
+// only by the live daemon.)
 pub async fn review(
     kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
     agent_id: &str,
@@ -522,7 +602,18 @@ pub async fn review(
     let policy = exec_policy?;
     let raw_command = input.get("command").and_then(|v| v.as_str())?;
 
-    let posture = kernel.gatekeeper_posture();
+    // ANAI-265 N2. The permissive posture's whole justification is that a
+    // suppression becomes unprompted, never *unseen*. For an agent with no
+    // channel binding — cron-triggered, daemon-spawned, unbound — there is
+    // nothing to see, and the original code degraded to a silent no-op for
+    // exactly the agents nobody is watching. Rather than leave the invariant
+    // aspirational, an unroutable agent does not get the permissive posture at
+    // all. Resolved before the request is built, so the judge is handed the
+    // prompt it is actually being judged by.
+    let route = kernel.channel_binding_route(agent_id);
+    let configured_posture = kernel.gatekeeper_posture();
+    let posture = resolve_posture(configured_posture, route.is_some());
+    let posture_downgraded = posture != configured_posture;
     let req = build_gate_request(
         agent_id,
         raw_command,
@@ -587,6 +678,28 @@ pub async fn review(
     let det_eligible = req.path_facts.suppress_eligible();
     let det_disagree = verdict == GateVerdict::Suppress && !det_eligible;
 
+    // ANAI-265 N1. `review()` reaches `notify_suppression` only on
+    // `effective == Suppress`, and in shadow `effective` is never `Suppress` —
+    // so a shadow validation run exercises the notification path zero times and
+    // tells the flip decision nothing about the one control that makes this
+    // posture better than turning the gate off. This is the counting half: what
+    // would have been posted, to a route or to nothing, and how often.
+    //
+    // `shadow-no-route` is the row that matters. N2 holds it at zero for the
+    // permissive posture by construction; a non-zero count here is either a
+    // strict-posture suppression or a bug in that downgrade, and either way it
+    // is a suppression that would have left no human-visible artifact.
+    let notify = notify_state(effective, verdict, shadow, route.is_some());
+    match notify {
+        NOTIFY_SHADOW_WOULD_POST => {
+            SHADOW_NOTIFY_WOULD_POST_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        NOTIFY_SHADOW_NO_ROUTE => {
+            SHADOW_NOTIFY_NO_ROUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
     // §5 logging contract. FULL command, never truncated: this log IS the
     // review mechanism for every command the judge suppresses, so a truncation
     // here is a hole in the audit trail, not a cosmetic choice.
@@ -597,6 +710,8 @@ pub async fn review(
         verdict = %verdict.as_log_token(),
         shadow = %shadow,
         posture = %posture.as_log_token(),
+        posture_downgraded = %posture_downgraded,
+        notify = %notify,
         latency_ms = %latency_ms,
         consulted_model = %consulted,
         judge = %outcome.as_log_token(),
@@ -657,7 +772,7 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={} posture={}",
+            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={} posture={} notify={}",
             correlation_id,
             consulted,
             outcome.as_log_token(),
@@ -666,7 +781,8 @@ pub async fn review(
             req.path_facts.as_log_token(),
             if det_eligible { "eligible" } else { "ineligible" },
             det_disagree,
-            posture.as_log_token()
+            posture.as_log_token(),
+            notify
         ),
         // ANAI-187: a shadow verdict carries a `shadow_` prefix. Two reasons,
         // both load-bearing. A reader of the chain must never mistake an
@@ -690,6 +806,7 @@ pub async fn review(
     if effective == GateVerdict::Suppress {
         notify_suppression(
             kernel,
+            route.as_deref(),
             agent_id,
             raw_command,
             &correlation_id,
@@ -736,6 +853,64 @@ mod tests {
             allowed_commands: vec!["bash".into(), "rm".into(), "curl".into()],
             ..Default::default()
         }
+    }
+
+    /// ANAI-265 N2. "Unprompted, never unseen" is the sentence the permissive
+    /// posture is sold on. An agent with no channel route has nowhere to be
+    /// seen, so it does not get the posture — the invariant is enforced, not
+    /// hoped for.
+    #[test]
+    fn an_agent_with_no_channel_route_does_not_get_the_permissive_posture() {
+        assert_eq!(
+            resolve_posture(GatePosture::Permissive, false),
+            GatePosture::Strict
+        );
+        assert_eq!(
+            resolve_posture(GatePosture::Permissive, true),
+            GatePosture::Permissive
+        );
+        // The downgrade only ever tightens. A strict operator setting is never
+        // loosened by the presence of a route.
+        assert_eq!(
+            resolve_posture(GatePosture::Strict, true),
+            GatePosture::Strict
+        );
+        assert_eq!(
+            resolve_posture(GatePosture::Strict, false),
+            GatePosture::Strict
+        );
+    }
+
+    /// ANAI-265 N1. The census the shadow run needs and did not have: in shadow
+    /// `effective` is never `Suppress`, so without this the notification path
+    /// is exercised zero times and measured zero times.
+    #[test]
+    fn the_shadow_run_counts_the_notifications_it_cannot_send() {
+        use GateVerdict::{Escalate, Suppress};
+
+        // Live suppression: posted, or — under N2, unreachable while permissive
+        // — not.
+        assert_eq!(notify_state(Suppress, Suppress, false, true), NOTIFY_POSTED);
+        assert_eq!(
+            notify_state(Suppress, Suppress, false, false),
+            NOTIFY_NO_ROUTE
+        );
+
+        // Shadow: the judge asked for a suppression, the daemon prompted
+        // anyway. This is the volume the operator would have received.
+        assert_eq!(
+            notify_state(Escalate, Suppress, true, true),
+            NOTIFY_SHADOW_WOULD_POST
+        );
+        assert_eq!(
+            notify_state(Escalate, Suppress, true, false),
+            NOTIFY_SHADOW_NO_ROUTE
+        );
+
+        // A genuine escalation is not a notification event in either mode, and
+        // an escalation outside shadow is not a suppression the judge wanted.
+        assert_eq!(notify_state(Escalate, Escalate, true, true), NOTIFY_NA);
+        assert_eq!(notify_state(Escalate, Escalate, false, true), NOTIFY_NA);
     }
 
     #[tokio::test]
