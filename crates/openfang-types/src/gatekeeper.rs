@@ -623,9 +623,17 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                     }
                     None => {}
                 }
+                // Round-12 J4. `skip(1)` was the position assumption W1 removed
+                // everywhere else, left in the one place it happened to be
+                // harmless — it is *wider* than the verb index, so it only ever
+                // saw extra tokens. Harmless and wrong reads as intentional to
+                // the next person, and the next person is the one who narrows
+                // it. Take the operands from after the resolved verb, like
+                // every other operand walk in this module.
+                let verb_idx = command_word(&tokens).map_or(0, |(_, i)| i);
                 let relative = tokens
                     .iter()
-                    .skip(1)
+                    .skip(verb_idx + 1)
                     .any(|t| is_relative_operand(strip_grouping(t)));
                 if blind {
                     // Deliberately narrower than the `writes` arm: a write to a
@@ -744,6 +752,21 @@ enum CdMove {
 /// HIGH.
 fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove> {
     let (base, idx) = command_word(tokens)?;
+    // Round-12 J3. `popd` moved the frame and matched nothing, so the walk kept
+    // whatever `pushd` had left it with:
+    //
+    // ```text
+    //   cd ~/.openfang/data; pushd /tmp; popd; rm openfang.db
+    // ```
+    //
+    // Not modelled as a stack on purpose. `prev` exists now, so a one-deep
+    // restore is tempting — and it is right exactly once and silently wrong at
+    // depth two, which is the worse failure because it looks resolved.
+    // [`Cwd::Unknown`] is the honest state, and since the round-11 narrowing it
+    // no longer means "escalate" — it means "record that we cannot say".
+    if base == "popd" {
+        return Some(CdMove::To(Frame::unknown()));
+    }
     if !matches!(base.as_str(), "cd" | "pushd") {
         return None;
     }
@@ -2839,6 +2862,16 @@ pub const DATASTORE_SUFFIXES: &[&str] = &[
 /// it.
 const FILE_ENDING_BINS: &[&str] = &["rm", "rmdir", "shred", "truncate", "mv", "mkfs"];
 
+/// Every base [`segment_ends_datastore`] acts on, in one place.
+///
+/// Round-12 J1 needs to ask "did [`command_word`] give me a verb this function
+/// can do anything with?" before it falls back to a token scan. Asking it
+/// against a list that omitted `dd`/`cp`/`install` would send a correctly
+/// resolved `dd of=…` down the scan path for no reason.
+fn is_ending_verb(base: &str) -> bool {
+    FILE_ENDING_BINS.contains(&base) || matches!(base, "dd" | "cp" | "install")
+}
+
 /// True if `token` names a durable OpenFang datastore.
 ///
 /// Both halves are required. `~/.openfang/` alone is the control plane and is
@@ -2976,7 +3009,52 @@ fn segment_ends_datastore(tokens: &[&str], is_target: &dyn Fn(&str) -> bool) -> 
     // both hard floors on the command line with no obfuscation at all. See
     // [`command_word`]: the index matters as much as the name, because in
     // `env rm -rf x` the operand is at index 3, not index 1.
-    let Some((base, idx)) = command_word(tokens) else {
+    //
+    // Round-12 J1. W1 replaced a broken `tokens[0]` with a smarter `tokens[0]`,
+    // and a smarter position is still a position. [`command_word`]'s wrapper
+    // skip loop breaks on the first token that is not a flag, a numeric or an
+    // assignment — so any wrapper flag taking a *separate* argument hands back
+    // the argument as the verb:
+    //
+    // ```text
+    //   sudo -u ben  rm ~/.openfang/data/openfang.db   -> ("ben", 2)
+    //   env -u FOO   rm ~/.openfang/data/openfang.db   -> ("FOO", 2)
+    //   timeout -s KILL 5 rm ~/.openfang/data/…        -> ("KILL", 2)
+    // ```
+    //
+    // The predicate one function away — [`segment_destroys_tree`] — was never
+    // vulnerable to any of this, because it scans every token's basename and
+    // never trusted position at all. So: keep [`command_word`] for operand
+    // indexing, and let a token scan supply the verb when the resolved word is
+    // not one.
+    //
+    // Not a per-wrapper table of flags-that-take-arguments. A table is the
+    // thing this ticket keeps relearning about, and a stale one here fails
+    // *open* — the flag-argument break returns a non-verb and stops looking,
+    // where the numeric rule over-skips and keeps looking. Only one of those
+    // directions is allowed in a verb resolver.
+    //
+    // The scan covers every base this function acts on, not just
+    // [`FILE_ENDING_BINS`] — `env -u FOO cp /tmp/x <datastore>` is the same
+    // defect wearing the destination-only reading. The index comes from the
+    // scan too, so `cp`'s last-operand rule and `dd`'s `of=` rule still read
+    // from after the verb they actually found.
+    //
+    // The cost is a bounded over-fire: a base in that set appearing *anywhere*
+    // in the segment now supplies the verb, so `grep rm <datastore>` reads as
+    // an ending. The target test still has to match, which keeps the
+    // population small, and one prompt is the right price for a hard floor.
+    let scanned = || {
+        tokens.iter().enumerate().find_map(|(i, t)| {
+            let base = basename(strip_grouping(t));
+            is_ending_verb(&base).then_some((base, i))
+        })
+    };
+    let resolved = match command_word(tokens) {
+        Some((base, idx)) if is_ending_verb(&base) => Some((base, idx)),
+        other => scanned().or(other),
+    };
+    let Some((base, idx)) = resolved else {
         return false;
     };
     let operands = || {
@@ -4079,6 +4157,88 @@ mod tests {
         // Bare `cd` is home, and home is not the substrate.
         assert!(!body_destroys_datastore(
             "cd ~/.openfang/data\ncd\nrm openfang.db\n"
+        ));
+    }
+
+    /// J1. A wrapper flag that takes a *separate* argument handed
+    /// [`command_word`]'s skip loop something to break on, and the argument
+    /// came back as the verb.
+    ///
+    /// Ben's own scary command, behind four characters. The substrate half was
+    /// never vulnerable, because [`segment_destroys_tree`] scans every token
+    /// and never trusted position — which is the whole argument for the
+    /// fallback.
+    #[test]
+    fn a_wrapper_flag_argument_is_not_the_verb() {
+        assert!(destroys_datastore(
+            "sudo -u ben rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "env -u FOO rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "timeout -s KILL 5 rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "ionice -c 2 rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "stdbuf -o L shred ~/.openfang/data/openfang.db"
+        ));
+        // W1's plain forms keep working.
+        assert!(destroys_datastore("env rm ~/.openfang/data/openfang.db"));
+        assert!(destroys_datastore("rm ~/.openfang/data/openfang.db"));
+        // The scan supplies a verb; it does not supply an *index*. `cp` and
+        // `dd` still resolve through `command_word`, so the destination-only
+        // and `of=`-only readings survive a wrapper.
+        assert!(destroys_datastore(
+            "env -u FOO cp /tmp/x ~/.openfang/data/openfang.db"
+        ));
+        assert!(!destroys_datastore(
+            "env -u FOO cp ~/.openfang/data/openfang.db /tmp/x"
+        ));
+        // A verb the scan cannot find is still not a verb.
+        assert!(!destroys_datastore(
+            "sudo -u ben cat ~/.openfang/data/openfang.db"
+        ));
+    }
+
+    /// J3. `popd` moved the frame and matched nothing, so the walk kept
+    /// `pushd`'s directory and answered from it — with a hard predicate.
+    ///
+    /// Not restored to `prev`: one-deep is right exactly once and silently
+    /// wrong at depth two. `Unknown` is the honest state, and it reports.
+    #[test]
+    fn popd_is_an_unknown_frame_not_a_retained_one() {
+        let nothing = Taint::default();
+        let data = Frame::under(vec!["data".to_string()]);
+        assert!(matches!(
+            cd_target(&["popd"], &data, &nothing),
+            Some(CdMove::To(Frame {
+                kind: Cwd::Unknown,
+                ..
+            }))
+        ));
+        let detour = "cd ~/.openfang/data\npushd /tmp\npopd\nrm openfang.db\n";
+        assert!(!body_destroys_datastore(detour));
+        // ...and it says so, rather than going quiet.
+        assert!(body_frame_blind(detour));
+    }
+
+    /// J4. The operand walk starts after the resolved verb, not after
+    /// `tokens[0]`.
+    ///
+    /// `skip(1)` was wider than the verb index, so with a wrapper present the
+    /// *verb itself* read as a relative operand — `env rm -rf ~/x` from a
+    /// substrate frame hard-floored on a path that is not the substrate.
+    #[test]
+    fn operands_are_taken_from_after_the_verb_in_the_walker() {
+        assert!(!body_destroys_substrate(
+            "cd ~/.openfang/agents\nenv rm -rf ~/x\n"
+        ));
+        // The case the arm exists for is unchanged.
+        assert!(body_destroys_substrate(
+            "cd ~/.openfang/agents\nenv rm -rf openfang-alpha\n"
         ));
     }
 
