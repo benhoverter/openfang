@@ -609,6 +609,23 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
                 // Round-15 M1: the frame at assignment time is evidence about
                 // the value, exactly as it is about a literal operand.
+                // Round-17 P1. The segment under evaluation is allowed to
+                // rewrite its own taint state before the arms read it, and a
+                // command-prefix assignment is expanded by the *parent* shell
+                // after argv is built:
+                //
+                // ```text
+                //   f=~/.openfang/data/openfang.db
+                //   f=/tmp/x rm -f "$f"      # removes the datastore
+                // ```
+                //
+                // N1 moved the *evidence* to the use site; the *value* was
+                // still read from a set the segment had already mutated. Both
+                // readings are legitimate — the pre-segment one is what the
+                // shell expands, the post-segment one is what a later segment
+                // will see — so evaluate against both and take either. One
+                // clone per segment.
+                let pre = tainted.clone();
                 taint_from_segment(&tokens, &mut tainted, frame.inside());
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
@@ -618,10 +635,12 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 let piped = pipeline_scoped_tokens(&tokens, pipeline);
                 let ds_tokens: &[&str] = piped.as_deref().unwrap_or(&tokens);
                 if segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &tainted))
+                    || segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &pre))
                 {
                     hits.destroys_datastore = true;
                 } else if blind
-                    && segment_ends_datastore(ds_tokens, &datastore_target(true, true, &tainted))
+                    && (segment_ends_datastore(ds_tokens, &datastore_target(true, true, &tainted))
+                        || segment_ends_datastore(ds_tokens, &datastore_target(true, true, &pre)))
                 {
                     // Round-11: it would have hit from the substrate, and we
                     // cannot say we are not there. Record rather than guess.
@@ -637,8 +656,11 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 if segment_destroys_tree(&tokens)
                     && tokens.iter().any(|t| {
                         let raw = strip_grouping(t);
-                        let expanded = tainted.expand(raw);
-                        expanded != raw && names_substrate(&expanded)
+                        // Round-17 P1, substrate half: same two readings.
+                        [&pre, &tainted].iter().any(|state| {
+                            let expanded = state.expand(raw);
+                            expanded != raw && names_substrate(&expanded)
+                        })
                     })
                 {
                     hits.destroys = true;
@@ -1082,7 +1104,7 @@ fn command_word(tokens: &[&str]) -> Option<(String, usize)> {
 /// Declared gaps, unchanged: arrays, `read`, indirect expansion (`${!x}`), and
 /// any value arriving from a command substitution. All three now land in
 /// [`Cwd::Unknown`] rather than silently keeping the last known frame.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Taint {
     names: Vec<String>,
     values: Vec<(String, String)>,
@@ -1124,7 +1146,15 @@ impl Taint {
         // map would answer for a variable that has since been reassigned to
         // something it cannot read.
         self.values.retain(|(n, _)| n != &name);
-        if !value.contains('$') {
+        // Round-17 P2. An *empty* value is as unreadable as an unresolved one,
+        // and it arrives the same way: `split_segments` treats a backtick as a
+        // separator, so `` d=`dirname "$0"` `` tears into the segment `d=` and
+        // records `d` as the empty string. Before N1 the name was never
+        // recorded at all and `cd "$d"` landed in [`Cwd::Unknown`]; keeping the
+        // empty value traded that report for a guess, because an empty
+        // expansion carries no `$` for [`cd_target`]'s guard to catch. A value
+        // the segmenter ate is not a path we can `cd` to either.
+        if !value.is_empty() && !value.contains('$') {
             self.values.push((name, value));
         }
     }
@@ -4705,6 +4735,61 @@ mod tests {
         // than kept, so the `cd` reads blind instead of reading the old path.
         assert!(!body_destroys_datastore(
             "d=~/.openfang/data\nd=$(cat f)\ncd \"$d\"\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// Round-17 P1. A command-prefix assignment is expanded by the *parent*
+    /// shell after argv is built, so `"$f"` in the argv still holds the old
+    /// value while the taint map has already been rewritten to the new one.
+    /// The segment under evaluation was allowed to rewrite its own state
+    /// before the arms read it, which cleared both hard floors in two lines
+    /// with no obfuscation and no `cd`.
+    #[test]
+    fn a_same_segment_assignment_does_not_rewrite_the_argv_it_shares() {
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\nf=/tmp/x rm -f \"$f\"\n"
+        ));
+        // Same thing wearing a wrapper.
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\nenv f=/tmp/x rm -f \"$f\"\n"
+        ));
+        // Substrate half.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\nd=/tmp/x rm -rf \"$d\"\n"
+        ));
+        // The post-segment reading still counts, so a name assigned and used
+        // in the same segment is not lost.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents rm -rf \"$d\"\n"
+        ));
+        // And the cross-line reassignment N4 pinned is unchanged: there the
+        // pre-segment state already holds the harmless value.
+        assert!(!body_destroys_substrate(
+            "d=~/.openfang/agents\nd=/tmp/x\nrm -rf \"$d\"\n"
+        ));
+    }
+
+    /// Round-17 P2. `split_segments` treats a backtick as a separator, so a
+    /// command substitution written in backticks tears into an assignment with
+    /// an *empty* value. An empty expansion carries no `$` for
+    /// [`cd_target`]'s guard, so the frame fell through to relative-descend
+    /// and kept whatever it had — trading N1's honest [`Cwd::Unknown`] report
+    /// for a guess. `$( … )` was never affected: the tear leaves a bare `$`.
+    #[test]
+    fn a_value_the_segmenter_ate_is_as_unreadable_as_one_we_cannot_expand() {
+        // The frame is unresolved, so the relative destruction is *reported*
+        // as blind rather than silently attributed to the previous frame.
+        assert!(body_frame_blind(
+            "cd ~/.openfang/data\nd=`dirname \"$0\"`\ncd \"$d\"\nrm -rf agents\n"
+        ));
+        // And the datastore floor does not fire from a frame we cannot name.
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/data\nd=`dirname \"$0\"`\ncd \"$d\"\nrm -f openfang.db\n"
+        ));
+        // `$( … )` behaved correctly already; pinned so the two spellings
+        // cannot drift apart again.
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/data\nd=$(dirname \"$0\")\ncd \"$d\"\nrm -f openfang.db\n"
         ));
     }
 
