@@ -593,8 +593,43 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
     for line in lines {
         // Round-18 R2: `argv`, not `text`. A heredoc payload is data this line
         // writes, not statements this line runs.
-        let mut prev_segments: Vec<String> = Vec::new();
-        for unit in walk_units(&line.argv) {
+        walk_statements(&line.argv, &mut frame, &mut prev, &mut tainted, &mut hits);
+        // Round-20 T2. A payload an interpreter runs is that interpreter's
+        // script, and it runs in a *child*: its frame, its previous frame and
+        // its taint all die at the terminator. Its hits do not — a payload
+        // that destroys the datastore destroyed it. Snapshot in, discard out.
+        if let Some(payload) = &line.exec_payload {
+            let mut child_frame = frame.clone();
+            let mut child_prev = prev.clone();
+            let mut child_taint = tainted.clone();
+            walk_statements(
+                payload,
+                &mut child_frame,
+                &mut child_prev,
+                &mut child_taint,
+                &mut hits,
+            );
+        }
+    }
+    hits
+}
+
+/// One walk over the statements in `text`, mutating the frame and taint state
+/// its caller owns.
+///
+/// Split out for round-20 T2: a heredoc payload an interpreter runs is this
+/// same walk against a *snapshot* of that state rather than against the state
+/// itself, which is what keeps a child's `cd` out of its parent.
+fn walk_statements(
+    text: &str,
+    frame: &mut Frame,
+    prev: &mut Frame,
+    tainted: &mut Taint,
+    hits: &mut CwdHits,
+) {
+    let mut prev_segments: Vec<String> = Vec::new();
+    {
+        for unit in walk_units(text) {
             let lowered = lower_for_segments(&unit);
             // Round-18 R1: the case-preserving twin, folded identically.
             // Lowercasing changes no separator, so the two segment vectors are
@@ -644,7 +679,7 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // clone per segment.
                 let pre = tainted.clone();
                 if !replayed {
-                    taint_from_segment(&tokens, &cased_tokens, &mut tainted, frame.inside());
+                    taint_from_segment(&tokens, &cased_tokens, tainted, frame.inside());
                 }
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
@@ -653,16 +688,28 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // its target in the segment on the *other* side of it.
                 let piped = pipeline_scoped_tokens(&tokens, pipeline);
                 let ds_tokens: &[&str] = piped.as_deref().unwrap_or(&tokens);
-                if segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &tainted))
+                if segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, tainted))
                     || segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &pre))
                 {
                     hits.destroys_datastore = true;
                 } else if blind
-                    && (segment_ends_datastore(ds_tokens, &datastore_target(true, true, &tainted))
+                    && (segment_ends_datastore(ds_tokens, &datastore_target(true, true, tainted))
                         || segment_ends_datastore(ds_tokens, &datastore_target(true, true, &pre)))
                 {
                     // Round-11: it would have hit from the substrate, and we
                     // cannot say we are not there. Record rather than guess.
+                    hits.frame_blind = true;
+                }
+                // Round-20 T6: readings we abandoned are readings we did not
+                // test, and an arm that ORs cannot tell that from a miss. The
+                // cap is a sum rather than a product now and so effectively
+                // unreachable — but silence there is the fail-open direction,
+                // so say it out loud instead.
+                if !hits.destroys_datastore
+                    && ds_tokens
+                        .iter()
+                        .any(|t| tainted.readings_truncated(strip_grouping(t)))
+                {
                     hits.frame_blind = true;
                 }
                 // Round-14 L1, substrate half. Same defect, other predicate:
@@ -676,7 +723,7 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                     && tokens.iter().any(|t| {
                         let raw = strip_grouping(t);
                         // Round-17 P1, substrate half: same two readings.
-                        [&pre, &tainted].iter().any(|state| {
+                        [&pre, tainted].iter().any(|state| {
                             // Round-19 S1: every reading, not a chosen one.
                             state
                                 .expansions(raw)
@@ -687,7 +734,7 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 {
                     hits.destroys = true;
                 }
-                if let Some(mv) = cd_target(&tokens, &frame, &tainted) {
+                if let Some(mv) = cd_target(&tokens, frame, tainted) {
                     // Round-18 R3: a replayed segment already moved the frame
                     // in the previous chunk. `cd ..` is not idempotent.
                     if !replayed {
@@ -696,9 +743,9 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                             // this is a swap rather than a guess. Swapping (not
                             // overwriting) also makes `cd -; cd -` return where
                             // it started, as a shell does.
-                            CdMove::Back => core::mem::swap(&mut frame, &mut prev),
+                            CdMove::Back => core::mem::swap(frame, prev),
                             CdMove::To(next) => {
-                                prev = core::mem::replace(&mut frame, next);
+                                *prev = core::mem::replace(frame, next);
                             }
                         }
                     }
@@ -742,7 +789,6 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
             }
         }
     }
-    hits
 }
 
 /// The target test the datastore arm hands [`segment_ends_datastore`].
@@ -1211,10 +1257,13 @@ struct Taint {
 }
 
 impl Taint {
-    /// Cap on how many readings one token may produce. Several colliding
-    /// names in one token is pathological; past the cap the branch is
-    /// abandoned rather than expanded, which fails toward "unresolved".
-    const MAX_READINGS: usize = 8;
+    /// Cap on how many readings one token may produce.
+    ///
+    /// Round-20 T6: readings are resolved one collision at a time, so this
+    /// bounds a *sum* rather than a product and is effectively unreachable.
+    /// When it is reached the walker reports blindness rather than dropping
+    /// the readings silently — see [`Taint::readings_truncated`].
+    const MAX_READINGS: usize = 16;
 
     /// Record what a name expands to, for *any* syntactic assignment.
     ///
@@ -1259,7 +1308,6 @@ impl Taint {
         // [`Taint::lookup`], which is where the walker's own lowering of the
         // command text is dealt with.
         let name = name.to_string();
-        let value = self.expand(value);
         // A value we could not fully expand is not a path we can `cd` to. Drop
         // it — and drop any earlier value for the same name with it, or the
         // map would answer for a variable that has since been reassigned to
@@ -1273,8 +1321,31 @@ impl Taint {
         // empty value traded that report for a guess, because an empty
         // expansion carries no `$` for [`cd_target`]'s guard to catch. A value
         // the segmenter ate is not a path we can `cd` to either.
-        if !value.is_empty() && !value.contains('$') {
-            self.values.push((name, value));
+        //
+        // Round-20 T3. The value used to be recorded through [`Taint::expand`],
+        // which returns the token *unchanged* when its readings disagree — so
+        // a fold collision upstream made the new value carry a `$` and be
+        // dropped here, severing the chain one hop early:
+        //
+        // ```text
+        //   p=~/.openfang/data/openfang.db
+        //   P=/tmp/x
+        //   q=$p
+        //   rm -f "$q"          # removes the datastore
+        // ```
+        //
+        // Dropping is fail-closed for [`cd_target`], which needs one frame, and
+        // fail-**open** for every arm that ORs over readings, where the
+        // disagreement was supposed to widen. So record every reading here too
+        // and let `expand` keep its one-reading contract for the one caller
+        // that needs it.
+        for reading in self.expansions(value) {
+            if reading.is_empty() || reading.contains('$') {
+                continue;
+            }
+            if !self.values.iter().any(|(n, v)| n == &name && v == &reading) {
+                self.values.push((name.clone(), reading));
+            }
         }
     }
 
@@ -1350,17 +1421,43 @@ impl Taint {
     /// and [`Cwd::Unknown`]. More than one reading means a fold collision;
     /// see [`Taint::lookup_all`].
     fn expansions(&self, token: &str) -> Vec<String> {
+        self.readings(token).0
+    }
+
+    /// True when [`Taint::readings`] hit its cap and stopped widening `token`.
+    fn readings_truncated(&self, token: &str) -> bool {
+        self.readings(token).1
+    }
+
+    /// Every reading of `token`, and whether the cap cut the list short.
+    ///
+    /// # Round-20 T6 — one collision at a time, not a cross-product
+    ///
+    /// This used to build the product of every reference's readings and
+    /// abandon the branch past the cap, leaving that reference literal. To
+    /// [`cd_target`] a surviving `$` reads as "gave up" and reports; to the
+    /// arms that OR over readings it reads as *nothing at all*, and nothing
+    /// sets `frame_blind` either. Nine plain lines of colliding assignments
+    /// cleared both hard floors in silence.
+    ///
+    /// Varying one reference at a time while the others hold their first value
+    /// is linear in the number of readings, so the cap stops being reachable
+    /// by construction; the residual — a combination that needs two references
+    /// to disagree at once — is a shape no shell writes by accident.
+    fn readings(&self, token: &str) -> (Vec<String>, bool) {
         if self.values.is_empty() || !token.contains('$') {
-            return vec![token.to_string()];
+            return (vec![token.to_string()], false);
         }
         let chars: Vec<char> = token.chars().collect();
-        let mut outs: Vec<String> = vec![String::new()];
+        // (text, candidate values). An empty candidate list means the part is
+        // literal — plain text, or a reference we could not resolve, which
+        // keeps its `$` so the caller can still tell "gave up" from "resolved".
+        let mut parts: Vec<(String, Vec<String>)> = Vec::new();
+        let mut lit = String::new();
         let mut i = 0usize;
         while i < chars.len() {
             if chars[i] != '$' {
-                for out in outs.iter_mut() {
-                    out.push(chars[i]);
-                }
+                lit.push(chars[i]);
                 i += 1;
                 continue;
             }
@@ -1383,50 +1480,57 @@ impl Taint {
                 if end == chars.len() {
                     // Unterminated. Not something we can read; hand the rest
                     // back verbatim so the `$` survives.
-                    for out in outs.iter_mut() {
-                        out.extend(chars[i..].iter());
-                    }
-                    return outs;
+                    lit.extend(chars[i..].iter());
+                    break;
                 }
                 end += 1;
             }
             let literal: String = chars[i..end].iter().collect();
-            let values = if name.is_empty() {
+            let values: Vec<String> = if name.is_empty() {
                 Vec::new()
             } else {
                 self.lookup_all(&name)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
             };
-            // Past the cap the branch is abandoned and the reference is left
-            // as written — it still carries its `$`, so it still reads as
-            // "gave up" rather than as a resolved path.
-            if values.is_empty() || values.len().saturating_mul(outs.len()) > Self::MAX_READINGS {
-                for out in outs.iter_mut() {
-                    out.push_str(&literal);
-                }
-            } else if values.len() == 1 {
-                for out in outs.iter_mut() {
-                    out.push_str(values[0]);
-                }
-            } else {
-                let mut next: Vec<String> = Vec::with_capacity(values.len() * outs.len());
-                for out in &outs {
-                    for value in &values {
-                        let mut branch = out.clone();
-                        branch.push_str(value);
-                        next.push(branch);
-                    }
-                }
-                outs = next;
+            if !lit.is_empty() {
+                parts.push((core::mem::take(&mut lit), Vec::new()));
             }
+            parts.push((literal, values));
             i = end;
         }
-        let mut uniq: Vec<String> = Vec::new();
-        for out in outs {
-            if !uniq.contains(&out) {
-                uniq.push(out);
+        if !lit.is_empty() {
+            parts.push((lit, Vec::new()));
+        }
+        let render = |pick: Option<(usize, usize)>| -> String {
+            let mut out = String::new();
+            for (idx, (literal, values)) in parts.iter().enumerate() {
+                match values.first() {
+                    None => out.push_str(literal),
+                    Some(first) => match pick {
+                        Some((at, which)) if at == idx => out.push_str(&values[which]),
+                        _ => out.push_str(first),
+                    },
+                }
+            }
+            out
+        };
+        let mut outs: Vec<String> = vec![render(None)];
+        let mut truncated = false;
+        'parts: for (idx, (_, values)) in parts.iter().enumerate() {
+            for which in 1..values.len() {
+                if outs.len() >= Self::MAX_READINGS {
+                    truncated = true;
+                    break 'parts;
+                }
+                let candidate = render(Some((idx, which)));
+                if !outs.contains(&candidate) {
+                    outs.push(candidate);
+                }
             }
         }
-        uniq
+        (outs, truncated)
     }
 
     /// The one reading of `token`, when there is one.
@@ -2635,6 +2739,30 @@ struct LogicalLine {
     /// plane escalates — is what masked this fail-open one for eleven commits.
     argv: String,
     heredoc_payload: Option<String>,
+    /// The payload statements an interpreter on this line *runs*, continuation
+    /// folded and `;`-joined. `None` when the payload is stored rather than
+    /// executed.
+    ///
+    /// # Round-20 T2 — payload state may not outlive the heredoc
+    ///
+    /// Round-19 S2 appended executed payload statements straight onto `argv`,
+    /// so a `cd`, an assignment or a `cd -` inside a payload mutated the walk
+    /// for every logical line *after* the terminator. A shell runs `bash <<EOF`
+    /// in a child; its `cd` does not move the parent:
+    ///
+    /// ```text
+    ///   cd ~/.openfang/data
+    ///   bash <<'EOF'
+    ///   cd /tmp
+    ///   EOF
+    ///   rm -f openfang.db          # removes the datastore
+    /// ```
+    ///
+    /// Keeping the payload in its own field lets the walker run it against a
+    /// snapshot: payload statements may *fire* arms, they may not mutate state
+    /// that survives the heredoc. That is the invariant `argv`'s own doc
+    /// comment already claimed and S2 made false for interpreters.
+    exec_payload: Option<String>,
 }
 
 /// True if this one logical line writes the control plane.
@@ -2721,6 +2849,8 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
     // Round-19 S2: the third element is whether this heredoc's consumer
     // *executes* the payload. See [`heredoc_payload_is_argv`].
     let mut heredoc: Option<(HeredocOpen, usize, bool)> = None;
+    // Round-20 T1: payload lines need continuation folding of their own.
+    let mut payload_pending: Option<String> = None;
 
     for raw in body.lines() {
         let state = heredoc
@@ -2728,23 +2858,58 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
             .map(|(open, idx, executes)| (terminates_heredoc(raw, open), *idx, *executes));
         if let Some((terminates, idx, executes)) = state {
             if terminates {
+                // An unterminated continuation at the delimiter is still a
+                // statement the interpreter would run.
+                if let Some(acc) = payload_pending.take() {
+                    push_exec_statement(&mut out[idx], &acc);
+                }
                 heredoc = None;
             } else {
-                let line = &mut out[idx];
-                line.text.push(' ');
-                line.text.push_str(raw);
-                // Round-19 S2. A payload an interpreter runs is that
-                // interpreter's script, so it belongs in `argv` after all.
-                // Joined with `;` rather than a space: each payload line is
-                // its own statement, and folding them together would let a
-                // `cd` swallow the verb on the next line.
-                if executes {
-                    line.argv.push_str(" ; ");
-                    line.argv.push_str(raw);
+                {
+                    let line = &mut out[idx];
+                    line.text.push(' ');
+                    line.text.push_str(raw);
+                    let payload = line.heredoc_payload.get_or_insert_with(String::new);
+                    payload.push('\n');
+                    payload.push_str(raw);
                 }
-                let payload = line.heredoc_payload.get_or_insert_with(String::new);
-                payload.push('\n');
-                payload.push_str(raw);
+                // Round-19 S2. A payload an interpreter runs is that
+                // interpreter's script, so it is argv after all — but its own
+                // argv, not this line's. See [`LogicalLine::exec_payload`].
+                //
+                // Round-20 T1. This branch returns before `strip_continuation`
+                // runs, so payload lines were never continuation-folded, and
+                // S2 then made each *physical* line its own statement — which
+                // splits a verb from its target:
+                //
+                // ```text
+                //   bash <<'EOF'
+                //   cd ~/.openfang/data
+                //   rm -f \
+                //   openfang.db
+                //   EOF
+                // ```
+                //
+                // `rm -f \` is a segment with a verb and no target, and
+                // `openfang.db` is a segment with a target and no verb, so the
+                // conjunction never sees both. A payload needs *both*
+                // operations, in this order: fold continuations, then split
+                // statements.
+                if executes {
+                    let joined = match payload_pending.take() {
+                        Some(mut acc) => {
+                            acc.push(' ');
+                            acc.push_str(raw);
+                            acc
+                        }
+                        None => raw.to_string(),
+                    };
+                    if let Some(head) = strip_continuation(&joined) {
+                        payload_pending = Some(head.to_string());
+                    } else {
+                        push_exec_statement(&mut out[idx], &joined);
+                    }
+                }
             }
             continue;
         }
@@ -2767,6 +2932,7 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
             argv: joined.clone(),
             text: joined,
             heredoc_payload: None,
+            exec_payload: None,
         });
         let idx = out.len() - 1;
         if let Some(open) = heredoc_delimiter(&out[idx].text) {
@@ -2780,9 +2946,29 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
             argv: acc.clone(),
             text: acc,
             heredoc_payload: None,
+            exec_payload: None,
         });
     }
+    // A body that ends inside a heredoc still ran the statements it held.
+    if let Some((_, idx, _)) = heredoc {
+        if let Some(acc) = payload_pending.take() {
+            push_exec_statement(&mut out[idx], &acc);
+        }
+    }
     out
+}
+
+/// Append one payload statement to the line that opened the heredoc.
+///
+/// `;`-joined rather than space-joined: each payload line is its own
+/// statement, and folding them together would let a `cd` swallow the verb on
+/// the next line.
+fn push_exec_statement(line: &mut LogicalLine, statement: &str) {
+    let buf = line.exec_payload.get_or_insert_with(String::new);
+    if !buf.is_empty() {
+        buf.push_str(" ; ");
+    }
+    buf.push_str(statement);
 }
 
 /// The line without its trailing continuation backslash, if it has one.
@@ -2800,10 +2986,27 @@ fn strip_continuation(line: &str) -> Option<&str> {
 ///
 /// Membership is one test: **does this line's command word run the payload as
 /// its script?** `cat`, `tee` and a redirect store it; an interpreter runs it.
-const HEREDOC_EXECUTING_BINS: &[&str] = &[
-    "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "perl", "ruby", "node", "xargs",
-    "sqlite3", "psql", "mysql",
-];
+///
+/// # Round-20 T4 — the payload has to be *shell*
+///
+/// This list started as "consumers that execute", which is the wrong question:
+/// `xargs` takes an argument list, `sqlite3`/`psql`/`mysql` take SQL, and
+/// `python3`/`perl`/`ruby`/`node` take source in another language. Routing any
+/// of those to the walker and splitting them on `;` hands it attacker-authored
+/// *data* as shell commands, which is round-18 R2 wearing a different hat:
+///
+/// ```text
+///   cd ~/.openfang/data
+///   sqlite3 /tmp/t.db <<'EOF'
+///   select 'x' ; cd /tmp
+///   EOF
+///   rm -f openfang.db
+/// ```
+///
+/// A SQL string literal moved the frame. `sqlite3`'s dangerous half is already
+/// covered by the dot-command opaque-exec check, and every payload here is
+/// still read in data position by [`line_writes_control_plane`].
+const HEREDOC_EXECUTING_BINS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
 /// True if the payload this line opens is argv rather than data.
 ///
@@ -2826,12 +3029,19 @@ const HEREDOC_EXECUTING_BINS: &[&str] = &[
 /// `bash <<EOF` runs. `sqlite3 db < script.sql` and `bash < script.sh` remain
 /// out of reach and are named in the known-uncovered list.
 fn heredoc_payload_is_argv(line: &str) -> bool {
+    // Round-20 T5. This was `any` over the line's segments while the heredoc
+    // belongs to exactly one of them, so an unrelated interpreter earlier in
+    // the line made a *stored* payload argv: `bash -c x ; cat > f <<EOF` is R2
+    // verbatim. Ask the segment that opens it.
     let lowered = lower_for_segments(line);
-    split_segments(&lowered).into_iter().any(|segment| {
-        let tokens: Vec<&str> = segment.split_whitespace().collect();
-        command_word(&tokens)
-            .is_some_and(|(base, _)| HEREDOC_EXECUTING_BINS.contains(&base.as_str()))
-    })
+    split_segments(&lowered)
+        .into_iter()
+        .find(|segment| segment.contains("<<"))
+        .is_some_and(|segment| {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            command_word(&tokens)
+                .is_some_and(|(base, _)| HEREDOC_EXECUTING_BINS.contains(&base.as_str()))
+        })
 }
 
 /// The heredoc delimiter this line opens, if any.
@@ -5173,6 +5383,77 @@ mod tests {
         let lines = logical_lines("cat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\n");
         assert!(lines[0].text.contains("cd /tmp"));
         assert!(!lines[0].argv.contains("cd /tmp"));
+    }
+
+    /// Round-20 T1. The heredoc branch returns before `strip_continuation`
+    /// runs, so payload lines were never continuation-folded — and round-19 S2
+    /// then made each physical line its own statement, splitting `rm -f \`
+    /// from its target. A payload needs both operations, in that order.
+    #[test]
+    fn a_continuation_inside_an_executed_payload_keeps_its_target() {
+        assert!(body_destroys_datastore(
+            "bash <<'EOF'\ncd ~/.openfang/data\nrm -f \\\nopenfang.db\nEOF\n"
+        ));
+    }
+
+    /// Round-20 T2. A payload an interpreter runs is a *child's* script: its
+    /// `cd`, its assignments and its `cd -` die at the terminator. S2
+    /// appended them to the opening line's argv, so they mutated the walk for
+    /// every logical line after it — while its own doc comment claimed a
+    /// payload may never supply a `cd` or an assignment.
+    #[test]
+    fn payload_state_does_not_outlive_the_heredoc() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nbash <<'EOF'\ncd /tmp\nEOF\nrm -f openfang.db\n"
+        ));
+        // Assignment half, same channel.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\nbash <<'EOF'\nd=/tmp/x\nEOF\nrm -rf \"$d\"\n"
+        ));
+        // Scoped, not ignored: the payload still fires on its own account.
+        assert!(body_destroys_datastore(
+            "bash <<'EOF'\ncd ~/.openfang/data\nrm -f openfang.db\nEOF\n"
+        ));
+    }
+
+    /// Round-20 T4 and T5. `sqlite3` takes SQL, not shell, so splitting its
+    /// payload on `;` handed the walker a string literal as a command — R2
+    /// with extra steps. And the executes test was `any` over the line's
+    /// segments, so an interpreter anywhere on the line made a *stored*
+    /// payload argv.
+    #[test]
+    fn only_a_shell_runs_a_payload_and_only_its_own_segment_says_so() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nsqlite3 /tmp/t.db <<'EOF'\nselect 'x' ; cd /tmp\nEOF\nrm -f openfang.db\n"
+        ));
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nbash -c true ; cat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// Round-20 T3. `record_value` recorded through `expand`, which returns the
+    /// token unchanged when its readings disagree — so a fold collision
+    /// upstream made the next value unrecordable and severed the chain.
+    #[test]
+    fn a_fold_collision_does_not_sever_the_taint_chain() {
+        assert!(body_destroys_datastore(
+            "p=~/.openfang/data/openfang.db\nP=/tmp/x\nq=$p\nrm -f \"$q\"\n"
+        ));
+    }
+
+    /// Round-20 T6. The cross-product abandoned a reference past the cap and
+    /// left it literal — which reads as "gave up" to `cd_target` and as
+    /// nothing at all to the arms that OR, with no report either way. Four
+    /// colliding names is a product of sixteen and a sum of five.
+    #[test]
+    fn colliding_names_do_not_exhaust_the_readings_cap() {
+        assert!(body_destroys_datastore(concat!(
+            "a=~\nA=/tmp/a\n",
+            "b=/.openfang\nB=/tmp/b\n",
+            "c=/data\nC=/tmp/c\n",
+            "d=/openfang.db\nD=/tmp/d\n",
+            "rm -f \"$a$b$c$d\"\n"
+        )));
     }
 
     /// Round-19 S1. Two spellings of one folded name are two *readings* of the
