@@ -2619,33 +2619,120 @@ pub fn strip_shell_comments(command: &str) -> String {
     out
 }
 
-fn strip_line_comment(line: &str) -> &str {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev_is_boundary = true; // line start counts as a boundary
-    let mut prev_backslash = false;
+/// The quoting context a character sits in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellQuote {
+    None,
+    /// `'…'` — no escapes, no expansion.
+    Single,
+    /// `$'…'` — ANSI-C quoting, which *does* process `\` escapes.
+    AnsiC,
+    /// `"…"`.
+    Double,
+}
 
-    for (idx, c) in line.char_indices() {
-        if prev_backslash {
-            prev_backslash = false;
-            prev_is_boundary = false;
-            continue;
+/// One character of a shell line, as the single scanner reads it.
+struct ShellChar {
+    idx: usize,
+    ch: char,
+    /// The quoting context this character is *in*, before it acts.
+    quote: ShellQuote,
+    /// Preceded by an active backslash, so it is a literal.
+    escaped: bool,
+    /// The previous significant character was whitespace, or this is the start
+    /// of the line — what makes a `#` a comment introducer.
+    boundary: bool,
+}
+
+/// The one quote-and-comment scanner every quote-sensitive pass in this module
+/// shares.
+///
+/// # Round-22 surface 4 — four parsers, two of which disagreed
+///
+/// Before this there were three hand-rolled quote scanners
+/// ([`strip_line_comment`], [`mask_quoted_separators`], [`ends_inside_quote`])
+/// plus a fourth implicit decision inside [`strip_continuation`], which read
+/// backslash parity with no idea what a comment was. Two of the four
+/// disagreed with each other and both disagreements were hard-floor bypasses:
+///
+/// - **V1** — `strip_continuation` ran *before* comment awareness, so a
+///   backslash inside a `#` comment — inert to the shell — folded the next
+///   line up into the comment and swallowed the statement on it.
+/// - **V2** — the masker's `'` was a plain toggle, so bash ANSI-C quoting
+///   (`$'a\'b'`, where `\'` is a literal quote and the string continues)
+///   closed early here. The region bash reads as string data was read here as
+///   code, and a `;` in it became a statement boundary — round-21 U1 through a
+///   different door.
+///
+/// The lesson this ticket keeps re-learning is that a second predicate written
+/// against the same text is a second grammar, and grammars drift. So this is
+/// the only place that decides what is quoted, what is escaped, and where a
+/// comment starts; the passes below are projections of its output.
+///
+/// Deliberate over-approximation: inside `"…"` bash treats `\` as an escape
+/// only before `$ \` `` ` `` `"` and newline. Treating it as a general escape
+/// can only make a separator *less* likely to be read as code, which is the
+/// safe direction here.
+fn scan_shell(line: &str) -> (Vec<ShellChar>, ShellQuote) {
+    let mut out = Vec::with_capacity(line.len());
+    let mut quote = ShellQuote::None;
+    let mut escaped = false;
+    let mut boundary = true; // line start counts as a boundary
+    let mut prev_dollar = false;
+
+    for (idx, ch) in line.char_indices() {
+        let facts = ShellChar {
+            idx,
+            ch,
+            quote,
+            escaped,
+            boundary,
+        };
+        let was_escaped = escaped;
+        if escaped {
+            escaped = false;
+            boundary = false;
+        } else {
+            match ch {
+                '\\' if quote != ShellQuote::Single => {
+                    escaped = true;
+                    boundary = false;
+                }
+                '\'' if quote == ShellQuote::None => {
+                    quote = if prev_dollar {
+                        ShellQuote::AnsiC
+                    } else {
+                        ShellQuote::Single
+                    };
+                    boundary = false;
+                }
+                '\'' if quote == ShellQuote::Single || quote == ShellQuote::AnsiC => {
+                    quote = ShellQuote::None;
+                    boundary = false;
+                }
+                '"' if quote == ShellQuote::None => {
+                    quote = ShellQuote::Double;
+                    boundary = false;
+                }
+                '"' if quote == ShellQuote::Double => {
+                    quote = ShellQuote::None;
+                    boundary = false;
+                }
+                c if c.is_whitespace() && quote == ShellQuote::None => boundary = true,
+                _ => boundary = false,
+            }
         }
-        match c {
-            '\\' if !in_single => prev_backslash = true,
-            '\'' if !in_double => {
-                in_single = !in_single;
-                prev_is_boundary = false;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                prev_is_boundary = false;
-            }
-            '#' if !in_single && !in_double && prev_is_boundary => {
-                return &line[..idx];
-            }
-            c if c.is_whitespace() => prev_is_boundary = true,
-            _ => prev_is_boundary = false,
+        prev_dollar = ch == '$' && !was_escaped && facts.quote == ShellQuote::None;
+        out.push(facts);
+    }
+    (out, quote)
+}
+
+fn strip_line_comment(line: &str) -> &str {
+    let (chars, _) = scan_shell(line);
+    for c in &chars {
+        if c.ch == '#' && c.quote == ShellQuote::None && !c.escaped && c.boundary {
+            return &line[..c.idx];
         }
     }
     line
@@ -2685,31 +2772,14 @@ fn strip_line_comment(line: &str) -> &str {
 /// otherwise promote it.
 fn mask_quoted_separators(s: &str) -> String {
     const SEPARATORS: [char; 7] = [';', '&', '|', '\n', '`', '(', ')'];
+    let (chars, _) = scan_shell(s);
     let mut out = String::with_capacity(s.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev_backslash = false;
-    for c in s.chars() {
-        if prev_backslash {
-            prev_backslash = false;
-            out.push(if SEPARATORS.contains(&c) { ' ' } else { c });
-            continue;
-        }
-        match c {
-            '\\' if !in_single => {
-                prev_backslash = true;
-                out.push(c);
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-                out.push(c);
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                out.push(c);
-            }
-            c if (in_single || in_double) && SEPARATORS.contains(&c) => out.push(' '),
-            c => out.push(c),
+    for c in &chars {
+        let quoted = c.quote != ShellQuote::None || c.escaped;
+        if quoted && SEPARATORS.contains(&c.ch) {
+            out.push(' ');
+        } else {
+            out.push(c.ch);
         }
     }
     out
@@ -2723,22 +2793,7 @@ fn mask_quoted_separators(s: &str) -> String {
 /// the shell does with it — so the walker has to fold them into one logical
 /// line before [`mask_quoted_separators`] can see the region as quoted.
 fn ends_inside_quote(s: &str) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut prev_backslash = false;
-    for c in s.chars() {
-        if prev_backslash {
-            prev_backslash = false;
-            continue;
-        }
-        match c {
-            '\\' if !in_single => prev_backslash = true,
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            _ => {}
-        }
-    }
-    in_single || in_double
+    scan_shell(s).1 != ShellQuote::None
 }
 
 // ---------------------------------------------------------------------------
@@ -3130,8 +3185,32 @@ fn push_exec_statement(line: &mut LogicalLine, statement: &str) {
 }
 
 /// The line without its trailing continuation backslash, if it has one.
+///
+/// # Round-22 V1 — a backslash inside a comment is not a continuation
+///
+/// This read backslash parity off the raw line, and `logical_lines` called it
+/// *before* it stripped comments. A `#` comment is inert to the shell, so a
+/// backslash inside one continues nothing — but here it folded the next
+/// physical line up into the comment, and the statement on that line stopped
+/// existing:
+///
+/// ```text
+///   cd ~/.openfang/data # cleanup \
+///   rm -f openfang.db
+/// ```
+///
+/// One `LogicalLine`, whose comment tail the canonicaliser then removed. No
+/// `rm` segment ever reached the datastore arm, and the merged segment was
+/// read while the frame was still `Elsewhere`, so the relative operand named
+/// nothing either. Both hard floors clean, no obfuscation, and the amplifier
+/// is worse: an apostrophe in the comment (`# Ben's cleanup \`) opens a quote
+/// on the folded line and masks the real separators on the line it swallowed.
+///
+/// Comments are therefore read *first*, through the shared scanner, and the
+/// continuation is measured on what is left. Ordering, not parity, was the
+/// defect.
 fn strip_continuation(line: &str) -> Option<&str> {
-    let trimmed = line.trim_end_matches([' ', '\t', '\r']);
+    let trimmed = strip_line_comment(line).trim_end_matches([' ', '\t', '\r']);
     let backslashes = trimmed.chars().rev().take_while(|c| *c == '\\').count();
     if backslashes % 2 == 1 {
         Some(&trimmed[..trimmed.len() - 1])

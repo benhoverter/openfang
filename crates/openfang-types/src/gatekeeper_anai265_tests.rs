@@ -410,3 +410,65 @@ fn golden_update_permissive_judge_prompt() {
         .join("src/testdata/judge_system_prompt_permissive.txt");
     std::fs::write(path, permissive_golden_request().system_prompt()).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Round 22 — one scanner decides what is quoted, escaped, or commented
+// ---------------------------------------------------------------------------
+
+/// V1. A backslash inside a `#` comment continues nothing in the shell. Here
+/// it folded the next physical line up into the comment and the statement on
+/// that line stopped existing, which cleared both hard floors on three lines
+/// of ordinary shell.
+#[test]
+fn a_backslash_inside_a_comment_does_not_swallow_the_next_statement() {
+    assert!(body_destroys_datastore(
+        "cd ~/.openfang/data # cleanup \\\nrm -f openfang.db\n"
+    ));
+    // The amplifier: an apostrophe in the comment opened a quote on the folded
+    // line, which then masked the separators on the line it had swallowed.
+    assert!(body_destroys_datastore(
+        "cd ~/.openfang/data # Ben's cleanup \\\nrm -f openfang.db\n"
+    ));
+    assert!(body_destroys_substrate(
+        "cd ~/.openfang # note \\\nrm -rf agents\n"
+    ));
+}
+
+/// ...and a real continuation still folds, including one whose line carries a
+/// quoted `#` that is not a comment at all. V1's fix is about *ordering*, and
+/// an over-correction here would give back the split-verb-from-target bypass
+/// the folding exists to close.
+#[test]
+fn a_real_continuation_still_folds_across_a_quoted_hash() {
+    assert!(body_destroys_datastore(
+        "rm -f \\\n~/.openfang/data/openfang.db\n"
+    ));
+    assert!(body_destroys_datastore(
+        "echo 'step # 1' && rm -f \\\n~/.openfang/data/openfang.db\n"
+    ));
+}
+
+/// V2. Bash ANSI-C quoting processes escapes, so `\'` inside `$'…'` is a
+/// literal quote and the string keeps going. The masker read `'` as a plain
+/// toggle, closed the string early, and then treated the string data after it
+/// as code — so a `;` in a message became a statement boundary and the `cd`
+/// after it moved the frame. Round-21 U1 through a different door.
+#[test]
+fn ansi_c_quoting_does_not_promote_string_data_to_a_statement() {
+    assert!(body_destroys_datastore(
+        "cd ~/.openfang/data\necho $'a\\'b ; cd /tmp ; '\nrm -f openfang.db\n"
+    ));
+}
+
+/// ...and an *unquoted* separator still segments, which is the direction that
+/// costs nothing to get wrong and everything to over-correct. A `cd /tmp` the
+/// shell really runs must still move the frame.
+#[test]
+fn an_unquoted_separator_still_moves_the_frame() {
+    assert!(!body_destroys_datastore(
+        "cd ~/.openfang/data ; cd /tmp\nrm -f openfang.db\n"
+    ));
+    assert!(body_destroys_datastore(
+        "cd ~/.openfang/data ; rm -f openfang.db\n"
+    ));
+}
