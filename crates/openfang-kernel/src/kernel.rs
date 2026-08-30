@@ -11030,8 +11030,22 @@ impl KernelHandle for OpenFangKernel {
     /// route so `agent_send_async` can default the surfacing route to the
     /// caller's home channel. `agent_name`-keyed to match the binding table;
     /// delegates to the private helper that also feeds the prompt summary.
-    fn channel_binding_route(&self, agent_name: &str) -> Option<String> {
-        self.agent_channel_binding_route(agent_name)
+    ///
+    /// ANAI-265: accepts a UUID as well as a name. The binding table is
+    /// name-keyed, but `gatekeeper::review` is handed the agent's id string,
+    /// so a pure name comparison answered `None` for every agent — and
+    /// `resolve_posture` reads that as "unroutable" and downgrades the
+    /// permissive posture to strict. The shadow window would have recorded
+    /// strict verdicts for the whole fleet while reporting itself as
+    /// permissive. Name first (the ANAI-125 caller's contract, unchanged),
+    /// UUID resolved through the registry only on miss.
+    fn channel_binding_route(&self, agent_ref: &str) -> Option<String> {
+        if let Some(route) = self.agent_channel_binding_route(agent_ref) {
+            return Some(route);
+        }
+        let id: AgentId = agent_ref.parse().ok()?;
+        let name = self.registry.get(id)?.name.clone();
+        self.agent_channel_binding_route(&name)
     }
 
     /// ANAI-210: expose a target's effective tool set so `agent_send_async` can
