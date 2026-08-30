@@ -29,7 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use openfang_types::gatekeeper::{
-    GateFlags, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
+    GateFlags, GatePosture, GateRequest, GateVerdict, JudgeOutcome, DEFAULT_POLICY,
+    DEFAULT_POLICY_PERMISSIVE,
 };
 
 /// What the caller of the gate should do next.
@@ -177,12 +178,22 @@ pub struct GateCounters {
     pub escalate: u64,
     pub deny: u64,
     pub shadow_deny: u64,
+    /// ANAI-265 N1: suppressions the judge wanted, counted while `shadow` is
+    /// still on, that had a channel route to post to. This is the volume the
+    /// operator would have received per day had the posture been live.
+    pub shadow_notify_would_post: u64,
+    /// ANAI-265 N1: the same, for an agent with **no** route. Every one of
+    /// these is a suppression that would have happened with no human-visible
+    /// artifact, which is the number N2 exists to hold at zero.
+    pub shadow_notify_no_route: u64,
 }
 
 static SUPPRESS_COUNT: AtomicU64 = AtomicU64::new(0);
 static ESCALATE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DENY_COUNT: AtomicU64 = AtomicU64::new(0);
 static SHADOW_DENY_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHADOW_NOTIFY_WOULD_POST_COUNT: AtomicU64 = AtomicU64::new(0);
+static SHADOW_NOTIFY_NO_ROUTE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot the gate counters.
 ///
@@ -195,6 +206,8 @@ pub fn counters() -> GateCounters {
         escalate: ESCALATE_COUNT.load(Ordering::Relaxed),
         deny: DENY_COUNT.load(Ordering::Relaxed),
         shadow_deny: SHADOW_DENY_COUNT.load(Ordering::Relaxed),
+        shadow_notify_would_post: SHADOW_NOTIFY_WOULD_POST_COUNT.load(Ordering::Relaxed),
+        shadow_notify_no_route: SHADOW_NOTIFY_NO_ROUTE_COUNT.load(Ordering::Relaxed),
     }
 }
 
@@ -207,9 +220,20 @@ pub fn counters() -> GateCounters {
 /// exists to close. One read at first use, and changing the policy means
 /// bouncing the daemon, which is the correct cost for editing a security
 /// control.
-fn policy_text() -> &'static str {
-    static POLICY: OnceLock<String> = OnceLock::new();
-    POLICY.get_or_init(|| {
+fn policy_text(posture: GatePosture) -> &'static str {
+    static POLICY: OnceLock<Option<String>> = OnceLock::new();
+    let compiled_in = match posture {
+        GatePosture::Strict => DEFAULT_POLICY,
+        GatePosture::Permissive => DEFAULT_POLICY_PERMISSIVE,
+    };
+    // ANAI-265. The operator file, when present, still wins in both postures —
+    // an operator who wrote `gatekeeper.md` meant it. What the posture selects
+    // is which compiled-in text stands in when there is no file, and those two
+    // must not be interchangeable: `DEFAULT_POLICY` ends with "anything whose
+    // effect you cannot predict from the text alone: ESCALATE", which is
+    // appended verbatim below the permissive rules and would silently reinstate
+    // the strict burden underneath them.
+    let from_disk = POLICY.get_or_init(|| {
         let path = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .map(|home| std::path::PathBuf::from(home).join(".openfang/gatekeeper.md"));
@@ -221,13 +245,14 @@ fn policy_text() -> &'static str {
                         path = %p.display(),
                         "Gatekeeper policy loaded from disk"
                     );
-                    text
+                    Some(text)
                 }
-                _ => DEFAULT_POLICY.to_string(),
+                _ => None,
             },
-            Err(_) => DEFAULT_POLICY.to_string(),
+            Err(_) => None,
         }
-    })
+    });
+    from_disk.as_deref().unwrap_or(compiled_in)
 }
 
 /// Compose the request the judge sees.
@@ -241,6 +266,7 @@ pub async fn build_gate_request(
     policy: &openfang_types::config::ExecPolicy,
     workspace_root: Option<&std::path::Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
+    posture: GatePosture,
 ) -> GateRequest {
     let command = openfang_types::gatekeeper::strip_shell_comments(raw_command);
     let workspace = workspace_root.map(|p| p.display().to_string());
@@ -292,6 +318,10 @@ pub async fn build_gate_request(
         // is the question, not what survives comment stripping. OR'd with the
         // script-body answer below.
         substrate_destruction: openfang_types::gatekeeper::destroys_substrate(raw_command),
+        // ANAI-265. The scary-moment class, and the one hard predicate added
+        // alongside the permissive posture. Computed on `raw_command` like its
+        // siblings: what the agent wrote is the question.
+        datastore_destruction: openfang_types::gatekeeper::destroys_datastore(raw_command),
         // ANAI-206 commit 6. Pre-existing control, kept alive across the
         // demotion of `touches_control_plane`: a write to the judge's own
         // instructions is not a question the judge can be asked.
@@ -334,6 +364,12 @@ pub async fn build_gate_request(
         .script_body
         .as_ref()
         .is_some_and(|b| b.destroys_substrate);
+
+    // ANAI-265. Same `|=`, same reason.
+    flags.datastore_destruction |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.destroys_datastore);
 
     // ANAI-206 commit 9, C6-3. The other three hard flags, one level down.
     //
@@ -384,8 +420,156 @@ pub async fn build_gate_request(
         trusted_commands: policy.trusted_commands.clone(),
         allowed_commands: policy.allowed_commands.clone(),
         flags,
-        policy: policy_text().to_string(),
+        policy: policy_text(posture).to_string(),
         path_facts,
+        posture,
+    }
+}
+
+/// Max characters of command text put on the operator's channel.
+///
+/// The audit row is the record and is never truncated; this is a notification,
+/// and a 4KB script pasted into a chat channel is how a notification stream
+/// becomes something nobody reads — which is the exact failure this whole
+/// posture exists to stop repeating one layer up.
+const NOTIFY_COMMAND_CHARS: usize = 240;
+
+/// ANAI-265: tell the operator about a command that ran without asking them.
+///
+/// # Why this is part of the permissive posture and not a nicety
+///
+/// Inverting the judge's burden trades a click for a risk. What makes that a
+/// good trade rather than merely a cheap one is that the operator keeps
+/// *visibility* — the suppression becomes unprompted, not unseen. Without this
+/// the permissive posture is indistinguishable from turning the gate off, and
+/// the incident that motivated the posture (a database delete the operator
+/// caught only because he was looking at a prompt) would have become invisible
+/// rather than merely un-clicked.
+///
+/// Fire-and-forget, on its own task. A notification must never add latency to
+/// the path it reports on, and must never be able to fail a command: a channel
+/// adapter that is down, rate-limited, or simply absent degrades to a log line
+/// and the audit row, both of which already happened before this is called.
+///
+/// The route is resolved by the caller, not here. ANAI-265 N2: `review()` needs
+/// the answer *before* it picks a posture, because an agent with no route does
+/// not get the permissive posture at all. Taking it as a parameter is what
+/// keeps the two decisions reading the same binding.
+///
+/// Still a no-op with no route, but that is now a belt rather than the policy:
+/// under the permissive posture it is unreachable, and under strict a
+/// suppression only happens if the model asked for one.
+fn notify_suppression(
+    kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
+    route: Option<&str>,
+    agent_id: &str,
+    command: &str,
+    correlation_id: &str,
+    floor: &str,
+) {
+    let Some(route) = route else {
+        return;
+    };
+    let Some((channel, recipient)) = route.split_once(':') else {
+        tracing::warn!(
+            target: "openfang::gatekeeper",
+            route = %route,
+            "Channel binding route is not <channel>:<recipient>; suppression not surfaced"
+        );
+        return;
+    };
+
+    let shown: String = if command.chars().count() > NOTIFY_COMMAND_CHARS {
+        command
+            .chars()
+            .take(NOTIFY_COMMAND_CHARS)
+            .collect::<String>()
+            + " […]"
+    } else {
+        command.to_string()
+    };
+    // Backticks, not a fenced block: this lands in a chat channel where a
+    // multi-line fence per suppressed command would bury the next one.
+    // Newlines inside the command would break the inline span, so they fold.
+    let shown = shown.replace(['\n', '\r'], " ⏎ ");
+    let message = format!(
+        "🜂 gatekeeper suppressed (`{}` · gk={} · floor={})\n`{}`",
+        agent_id, correlation_id, floor, shown
+    );
+
+    let kernel = kernel.clone();
+    let channel = channel.to_string();
+    let recipient = recipient.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = kernel
+            .send_channel_message(&channel, &recipient, &message, None, None)
+            .await
+        {
+            tracing::warn!(
+                target: "openfang::gatekeeper",
+                channel = %channel,
+                error = %e,
+                "Failed to surface a gatekeeper suppression to the operator"
+            );
+        }
+    });
+}
+
+/// `notify=` tokens for the §5 log line and the audit row. ANAI-265 N1.
+pub(crate) const NOTIFY_POSTED: &str = "posted";
+pub(crate) const NOTIFY_NO_ROUTE: &str = "no-route";
+pub(crate) const NOTIFY_SHADOW_WOULD_POST: &str = "shadow-would-post";
+pub(crate) const NOTIFY_SHADOW_NO_ROUTE: &str = "shadow-no-route";
+pub(crate) const NOTIFY_NA: &str = "n/a";
+
+/// ANAI-265 N2: which posture this review actually runs under.
+///
+/// The permissive posture's justification is that a suppression becomes
+/// unprompted, never *unseen*. For an agent with no channel binding —
+/// cron-triggered, daemon-spawned, unbound — there is nothing to see, and the
+/// notification degraded to a silent no-op for exactly the agents nobody is
+/// watching. An unroutable agent therefore does not get the permissive posture
+/// at all: one line, and the invariant becomes true rather than aspirational.
+fn resolve_posture(configured: GatePosture, has_route: bool) -> GatePosture {
+    if has_route {
+        configured
+    } else {
+        GatePosture::Strict
+    }
+}
+
+/// ANAI-265 N1: what happened, or would have happened, to the notification.
+///
+/// `review()` reaches `notify_suppression` only on `effective == Suppress`, and
+/// in shadow `effective` is never `Suppress`. So a shadow validation run
+/// exercises the notification path zero times and tells the flip decision
+/// nothing about the one control that makes this posture better than turning
+/// the gate off. This is the counting half.
+///
+/// `shadow-no-route` is the row worth watching: `resolve_posture` holds it at
+/// zero for the permissive posture by construction, so a non-zero count is
+/// either a strict-posture suppression or a bug in that downgrade — and either
+/// way it is a suppression that would have left no human-visible artifact.
+fn notify_state(
+    effective: GateVerdict,
+    verdict: GateVerdict,
+    shadow: bool,
+    has_route: bool,
+) -> &'static str {
+    if effective == GateVerdict::Suppress {
+        if has_route {
+            NOTIFY_POSTED
+        } else {
+            NOTIFY_NO_ROUTE
+        }
+    } else if shadow && verdict == GateVerdict::Suppress {
+        if has_route {
+            NOTIFY_SHADOW_WOULD_POST
+        } else {
+            NOTIFY_SHADOW_NO_ROUTE
+        }
+    } else {
+        NOTIFY_NA
     }
 }
 
@@ -394,6 +578,10 @@ pub async fn build_gate_request(
 /// Returns `None` when the gate does not apply (disabled, non-shell tool, no
 /// exec policy, no command) — the caller then behaves exactly as it did before
 /// ANAI-154.
+//
+// (Helpers for N1/N2 live immediately above so they can be unit-tested without
+// a `KernelHandle`; `review()` itself has no mock and is exercised end-to-end
+// only by the live daemon.)
 pub async fn review(
     kernel: &std::sync::Arc<dyn crate::kernel_handle::KernelHandle>,
     agent_id: &str,
@@ -414,7 +602,27 @@ pub async fn review(
     let policy = exec_policy?;
     let raw_command = input.get("command").and_then(|v| v.as_str())?;
 
-    let req = build_gate_request(agent_id, raw_command, policy, workspace_root, file_policy).await;
+    // ANAI-265 N2. The permissive posture's whole justification is that a
+    // suppression becomes unprompted, never *unseen*. For an agent with no
+    // channel binding — cron-triggered, daemon-spawned, unbound — there is
+    // nothing to see, and the original code degraded to a silent no-op for
+    // exactly the agents nobody is watching. Rather than leave the invariant
+    // aspirational, an unroutable agent does not get the permissive posture at
+    // all. Resolved before the request is built, so the judge is handed the
+    // prompt it is actually being judged by.
+    let route = kernel.channel_binding_route(agent_id);
+    let configured_posture = kernel.gatekeeper_posture();
+    let posture = resolve_posture(configured_posture, route.is_some());
+    let posture_downgraded = posture != configured_posture;
+    let req = build_gate_request(
+        agent_id,
+        raw_command,
+        policy,
+        workspace_root,
+        file_policy,
+        posture,
+    )
+    .await;
     let floor = req.floor();
 
     let started = std::time::Instant::now();
@@ -470,6 +678,28 @@ pub async fn review(
     let det_eligible = req.path_facts.suppress_eligible();
     let det_disagree = verdict == GateVerdict::Suppress && !det_eligible;
 
+    // ANAI-265 N1. `review()` reaches `notify_suppression` only on
+    // `effective == Suppress`, and in shadow `effective` is never `Suppress` —
+    // so a shadow validation run exercises the notification path zero times and
+    // tells the flip decision nothing about the one control that makes this
+    // posture better than turning the gate off. This is the counting half: what
+    // would have been posted, to a route or to nothing, and how often.
+    //
+    // `shadow-no-route` is the row that matters. N2 holds it at zero for the
+    // permissive posture by construction; a non-zero count here is either a
+    // strict-posture suppression or a bug in that downgrade, and either way it
+    // is a suppression that would have left no human-visible artifact.
+    let notify = notify_state(effective, verdict, shadow, route.is_some());
+    match notify {
+        NOTIFY_SHADOW_WOULD_POST => {
+            SHADOW_NOTIFY_WOULD_POST_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        NOTIFY_SHADOW_NO_ROUTE => {
+            SHADOW_NOTIFY_NO_ROUTE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
     // §5 logging contract. FULL command, never truncated: this log IS the
     // review mechanism for every command the judge suppresses, so a truncation
     // here is a hole in the audit trail, not a cosmetic choice.
@@ -479,6 +709,9 @@ pub async fn review(
         gk = %correlation_id,
         verdict = %verdict.as_log_token(),
         shadow = %shadow,
+        posture = %posture.as_log_token(),
+        posture_downgraded = %posture_downgraded,
+        notify = %notify,
         latency_ms = %latency_ms,
         consulted_model = %consulted,
         judge = %outcome.as_log_token(),
@@ -539,7 +772,7 @@ pub async fn review(
         agent_id,
         raw_command,
         &format!(
-            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={}",
+            "gk={} tool=shell_exec consulted_model={} judge={} latency_ms={} floor={} paths=[{}] det={} det_disagree={} posture={} notify={}",
             correlation_id,
             consulted,
             outcome.as_log_token(),
@@ -547,7 +780,9 @@ pub async fn review(
             req.flags.as_log_string(),
             req.path_facts.as_log_token(),
             if det_eligible { "eligible" } else { "ineligible" },
-            det_disagree
+            det_disagree,
+            posture.as_log_token(),
+            notify
         ),
         // ANAI-187: a shadow verdict carries a `shadow_` prefix. Two reasons,
         // both load-bearing. A reader of the chain must never mistake an
@@ -563,6 +798,21 @@ pub async fn review(
             verdict.as_log_token().to_string()
         },
     );
+
+    // ANAI-265. Surfaced only for a suppression that actually happened —
+    // `effective`, never `verdict`. In shadow every command still prompts, and
+    // posting "suppressed" next to a live approval button would be a false
+    // statement about what the daemon did.
+    if effective == GateVerdict::Suppress {
+        notify_suppression(
+            kernel,
+            route.as_deref(),
+            agent_id,
+            raw_command,
+            &correlation_id,
+            &req.flags.as_log_string(),
+        );
+    }
 
     Some(GateDecision {
         correlation_id,
@@ -605,6 +855,64 @@ mod tests {
         }
     }
 
+    /// ANAI-265 N2. "Unprompted, never unseen" is the sentence the permissive
+    /// posture is sold on. An agent with no channel route has nowhere to be
+    /// seen, so it does not get the posture — the invariant is enforced, not
+    /// hoped for.
+    #[test]
+    fn an_agent_with_no_channel_route_does_not_get_the_permissive_posture() {
+        assert_eq!(
+            resolve_posture(GatePosture::Permissive, false),
+            GatePosture::Strict
+        );
+        assert_eq!(
+            resolve_posture(GatePosture::Permissive, true),
+            GatePosture::Permissive
+        );
+        // The downgrade only ever tightens. A strict operator setting is never
+        // loosened by the presence of a route.
+        assert_eq!(
+            resolve_posture(GatePosture::Strict, true),
+            GatePosture::Strict
+        );
+        assert_eq!(
+            resolve_posture(GatePosture::Strict, false),
+            GatePosture::Strict
+        );
+    }
+
+    /// ANAI-265 N1. The census the shadow run needs and did not have: in shadow
+    /// `effective` is never `Suppress`, so without this the notification path
+    /// is exercised zero times and measured zero times.
+    #[test]
+    fn the_shadow_run_counts_the_notifications_it_cannot_send() {
+        use GateVerdict::{Escalate, Suppress};
+
+        // Live suppression: posted, or — under N2, unreachable while permissive
+        // — not.
+        assert_eq!(notify_state(Suppress, Suppress, false, true), NOTIFY_POSTED);
+        assert_eq!(
+            notify_state(Suppress, Suppress, false, false),
+            NOTIFY_NO_ROUTE
+        );
+
+        // Shadow: the judge asked for a suppression, the daemon prompted
+        // anyway. This is the volume the operator would have received.
+        assert_eq!(
+            notify_state(Escalate, Suppress, true, true),
+            NOTIFY_SHADOW_WOULD_POST
+        );
+        assert_eq!(
+            notify_state(Escalate, Suppress, true, false),
+            NOTIFY_SHADOW_NO_ROUTE
+        );
+
+        // A genuine escalation is not a notification event in either mode, and
+        // an escalation outside shadow is not a suppression the judge wanted.
+        assert_eq!(notify_state(Escalate, Escalate, true, true), NOTIFY_NA);
+        assert_eq!(notify_state(Escalate, Escalate, false, true), NOTIFY_NA);
+    }
+
     #[tokio::test]
     async fn benign_command_has_a_clear_floor() {
         let req = build_gate_request(
@@ -613,6 +921,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(!req.flags.any(), "flags: {}", req.flags.as_log_string());
@@ -627,6 +936,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.touches_control_plane);
@@ -642,6 +952,7 @@ mod tests {
             &policy(),
             None,
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(!req.command.contains("approved by Ben"));
@@ -651,7 +962,15 @@ mod tests {
 
     #[tokio::test]
     async fn network_binary_hits_the_floor() {
-        let req = build_gate_request("a", "curl https://example.com", &policy(), None, None).await;
+        let req = build_gate_request(
+            "a",
+            "curl https://example.com",
+            &policy(),
+            None,
+            None,
+            GatePosture::Strict,
+        )
+        .await;
         assert!(req.flags.network_binary);
         // ANAI-206 commit 6: the flag still fires, but a network binary is a
         // fact the judge weighs, not a bypass. `curl` fetching a public URL and
@@ -670,7 +989,8 @@ mod tests {
         // belt to that braces, and it is the arm that matters most, because a
         // parse failure yielding an empty `bases` list would otherwise look
         // exactly like a command with nothing dangerous in it.
-        let req = build_gate_request("a", "bash -i", &policy(), None, None).await;
+        let req =
+            build_gate_request("a", "bash -i", &policy(), None, None, GatePosture::Strict).await;
         assert!(
             req.flags.parse_failed,
             "expected extraction to fail, flags: {}",
@@ -681,7 +1001,15 @@ mod tests {
 
     #[tokio::test]
     async fn inner_commands_are_first_class() {
-        let req = build_gate_request("a", "bash -c \"rm -rf /tmp/x\"", &policy(), None, None).await;
+        let req = build_gate_request(
+            "a",
+            "bash -c \"rm -rf /tmp/x\"",
+            &policy(),
+            None,
+            None,
+            GatePosture::Strict,
+        )
+        .await;
         assert!(
             req.flags.destructive_verb,
             "inner rm must be seen as a command, not a string argument: {:?}",
@@ -703,6 +1031,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -723,6 +1052,7 @@ mod tests {
             &policy(),
             None,
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.fence_escape);
@@ -741,6 +1071,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -765,9 +1096,15 @@ mod tests {
             "git log --oneline -20",
             "git diff HEAD",
         ] {
-            let req =
-                build_gate_request("a", cmd, &policy(), Some(std::path::Path::new("/ws")), None)
-                    .await;
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
             assert!(!req.flags.any(), "{cmd} → {}", req.flags.as_log_string());
         }
     }
@@ -780,6 +1117,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -803,6 +1141,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -831,6 +1170,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(
@@ -857,6 +1197,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.touches_control_plane);
@@ -875,6 +1216,7 @@ mod tests {
             &policy(),
             Some(std::path::Path::new("/ws")),
             None,
+            GatePosture::Strict,
         )
         .await;
         assert!(req.flags.destructive_verb);
@@ -887,9 +1229,15 @@ mod tests {
     #[tokio::test]
     async fn a_bare_root_wipe_never_reaches_the_judge() {
         for cmd in ["rm -rf ~/.openfang", "rm -rf ~/.openfang/agents"] {
-            let req =
-                build_gate_request("a", cmd, &policy(), Some(std::path::Path::new("/ws")), None)
-                    .await;
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
             assert!(
                 req.flags.substrate_destruction,
                 "{cmd} → {}",

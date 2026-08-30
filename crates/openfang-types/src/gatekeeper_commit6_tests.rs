@@ -268,6 +268,7 @@ fn golden_request() -> GateRequest {
             ..Default::default()
         },
         policy: DEFAULT_POLICY.to_string(),
+        posture: GatePosture::Strict,
         path_facts: crate::path_facts::PathFactSheet::default(),
     }
 }

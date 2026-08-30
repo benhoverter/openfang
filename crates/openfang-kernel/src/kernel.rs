@@ -12142,6 +12142,11 @@ impl KernelHandle for OpenFangKernel {
         self.config.gatekeeper.shadow
     }
 
+    /// ANAI-265: the operator's declared burden of proof.
+    fn gatekeeper_posture(&self) -> openfang_types::gatekeeper::GatePosture {
+        self.config.gatekeeper.posture
+    }
+
     /// ANAI-154: single-shot judge for one gated `shell_exec`.
     ///
     /// Shape is `compactor::compact_session`, not an agent: one

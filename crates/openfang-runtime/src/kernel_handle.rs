@@ -626,6 +626,17 @@ pub trait KernelHandle: Send + Sync {
         false
     }
 
+    /// ANAI-265: which way the burden of proof runs at the judge.
+    ///
+    /// A runtime concern for the same reason `gatekeeper_shadow` is: the
+    /// kernel makes the model call, the runtime decides what the call is
+    /// about. Defaults to `Strict` so every existing test double and host shim
+    /// compiles untouched and, more importantly, so the *absence* of an answer
+    /// is never read as consent to a looser posture.
+    fn gatekeeper_posture(&self) -> openfang_types::gatekeeper::GatePosture {
+        openfang_types::gatekeeper::GatePosture::Strict
+    }
+
     /// ANAI-186: append one gatekeeper verdict to the Merkle audit chain.
     ///
     /// The gatekeeper's `tracing::info!` is not a ledger. The daemon's stderr

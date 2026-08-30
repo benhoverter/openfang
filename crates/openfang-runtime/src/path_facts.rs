@@ -133,6 +133,7 @@ fn read_script_body(
         body_unresolved: false,
         writes_control_plane: false,
         destroys_substrate: false,
+        destroys_datastore: false,
         writes_gatekeeper_policy: false,
         writes_agent_config: false,
         writes_runtime_config: false,
@@ -299,6 +300,9 @@ fn read_script_body(
     // substrate on line 40 of the file this command runs bypasses the judge for
     // exactly the same reason it does on the command line.
     body.destroys_substrate = openfang_types::gatekeeper::body_destroys_substrate(&text);
+    // ANAI-265. Same argument, one class down: a datastore deletion inside the
+    // body bypasses the command-line predicate by being in a file.
+    body.destroys_datastore = openfang_types::gatekeeper::body_destroys_datastore(&text);
     // ANAI-206 commit 9, C6-3. The other three hard flags, which commit 6 and
     // commit 8 both left scoped to the command line. A hard flag that stops at
     // the command line has a one-line bypass — put the line in a file and run
