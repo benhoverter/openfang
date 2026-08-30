@@ -591,9 +591,26 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
         frame_blind: false,
     };
     for line in lines {
-        for unit in walk_units(&line.text) {
+        // Round-18 R2: `argv`, not `text`. A heredoc payload is data this line
+        // writes, not statements this line runs.
+        let mut prev_segments: Vec<String> = Vec::new();
+        for unit in walk_units(&line.argv) {
             let lowered = lower_for_segments(&unit);
-            for (segment, pipeline) in segments_with_pipelines(&lowered) {
+            // Round-18 R1: the case-preserving twin, folded identically.
+            // Lowercasing changes no separator, so the two segment vectors are
+            // structurally identical and index-aligned.
+            let cased = fold_clobber_redirect(&unit);
+            let segments = segments_with_pipelines(&lowered);
+            let cased_segments = segments_with_pipelines(&cased);
+            // Round-18 R3.
+            let replay = overlap_prefix(&prev_segments, &segments);
+            prev_segments = segments.iter().map(|(s, _)| (*s).to_string()).collect();
+            for (idx, (segment, pipeline)) in segments.into_iter().enumerate() {
+                let replayed = idx < replay;
+                let cased_tokens: Vec<&str> = cased_segments
+                    .get(idx)
+                    .map(|(s, _)| s.split_whitespace().collect())
+                    .unwrap_or_default();
                 let tokens: Vec<&str> = segment.split_whitespace().collect();
                 if tokens.is_empty() {
                     continue;
@@ -626,7 +643,9 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // will see — so evaluate against both and take either. One
                 // clone per segment.
                 let pre = tainted.clone();
-                taint_from_segment(&tokens, &mut tainted, frame.inside());
+                if !replayed {
+                    taint_from_segment(&tokens, &cased_tokens, &mut tainted, frame.inside());
+                }
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
                 let blind = frame.kind == Cwd::Unknown;
@@ -665,20 +684,22 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 {
                     hits.destroys = true;
                 }
-                match cd_target(&tokens, &frame, &tainted) {
-                    // `cd -`: the walker holds the previous frame, so this is a
-                    // swap rather than a guess. Swapping (not overwriting) also
-                    // makes `cd -; cd -` return where it started, as a shell
-                    // does.
-                    Some(CdMove::Back) => {
-                        core::mem::swap(&mut frame, &mut prev);
-                        continue;
+                if let Some(mv) = cd_target(&tokens, &frame, &tainted) {
+                    // Round-18 R3: a replayed segment already moved the frame
+                    // in the previous chunk. `cd ..` is not idempotent.
+                    if !replayed {
+                        match mv {
+                            // `cd -`: the walker holds the previous frame, so
+                            // this is a swap rather than a guess. Swapping (not
+                            // overwriting) also makes `cd -; cd -` return where
+                            // it started, as a shell does.
+                            CdMove::Back => core::mem::swap(&mut frame, &mut prev),
+                            CdMove::To(next) => {
+                                prev = core::mem::replace(&mut frame, next);
+                            }
+                        }
                     }
-                    Some(CdMove::To(next)) => {
-                        prev = core::mem::replace(&mut frame, next);
-                        continue;
-                    }
-                    None => {}
+                    continue;
                 }
                 // Round-12 J4. `skip(1)` was the position assumption W1 removed
                 // everywhere else, left in the one place it happened to be
@@ -802,7 +823,16 @@ fn datastore_target(inside: bool, substrate: bool, tainted: &Taint) -> impl Fn(&
 /// ANAI-206 F7 for the third time. Chunking keeps the walk evaluating rather
 /// than silently ending mid-body. The chunks overlap and are yielded in order,
 /// so a `cd` and the command it laundered cannot be separated by a boundary and
-/// re-walking the overlap only re-applies frames that were already correct.
+/// a `cd` and the command it laundered cannot be separated by a boundary.
+///
+/// # Round-18 R3 — the overlap is not free
+///
+/// Re-walking it is idempotent for an absolute `cd` and for an assignment, and
+/// *not* for a relative one: `cd ..` applied twice pops twice, and a second pop
+/// out of `~/.openfang/data` leaves `Frame::elsewhere()`. Fail-open, inside an
+/// over-cap line whose padding and placement the attacker controls. The walker
+/// therefore replays already-evaluated segments for their arms only — see
+/// [`overlap_prefix`].
 fn walk_units(text: &str) -> Vec<String> {
     if text.chars().count() <= crate::cmd_norm::MAX_NORMALIZE_INPUT {
         return vec![crate::cmd_norm::canonical(text)];
@@ -811,6 +841,51 @@ fn walk_units(text: &str) -> Vec<String> {
         .iter()
         .map(|chunk| crate::cmd_norm::canonical(chunk))
         .collect()
+}
+
+/// How many leading segments of `cur` were already evaluated as the tail of
+/// `prev` — the overlap [`overcap_chunks`] deliberately introduces.
+///
+/// The longest suffix of `prev` that is a prefix of `cur`, bounded by
+/// [`OVERCAP_CHUNK_OVERLAP`] characters so a body that genuinely repeats a
+/// segment cannot be talked into skipping more than the overlap can hold. A
+/// segment torn by the chunk boundary is truncated in `prev` and whole in
+/// `cur`, so it does not match and is not skipped — which is the whole reason
+/// the overlap exists.
+fn overlap_prefix(prev: &[String], cur: &[(&str, &str)]) -> usize {
+    // A chunk boundary lands mid-text, so the previous chunk ends in a
+    // separator artifact (an empty segment) or a torn one, and this chunk may
+    // open with the tail of a segment that was whole in neither. Neither is a
+    // replay: trim the empties, and allow the match to start one segment in so
+    // a leading fragment does not defeat it. A *torn* segment cannot match its
+    // whole self, which is exactly the behaviour the overlap exists for.
+    let mut plen = prev.len();
+    while plen > 0 && prev[plen - 1].trim().is_empty() {
+        plen -= 1;
+    }
+    for off in 0..2usize {
+        if off >= cur.len() {
+            break;
+        }
+        let max = plen.min(cur.len() - off);
+        for k in (1..=max).rev() {
+            let width: usize = cur[off..off + k]
+                .iter()
+                .map(|(s, _)| s.chars().count() + 1)
+                .sum();
+            if width > OVERCAP_CHUNK_OVERLAP {
+                continue;
+            }
+            if prev[plen - k..plen]
+                .iter()
+                .zip(cur[off..off + k].iter())
+                .all(|(a, (b, _))| a == b)
+            {
+                return off + k;
+            }
+        }
+    }
+    0
 }
 
 /// What a `cd` segment does to the frame.
@@ -1139,7 +1214,21 @@ impl Taint {
     /// overwrites, so `d=~/.openfang/agents; d=/tmp/x` no longer expands to the
     /// value it used to have.
     fn record_value(&mut self, name: &str, value: &str) {
-        let name = name.to_ascii_lowercase();
+        // Round-18 R1. Keys are case-*preserved*. Shell variable names are
+        // case-sensitive and `F` is not `f`; folding them meant an unrelated
+        // uppercase assignment `retain`ed away a tainted value:
+        //
+        // ```text
+        //   f=~/.openfang/data/openfang.db
+        //   F=/tmp/x
+        //   rm -f "$f"          # removes the datastore
+        // ```
+        //
+        // Both hard floors went clean, in three plain lines. Path comparison
+        // still folds (APFS); variable identity never does. Lookup is in
+        // [`Taint::lookup`], which is where the walker's own lowering of the
+        // command text is dealt with.
+        let name = name.to_string();
         let value = self.expand(value);
         // A value we could not fully expand is not a path we can `cd` to. Drop
         // it — and drop any earlier value for the same name with it, or the
@@ -1160,7 +1249,9 @@ impl Taint {
     }
 
     fn record_name(&mut self, name: &str) {
-        let name = name.to_ascii_lowercase();
+        // Round-18 R1: case-preserved like `values`. [`references_tainted`]
+        // compares case-insensitively, which is the over-fire direction.
+        let name = name.to_string();
         if !self.names.contains(&name) {
             self.names.push(name);
         }
@@ -1175,6 +1266,40 @@ impl Taint {
     /// Unknown names are left exactly as written, so the result still carries a
     /// `$` and the caller can tell "resolved" from "gave up" — which is the
     /// whole distinction between [`Cwd::Elsewhere`] and [`Cwd::Unknown`].
+    /// The value of a name, resolved against case-preserved keys.
+    ///
+    /// # Round-18 R1 — the reference arrives folded, the assignment did not
+    ///
+    /// [`cwd_relative_hits`] lowercases the whole unit before it segments,
+    /// because every path and verb test in this module compares against
+    /// lowercase constants. So a reference reaches here as `$f` whether the
+    /// script wrote `$f` or `$F`, while the *assignment* side now records the
+    /// spelling it actually used. Exact case answers the ordinary case.
+    ///
+    /// When two spellings of one folded name are recorded, the lowered text
+    /// cannot say which was referenced, and the two readings differ. Resolving
+    /// toward the value that carries evidence is the fail-closed direction:
+    /// it costs a prompt on `d=/tmp/x; D=~/.openfang/data; rm -f "$d/openfang.db"`,
+    /// which touches nothing, and it refuses to hand back the innocent value
+    /// for a reference that meant the dangerous one. Guessing the other way is
+    /// R1 itself.
+    fn lookup(&self, name: &str) -> Option<&str> {
+        let folded: Vec<&(String, String)> = self
+            .values
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .collect();
+        match folded.len() {
+            0 => None,
+            1 => Some(folded[0].1.as_str()),
+            _ => folded
+                .iter()
+                .find(|(_, v)| names_control_plane(v))
+                .or_else(|| folded.iter().find(|(n, _)| n == name))
+                .map(|(_, v)| v.as_str()),
+        }
+    }
+
     fn expand(&self, token: &str) -> String {
         if self.values.is_empty() || !token.contains('$') {
             return token.to_string();
@@ -1197,10 +1322,7 @@ impl Taint {
             while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
                 j += 1;
             }
-            let name: String = chars[start..j]
-                .iter()
-                .collect::<String>()
-                .to_ascii_lowercase();
+            let name: String = chars[start..j].iter().collect::<String>();
             let mut end = j;
             if braced {
                 // Skip a `:-default` / `:+alt` tail and the closing brace.
@@ -1215,8 +1337,8 @@ impl Taint {
                 }
                 end += 1;
             }
-            match self.values.iter().find(|(n, _)| n == &name) {
-                Some((_, value)) if !name.is_empty() => out.push_str(value),
+            match self.lookup(&name) {
+                Some(value) if !name.is_empty() => out.push_str(value),
                 _ => out.extend(chars[i..end].iter()),
             }
             i = end;
@@ -2385,7 +2507,34 @@ pub fn body_writes_control_plane(body: &str) -> bool {
 
 /// One logical line of a script body, plus any heredoc payload it consumes.
 struct LogicalLine {
+    /// The line as a shell would execute it, heredoc payload folded in. Every
+    /// *conjunctive* predicate reads this: a payload naming the control plane
+    /// in data position is still evidence.
     text: String,
+    /// The same line without its heredoc payload — argv only.
+    ///
+    /// # Round-18 R2 — a payload is operand text, never a command
+    ///
+    /// [`cwd_relative_hits`] segments what it walks and `split_segments`
+    /// treats `;` as a separator, so folding the payload into `text` let
+    /// payload *data* hand the walker commands:
+    ///
+    /// ```text
+    ///   cd ~/.openfang/data
+    ///   cat > /tmp/notes <<'EOF'
+    ///   ; cd /tmp
+    ///   EOF
+    ///   rm -f openfang.db
+    /// ```
+    ///
+    /// The folded opening line becomes `cat > /tmp/notes <<'eof' ; cd /tmp`,
+    /// the frame moves to `Elsewhere`, and both hard floors go clean. The same
+    /// channel sets and clears taint and swaps `prev`. A payload may *name*
+    /// things; it may never supply a command word, a `cd` or an assignment.
+    ///
+    /// The fold's known over-fire direction — a payload naming the control
+    /// plane escalates — is what masked this fail-open one for eleven commits.
+    argv: String,
     heredoc_payload: Option<String>,
 }
 
@@ -2505,6 +2654,7 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
         }
 
         out.push(LogicalLine {
+            argv: joined.clone(),
             text: joined,
             heredoc_payload: None,
         });
@@ -2516,6 +2666,7 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
 
     if let Some(acc) = pending {
         out.push(LogicalLine {
+            argv: acc.clone(),
             text: acc,
             heredoc_payload: None,
         });
@@ -2651,8 +2802,15 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
     let mut tainted = Taint::default();
     for line in lines {
         let lowered = lower_for_segments(&line.text);
-        for segment in split_segments(&lowered) {
+        // Round-18 R1: case-preserving twin, for the assignment names only.
+        let cased = fold_clobber_redirect(&line.text);
+        let cased_segments = split_segments(&cased);
+        for (idx, segment) in split_segments(&lowered).into_iter().enumerate() {
             let tokens: Vec<&str> = segment.split_whitespace().collect();
+            let cased_tokens: Vec<&str> = cased_segments
+                .get(idx)
+                .map(|s| s.split_whitespace().collect())
+                .unwrap_or_default();
             if tokens.is_empty() {
                 continue;
             }
@@ -2660,7 +2818,7 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
             // segment, and the assignment happens first.
             // No frame walk here: this predicate reads names, not directories,
             // so there is no control-plane frame to inherit evidence from.
-            taint_from_segment(&tokens, &mut tainted, false);
+            taint_from_segment(&tokens, &cased_tokens, &mut tainted, false);
             if tokens
                 .iter()
                 .any(|t| references_tainted(t, tainted.names()))
@@ -2713,13 +2871,31 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
 /// [`datastore_target`], which already tests it. `inside_control_plane`
 /// survives only as evidence for the *name* set, which is what
 /// [`references_tainted`] reads.
-fn taint_from_segment(tokens: &[&str], tainted: &mut Taint, inside_control_plane: bool) {
-    for token in tokens {
+fn taint_from_segment(
+    tokens: &[&str],
+    cased: &[&str],
+    tainted: &mut Taint,
+    inside_control_plane: bool,
+) {
+    for (i, token) in tokens.iter().enumerate() {
         let token = strip_grouping(token);
         if let Some((name, value)) = token.split_once('=') {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
+            // Round-18 R1. Everything else in this function reads the lowered
+            // token, because the evidence tests compare against lowercase
+            // constants. The variable *name* is the one thing that must not be
+            // folded, so it comes from the case-preserving twin of the same
+            // segment — same characters modulo case, so the split index is
+            // identical. A missing twin keeps the folded name rather than
+            // dropping the assignment.
+            let name = cased
+                .get(i)
+                .map(|t| strip_grouping(t))
+                .and_then(|t| t.split_once('=').map(|(n, _)| n))
+                .filter(|n| n.eq_ignore_ascii_case(name))
+                .unwrap_or(name);
             let expanded = tainted.expand(value);
             let evidence = names_control_plane(&expanded)
                 || references_tainted(value, tainted.names())
@@ -2775,7 +2951,10 @@ fn references_tainted(token: &str, tainted: &[String]) -> bool {
                 .iter()
                 .collect::<String>()
                 .to_ascii_lowercase();
-            if !name.is_empty() && tainted.contains(&name) {
+            // Round-18 R1: `names` is case-preserved, the token is folded.
+            // Comparing insensitively is the over-fire direction and the one
+            // to take here — `references_tainted` only ever adds evidence.
+            if !name.is_empty() && tainted.iter().any(|t| t.eq_ignore_ascii_case(&name)) {
                 return true;
             }
         }
@@ -4791,6 +4970,86 @@ mod tests {
         assert!(!body_destroys_datastore(
             "cd ~/.openfang/data\nd=$(dirname \"$0\")\ncd \"$d\"\nrm -f openfang.db\n"
         ));
+    }
+
+    /// Round-18 R1. Shell variable names are case-sensitive; the walker's
+    /// lowering made them not be. `record_value` then `retain`ed the folded
+    /// key, so an unrelated uppercase assignment *deleted* a tainted value and
+    /// both hard floors went clean in three plain lines.
+    ///
+    /// The reference side is still folded — that is what the walker hands us —
+    /// so a collision between two spellings of one name cannot be resolved
+    /// from the text. [`Taint::lookup`] resolves it toward the value that
+    /// carries evidence, which is fail-closed: it costs a prompt on a command
+    /// that touches nothing and never hands back the innocent value for a
+    /// reference that meant the dangerous one.
+    #[test]
+    fn an_uppercase_assignment_is_a_different_variable() {
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\nF=/tmp/x\nrm -f \"$f\"\n"
+        ));
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\nD=/tmp/x\nrm -rf \"$d\"\n"
+        ));
+        // Uppercase assignment, uppercase reference: the reference arrives
+        // folded, so this resolves through the collision rule.
+        assert!(body_destroys_datastore(
+            "F=~/.openfang/data/openfang.db\nf=/tmp/x\nrm -f \"$F\"\n"
+        ));
+        // The stated over-fire, and the direction it fails in.
+        assert!(body_destroys_datastore(
+            "d=/tmp/x\nD=~/.openfang/data\nrm -f \"$d/openfang.db\"\n"
+        ));
+        // One spelling, reassigned: N4's pin, untouched by any of this.
+        assert!(!body_destroys_substrate(
+            "d=~/.openfang/agents\nd=/tmp/x\nrm -rf \"$d\"\n"
+        ));
+    }
+
+    /// Round-18 R2. A heredoc payload is folded onto the line that opens it,
+    /// which is right for the conjunctive predicate that reads it in *data*
+    /// position and wrong for the walker: `split_segments` treats `;` as a
+    /// separator, so payload data supplied the walk with commands. The
+    /// walker reads `argv`; the payload is still there for everyone else.
+    #[test]
+    fn a_heredoc_payload_cannot_move_the_frame() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\ncat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\nrm -f openfang.db\n"
+        ));
+        // Same channel, taint rather than frame.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\ncat > /tmp/notes <<'EOF'\n; d=/tmp/x\nEOF\nrm -rf \"$d\"\n"
+        ));
+        // And the fold itself is intact for the predicate it exists for.
+        let lines = logical_lines("cat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\n");
+        assert!(lines[0].text.contains("cd /tmp"));
+        assert!(!lines[0].argv.contains("cd /tmp"));
+    }
+
+    /// Round-18 R3. [`overcap_chunks`] overlaps so a construct straddling a
+    /// boundary is intact in one chunk — but the walk carries state, and a
+    /// *relative* `cd` is not idempotent. `cd ..` replayed in the overlap pops
+    /// twice, and a second pop out of `~/.openfang/data` leaves
+    /// `Frame::elsewhere()`, so everything after it in the last chunk reads as
+    /// outside the control plane. The `cd ..` here lands inside the overlap by
+    /// construction and the destruction lands after it.
+    #[test]
+    fn a_chunk_overlap_does_not_re_apply_a_relative_cd() {
+        let cap = crate::cmd_norm::MAX_NORMALIZE_INPUT;
+        // One pop lands on the control-plane root, which is still inside;
+        // a second pop lands on `$HOME`, which is not. That gap is the only
+        // place the extra `cd ..` is observable, and it is where the test has
+        // to stand.
+        let head = "cd ~/.openfang/data;";
+        let pop = "cd ..;";
+        let pad = "a;".repeat((cap - head.len() - pop.len()) / 2);
+        let over = format!("{head}{pad}{pop}rm -f openfang.db;");
+        assert!(over.chars().count() > cap);
+        assert!(body_destroys_datastore(&over));
+        // The same body under the cap: chunking must not change the answer.
+        assert!(body_destroys_datastore(&format!(
+            "{head}{pop}rm -f openfang.db;"
+        )));
     }
 
     /// Round-16 Q3. sqlite3 resolves an unambiguous *prefix* of a dot-command,
