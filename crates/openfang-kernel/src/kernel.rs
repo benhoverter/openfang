@@ -9978,8 +9978,27 @@ fn require_project_membership(
     } else {
         format!("it declares: {}", entry.manifest.projects.join(", "))
     };
+    // ANAI-264 follow-up. Name the namespace, not just the caller's slice of
+    // it. "you declare: openfang" tells an agent it was refused; "declared
+    // roots: aquilae, kimiya, openfang, tabletop-toybox" tells it whether it
+    // mistyped a real project or invented one — which is the difference
+    // between a retry and a manifest edit. Membership fires first for any
+    // agent that declares anything, so this is the only place most callers
+    // will ever see the root set. Empty root set stays silent, mirroring
+    // `require_known_project_root`: nothing to compare against, nothing to say.
+    let known_roots = {
+        let roots = registry.project_roots();
+        if roots.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Projects this fleet declares: {}.",
+                roots.iter().cloned().collect::<Vec<_>>().join(", ")
+            )
+        }
+    };
     Err(format!(
-        "agent '{}' is not a member of project '{scope_ref}' — {declared}. \
+        "agent '{}' is not a member of project '{scope_ref}' — {declared}.{known_roots} \
          Project-scoped facts are visible to declared members only; add \
          `projects = [\"{scope_ref}\"]` to the agent's agent.toml and restart it \
          (ANAI-208).",
@@ -13365,6 +13384,13 @@ mod tests {
             denied.contains("tttb"),
             "error should name what it declares"
         );
+        // ANAI-264 follow-up: the refusal names the whole namespace, so a
+        // caller can tell a typo from an undeclared project without a second
+        // round trip.
+        assert!(
+            denied.contains("Projects this fleet declares: openfang-fork, tttb."),
+            "error should name the fleet's declared roots: {denied}"
+        );
 
         // Default-deny: undeclared is a member of nothing. This is the case
         // that covers all 71 agents on the first restart after this ships.
@@ -13380,6 +13406,25 @@ mod tests {
 
     #[test]
     fn the_gate_applies_only_to_project_scope() {
+        use openfang_memory::vocabulary::FactScope;
+
+        let registry = AgentRegistry::new();
+        let undeclared = register_with_projects(&registry, "undecl", vec![]);
+
+        let denied =
+            require_project_membership(&registry, undeclared, FactScope::Project, "openfang")
+                .expect_err("undeclared agent must be refused");
+        assert!(
+            !denied.contains("this fleet declares"),
+            "an empty root set must not render as a list: {denied}"
+        );
+    }
+
+    /// ANAI-264 follow-up. A fleet that declares nothing has no namespace to
+    /// name, so the refusal says nothing about roots rather than printing an
+    /// empty list — same silence rule as `require_known_project_root`.
+    #[test]
+    fn the_refusal_omits_the_root_list_when_the_fleet_declares_nothing() {
         use openfang_memory::vocabulary::FactScope;
 
         let registry = AgentRegistry::new();
