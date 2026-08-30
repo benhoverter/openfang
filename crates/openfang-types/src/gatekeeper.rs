@@ -485,6 +485,15 @@ struct Frame {
     under_root: Option<Vec<String>>,
 }
 
+/// Cap on how many hypothetical frames a single segment's swallowed-`cd` scan
+/// may carry at once (round-24 X4).
+///
+/// The scan composes frames left to right and keeps every reading rather than
+/// choosing one, so a segment with several fold-colliding `cd "$d"` moves could
+/// in principle widen without bound. Reaching this is a shape no shell writes:
+/// it needs more than eight distinct resolutions of the same swallowed region.
+const MAX_HYPO_FRAMES: usize = 8;
+
 impl Frame {
     fn elsewhere() -> Self {
         Frame {
@@ -812,38 +821,84 @@ fn walk_statements(
                 // been running in is another reading, OR-ed into the arms
                 // exactly as the taint states are — the same "stop choosing"
                 // structure as round-19 S1 and round-17 P1.
+                //
+                // Round-24 X2. Do not keep a second definition of "frame
+                // mover": this arm tested `basename(tokens[pos]) == "cd"` while
+                // [`cd_target`] accepts `cd`, `pushd` and `popd`, so a
+                // swallowed `pushd ~/.openfang/data` was skipped by the very
+                // arm written to catch a swallowed frame move — and a wrapped
+                // `env cd data` survived only by the luck of the loop reaching
+                // the inner token. Deleting the name test and letting
+                // `cd_target` answer removes the duplicate rather than syncing
+                // it, which is the one shape this ticket has punished every
+                // time it was fixed the other way.
+                //
+                // Round-24 X4. Two asymmetries with the rest of the walk:
+                // frames are composed left to right, so a second *relative*
+                // move (`cd ~/.openfang/scripts` then `cd ../agents`) resolves
+                // against the frame the segment reached rather than against the
+                // real one it never left; and the readings are the same
+                // `states` every other arm ORs over, not the post-segment taint
+                // alone. The frames are a set for exactly S1's reason — a
+                // `cd "$d"` under a fold collision has more than one reading,
+                // and choosing one is how a floor gets lost.
+                let mut hypo_frames: Vec<Frame> = vec![frame.clone()];
+                let mut last_verb: Option<usize> = None;
                 for pos in 0..tokens.len() {
                     if hits.destroys_datastore && hits.destroys {
                         break;
                     }
-                    if Some(pos) == cw_idx || basename(strip_grouping(tokens[pos])) != "cd" {
+                    let Some((_, rel)) = command_word(&tokens[pos..]) else {
                         continue;
-                    }
-                    let hypo = match cd_target(&tokens[pos..], frame, tainted) {
-                        Some(CdMove::To(next)) => next,
-                        Some(CdMove::Back) => prev.clone(),
-                        None => continue,
                     };
-                    if !hypo.inside() {
+                    // One resolved verb is one statement, however many
+                    // positions in front of it resolve to it — otherwise a
+                    // wrapper prefix applies a relative `cd` twice, which is
+                    // round-18 R3's non-idempotence in a second place.
+                    let verb_at = pos + rel;
+                    if Some(verb_at) == cw_idx || last_verb == Some(verb_at) {
                         continue;
                     }
-                    let h_substrate = hypo.kind == Cwd::Substrate;
-                    if states.iter().any(|state| {
-                        segment_ends_datastore(
-                            ds_tokens,
-                            &datastore_target(true, h_substrate, state),
-                        )
-                    }) {
-                        hits.destroys_datastore = true;
+                    let mut next: Vec<Frame> = Vec::new();
+                    for base in &hypo_frames {
+                        for state in &states {
+                            let moved = match cd_target(&tokens[pos..], base, state) {
+                                Some(CdMove::To(f)) => f,
+                                Some(CdMove::Back) => prev.clone(),
+                                None => continue,
+                            };
+                            if !next.contains(&moved) && next.len() < MAX_HYPO_FRAMES {
+                                next.push(moved);
+                            }
+                        }
                     }
-                    if h_substrate
-                        && segment_destroys_tree(&tokens)
-                        && tokens
-                            .iter()
-                            .skip(pos + 1)
-                            .any(|t| is_relative_operand(strip_grouping(t)))
-                    {
-                        hits.destroys = true;
+                    if next.is_empty() {
+                        continue;
+                    }
+                    last_verb = Some(verb_at);
+                    hypo_frames = next;
+                    for hypo in &hypo_frames {
+                        if !hypo.inside() {
+                            continue;
+                        }
+                        let h_substrate = hypo.kind == Cwd::Substrate;
+                        if states.iter().any(|state| {
+                            segment_ends_datastore(
+                                ds_tokens,
+                                &datastore_target(true, h_substrate, state),
+                            )
+                        }) {
+                            hits.destroys_datastore = true;
+                        }
+                        if h_substrate
+                            && segment_destroys_tree(&tokens)
+                            && tokens
+                                .iter()
+                                .skip(verb_at + 1)
+                                .any(|t| is_relative_operand(strip_grouping(t)))
+                        {
+                            hits.destroys = true;
+                        }
                     }
                 }
                 let verb_idx = cw_idx.unwrap_or(0);
@@ -1073,6 +1128,35 @@ enum CdMove {
 /// HIGH.
 fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove> {
     let (base, idx) = command_word(tokens)?;
+    // Round-24 X1 — the verb through the taint set, not just the argument.
+    //
+    // [`command_word`] resolves wrappers but never expansions, so a frame move
+    // held in a variable was invisible:
+    //
+    // ```text
+    //   c=cd
+    //   $c ~/.openfang/data
+    //   rm -f openfang.db      # removes the datastore
+    // ```
+    //
+    // Round-11 H1's exact shape with the variable moved one position left. H1
+    // taught this function to resolve its *argument* through the taint set;
+    // verb position was never covered, and the `Taint` doc lists its declared
+    // gaps without it, so it read as covered.
+    //
+    // Fixed here rather than in [`command_word`], whose answer the operand
+    // indexing (J4) and the wrapper resolution (K1, V3) both depend on — and
+    // by OR-ing over the readings rather than choosing one, per S1.
+    let mut bases: Vec<String> = vec![base];
+    let raw = strip_grouping(tokens[idx]);
+    if raw.contains('$') {
+        for reading in tainted.expansions(raw) {
+            let candidate = basename(&reading);
+            if !bases.contains(&candidate) {
+                bases.push(candidate);
+            }
+        }
+    }
     // Round-12 J3. `popd` moved the frame and matched nothing, so the walk kept
     // whatever `pushd` had left it with:
     //
@@ -1093,10 +1177,10 @@ fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove
     // cosmetic — both ends of the swap are already unresolved or already
     // recorded — and making `prev` a stack to tidy it up buys a second place
     // for the frame to be silently wrong at depth two.
-    if base == "popd" {
+    if bases.iter().any(|b| b == "popd") {
         return Some(CdMove::To(Frame::unknown()));
     }
-    if !matches!(base.as_str(), "cd" | "pushd") {
+    if !bases.iter().any(|b| matches!(b.as_str(), "cd" | "pushd")) {
         return None;
     }
     let args: Vec<&str> = tokens
@@ -2812,7 +2896,24 @@ fn scan_shell(line: &str) -> (Vec<ShellChar>, ShellQuote) {
 /// The subset that matters here: bash's metacharacters minus whitespace, which
 /// the caller handles, and minus `!` and `#` themselves.
 fn is_shell_metachar(c: char) -> bool {
-    matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
+    // Round-24 X3. A backtick opens a command substitution and the text inside
+    // it is re-lexed as a fresh command, so a `#` immediately after one is
+    // always word-start and always a comment to bash — verified against the
+    // installed shell, where `echo A`#c ; cd /var` B` prints `A B` and does not
+    // change directory. We kept it as code, and the code we kept carried
+    // separators the segmenter honoured, inventing a `cd` the shell never ran.
+    //
+    // Strictly correct with no over-fire direction: after a backtick a new
+    // command begins, so there is no benign spelling where this now strips
+    // something bash would have executed.
+    //
+    // Note the two tables this leaves adjacent and *deliberately* unequal:
+    // `mask_quoted_separators::SEPARATORS` carries the backtick and a newline
+    // but not `<`/`>`, because a redirect delimits a word without separating a
+    // statement. Same question, two answers, and only the backtick difference
+    // was a bug. Deriving both from one table with the justification in the
+    // column header belongs to the lowering refactor.
+    matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>' | '`')
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -3239,7 +3340,7 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
         }
 
         out.push(LogicalLine {
-            argv: joined.clone(),
+            argv: statement_text(&joined),
             text: joined,
             heredoc_payload: None,
             exec_payload: None,
@@ -3253,7 +3354,7 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
 
     if let Some(acc) = pending {
         out.push(LogicalLine {
-            argv: acc.clone(),
+            argv: statement_text(&acc),
             text: acc,
             heredoc_payload: None,
             exec_payload: None,
@@ -3274,11 +3375,47 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
 /// statement, and folding them together would let a `cd` swallow the verb on
 /// the next line.
 fn push_exec_statement(line: &mut LogicalLine, statement: &str) {
+    let statement = statement_text(statement);
+    let statement = statement.as_str();
+    if statement.is_empty() {
+        return;
+    }
     let buf = line.exec_payload.get_or_insert_with(String::new);
     if !buf.is_empty() {
         buf.push_str(" ; ");
     }
     buf.push_str(statement);
+}
+
+/// The part of a line that is a *statement*: everything before a comment.
+///
+/// # Round-24 X3 — a comment can never be a command, and we were running one
+///
+/// [`is_shell_metachar`] gained the backtick this round, but recognising the
+/// comment was only half the fix: nothing stripped it from the text the walker
+/// segments. A backtick opens a command substitution whose contents bash
+/// re-lexes as a fresh command, so `#` there is a comment — while the walker
+/// read it as code, and the code it read carried separators the segmenter
+/// honoured:
+///
+/// ```text
+///   cd ~/.openfang/data
+///   echo `#cleanup ; cd /tmp`
+///   rm -f openfang.db          # removes the datastore
+/// ```
+///
+/// Bash runs nothing on line 2 (verified against the installed shell: it
+/// prints the surrounding text and does not change directory). We invented a
+/// `cd /tmp`, lost the frame, and both hard floors went clean.
+///
+/// Note which field this feeds. `argv` is what the walker treats as statements,
+/// and inventing a statement is fail-**open** for the frame — round-23 W3's
+/// direction argument, in the mirror. `text` keeps the comment, because there
+/// it is only evidence and extra evidence is fail-closed: a control-plane path
+/// mentioned inside a comment still escalates, which is the injection defense
+/// [`strip_shell_comments`] exists for at the command line.
+fn statement_text(line: &str) -> String {
+    strip_line_comment(line).trim_end().to_string()
 }
 
 /// The line without its trailing continuation backslash, if it has one.
@@ -6202,6 +6339,109 @@ mod tests {
         assert!(!body_destroys_datastore(
             "cd /tmp\necho 'x ; cd ~/.openfang/data ; rm -f notes.txt'\n"
         ));
+    }
+
+    /// X1. `command_word` resolves wrappers but never expansions, so a frame
+    /// move held in a variable was invisible — and the verb that matters to
+    /// this walk is `cd`. Round-11 H1's shape with the variable moved one
+    /// position left: H1 taught `cd` to resolve its *argument* through the
+    /// taint set and verb position was never covered.
+    #[test]
+    fn a_frame_mover_held_in_a_variable_still_moves_the_frame() {
+        assert!(body_destroys_datastore(
+            "c=cd\n$c ~/.openfang/data\nrm -f openfang.db\n"
+        ));
+        assert!(body_destroys_datastore(
+            "c=cd\n${c} ~/.openfang/data\nrm -f openfang.db\n"
+        ));
+        assert!(body_destroys_substrate(
+            "c=cd\n$c ~/.openfang/agents\nrm -rf openfang-alpha\n"
+        ));
+        // A reading, not a promotion: a variable that is not a frame mover is
+        // still not one, and the argument still has to name the control plane.
+        assert!(!body_destroys_datastore(
+            "c=cat\n$c ~/.openfang/data\nrm -f openfang.db\n"
+        ));
+        assert!(!body_destroys_datastore(
+            "c=cd\n$c /var/data\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// X2. The swallowed-frame arm kept a *second* definition of "frame
+    /// mover" — `basename(token) == "cd"` — while [`cd_target`] accepts `cd`,
+    /// `pushd` and `popd`. So the one spelling written to catch a swallowed
+    /// frame move skipped a swallowed `pushd`, ten lines from the function
+    /// that would have resolved it. The fix is a deletion, not a sync.
+    #[test]
+    fn a_swallowed_frame_mover_is_not_only_spelled_cd() {
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho 'x ; pushd ~/.openfang/data ; rm -f openfang.db'\n"
+        ));
+        // A wrapper in front of it used to survive only by the luck of the
+        // loop reaching the inner token.
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho 'x ; env cd ~/.openfang/data ; rm -f openfang.db'\n"
+        ));
+        // `popd` is still `Unknown`, and `Unknown` satisfies no arm.
+        assert!(!body_destroys_datastore(
+            "cd /tmp\necho 'x ; popd ; rm -f openfang.db'\n"
+        ));
+    }
+
+    /// X4. The arm evaluated every swallowed `cd` against the *real* frame and
+    /// never carried a hypothetical one across positions, so a second relative
+    /// move resolved against a directory the segment had already left. The
+    /// datastore half survived by accident — its suffix arm fires from any
+    /// control-plane frame — and the substrate half, whose gate is `Substrate`
+    /// alone, missed.
+    #[test]
+    fn swallowed_frame_moves_compose_left_to_right() {
+        assert!(body_destroys_substrate(
+            "cd /tmp\necho 'x ; cd ~/.openfang/scripts ; cd ../agents ; rm -rf openfang-alpha'\n"
+        ));
+        // Composition ends where the path does: `..` past the root leaves the
+        // control plane, so the composed frame is `Elsewhere` and no arm fires
+        // *from it*.
+        assert!(matches!(
+            cd_target(
+                &["cd", "../../"],
+                &Frame::under(vec!["agents".to_string()]),
+                &Taint::default()
+            ),
+            Some(CdMove::To(f)) if f == Frame::elsewhere()
+        ));
+        // Stated rather than hidden: the arms are segment-scoped, so a
+        // swallowed region that enters the substrate and then leaves it still
+        // fires on the operand that follows. Over-fire, one prompt, and the
+        // fail-closed direction — narrowing it would need statement ordering
+        // the segmenter deliberately does not model.
+        assert!(body_destroys_substrate(
+            "cd /tmp\necho 'x ; cd ~/.openfang/agents ; cd ../../ ; rm -rf openfang-alpha'\n"
+        ));
+    }
+
+    /// X3. A backtick opens a command substitution whose contents bash re-lexes
+    /// as a fresh command, so a `#` immediately after one is word-start and
+    /// therefore a comment. Verified against the installed shell:
+    /// `echo A`#c ; cd /var` B` prints `A B` and does not change directory.
+    ///
+    /// Recognising the comment was only half of it — nothing stripped it from
+    /// the text the walker segments, so we *ran* it. `argv` is statements now;
+    /// `text` keeps the comment, because there it is only evidence and extra
+    /// evidence is the fail-closed direction.
+    #[test]
+    fn a_comment_inside_a_command_substitution_is_not_a_statement() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\necho `#cleanup ; cd /tmp`\nrm -f openfang.db\n"
+        ));
+        assert_eq!(strip_line_comment("echo `#c ; cd /tmp`"), "echo `");
+        // A comment stops being a *statement*; it does not stop being evidence.
+        // `argv` is what the walker segments, `text` is what the conjunctive
+        // predicates read, and only the first one loses the comment.
+        let lines = logical_lines("echo hi # ~/.openfang/agents/openfang-alpha.toml\n");
+        assert!(lines[0].text.contains(".openfang/agents"));
+        assert!(!lines[0].argv.contains(".openfang/agents"));
+        assert_eq!(lines[0].argv, "echo hi");
     }
 
     /// Round-23, surface 3. The parent got the quote-balance fold and the
