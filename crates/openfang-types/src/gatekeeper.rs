@@ -306,6 +306,18 @@ pub const OPAQUE_EXEC_VERBS: &[(&str, &[&str])] = &[
     ("ruby", &["-e"]),
     ("perl", &["-e"]),
     ("php", &["-r"]),
+    // Round-15 M3. `sqlite3` was added to `is_ending_verb` last round, which
+    // prices it as a file-toucher — the smaller half of what it is. Its
+    // dot-commands run a shell (`.shell`, `.system`), read a script off disk
+    // (`.read`), or redirect output at a path (`.output`, `.once`), none of
+    // which this floor can read. Keyed on the dot-command rather than on the
+    // binary so `sqlite3 <db> .tables` stays a read and costs nothing.
+    (
+        "sqlite3",
+        &[
+            ".shell", ".system", ".read", ".import", ".output", ".once", ".log",
+        ],
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -595,7 +607,9 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // Ordered before the `cd` arm and before the `Elsewhere` bail on
                 // purpose: the tainted-variable half is live from any frame, because
                 // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
-                taint_from_segment(&tokens, &mut tainted);
+                // Round-15 M1: the frame at assignment time is evidence about
+                // the value, exactly as it is about a literal operand.
+                taint_from_segment(&tokens, &mut tainted, frame.inside());
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
                 let blind = frame.kind == Cwd::Unknown;
@@ -2588,7 +2602,9 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
             }
             // Taint before checking: `f=~/.openfang/agents rm -rf "$f"` is one
             // segment, and the assignment happens first.
-            taint_from_segment(&tokens, &mut tainted);
+            // No frame walk here: this predicate reads names, not directories,
+            // so there is no control-plane frame to inherit evidence from.
+            taint_from_segment(&tokens, &mut tainted, false);
             if tokens
                 .iter()
                 .any(|t| references_tainted(t, tainted.names()))
@@ -2606,7 +2622,31 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
 /// Round-11 H1: records the *value* as well, expanded against everything
 /// recorded before it, so [`cd_target`] can resolve `cd "$d"` and
 /// `d=~/.openfang; e=$d/data; cd "$e"` closes transitively.
-fn taint_from_segment(tokens: &[&str], tainted: &mut Taint) {
+///
+/// # Round-15 M1 — recording has to be as frame-aware as the operand test
+///
+/// The gate was the value's own *text*: a name was recorded only if its value
+/// named the control plane. That drops the frame-relative spelling entirely,
+/// which is the third route to the same place after H1 closed the `cd` operand
+/// and L1 the direct one:
+///
+/// ```text
+///   cd ~/.openfang/data
+///   f=openfang.db
+///   rm -f "$f"
+/// ```
+///
+/// `openfang.db` names no control plane, so `f` is never recorded, so `$f`
+/// expands to nothing, so the suffix arm sees no suffix and the carried arm has
+/// nothing carried. Both hard floors clean, three lines, no obfuscation, inside
+/// the exact frame the predicate exists for.
+///
+/// `inside_control_plane` is the frame at *assignment* time. Inside it a
+/// relative value is a control-plane path by construction — which is the same
+/// evidence [`datastore_target`] already accepts for a literal relative operand,
+/// arriving through a name instead of through the token. Outside it nothing
+/// changes: `f=openfang.db` in a checkout is still any project's scratch file.
+fn taint_from_segment(tokens: &[&str], tainted: &mut Taint, inside_control_plane: bool) {
     for token in tokens {
         let token = strip_grouping(token);
         if let Some((name, value)) = token.split_once('=') {
@@ -2614,7 +2654,10 @@ fn taint_from_segment(tokens: &[&str], tainted: &mut Taint) {
                 continue;
             }
             let expanded = tainted.expand(value);
-            if names_control_plane(&expanded) || references_tainted(value, tainted.names()) {
+            if names_control_plane(&expanded)
+                || references_tainted(value, tainted.names())
+                || (inside_control_plane && is_relative_operand(&expanded))
+            {
                 tainted.record(name, value);
             }
         }
@@ -2943,7 +2986,10 @@ const FILE_ENDING_BINS: &[&str] = &["rm", "rmdir", "shred", "truncate", "mv", "m
 /// widening the surface for free — and the population is one binary against
 /// paths under `~/.openfang`.
 fn is_ending_verb(base: &str) -> bool {
-    FILE_ENDING_BINS.contains(&base) || matches!(base, "dd" | "cp" | "install" | "sqlite3")
+    // Round-15 M4: `tee` truncates every path operand it is handed, so
+    // `echo "" | tee <datastore>` is an ending with no verb in the vocabulary —
+    // the same family as `: > db` and last round's `sqlite3` gap.
+    FILE_ENDING_BINS.contains(&base) || matches!(base, "dd" | "cp" | "install" | "sqlite3" | "tee")
 }
 
 /// True if `token` names a durable OpenFang datastore.
@@ -4475,6 +4521,77 @@ mod tests {
         // Widening on the pipe itself would make a read into an ending.
         assert!(!destroys_datastore(
             "cat ~/.openfang/data/openfang.db | less"
+        ));
+    }
+
+    /// Round-15 M1. Taint recorded a value only when the value's own text named
+    /// the control plane, so the frame-relative spelling was never recorded at
+    /// all — the third route to the same place, after H1 closed the `cd`
+    /// operand and L1 the direct one.
+    #[test]
+    fn a_relative_name_taken_inside_the_control_plane_is_still_the_path() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nf=openfang.db\nrm -f \"$f\"\n"
+        ));
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang\ncd data\nf=openfang.db\nrm -f \"${f}\"\n"
+        ));
+        // Transitive through the frame-relative value, like the other two
+        // routes: `g` never names the control plane either.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nf=openfang.db\ng=$f\nrm -f \"$g\"\n"
+        ));
+        // The frame is the evidence. Outside it the same two lines are any
+        // checkout's scratch file and must stay clean.
+        assert!(!body_destroys_datastore("f=openfang.db\nrm -f \"$f\"\n"));
+        assert!(!body_destroys_datastore(
+            "cd /tmp/scratch\nf=openfang.db\nrm -f \"$f\"\n"
+        ));
+    }
+
+    /// Round-15 M2, refuted and pinned. [`Taint::expand`] substitutes *inside* a
+    /// token, so a variable holding the directory with a literal basename
+    /// concatenated onto it already resolves. This is round-2 F5, closed by
+    /// L1's operand-side expansion rather than by a fix of its own — pinned
+    /// because "already covered two functions away" is what stops being true.
+    #[test]
+    fn a_variable_directory_with_a_literal_basename_resolves() {
+        assert!(body_destroys_datastore(
+            "root=~/.openfang/data\nrm -f \"$root/openfang.db\"\n"
+        ));
+        assert!(body_destroys_datastore(
+            "root=~/.openfang/data\nrm -f \"${root}/openfang.db\"\n"
+        ));
+        assert!(body_destroys_substrate(
+            "root=~/.openfang\nrm -rf \"$root/agents\"\n"
+        ));
+    }
+
+    /// Round-15 M3/M4. `sqlite3`'s dot-commands run a shell; `tee` truncates
+    /// every path operand it is handed. Neither had a verb in the vocabulary.
+    #[test]
+    fn sqlite_dot_commands_are_opaque_and_tee_is_an_ending() {
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db \".shell rm -rf ~/.openfang/agents\"",
+            &[],
+            &[]
+        ));
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db \".read /tmp/payload.sql\"",
+            &[],
+            &[]
+        ));
+        // Reads stay free: the key is the dot-command, not the binary.
+        assert!(!has_opaque_execution(
+            "sqlite3 ~/.openfang/data/openfang.db .tables",
+            &[],
+            &[]
+        ));
+        assert!(destroys_datastore(
+            "echo x | tee ~/.openfang/data/openfang.db"
+        ));
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\necho x | tee openfang.db\n"
         ));
     }
 
