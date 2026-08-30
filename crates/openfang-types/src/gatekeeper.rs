@@ -593,7 +593,14 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
     for line in lines {
         // Round-18 R2: `argv`, not `text`. A heredoc payload is data this line
         // writes, not statements this line runs.
-        walk_statements(&line.argv, &mut frame, &mut prev, &mut tainted, &mut hits);
+        walk_statements(
+            &line.argv,
+            &mut frame,
+            &mut prev,
+            &mut tainted,
+            None,
+            &mut hits,
+        );
         // Round-20 T2. A payload an interpreter runs is that interpreter's
         // script, and it runs in a *child*: its frame, its previous frame and
         // its taint all die at the terminator. Its hits do not — a payload
@@ -602,11 +609,31 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
             let mut child_frame = frame.clone();
             let mut child_prev = prev.clone();
             let mut child_taint = tainted.clone();
+            // Round-21 U2. For an unquoted delimiter the *parent* expands the
+            // payload before the child sees a byte, so an assignment inside
+            // the payload cannot shadow a value the parent already held:
+            //
+            // ```text
+            //   f=~/.openfang/data/openfang.db
+            //   bash <<EOF
+            //   f=/tmp/x
+            //   rm -f "$f"          # removes the datastore
+            //   EOF
+            // ```
+            //
+            // P1's pre/post snapshot is per *segment*, so `pre` for the `rm`
+            // segment was already post-`f=/tmp/x` and every reading said
+            // `/tmp/x`. The entry state is a third reading, OR-ed like the
+            // other two. Passing it for a quoted delimiter too is the
+            // over-fire direction — the child would have expanded its own
+            // value, and we consider the parent's as well.
+            let entry = tainted.clone();
             walk_statements(
                 payload,
                 &mut child_frame,
                 &mut child_prev,
                 &mut child_taint,
+                Some(&entry),
                 &mut hits,
             );
         }
@@ -625,11 +652,14 @@ fn walk_statements(
     frame: &mut Frame,
     prev: &mut Frame,
     tainted: &mut Taint,
+    entry: Option<&Taint>,
     hits: &mut CwdHits,
 ) {
     let mut prev_segments: Vec<String> = Vec::new();
     {
-        for unit in walk_units(text) {
+        // Round-21 U1: separators inside quotes are argument characters, and
+        // the canonicaliser below is about to strip the quotes that say so.
+        for unit in walk_units(&mask_quoted_separators(text)) {
             let lowered = lower_for_segments(&unit);
             // Round-18 R1: the case-preserving twin, folded identically.
             // Lowercasing changes no separator, so the two segment vectors are
@@ -681,6 +711,12 @@ fn walk_statements(
                 if !replayed {
                     taint_from_segment(&tokens, &cased_tokens, tainted, frame.inside());
                 }
+                // Round-17 P1 and round-21 U2: every taint state this segment
+                // could legitimately have been expanded against.
+                let states: Vec<&Taint> = [Some(&*tainted), Some(&pre), entry]
+                    .into_iter()
+                    .flatten()
+                    .collect();
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
                 let blind = frame.kind == Cwd::Unknown;
@@ -688,13 +724,14 @@ fn walk_statements(
                 // its target in the segment on the *other* side of it.
                 let piped = pipeline_scoped_tokens(&tokens, pipeline);
                 let ds_tokens: &[&str] = piped.as_deref().unwrap_or(&tokens);
-                if segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, tainted))
-                    || segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &pre))
-                {
+                if states.iter().any(|state| {
+                    segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, state))
+                }) {
                     hits.destroys_datastore = true;
                 } else if blind
-                    && (segment_ends_datastore(ds_tokens, &datastore_target(true, true, tainted))
-                        || segment_ends_datastore(ds_tokens, &datastore_target(true, true, &pre)))
+                    && states.iter().any(|state| {
+                        segment_ends_datastore(ds_tokens, &datastore_target(true, true, state))
+                    })
                 {
                     // Round-11: it would have hit from the substrate, and we
                     // cannot say we are not there. Record rather than guess.
@@ -706,9 +743,11 @@ fn walk_statements(
                 // unreachable — but silence there is the fail-open direction,
                 // so say it out loud instead.
                 if !hits.destroys_datastore
-                    && ds_tokens
-                        .iter()
-                        .any(|t| tainted.readings_truncated(strip_grouping(t)))
+                    && ds_tokens.iter().any(|t| {
+                        states
+                            .iter()
+                            .any(|state| state.readings_truncated(strip_grouping(t)))
+                    })
                 {
                     hits.frame_blind = true;
                 }
@@ -722,8 +761,8 @@ fn walk_statements(
                 if segment_destroys_tree(&tokens)
                     && tokens.iter().any(|t| {
                         let raw = strip_grouping(t);
-                        // Round-17 P1, substrate half: same two readings.
-                        [&pre, tainted].iter().any(|state| {
+                        // Round-17 P1, substrate half: the same readings.
+                        states.iter().any(|state| {
                             // Round-19 S1: every reading, not a chosen one.
                             state
                                 .expansions(raw)
@@ -1517,7 +1556,22 @@ impl Taint {
             out
         };
         let mut outs: Vec<String> = vec![render(None)];
-        let mut truncated = false;
+        // Round-21 U3. Varying one reference at a time never renders a
+        // combination that needs *two* references to disagree at once, and the
+        // reading that fires can be exactly that one:
+        //
+        // ```text
+        //   a=/tmp;  A=~/.openfang/data
+        //   b=x;     B=openfang.db
+        //   rm -f "$a/$b"
+        // ```
+        //
+        // Renderings are `/tmp/x`, `~/.openfang/data/x` and `/tmp/openfang.db`;
+        // the datastore never appears under the control plane. Building the
+        // product is what T6 removed, so say the list is short instead: two or
+        // more colliding references in one token is blindness, and the walker
+        // reports it.
+        let mut truncated = parts.iter().filter(|(_, v)| v.len() > 1).count() >= 2;
         'parts: for (idx, (_, values)) in parts.iter().enumerate() {
             for which in 1..values.len() {
                 if outs.len() >= Self::MAX_READINGS {
@@ -2597,6 +2651,96 @@ fn strip_line_comment(line: &str) -> &str {
     line
 }
 
+/// `s` with every statement separator that sits *inside a quoted string*
+/// replaced by a space.
+///
+/// # Round-21 U1 — quote stripping promotes string data to statements
+///
+/// [`crate::cmd_norm::NORMALIZE_STEPS`] strips quotes, and the walker segments
+/// the canonical form, which is quote-naive. So a `;` inside a string literal
+/// became a statement boundary and the text after it became a command:
+///
+/// ```text
+///   cd ~/.openfang/data
+///   echo "starting cleanup ; cd /tmp"
+///   rm -f openfang.db
+/// ```
+///
+/// The `cd /tmp` the shell never ran moved the frame, `inside` went false, and
+/// both hard floors went clean. This is R2 and T4 — attacker-controlled data
+/// reaching the walker as statements — arriving through the canonicaliser
+/// instead of through a heredoc.
+///
+/// The asymmetry to hold on to: quote stripping is right and load-bearing for
+/// the **name** tests (`rm ~/.open""fang/data/x.db` must keep firing — that is
+/// what E1 is for) and wrong for **segmentation**, where it can only invent
+/// statements the shell never ran. So the separators are neutralised *before*
+/// canonicalisation and the quotes themselves are left for it to strip: the
+/// evidence tests see what they always saw, and the segmenter sees only
+/// boundaries the shell would honour.
+///
+/// Replacement is one char for one char so the lowered and case-preserving
+/// twins stay index-aligned (round-18 R1), and an escaped separator outside
+/// quotes (`\;`) is neutralised for the same reason `strip_escapes` would
+/// otherwise promote it.
+fn mask_quoted_separators(s: &str) -> String {
+    const SEPARATORS: [char; 7] = [';', '&', '|', '\n', '`', '(', ')'];
+    let mut out = String::with_capacity(s.len());
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_backslash = false;
+    for c in s.chars() {
+        if prev_backslash {
+            prev_backslash = false;
+            out.push(if SEPARATORS.contains(&c) { ' ' } else { c });
+            continue;
+        }
+        match c {
+            '\\' if !in_single => {
+                prev_backslash = true;
+                out.push(c);
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(c);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(c);
+            }
+            c if (in_single || in_double) && SEPARATORS.contains(&c) => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// True if `s` ends inside a quoted string.
+///
+/// Round-21 U1, third route: a literal newline inside a string needs no
+/// separator at all, because `body.lines()` has already split it. A physical
+/// line that leaves a quote open continues into the next one — that is what
+/// the shell does with it — so the walker has to fold them into one logical
+/// line before [`mask_quoted_separators`] can see the region as quoted.
+fn ends_inside_quote(s: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut prev_backslash = false;
+    for c in s.chars() {
+        if prev_backslash {
+            prev_backslash = false;
+            continue;
+        }
+        match c {
+            '\\' if !in_single => prev_backslash = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            _ => {}
+        }
+    }
+    in_single || in_double
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic floor predicates
 // ---------------------------------------------------------------------------
@@ -2928,6 +3072,20 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
             continue;
         }
 
+        // Round-21 U1, third route. A quoted string that runs past the end of
+        // a physical line is still one string to the shell, and `body.lines()`
+        // has already cut it. Fold it back so the newline inside it is a
+        // quoted character rather than a statement separator. The comment is
+        // stripped before the balance is read: an apostrophe in `# don't` is
+        // not an open quote to the shell either, and treating it as one would
+        // swallow the rest of the body.
+        if ends_inside_quote(strip_line_comment(&joined)) {
+            let mut acc = joined;
+            acc.push('\n');
+            pending = Some(acc);
+            continue;
+        }
+
         out.push(LogicalLine {
             argv: joined.clone(),
             text: joined,
@@ -3236,7 +3394,16 @@ fn taint_from_segment(
     tainted: &mut Taint,
     inside_control_plane: bool,
 ) {
-    for (i, token) in tokens.iter().enumerate() {
+    // Round-21 U1, assignment half. Only a *prefix* assignment assigns:
+    // `echo note f=/tmp/x` passes an argument and the shell records nothing.
+    // That matters beyond fidelity, because `record_value` retains
+    // unconditionally (N4) — so an argument that merely looks like an
+    // assignment could erase a tainted value, and after quote stripping
+    // `echo "note ; f=/tmp/x"` is exactly that token sequence. A segment that
+    // resolves no verb at all is all assignments, which is the ordinary
+    // `f=~/.openfang/data/openfang.db` line.
+    let assignment_limit = command_word(tokens).map_or(tokens.len(), |(_, idx)| idx);
+    for (i, token) in tokens.iter().enumerate().take(assignment_limit) {
         let token = strip_grouping(token);
         if let Some((name, value)) = token.split_once('=') {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -5590,6 +5757,67 @@ mod tests {
             "sqlite3 /tmp/scratch.db <<'SQL'\n.shell rm -rf ~/.openfang/agents\nSQL\n",
             &[],
             &[]
+        ));
+    }
+
+    /// Round-21 U1. Quote stripping is a lowering step for the *name* tests
+    /// and was a statement generator for the *segmenter*: a `;` inside a
+    /// string literal moved the frame with a `cd` the shell never ran.
+    ///
+    /// Three routes, one mechanism. The third needs no separator at all —
+    /// `body.lines()` cuts a multi-line string before anything folds it back.
+    #[test]
+    fn a_quoted_separator_is_an_argument_character_not_a_statement() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\necho \"starting cleanup ; cd /tmp\"\nrm -f openfang.db\n"
+        ));
+        // Assignment half: `record_value` retains unconditionally (N4), so a
+        // string literal that looks like an assignment could erase the value.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nf=openfang.db\necho \"note ; f=/tmp/x\"\nrm -f \"$f\"\n"
+        ));
+        // A newline inside a string is a quoted character.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\necho \"starting\ncd /tmp\"\nrm -f openfang.db\n"
+        ));
+        // And an unquoted separator is still a separator: masking may not cost
+        // the segmentation this walker exists for.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data ; rm -f openfang.db\n"
+        ));
+    }
+
+    /// Round-21 U1, assignment half stated on its own: only a *prefix*
+    /// assignment assigns. `echo note f=/tmp/x` passes an argument.
+    #[test]
+    fn only_a_prefix_assignment_records_a_value() {
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\necho note f=/tmp/x\nrm -f \"$f\"\n"
+        ));
+        // The command-prefix spelling still assigns — P1's case is untouched.
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\nf=/tmp/x rm -f \"$f\"\n"
+        ));
+    }
+
+    /// Round-21 U2. An unquoted heredoc is expanded by the *parent* before the
+    /// child sees a byte, so a payload assignment cannot shadow the value the
+    /// parent held. P1's snapshot is per segment and could not see this.
+    #[test]
+    fn a_heredoc_payload_cannot_shadow_the_parents_taint() {
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data/openfang.db\nbash <<EOF\nf=/tmp/x\nrm -f \"$f\"\nEOF\n"
+        ));
+    }
+
+    /// Round-21 U3. Readings vary one reference at a time, so a token needing
+    /// *two* references to disagree at once is never rendered — and silence
+    /// there is the fail-open direction. Two colliding references in one token
+    /// is blindness, and the walker says so.
+    #[test]
+    fn two_colliding_references_in_one_token_report_blindness() {
+        assert!(body_frame_blind(
+            "a=/tmp\nA=~/.openfang/data\nb=x\nB=openfang.db\nrm -f \"$a/$b\"\n"
         ));
     }
 
