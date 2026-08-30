@@ -677,8 +677,11 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                         let raw = strip_grouping(t);
                         // Round-17 P1, substrate half: same two readings.
                         [&pre, &tainted].iter().any(|state| {
-                            let expanded = state.expand(raw);
-                            expanded != raw && names_substrate(&expanded)
+                            // Round-19 S1: every reading, not a chosen one.
+                            state
+                                .expansions(raw)
+                                .into_iter()
+                                .any(|expanded| expanded != raw && names_substrate(&expanded))
                         })
                     })
                 {
@@ -783,10 +786,15 @@ fn datastore_target(inside: bool, substrate: bool, tainted: &Taint) -> impl Fn(&
         // other half. A value we could not fully resolve keeps its name and
         // loses its value (see `Taint`), so it still reaches the first arm
         // through `references_tainted`.
-        let expanded = tainted.expand(t);
-        expanded != t
-            && names(&expanded)
-            && (names_control_plane(&expanded) || (inside && is_relative_operand(&expanded)))
+        //
+        // Round-19 S1: a fold collision is two readings of one token, not a
+        // contest for a heuristic to settle. OR over them, exactly as the
+        // caller already ORs the pre- and post-segment taint snapshots.
+        tainted.expansions(t).into_iter().any(|expanded| {
+            expanded != t
+                && names(&expanded)
+                && (names_control_plane(&expanded) || (inside && is_relative_operand(&expanded)))
+        })
     }
 }
 
@@ -852,6 +860,23 @@ fn walk_units(text: &str) -> Vec<String> {
 /// segment torn by the chunk boundary is truncated in `prev` and whole in
 /// `cur`, so it does not match and is not skipped — which is the whole reason
 /// the overlap exists.
+///
+/// # Why the match may start one segment in, and which way that fails
+///
+/// `off = 1` is only reachable after `off = 0` has failed at every width: the
+/// chunks are overlapping windows of one string, so a whole segment at
+/// `cur[0]` is byte-identical to its counterpart in `prev`'s tail and would
+/// have matched at `off = 0`. It therefore fires only on a genuinely torn
+/// leading fragment.
+///
+/// The residual — a body that legitimately repeats a segment inside the
+/// overlap — is bounded at [`OVERCAP_CHUNK_OVERLAP`] characters, and both
+/// directions of the skip are safe. Skipping a repeated `cd` leaves the frame
+/// where it already was, which is fail-closed for a `cd` that would have moved
+/// outward; skipping a repeated assignment re-records an identical value,
+/// which is idempotent. State the direction here rather than leave it implied,
+/// because "heuristic in a state machine" with no stated direction is what the
+/// next reader narrows. (Round-19, security surface 4.)
 fn overlap_prefix(prev: &[String], cur: &[(&str, &str)]) -> usize {
     // A chunk boundary lands mid-text, so the previous chunk ends in a
     // separator artifact (an empty segment) or a torn one, and this chunk may
@@ -1186,6 +1211,11 @@ struct Taint {
 }
 
 impl Taint {
+    /// Cap on how many readings one token may produce. Several colliding
+    /// names in one token is pathological; past the cap the branch is
+    /// abandoned rather than expanded, which fails toward "unresolved".
+    const MAX_READINGS: usize = 8;
+
     /// Record what a name expands to, for *any* syntactic assignment.
     ///
     /// # Round-16 N1 — expansion is a lowering step, evidence is a predicate
@@ -1261,55 +1291,76 @@ impl Taint {
         &self.names
     }
 
-    /// Substitute recorded values into `$name`, `${name}` and `${name:-…}`.
-    ///
-    /// Unknown names are left exactly as written, so the result still carries a
-    /// `$` and the caller can tell "resolved" from "gave up" — which is the
-    /// whole distinction between [`Cwd::Elsewhere`] and [`Cwd::Unknown`].
-    /// The value of a name, resolved against case-preserved keys.
+    /// Every value recorded under a folded spelling of `name`, exact case first.
     ///
     /// # Round-18 R1 — the reference arrives folded, the assignment did not
     ///
     /// [`cwd_relative_hits`] lowercases the whole unit before it segments,
     /// because every path and verb test in this module compares against
     /// lowercase constants. So a reference reaches here as `$f` whether the
-    /// script wrote `$f` or `$F`, while the *assignment* side now records the
+    /// script wrote `$f` or `$F`, while the *assignment* side records the
     /// spelling it actually used. Exact case answers the ordinary case.
     ///
-    /// When two spellings of one folded name are recorded, the lowered text
-    /// cannot say which was referenced, and the two readings differ. Resolving
-    /// toward the value that carries evidence is the fail-closed direction:
-    /// it costs a prompt on `d=/tmp/x; D=~/.openfang/data; rm -f "$d/openfang.db"`,
-    /// which touches nothing, and it refuses to hand back the innocent value
-    /// for a reference that meant the dangerous one. Guessing the other way is
-    /// R1 itself.
-    fn lookup(&self, name: &str) -> Option<&str> {
-        let folded: Vec<&(String, String)> = self
+    /// # Round-19 S1 — a fold collision is two readings, not a contest
+    ///
+    /// R1 resolved a collision by *choosing*: prefer the candidate that names
+    /// the control plane, fall back to the exact-case key. But the evidence
+    /// the datastore arm needs is a datastore suffix, not a control-plane
+    /// name, so the rule picked by the wrong predicate:
+    ///
+    /// ```text
+    ///   db=~/.openfang/agents/openfang-alpha.toml
+    ///   DB=~/.openfang/data/openfang.db
+    ///   rm -f "$DB"                      # removes the datastore
+    /// ```
+    ///
+    /// Both spellings name the control plane, so the innocent `.toml` won and
+    /// both hard floors went clean in two plain lines. Reversing the
+    /// preference only moves the hole back onto R1's own case, because the
+    /// lowered text genuinely cannot say which spelling was written.
+    ///
+    /// So stop choosing. This hands back every candidate and the callers OR
+    /// over them — the same structure the walker already uses for the pre/post
+    /// taint snapshots of round-17 P1, and the same lesson E1 → H1 → M1 → N1
+    /// → P1 taught about the command word and the operand. [`cd_target`] must
+    /// produce exactly one frame, so there a disagreement resolves to
+    /// [`Cwd::Unknown`]: the reading it cannot pick is a directory it cannot
+    /// name, which is what `Unknown` is for.
+    fn lookup_all(&self, name: &str) -> Vec<&str> {
+        let exact = self.values.iter().filter(|(n, _)| n == name);
+        let folded = self
             .values
             .iter()
-            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-            .collect();
-        match folded.len() {
-            0 => None,
-            1 => Some(folded[0].1.as_str()),
-            _ => folded
-                .iter()
-                .find(|(_, v)| names_control_plane(v))
-                .or_else(|| folded.iter().find(|(n, _)| n == name))
-                .map(|(_, v)| v.as_str()),
+            .filter(|(n, _)| n != name && n.eq_ignore_ascii_case(name));
+        let mut out: Vec<&str> = Vec::new();
+        for (_, value) in exact.chain(folded) {
+            if !out.contains(&value.as_str()) {
+                out.push(value.as_str());
+            }
         }
+        out
     }
 
-    fn expand(&self, token: &str) -> String {
+    /// Substitute recorded values into `$name`, `${name}` and `${name:-…}`,
+    /// returning every reading the token admits.
+    ///
+    /// Always non-empty. Unknown names are left exactly as written, so the
+    /// result still carries a `$` and the caller can tell "resolved" from
+    /// "gave up" — which is the whole distinction between [`Cwd::Elsewhere`]
+    /// and [`Cwd::Unknown`]. More than one reading means a fold collision;
+    /// see [`Taint::lookup_all`].
+    fn expansions(&self, token: &str) -> Vec<String> {
         if self.values.is_empty() || !token.contains('$') {
-            return token.to_string();
+            return vec![token.to_string()];
         }
         let chars: Vec<char> = token.chars().collect();
-        let mut out = String::new();
+        let mut outs: Vec<String> = vec![String::new()];
         let mut i = 0usize;
         while i < chars.len() {
             if chars[i] != '$' {
-                out.push(chars[i]);
+                for out in outs.iter_mut() {
+                    out.push(chars[i]);
+                }
                 i += 1;
                 continue;
             }
@@ -1332,18 +1383,66 @@ impl Taint {
                 if end == chars.len() {
                     // Unterminated. Not something we can read; hand the rest
                     // back verbatim so the `$` survives.
-                    out.extend(chars[i..].iter());
-                    return out;
+                    for out in outs.iter_mut() {
+                        out.extend(chars[i..].iter());
+                    }
+                    return outs;
                 }
                 end += 1;
             }
-            match self.lookup(&name) {
-                Some(value) if !name.is_empty() => out.push_str(value),
-                _ => out.extend(chars[i..end].iter()),
+            let literal: String = chars[i..end].iter().collect();
+            let values = if name.is_empty() {
+                Vec::new()
+            } else {
+                self.lookup_all(&name)
+            };
+            // Past the cap the branch is abandoned and the reference is left
+            // as written — it still carries its `$`, so it still reads as
+            // "gave up" rather than as a resolved path.
+            if values.is_empty() || values.len().saturating_mul(outs.len()) > Self::MAX_READINGS {
+                for out in outs.iter_mut() {
+                    out.push_str(&literal);
+                }
+            } else if values.len() == 1 {
+                for out in outs.iter_mut() {
+                    out.push_str(values[0]);
+                }
+            } else {
+                let mut next: Vec<String> = Vec::with_capacity(values.len() * outs.len());
+                for out in &outs {
+                    for value in &values {
+                        let mut branch = out.clone();
+                        branch.push_str(value);
+                        next.push(branch);
+                    }
+                }
+                outs = next;
             }
             i = end;
         }
-        out
+        let mut uniq: Vec<String> = Vec::new();
+        for out in outs {
+            if !uniq.contains(&out) {
+                uniq.push(out);
+            }
+        }
+        uniq
+    }
+
+    /// The one reading of `token`, when there is one.
+    ///
+    /// Readings that disagree have no single answer, so the token comes back
+    /// unchanged — which every caller of this already treats as "did not
+    /// resolve". That is what turns a [`Taint::lookup_all`] collision into
+    /// [`Cwd::Unknown`] in [`cd_target`] instead of into a guess, and what
+    /// stops [`Taint::record_value`] from propagating one arbitrary branch of
+    /// a collision transitively into the next variable.
+    fn expand(&self, token: &str) -> String {
+        let mut readings = self.expansions(token);
+        match readings.len() {
+            1 => readings.pop().unwrap_or_default(),
+            _ => token.to_string(),
+        }
     }
 }
 
@@ -2619,19 +2718,30 @@ fn line_writes_control_plane(line: &LogicalLine) -> bool {
 fn logical_lines(body: &str) -> Vec<LogicalLine> {
     let mut out: Vec<LogicalLine> = Vec::new();
     let mut pending: Option<String> = None;
-    let mut heredoc: Option<(HeredocOpen, usize)> = None;
+    // Round-19 S2: the third element is whether this heredoc's consumer
+    // *executes* the payload. See [`heredoc_payload_is_argv`].
+    let mut heredoc: Option<(HeredocOpen, usize, bool)> = None;
 
     for raw in body.lines() {
         let state = heredoc
             .as_ref()
-            .map(|(open, idx)| (terminates_heredoc(raw, open), *idx));
-        if let Some((terminates, idx)) = state {
+            .map(|(open, idx, executes)| (terminates_heredoc(raw, open), *idx, *executes));
+        if let Some((terminates, idx, executes)) = state {
             if terminates {
                 heredoc = None;
             } else {
                 let line = &mut out[idx];
                 line.text.push(' ');
                 line.text.push_str(raw);
+                // Round-19 S2. A payload an interpreter runs is that
+                // interpreter's script, so it belongs in `argv` after all.
+                // Joined with `;` rather than a space: each payload line is
+                // its own statement, and folding them together would let a
+                // `cd` swallow the verb on the next line.
+                if executes {
+                    line.argv.push_str(" ; ");
+                    line.argv.push_str(raw);
+                }
                 let payload = line.heredoc_payload.get_or_insert_with(String::new);
                 payload.push('\n');
                 payload.push_str(raw);
@@ -2660,7 +2770,8 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
         });
         let idx = out.len() - 1;
         if let Some(open) = heredoc_delimiter(&out[idx].text) {
-            heredoc = Some((open, idx));
+            let executes = heredoc_payload_is_argv(&out[idx].text);
+            heredoc = Some((open, idx, executes));
         }
     }
 
@@ -2683,6 +2794,44 @@ fn strip_continuation(line: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Binaries that *execute* a heredoc payload instead of storing it.
+///
+/// Membership is one test: **does this line's command word run the payload as
+/// its script?** `cat`, `tee` and a redirect store it; an interpreter runs it.
+const HEREDOC_EXECUTING_BINS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "perl", "ruby", "node", "xargs",
+    "sqlite3", "psql", "mysql",
+];
+
+/// True if the payload this line opens is argv rather than data.
+///
+/// # Round-19 S2 — R2 traded a miss
+///
+/// R2 stopped a stored payload from handing the walker commands, which was
+/// right, and made every payload data, which was not:
+///
+/// ```text
+///   bash <<'EOF'
+///   cd ~/.openfang/data
+///   rm openfang.db
+///   EOF
+/// ```
+///
+/// The walker then sees one line — `bash <<'eof'` — with no verb, no `cd`
+/// and no target, and the command-line predicate finds no single token holding
+/// both `.openfang` and a datastore suffix. Both hard floors went clean. The
+/// distinction is the consumer, not the payload: `cat > f <<EOF` stores,
+/// `bash <<EOF` runs. `sqlite3 db < script.sql` and `bash < script.sh` remain
+/// out of reach and are named in the known-uncovered list.
+fn heredoc_payload_is_argv(line: &str) -> bool {
+    let lowered = lower_for_segments(line);
+    split_segments(&lowered).into_iter().any(|segment| {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        command_word(&tokens)
+            .is_some_and(|(base, _)| HEREDOC_EXECUTING_BINS.contains(&base.as_str()))
+    })
 }
 
 /// The heredoc delimiter this line opens, if any.
@@ -5024,6 +5173,73 @@ mod tests {
         let lines = logical_lines("cat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\n");
         assert!(lines[0].text.contains("cd /tmp"));
         assert!(!lines[0].argv.contains("cd /tmp"));
+    }
+
+    /// Round-19 S1. Two spellings of one folded name are two *readings* of the
+    /// reference, and R1's lookup chose between them — preferring the value
+    /// that names the control plane. The datastore arm's evidence is a
+    /// datastore suffix, not a control-plane name, so the rule picked by the
+    /// wrong predicate and the innocent `.toml` won:
+    ///
+    /// ```text
+    ///   db=~/.openfang/agents/openfang-alpha.toml
+    ///   DB=~/.openfang/data/openfang.db
+    ///   rm -f "$DB"                      # removes the datastore
+    /// ```
+    ///
+    /// Swapping the preference only moves the hole onto R1's own case. There
+    /// is no rule, because the lowered text cannot say which spelling was
+    /// written — so the readings are OR-ed, exactly as the walker already ORs
+    /// the pre/post taint snapshots. A `cd` must produce one frame, so there
+    /// the disagreement resolves to [`Cwd::Unknown`] instead of to a pick.
+    #[test]
+    fn a_fold_collision_is_read_both_ways() {
+        assert!(body_destroys_datastore(
+            "db=~/.openfang/agents/openfang-alpha.toml\nDB=~/.openfang/data/openfang.db\nrm -f \"$DB\"\n"
+        ));
+        // The other order, which the discarded preference happened to get right.
+        assert!(body_destroys_datastore(
+            "DB=~/.openfang/data/openfang.db\ndb=~/.openfang/agents/openfang-alpha.toml\nrm -f \"$db\"\n"
+        ));
+        // Substrate half: neither spelling may be discarded.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/workspaces/alpha\nD=~/.openfang/agents\nrm -rf \"$D\"\n"
+        ));
+        // Colliding spellings that agree on naming nothing stay inert.
+        assert!(!body_destroys_datastore(
+            "db=/tmp/a\nDB=/tmp/b\nrm -f \"$DB\"\n"
+        ));
+        // A `cd` needs one frame: disagreement is reported, not guessed.
+        assert!(body_frame_blind(
+            "d=~/.openfang/data\nD=/tmp/x\ncd \"$d\"\nrm -rf agents\n"
+        ));
+    }
+
+    /// Round-19 S2. R2 made the walker read `argv`, which is right for a
+    /// payload the line *stores* and wrong for one it *executes*. A heredoc
+    /// fed to an interpreter is that interpreter's script, so the walker went
+    /// blind on it entirely — `bash <<'EOF'` carries no verb, no `cd` and no
+    /// target of its own, and the command-line predicate finds no single token
+    /// holding both `.openfang` and a datastore suffix.
+    #[test]
+    fn a_heredoc_an_interpreter_executes_is_argv_after_all() {
+        assert!(body_destroys_datastore(
+            "bash <<'EOF'\ncd ~/.openfang/data\nrm openfang.db\nEOF\n"
+        ));
+        // Payload lines are separate statements, so the fold may not run them
+        // together: `cd` on one line must not swallow the verb on the next.
+        assert!(body_destroys_datastore(
+            "sh <<'EOF'\ncd ~/.openfang/data\nls\nrm openfang.db\nEOF\n"
+        ));
+        // The wrapper does not hide the interpreter.
+        assert!(body_destroys_datastore(
+            "env bash <<'EOF'\ncd ~/.openfang/data\nrm openfang.db\nEOF\n"
+        ));
+        // R2's case is unchanged: `cat` stores its payload, so the payload
+        // still may not supply the walker with a command.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\ncat > /tmp/notes <<'EOF'\n; cd /tmp\nEOF\nrm -f openfang.db\n"
+        ));
     }
 
     /// Round-18 R3. [`overcap_chunks`] overlaps so a construct straddling a
