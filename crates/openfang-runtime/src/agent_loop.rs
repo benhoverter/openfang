@@ -1025,6 +1025,12 @@ pub async fn run_agent_loop(
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
+                    // ANAI-87: the substantive exit prunes heartbeat turns before
+                    // saving; the silent exit did not, so a NO_REPLY-only agent's
+                    // blob was bounded only by compaction — paying an LLM call to
+                    // summarise junk a pure function can delete. The 10 most recent
+                    // messages are kept intact, so the turn just pushed survives.
+                    crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                     memory
                         .save_session_async(session)
                         .await
@@ -2767,6 +2773,12 @@ pub async fn run_agent_loop_streaming(
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
+                    // ANAI-87: the substantive exit prunes heartbeat turns before
+                    // saving; the silent exit did not, so a NO_REPLY-only agent's
+                    // blob was bounded only by compaction — paying an LLM call to
+                    // summarise junk a pure function can delete. The 10 most recent
+                    // messages are kept intact, so the turn just pushed survives.
+                    crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
                     memory
                         .save_session_async(session)
                         .await
@@ -7839,5 +7851,183 @@ mod tests {
             "standing by",
             "kept user turn",
         );
+    }
+
+    // === ANAI-87: the silent exit prunes heartbeat turns, same as the
+    // substantive one ===
+    //
+    // Exit A (NO_REPLY) returned early without calling
+    // `prune_heartbeat_turns`, so an agent that only ever answers NO_REPLY
+    // accumulated its own heartbeat pairs until *compaction* removed them --
+    // an LLM call paying for what a pure function deletes for free. These
+    // assert the observable consequence (stale pairs absent from the
+    // persisted transcript), not the call site, and there is one per loop
+    // because the two loops are near-verbatim copies.
+
+    /// Always answers `NO_REPLY` -- drives the silent early return.
+    struct SilentDriver;
+
+    fn silent_response() -> CompletionResponse {
+        CompletionResponse {
+            content: vec![ContentBlock::Text {
+                text: "NO_REPLY".to_string(),
+                provider_metadata: None,
+            }],
+            stop_reason: StopReason::EndTurn,
+            tool_calls: vec![],
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 1,
+            },
+            observed_tools: Vec::new(),
+            observer_live: true,
+        }
+    }
+
+    #[async_trait]
+    impl LlmDriver for SilentDriver {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+            Ok(silent_response())
+        }
+        async fn stream(
+            &self,
+            _r: CompletionRequest,
+            tx: mpsc::Sender<StreamEvent>,
+        ) -> Result<CompletionResponse, LlmError> {
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    text: "NO_REPLY".to_string(),
+                })
+                .await;
+            Ok(silent_response())
+        }
+    }
+
+    /// Twelve stale heartbeat pairs -- well past the ten `prune_heartbeat_turns`
+    /// keeps intact, so the oldest are prunable and the newest are not.
+    fn session_with_stale_heartbeats(agent_id: openfang_types::agent::AgentId) -> Session {
+        let mut session = blank_session(agent_id);
+        for i in 0..12 {
+            session
+                .messages
+                .push(Message::user(format!("stale heartbeat {i}")));
+            session
+                .messages
+                .push(Message::assistant("[no reply needed]".to_string()));
+        }
+        session
+    }
+
+    fn assert_stale_heartbeats_pruned(
+        memory: &openfang_memory::MemorySubstrate,
+        session_id: openfang_types::agent::SessionId,
+        context: &str,
+    ) {
+        let saved = memory
+            .get_session(session_id)
+            .expect("session store must be readable")
+            .expect("the silent exit must still persist the session");
+        let rendered = format!("{:?}", saved.messages);
+        assert!(
+            !rendered.contains("stale heartbeat 0"),
+            "{context}: the oldest heartbeat pair survived the silent exit -- \
+             Exit A is not pruning; got {rendered:?}"
+        );
+        assert!(
+            saved.messages.len() <= 12,
+            "{context}: silent exit left {} messages; prune keeps the 10 most \
+             recent and drops older NO_REPLY pairs",
+            saved.messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_exit_prunes_stale_heartbeats() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = session_with_stale_heartbeats(agent_id);
+        let session_id = session.id;
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(SilentDriver);
+
+        let result = run_agent_loop(
+            &manifest,
+            "another heartbeat",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
+            false, // text_reply_is_delivery
+            TurnTrigger::Heartbeat,
+        )
+        .await
+        .expect("loop should complete");
+
+        assert!(result.silent, "the driver answered NO_REPLY");
+        assert_stale_heartbeats_pruned(&memory, session_id, "silent exit (non-streaming)");
+    }
+
+    #[tokio::test]
+    async fn silent_exit_prunes_stale_heartbeats_streaming() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = openfang_types::agent::AgentId::new();
+        let mut session = session_with_stale_heartbeats(agent_id);
+        let session_id = session.id;
+        let manifest = test_manifest();
+        let driver: Arc<dyn LlmDriver> = Arc::new(SilentDriver);
+        let (tx, _rx) = mpsc::channel(64);
+
+        let result = run_agent_loop_streaming(
+            &manifest,
+            "another heartbeat",
+            &mut session,
+            &memory,
+            driver,
+            &[],
+            None,
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  // on_phase
+            None,  // media_engine
+            None,  // tts_engine
+            None,  // docker_config
+            None,  // hooks
+            None,  // context_window_tokens
+            None,  // process_manager
+            None,  // user_content_blocks
+            None,  // sender_id
+            None,  // sender_name
+            None,  // origin
+            false, // suppress_phantom_guard
+            TurnTrigger::Heartbeat,
+        )
+        .await
+        .expect("streaming loop should complete");
+
+        assert!(result.silent, "the driver answered NO_REPLY");
+        assert_stale_heartbeats_pruned(&memory, session_id, "silent exit (streaming)");
     }
 }
