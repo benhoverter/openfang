@@ -425,13 +425,100 @@ fn overcap_chunks(text: &str) -> Vec<String> {
 /// Where a script body's working directory sits, as far as this floor can tell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cwd {
-    /// Unknown, or somewhere outside the control plane. The default, and the
-    /// assumption for everything except a `cd` we could read.
+    /// Somewhere outside the control plane. The default, and the assumption
+    /// for everything except a `cd` we could read.
     Elsewhere,
+    /// ANAI-265 round-11: a `cd` whose argument this floor could not evaluate
+    /// — a command substitution, an environment variable it never saw
+    /// assigned, a positional it cannot resolve.
+    ///
+    /// Distinct from `Elsewhere` because `Elsewhere` is a *claim* and this is
+    /// the absence of one. It satisfies no arm — not `inside`, not
+    /// `substrate` — and instead records: a segment that would have hit a hard
+    /// arm had the frame been the substrate sets [`CwdHits::frame_blind`], so
+    /// "this body destroys a relative target from a directory we could not
+    /// resolve" becomes a stated fact rather than a silent miss.
+    ///
+    /// Before this, an unresolvable `cd` fell through to *keep the current
+    /// frame*. That is fail-open by default, and it is where round-11 H1 lived:
+    /// a walk that had lost track of itself went on answering as if it had not.
+    Unknown,
     /// Under `~/.openfang/`, but not under a substrate subtree.
     ControlPlane,
     /// Under the control-plane root itself, or one of [`SUBSTRATE_SUBTREES`].
     Substrate,
+}
+
+/// The walk's working-directory state: a classification, plus the path that
+/// produced it whenever we can name one.
+///
+/// # Round-11 H3 — the frame was spelling-dependent
+///
+/// Keeping only the classification made two spellings of the same directory
+/// disagree. `cd ~/.openfang/scripts` resolved to `ControlPlane` and was
+/// correctly inert; `cd ~/.openfang` then `cd scripts` kept `Substrate` —
+/// because a relative descend used to return the *current* frame unchanged —
+/// and hard-floored `rm -f *.log` in the single most-walked directory this
+/// floor reads. Same shell, same directory, two verdicts, and the second
+/// spelling reinstated exactly the collateral round-8 E3 removed.
+///
+/// Carrying the components makes the spellings converge and gives `.`, `..`
+/// and `cd -` somewhere to be applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Frame {
+    kind: Cwd,
+    /// Path components below the control-plane root, when known.
+    /// `Some(vec![])` is the root itself. `None` means we never had a path —
+    /// either we were never inside, or we lost it.
+    under_root: Option<Vec<String>>,
+}
+
+impl Frame {
+    fn elsewhere() -> Self {
+        Frame {
+            kind: Cwd::Elsewhere,
+            under_root: None,
+        }
+    }
+
+    fn unknown() -> Self {
+        Frame {
+            kind: Cwd::Unknown,
+            under_root: None,
+        }
+    }
+
+    /// Classify a known component path below the control-plane root.
+    ///
+    /// Re-renders the path and asks [`names_substrate`] and
+    /// [`names_control_plane`] rather than re-deciding the question here. That
+    /// is not fastidiousness: [`CONTROL_PLANE_BENIGN_PREFIXES`] lives behind
+    /// those predicates, and a hand-rolled classifier would have made
+    /// `cd ~/.openfang/workspaces/alpha` *inside* the control plane — firing
+    /// `script_body_control_plane` for every agent working in its own
+    /// workspace, which is the population this floor exists to leave alone.
+    fn under(components: Vec<String>) -> Self {
+        let path = if components.is_empty() {
+            format!("~/{CONTROL_PLANE_ROOT_BARE}")
+        } else {
+            format!("~/{}/{}", CONTROL_PLANE_ROOT_BARE, components.join("/"))
+        };
+        let kind = if names_substrate(&path) {
+            Cwd::Substrate
+        } else if names_control_plane(&path) {
+            Cwd::ControlPlane
+        } else {
+            Cwd::Elsewhere
+        };
+        Frame {
+            kind,
+            under_root: Some(components),
+        }
+    }
+
+    fn inside(&self) -> bool {
+        matches!(self.kind, Cwd::ControlPlane | Cwd::Substrate)
+    }
 }
 
 /// What a walk over a body's `cd` frames found.
@@ -450,6 +537,11 @@ struct CwdHits {
     /// hard floor, which is why it walks the same frames the substrate half
     /// does instead of reading tokens on its own.
     destroys_datastore: bool,
+    /// ANAI-265 round-11: a segment that *would* have set one of the hard hits
+    /// had the frame been the substrate, evaluated while the frame was
+    /// [`Cwd::Unknown`]. See [`body_frame_blind`] for why this is a fact and
+    /// not a floor.
+    frame_blind: bool,
 }
 
 /// ANAI-206 F3: follow `cd` so a relative operand cannot launder its target.
@@ -477,12 +569,14 @@ struct CwdHits {
 /// is not a stack here, and a `cd` whose argument is an expansion this floor
 /// cannot evaluate leaves the frame `Elsewhere`. This closes the shape.
 fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
-    let mut cwd = Cwd::Elsewhere;
-    let mut tainted: Vec<String> = Vec::new();
+    let mut frame = Frame::elsewhere();
+    let mut prev = Frame::elsewhere();
+    let mut tainted = Taint::default();
     let mut hits = CwdHits {
         writes: false,
         destroys: false,
         destroys_datastore: false,
+        frame_blind: false,
     };
     for line in lines {
         for unit in walk_units(&line.text) {
@@ -502,37 +596,82 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 // purpose: the tainted-variable half is live from any frame, because
                 // `d=~/.openfang/data; rm "$d/openfang.db"` never changes directory.
                 taint_from_segment(&tokens, &mut tainted);
-                let inside = cwd != Cwd::Elsewhere;
-                let substrate = cwd == Cwd::Substrate;
-                if segment_ends_datastore(&tokens, &|t: &str| {
-                    // Round-8 E3. The extension arm carries its own evidence and is
-                    // frame-agnostic; the glob arm carries none and is gated on the
-                    // substrate frame. See [`has_datastore_glob`].
-                    (has_datastore_extension(t) || (substrate && has_datastore_glob(t)))
-                        && ((inside && is_relative_operand(t)) || references_tainted(t, &tainted))
-                }) {
+                let inside = frame.inside();
+                let substrate = frame.kind == Cwd::Substrate;
+                let blind = frame.kind == Cwd::Unknown;
+                if segment_ends_datastore(&tokens, &datastore_target(inside, substrate, &tainted)) {
                     hits.destroys_datastore = true;
+                } else if blind
+                    && segment_ends_datastore(&tokens, &datastore_target(true, true, &tainted))
+                {
+                    // Round-11: it would have hit from the substrate, and we
+                    // cannot say we are not there. Record rather than guess.
+                    hits.frame_blind = true;
                 }
-                if let Some(next) = cd_target(&tokens, cwd) {
-                    cwd = next;
+                match cd_target(&tokens, &frame, &tainted) {
+                    // `cd -`: the walker holds the previous frame, so this is a
+                    // swap rather than a guess. Swapping (not overwriting) also
+                    // makes `cd -; cd -` return where it started, as a shell
+                    // does.
+                    Some(CdMove::Back) => {
+                        core::mem::swap(&mut frame, &mut prev);
+                        continue;
+                    }
+                    Some(CdMove::To(next)) => {
+                        prev = core::mem::replace(&mut frame, next);
+                        continue;
+                    }
+                    None => {}
+                }
+                let relative = tokens
+                    .iter()
+                    .skip(1)
+                    .any(|t| is_relative_operand(strip_grouping(t)));
+                if blind {
+                    // Deliberately narrower than the `writes` arm: a write to a
+                    // relative operand is most of what scripts do, and flagging
+                    // it from an unresolved frame would say nothing. A
+                    // whole-tree destruction from an unresolved frame says
+                    // something.
+                    if relative && segment_destroys_tree(&tokens) {
+                        hits.frame_blind = true;
+                    }
                     continue;
                 }
-                if cwd == Cwd::Elsewhere {
+                if frame.kind == Cwd::Elsewhere {
                     continue;
                 }
-                if !tokens.iter().skip(1).any(|t| is_relative_operand(t)) {
+                if !relative {
                     continue;
                 }
                 if segment_writes(&tokens) {
                     hits.writes = true;
                 }
-                if cwd == Cwd::Substrate && segment_destroys_tree(&tokens) {
+                if substrate && segment_destroys_tree(&tokens) {
                     hits.destroys = true;
                 }
             }
         }
     }
     hits
+}
+
+/// The target test the datastore arm hands [`segment_ends_datastore`].
+///
+/// Round-8 E3: the extension arm carries its own evidence and is frame-agnostic;
+/// the glob arm carries none and is gated on the substrate frame. See
+/// [`has_datastore_glob`].
+///
+/// Lifted out of the walker so the same test can be evaluated twice — once
+/// against the real frame, once against a hypothetical substrate frame when the
+/// real one is [`Cwd::Unknown`]. The second evaluation is what makes blindness
+/// reportable instead of silent.
+fn datastore_target(inside: bool, substrate: bool, tainted: &Taint) -> impl Fn(&str) -> bool + '_ {
+    move |t: &str| {
+        let t = strip_grouping(t);
+        (has_datastore_extension(t) || (substrate && has_datastore_glob(t)))
+            && ((inside && is_relative_operand(t)) || references_tainted(t, tainted.names()))
+    }
 }
 
 /// The text [`cwd_relative_hits`] actually walks: deobfuscated, in order, and
@@ -579,33 +718,135 @@ fn walk_units(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// What a `cd` segment does to the frame.
+enum CdMove {
+    To(Frame),
+    /// `cd -`: back to the previous frame, which the walker holds.
+    Back,
+}
+
 /// The frame this segment moves to, or `None` if it is not a `cd`.
-fn cd_target(tokens: &[&str], current: Cwd) -> Option<Cwd> {
-    if !matches!(basename(tokens[0]).as_str(), "cd" | "pushd") {
+///
+/// # Contract
+///
+/// **Resolve the argument as fully as the walk can, from any source the walk
+/// tracks — and identify the command word as fully as the walk can.**
+///
+/// Round-11 H1, H2′, H3 and `cd -` were four spellings of one defect: this
+/// function was narrower than the walk around it. It read a prefix table while
+/// the walk held a taint set, and it read `tokens[0]` while the segmenter left
+/// `{` glued to it. Written as a contract rather than as a table, all four are
+/// the same fix.
+///
+/// What it still cannot resolve now returns [`Cwd::Unknown`] rather than the
+/// current frame. `cd "$(cat f)"`, `cd "$WORKDIR"` and `cd $1` used to *keep*
+/// whatever frame preceded them — fail-open, and the reason H1 was worth a
+/// HIGH.
+fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove> {
+    let (base, idx) = command_word(tokens)?;
+    if !matches!(base.as_str(), "cd" | "pushd") {
         return None;
     }
-    // Bare `cd` goes home and `cd -` goes back; either way, not here.
-    let Some(arg) = tokens.iter().skip(1).find(|t| !t.starts_with('-')) else {
-        return Some(Cwd::Elsewhere);
-    };
-    let arg = arg.trim_matches(|c| c == '"' || c == '\'');
-    if names_substrate(arg) {
-        return Some(Cwd::Substrate);
+    let args: Vec<&str> = tokens
+        .iter()
+        .skip(idx + 1)
+        .map(|t| strip_grouping(t))
+        .filter(|t| !t.is_empty())
+        .collect();
+    // `cd -` is the previous directory, not a path — and it is how a body
+    // returns to the substrate after a detour:
+    // `cd ~/.openfang/data; cd /tmp; cd -`.
+    if args.contains(&"-") {
+        return Some(CdMove::Back);
     }
-    if names_control_plane(arg) {
-        return Some(Cwd::ControlPlane);
+    // Bare `cd`, or nothing but flags (`cd -P`): home.
+    let Some(arg) = args.iter().find(|t| !t.starts_with('-')) else {
+        return Some(CdMove::To(Frame::elsewhere()));
+    };
+    let arg = tainted.expand(arg);
+    let arg = arg.trim_matches(|c| c == '"' || c == '\'');
+    // Still carrying an expansion, a substitution or a glob: a directory we
+    // cannot name. Say so instead of keeping the last one we could.
+    if arg.contains('$') || arg.contains('`') || arg.contains('*') || arg.contains('?') {
+        return Some(CdMove::To(Frame::unknown()));
+    }
+    if let Some(components) = control_root_components(arg) {
+        return Some(CdMove::To(Frame::under(components)));
     }
     // Absolute or home-anchored: we can see the whole path, and it is not the
     // control plane.
     if arg.starts_with('/') || arg.starts_with('~') {
-        return Some(Cwd::Elsewhere);
+        return Some(CdMove::To(Frame::elsewhere()));
     }
-    // Relative. Descending keeps whatever frame we were in; anything walking
-    // upwards leaves it, because we cannot say where it lands.
-    if arg.starts_with("..") {
-        return Some(Cwd::Elsewhere);
+    // Relative, against a frame whose path we know: join and re-classify, so
+    // `cd ~/.openfang` + `cd scripts` and `cd ~/.openfang/scripts` agree, and
+    // so `..` pops rather than blanket-leaving.
+    if let Some(base_components) = current.under_root.as_ref() {
+        return Some(CdMove::To(match join_components(base_components, arg) {
+            Some(components) => Frame::under(components),
+            // Walked up out of the control plane entirely.
+            None => Frame::elsewhere(),
+        }));
     }
-    Some(current)
+    // Relative against a frame we have no path for. Unknown stays unknown;
+    // elsewhere stays elsewhere.
+    Some(CdMove::To(match current.kind {
+        Cwd::Unknown => Frame::unknown(),
+        _ => Frame::elsewhere(),
+    }))
+}
+
+/// The path components below the control-plane root named by `s`, if it names
+/// the root at all. `Some(vec![])` is the root itself.
+///
+/// The component-vector sibling of [`control_root_tails`], which answers the
+/// same question exactly one component deep. [`cd_target`] is the only caller
+/// and needs the whole path, because a later relative `cd` is joined onto it.
+fn control_root_components(s: &str) -> Option<Vec<String>> {
+    let lowered = s.to_ascii_lowercase();
+    let idx = lowered.find(CONTROL_PLANE_ROOT_BARE)?;
+    let after = &lowered[idx + CONTROL_PLANE_ROOT_BARE.len()..];
+    match after.chars().next() {
+        None => Some(Vec::new()),
+        Some('/') => normalize_components(after[1..].split('/')),
+        // `.openfangx`, `.openfang.tar.gz`: a different name that merely starts
+        // the same way. Same boundary rule [`names_control_plane`] uses.
+        Some(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' => None,
+        Some(_) => Some(Vec::new()),
+    }
+}
+
+/// Fold `.` and `..` into a component vector, or `None` if it walks above the
+/// root it started from.
+fn normalize_components<'a, I: Iterator<Item = &'a str>>(parts: I) -> Option<Vec<String>> {
+    let mut stack: Vec<String> = Vec::new();
+    for comp in parts {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            stack.pop()?;
+            continue;
+        }
+        stack.push(comp.to_string());
+    }
+    Some(stack)
+}
+
+/// Join a relative `cd` argument onto a known control-plane path.
+fn join_components(base: &[String], arg: &str) -> Option<Vec<String>> {
+    let mut stack: Vec<String> = base.to_vec();
+    for comp in arg.split('/') {
+        if comp.is_empty() || comp == "." {
+            continue;
+        }
+        if comp == ".." {
+            stack.pop()?;
+            continue;
+        }
+        stack.push(comp.to_ascii_lowercase());
+    }
+    Some(stack)
 }
 
 /// True when a token is an operand resolved against the current directory —
@@ -620,6 +861,216 @@ fn is_relative_operand(token: &str) -> bool {
     // An assignment is not an operand, and a redirect target is
     // `redirects_outside_workspace`'s question.
     !token.contains('=') && !token.contains('>')
+}
+
+/// Binaries that run their operand as the real command, so the token that
+/// *looks* like the verb is not the verb.
+///
+/// # Round-11 W1
+///
+/// Every `tokens[0]`-anchored test in this module read `basename(tokens[0])`
+/// and compared it against a bin list. `rm` is a real binary, so every one of
+/// these prefixes cleared the datastore and substrate floors *on the command
+/// line* — no obfuscation, no frame, nothing the exec policy blocks:
+///
+/// ```text
+///   env rm -rf ~/.openfang/agents
+///   nohup rm ~/.openfang/data/openfang.db
+///   timeout 5 rm -rf ~/.openfang/agents
+///   sudo rm ~/.openfang/data/openfang.db
+/// ```
+///
+/// `sudo` escaped notice for eleven rounds because it is independently in
+/// [`DESTRUCTIVE_BINS`], and `xargs`/`eval` because [`OPAQUE_EXEC_BINS`] catches
+/// them. The *benign* wrappers had nothing behind them at all.
+///
+/// Membership is one test: **does it run `argv[1..]` as a command, in this
+/// machine's file namespace?** `ssh` and `docker` are absent on purpose — they
+/// run somewhere else, and a path on the far side of them is not this
+/// machine's control plane.
+const COMMAND_WRAPPER_BINS: &[&str] = &[
+    "command", "builtin", "exec", "time", "env", "nohup", "nice", "ionice", "stdbuf", "setsid",
+    "timeout", "sudo", "doas",
+];
+
+/// Strip the shell grouping punctuation a whitespace split leaves glued to a
+/// token.
+///
+/// Round-10 H2′. [`split_segments`] splits on `(` and `)` but not on `{` and
+/// `}` — and it must not, because `${...}` is everywhere in this module's
+/// input. So `{ cd ~/.openfang/data; rm openfang.db; }` handed the frame test a
+/// `tokens[0]` of `{`, the frame was never entered, and both hard floors came
+/// back clean. One character.
+fn strip_grouping(token: &str) -> &str {
+    let head = token.trim_start_matches(['(', '{', ';', '&']);
+    // `${d}` and `${d:-/tmp}` are expansions, not groups. Trimming their tail
+    // would tear the closing brace off the name and lose the reference — which
+    // would defeat the H1 fix with the very punctuation the H2′ fix strips.
+    if head.contains('$') {
+        return head;
+    }
+    head.trim_end_matches([')', '}', ';', '&'])
+}
+
+/// True if this token is a `NAME=value` environment-assignment prefix.
+fn is_assignment(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// The real command word of a segment, and the index it sits at.
+///
+/// Round-11 W1 and H2′ are one contract: *identify the command word as fully as
+/// the walk can* — strip grouping punctuation, drop environment assignments,
+/// skip [`COMMAND_WRAPPER_BINS`] and their own arguments, then `basename`.
+///
+/// Returns the index so callers take operands from after the verb rather than
+/// from `skip(1)`: in `env rm -rf x`, the operand `x` is at index 3.
+///
+/// Deliberately over-inclusive for `cd`: `env cd /x` does not change the
+/// calling shell's directory, so treating it as a frame move claims a directory
+/// a real shell never entered. That direction costs one approval prompt on a
+/// line nobody writes. The other direction cost a hard floor.
+fn command_word(tokens: &[&str]) -> Option<(String, usize)> {
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let raw = strip_grouping(tokens[i]);
+        if raw.is_empty() || is_assignment(raw) {
+            i += 1;
+            continue;
+        }
+        let base = basename(raw);
+        if !COMMAND_WRAPPER_BINS.contains(&base.as_str()) {
+            return Some((base, i));
+        }
+        i += 1;
+        // Skip the wrapper's own flags and assignments, and the numeric operand
+        // `timeout 5 rm` and `nice -n 10 rm` put between it and the verb.
+        while i < tokens.len() {
+            let arg = strip_grouping(tokens[i]);
+            let numeric = arg.chars().next().is_some_and(|c| c.is_ascii_digit());
+            if arg.is_empty() || arg.starts_with('-') || numeric || is_assignment(arg) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Names that took a control-plane value, and the values they took.
+///
+/// # Round-11 H1 — taint has to carry values, not just names
+///
+/// The name half is ANAI-206's. The value half is the fix: [`cd_target`]
+/// resolved its argument against a prefix table and never consulted the taint
+/// set, so the *shorter* spelling of the very case ANAI-265 D1 added taint for
+/// walked straight past both hard floors.
+///
+/// ```text
+///   d=~/.openfang/data
+///   cd "$d"          # names_substrate("$d") is false -> frame unchanged
+///   rm openfang.db   # relative, no frame, no expansion -> clean
+/// ```
+///
+/// Three lines of ordinary shell, cheaper than the `cd ~/.open""fang/data` case
+/// round-8 E1 closed. Values are stored already expanded against the entries
+/// that preceded them, so `d=~/.openfang; e=$d/data; cd "$e"` closes
+/// transitively instead of stopping one hop short.
+///
+/// Declared gaps, unchanged: arrays, `read`, indirect expansion (`${!x}`), and
+/// any value arriving from a command substitution. All three now land in
+/// [`Cwd::Unknown`] rather than silently keeping the last known frame.
+#[derive(Default)]
+struct Taint {
+    names: Vec<String>,
+    values: Vec<(String, String)>,
+}
+
+impl Taint {
+    /// Record a name and, when it resolves to a literal, its value.
+    fn record(&mut self, name: &str, value: &str) {
+        let name = name.to_ascii_lowercase();
+        let value = self.expand(value);
+        self.record_name(&name);
+        // A value we could not fully expand is not a path we can `cd` to. Keep
+        // the name — `references_tainted` still fires — and drop the value, so
+        // `cd "$x"` reads as blind rather than as somewhere specific.
+        if !value.contains('$') {
+            self.values.retain(|(n, _)| n != &name);
+            self.values.push((name, value));
+        }
+    }
+
+    fn record_name(&mut self, name: &str) {
+        let name = name.to_ascii_lowercase();
+        if !self.names.contains(&name) {
+            self.names.push(name);
+        }
+    }
+
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Substitute recorded values into `$name`, `${name}` and `${name:-…}`.
+    ///
+    /// Unknown names are left exactly as written, so the result still carries a
+    /// `$` and the caller can tell "resolved" from "gave up" — which is the
+    /// whole distinction between [`Cwd::Elsewhere`] and [`Cwd::Unknown`].
+    fn expand(&self, token: &str) -> String {
+        if self.values.is_empty() || !token.contains('$') {
+            return token.to_string();
+        }
+        let chars: Vec<char> = token.chars().collect();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if chars[i] != '$' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            let braced = j < chars.len() && chars[j] == '{';
+            if braced {
+                j += 1;
+            }
+            let start = j;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let name: String = chars[start..j]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let mut end = j;
+            if braced {
+                // Skip a `:-default` / `:+alt` tail and the closing brace.
+                while end < chars.len() && chars[end] != '}' {
+                    end += 1;
+                }
+                if end == chars.len() {
+                    // Unterminated. Not something we can read; hand the rest
+                    // back verbatim so the `$` survives.
+                    out.extend(chars[i..].iter());
+                    return out;
+                }
+                end += 1;
+            }
+            match self.values.iter().find(|(n, _)| n == &name) {
+                Some((_, value)) if !name.is_empty() => out.push_str(value),
+                _ => out.extend(chars[i..end].iter()),
+            }
+            i = end;
+        }
+        out
+    }
 }
 
 impl GateVerdict {
@@ -2045,7 +2496,7 @@ fn terminates_heredoc(raw: &str, open: &HeredocOpen) -> bool {
 /// (`${!x}`), and any value arriving from a command substitution this floor
 /// cannot evaluate. This closes the shape, not the class.
 fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
-    let mut tainted: Vec<String> = Vec::new();
+    let mut tainted = Taint::default();
     for line in lines {
         let lowered = lower_for_segments(&line.text);
         for segment in split_segments(&lowered) {
@@ -2056,7 +2507,11 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
             // Taint before checking: `f=~/.openfang/agents rm -rf "$f"` is one
             // segment, and the assignment happens first.
             taint_from_segment(&tokens, &mut tainted);
-            if tokens.iter().any(|t| references_tainted(t, &tainted)) && segment_writes(&tokens) {
+            if tokens
+                .iter()
+                .any(|t| references_tainted(t, tainted.names()))
+                && segment_writes(&tokens)
+            {
                 return true;
             }
         }
@@ -2065,33 +2520,34 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
 }
 
 /// Record names this segment gives a control-plane value to.
-fn taint_from_segment(tokens: &[&str], tainted: &mut Vec<String>) {
+///
+/// Round-11 H1: records the *value* as well, expanded against everything
+/// recorded before it, so [`cd_target`] can resolve `cd "$d"` and
+/// `d=~/.openfang; e=$d/data; cd "$e"` closes transitively.
+fn taint_from_segment(tokens: &[&str], tainted: &mut Taint) {
     for token in tokens {
+        let token = strip_grouping(token);
         if let Some((name, value)) = token.split_once('=') {
             if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 continue;
             }
-            if names_control_plane(value) || references_tainted(value, tainted) {
-                let name = name.to_ascii_lowercase();
-                if !tainted.contains(&name) {
-                    tainted.push(name);
-                }
+            let expanded = tainted.expand(value);
+            if names_control_plane(&expanded) || references_tainted(value, tainted.names()) {
+                tainted.record(name, value);
             }
         }
     }
     // Positional parameters: `set -- <control path>` is readable later as `$@`,
-    // `$*` or `$1`.
-    if basename(tokens[0]).as_str() == "set"
+    // `$*` or `$1`. Round-11 W1: the verb is read through [`command_word`], not
+    // off `tokens[0]`, so `command set -- …` and `{ set -- …` still count.
+    if command_word(tokens).is_some_and(|(base, _)| base == "set")
         && tokens.contains(&"--")
-        && tokens
-            .iter()
-            .any(|t| names_control_plane(t) || references_tainted(t, tainted))
+        && tokens.iter().any(|t| {
+            names_control_plane(&tainted.expand(t)) || references_tainted(t, tainted.names())
+        })
     {
         for positional in ["@", "*", "1", "2", "3"] {
-            let positional = positional.to_string();
-            if !tainted.contains(&positional) {
-                tainted.push(positional);
-            }
+            tainted.record_name(positional);
         }
     }
 }
@@ -2514,23 +2970,35 @@ fn segment_ends_datastore(tokens: &[&str], is_target: &dyn Fn(&str) -> bool) -> 
         }
     }
 
-    let Some(base) = tokens.first().map(|t| basename(t)) else {
+    // Round-11 W1. This was `tokens.first().map(basename)`, and `rm` is a real
+    // binary — so `env rm -rf ~/.openfang/agents`, `nohup rm …`, `timeout 5 rm
+    // …` and `sudo rm …` all read as a base that is in no bin list, and cleared
+    // both hard floors on the command line with no obfuscation at all. See
+    // [`command_word`]: the index matters as much as the name, because in
+    // `env rm -rf x` the operand is at index 3, not index 1.
+    let Some((base, idx)) = command_word(tokens) else {
         return false;
     };
-    let operands = || tokens.iter().skip(1).filter(|t| !t.starts_with('-'));
+    let operands = || {
+        tokens
+            .iter()
+            .skip(idx + 1)
+            .map(|t| strip_grouping(t))
+            .filter(|t| !t.is_empty() && !t.starts_with('-'))
+    };
 
     if FILE_ENDING_BINS.contains(&base.as_str()) {
-        return operands().any(|t| is_target(t));
+        return operands().any(is_target);
     }
     if base == "dd" {
         return tokens
             .iter()
-            .filter_map(|t| t.strip_prefix("of="))
+            .filter_map(|t| strip_grouping(t).strip_prefix("of="))
             .any(is_target);
     }
     if base == "cp" || base == "install" {
         // Destination only — the last operand.
-        return operands().next_back().is_some_and(|t| is_target(t));
+        return operands().next_back().is_some_and(is_target);
     }
     false
 }
@@ -2698,6 +3166,32 @@ pub fn body_destroys_datastore(body: &str) -> bool {
         return true;
     }
     cwd_relative_hits(&lines).destroys_datastore
+}
+
+/// ANAI-265 round-11: the body destroys a relative target from a directory this
+/// floor could not resolve.
+///
+/// # Why this is a fact and not a floor
+///
+/// The review that produced [`Cwd::Unknown`] asked for it to withhold
+/// suppression eligibility outright. In this module that means membership in
+/// [`GateFlags::hard`], and it is not shippable there: `cd "$(dirname "$0")"`
+/// is the most common line in shell scripts, and `~/.openfang/scripts/` is the
+/// population this predicate reads most. A hard flag on any unresolvable `cd`
+/// would escalate nearly every script the fleet runs, which is how a control
+/// gets turned off.
+///
+/// So the reportable half is narrowed to the case that carries evidence:
+/// **a destructive verb ran against a relative operand from a frame we could
+/// not name.** That is a *named* consequence rather than a bare blindness flag,
+/// which is what makes it survive [`GatePosture::Permissive`] rule 4 — the rule
+/// that tells the judge an unnamed flag is not a concern.
+///
+/// Not yet wired to a [`GateFlags`] field; that plumb travels with the rest of
+/// the evidence-surfacing work rather than with this contract.
+#[must_use]
+pub fn body_frame_blind(body: &str) -> bool {
+    cwd_relative_hits(&logical_lines(body)).frame_blind
 }
 
 /// [`destroys_datastore`] against one folded logical line, with an above-cap
@@ -3374,27 +3868,55 @@ mod tests {
     /// the command-line path fires independently. This asserts the frame.
     #[test]
     fn cd_frames_resolve_where_the_glob_arm_assumes_they_do() {
+        let nothing = Taint::default();
+        let from = |tokens: &[&str], current: &Frame| match cd_target(tokens, current, &nothing) {
+            Some(CdMove::To(frame)) => frame.kind,
+            Some(CdMove::Back) => panic!("expected a path, got `cd -`"),
+            None => panic!("expected a cd"),
+        };
+        let away = Frame::elsewhere();
+        assert_eq!(from(&["cd", "~/.openfang/data"], &away), Cwd::Substrate);
+        assert_eq!(from(&["cd", "~/.openfang/data/"], &away), Cwd::Substrate);
         assert_eq!(
-            cd_target(&["cd", "~/.openfang/data"], Cwd::Elsewhere),
-            Some(Cwd::Substrate)
+            from(&["cd", "\"~/.openfang/agents\""], &away),
+            Cwd::Substrate
         );
         assert_eq!(
-            cd_target(&["cd", "~/.openfang/data/"], Cwd::Elsewhere),
-            Some(Cwd::Substrate)
+            from(&["cd", "~/.openfang/scripts"], &away),
+            Cwd::ControlPlane
         );
-        assert_eq!(
-            cd_target(&["cd", "\"~/.openfang/agents\""], Cwd::Elsewhere),
-            Some(Cwd::Substrate)
-        );
-        assert_eq!(
-            cd_target(&["cd", "~/.openfang/scripts"], Cwd::Elsewhere),
-            Some(Cwd::ControlPlane)
-        );
+        assert_eq!(from(&["cd", "~/.openfang/./agents"], &away), Cwd::Substrate);
         // Walking upwards leaves the frame; the glob arm must not survive it.
+        let data = Frame::under(vec!["data".to_string()]);
+        assert_eq!(data.kind, Cwd::Substrate);
+        assert_eq!(from(&["cd", "../.."], &data), Cwd::Elsewhere);
+        // Round-11 H3: the two-step spelling has to land where the one-token
+        // spelling does, or the arm is gated on how the author typed it.
+        let root = Frame::under(Vec::new());
+        assert_eq!(root.kind, Cwd::Substrate);
+        assert_eq!(from(&["cd", "scripts"], &root), Cwd::ControlPlane);
+        assert_eq!(from(&["cd", "./scripts"], &root), Cwd::ControlPlane);
+        assert_eq!(from(&["cd", "agents"], &root), Cwd::Substrate);
+        // ...and popping back out of a non-substrate component restores it.
+        let scripts = Frame::under(vec!["scripts".to_string()]);
+        assert_eq!(from(&["cd", "../agents"], &scripts), Cwd::Substrate);
+        // Round-11 H1/H2′: the command word survives grouping and wrappers.
         assert_eq!(
-            cd_target(&["cd", "../.."], Cwd::Substrate),
-            Some(Cwd::Elsewhere)
+            from(&["{", "cd", "~/.openfang/data"], &away),
+            Cwd::Substrate
         );
+        assert_eq!(
+            from(&["command", "cd", "~/.openfang/data"], &away),
+            Cwd::Substrate
+        );
+        // Round-11: what we cannot evaluate is stated, not guessed.
+        assert_eq!(from(&["cd", "\"$workdir\""], &data), Cwd::Unknown);
+        assert_eq!(from(&["cd", "$(cat", "f)"], &data), Cwd::Unknown);
+        // `cd -` is a move the walker resolves, not a path.
+        assert!(matches!(
+            cd_target(&["cd", "-"], &data, &nothing),
+            Some(CdMove::Back)
+        ));
     }
 
     /// E3's cost, from both directions.
@@ -3432,6 +3954,156 @@ mod tests {
         assert!(body_writes_runtime_config(
             "#!/bin/sh\ncat x >| ~/.openfang/config.toml\n"
         ));
+    }
+
+    // -- round 11: the frame walk's own bypasses ------------------------------
+
+    /// H1. The shorter spelling of the case D1's taint set was added for.
+    ///
+    /// D1 taught the walk that `d=~/.openfang/data; rm "$d/openfang.db"` fires.
+    /// It did not teach `cd_target`, which resolved its argument against a
+    /// prefix table and never consulted the taint set — so putting the path in
+    /// the variable, `cd`ing it, and then using bare names cleared *both* hard
+    /// floors in three lines of ordinary shell.
+    #[test]
+    fn a_cd_through_a_tainted_variable_keeps_the_frame() {
+        assert!(body_destroys_datastore(
+            "d=~/.openfang/data\ncd \"$d\"\nrm openfang.db\n"
+        ));
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\ncd \"$d\"\nrm -rf openfang-alpha\n"
+        ));
+        // Every spelling of the reference, because a careful script writes the
+        // braced ones.
+        for reference in ["$d", "\"$d\"", "${d}", "\"${d}\"", "${d:-/tmp}"] {
+            let body = format!("d=~/.openfang/data\ncd {reference}\nrm openfang.db\n");
+            assert!(body_destroys_datastore(&body), "{reference}");
+        }
+        // Transitive through values, not just through names: ANAI-206's taint
+        // was transitive over names and the value map has to match it or it
+        // stops one hop short.
+        assert!(body_destroys_datastore(
+            "d=~/.openfang\ne=$d/data\ncd \"$e\"\nrm openfang.db\n"
+        ));
+        // A variable that never held a control path is still not a frame.
+        assert!(!body_destroys_datastore(
+            "d=/tmp/scratch\ncd \"$d\"\nrm openfang.db\n"
+        ));
+    }
+
+    /// W1. The verb test read `tokens[0]`, and `rm` is a real binary.
+    ///
+    /// This is the command-line half — no frame, no script body, no
+    /// obfuscation, nothing the exec policy blocks. `sudo` was covered only by
+    /// accident, through [`DESTRUCTIVE_BINS`]; the benign wrappers had nothing.
+    #[test]
+    fn benign_wrappers_do_not_hide_the_verb() {
+        for wrapper in [
+            "env",
+            "nohup",
+            "nice",
+            "stdbuf",
+            "setsid",
+            "command",
+            "sudo",
+            "doas",
+            "time",
+            "timeout 5",
+            "nice -n 10",
+            "env foo=bar",
+        ] {
+            let datastore = format!("{wrapper} rm ~/.openfang/data/openfang.db");
+            assert!(destroys_datastore(&datastore), "{wrapper}");
+            let substrate = format!("{wrapper} rm -rf ~/.openfang/agents");
+            assert!(destroys_substrate(&substrate), "{wrapper}");
+        }
+        // The operand index has to move with the verb: `cp` reads its *last*
+        // operand, so a wrapper that shifted the tokens without shifting the
+        // index would read the wrong one.
+        assert!(destroys_datastore(
+            "env cp /tmp/x ~/.openfang/data/openfang.db"
+        ));
+        assert!(!destroys_datastore(
+            "env cp ~/.openfang/data/openfang.db /tmp/x"
+        ));
+        // And a wrapper is not itself a verb.
+        assert!(!destroys_datastore("env ~/.openfang/data/openfang.db"));
+    }
+
+    /// H2′. `split_segments` splits on `(` and `)` — but not on `{`, and it
+    /// must not, because `${...}` is everywhere in this module's input. So the
+    /// brace-group spelling handed the frame test a `tokens[0]` of `{`.
+    #[test]
+    fn a_brace_group_does_not_hide_the_cd() {
+        assert!(body_destroys_datastore(
+            "{ cd ~/.openfang/data; rm openfang.db; }\n"
+        ));
+        assert!(body_destroys_substrate(
+            "{ cd ~/.openfang/agents; rm -rf openfang-alpha; }\n"
+        ));
+        // The subshell spelling already worked, because `(` *is* a separator.
+        assert!(body_destroys_datastore(
+            "( cd ~/.openfang/data && rm openfang.db )\n"
+        ));
+    }
+
+    /// H3. Two spellings of the same directory, one verdict.
+    ///
+    /// `cd ~/.openfang/scripts` was correctly inert while `cd ~/.openfang`
+    /// then `cd scripts` kept `Substrate` and hard-floored — in the one
+    /// directory E3 exists to protect.
+    #[test]
+    fn a_two_step_cd_lands_where_the_one_step_cd_does() {
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang\ncd scripts\nrm -f *.log\n"
+        ));
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang\ncd ./scripts\nmv *.sh archive/\n"
+        ));
+        // The substrate case the arm was written for still fires either way.
+        assert!(body_destroys_datastore("cd ~/.openfang\ncd data\nrm *\n"));
+        assert!(body_destroys_datastore("cd ~/.openfang/data\nrm *\n"));
+        // Popping out of the control plane entirely takes the frame with it.
+        assert!(!body_destroys_substrate(
+            "cd ~/.openfang/agents\ncd ../../..\nrm -rf openfang-alpha\n"
+        ));
+    }
+
+    /// `cd -` is how a body returns to the substrate after a detour, and the
+    /// old flag-skipping argument search read straight past it.
+    #[test]
+    fn cd_dash_returns_to_the_previous_frame() {
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\ncd /tmp\ncd -\nrm openfang.db\n"
+        ));
+        // Bare `cd` is home, and home is not the substrate.
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/data\ncd\nrm openfang.db\n"
+        ));
+    }
+
+    /// `Cwd::Unknown`: an unresolvable `cd` is a stated blindness, not a
+    /// retained frame.
+    ///
+    /// The old fall-through kept whatever frame preceded it, so a walk that had
+    /// lost track of itself went on answering as if it had not — and the
+    /// answers it gave were *hard*.
+    #[test]
+    fn an_unresolvable_cd_reports_instead_of_guessing() {
+        // It must not carry the previous frame forward into a hard hit.
+        let laundered = "cd ~/.openfang/data\ncd \"$workdir\"\nrm -rf agents\n";
+        assert!(!body_destroys_substrate(laundered));
+        // ...but it must not be silent about it either.
+        assert!(body_frame_blind(laundered));
+        assert!(body_frame_blind(
+            "cd \"$(dirname \"$0\")\"\nrm openfang.db\n"
+        ));
+        // The common benign shape stays quiet: an unresolvable `cd` on its own
+        // is most shell scripts, and flagging it would turn the control off.
+        assert!(!body_frame_blind(
+            "cd \"$(dirname \"$0\")\"\ncargo build --release\n"
+        ));
+        assert!(!body_frame_blind("cd ~/.openfang/scripts\nrm -f *.log\n"));
     }
 
     // -- config --------------------------------------------------------------
