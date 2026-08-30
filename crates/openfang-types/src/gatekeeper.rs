@@ -782,7 +782,24 @@ fn walk_statements(
                 {
                     hits.destroys = true;
                 }
-                if let Some(mv) = cd_target(&tokens, frame, tainted) {
+                // Round-25 Y2. This branch used to `continue`, and the
+                // hypothetical-frame arm below it therefore never ran for a
+                // merged segment whose *command word* was itself a frame
+                // mover. That is the highest-value swallowed shape rather than
+                // a corner: a region the segmenter merged across a statement
+                // boundary begins with the statement that was already there,
+                // and since D1 the body shape this ticket chases starts with a
+                // `cd`. [`cd_argument`] also takes the first operand only, so
+                // a second `cd` in the same merged segment moved nothing and
+                // was not even a reading.
+                //
+                // The move is applied exactly as before; the arm now runs
+                // afterwards, seeded with where the move landed. The tail
+                // below is still skipped for a `cd` segment, so nothing else
+                // about this branch changes.
+                let base_frame = frame.clone();
+                let real_move = cd_target(&tokens, frame, tainted);
+                if let Some(mv) = &real_move {
                     // Round-18 R3: a replayed segment already moved the frame
                     // in the previous chunk. `cd ..` is not idempotent.
                     if !replayed {
@@ -793,11 +810,10 @@ fn walk_statements(
                             // it started, as a shell does.
                             CdMove::Back => core::mem::swap(frame, prev),
                             CdMove::To(next) => {
-                                *prev = core::mem::replace(frame, next);
+                                *prev = core::mem::replace(frame, next.clone());
                             }
                         }
                     }
-                    continue;
                 }
                 // Round-12 J4. `skip(1)` was the position assumption W1 removed
                 // everywhere else, left in the one place it happened to be
@@ -839,10 +855,47 @@ fn walk_statements(
                 // against the frame the segment reached rather than against the
                 // real one it never left; and the readings are the same
                 // `states` every other arm ORs over, not the post-segment taint
-                // alone. The frames are a set for exactly S1's reason — a
-                // `cd "$d"` under a fold collision has more than one reading,
-                // and choosing one is how a floor gets lost.
+                // alone.
+                //
+                // Round-25 Y3 corrects why the frames are a set. It is *not*
+                // the argument under a fold collision — [`cd_argument`]
+                // resolves its argument with [`Taint::expand`], the
+                // one-reading contract, so a colliding `cd "$d"` yields
+                // exactly one frame and it is [`Cwd::Unknown`] via the `$`
+                // guard. The set widens through `states` (at most three) and,
+                // since Y1, through a *verb* whose readings are different
+                // movers. `MAX_HYPO_FRAMES` is a backstop on those two, not a
+                // cross-product bound.
+                // Round-25 Y1/Y2. The seed is the frame we carried plus every
+                // frame the segment's own verb readings could have moved to —
+                // including the ones [`cd_target`]'s ranking did not carry
+                // across the boundary, and including the move itself, which
+                // used to be evaluated by nobody.
+                let mut landed: Vec<Frame> = Vec::new();
+                for state in &states {
+                    for mv in cd_moves(&tokens, &base_frame, state) {
+                        let f = match mv {
+                            CdMove::Back => prev.clone(),
+                            CdMove::To(f) => f,
+                        };
+                        if !landed.contains(&f) && landed.len() < MAX_HYPO_FRAMES {
+                            landed.push(f);
+                        }
+                    }
+                }
+                // Only the frames a move *landed* on are evaluated here. The
+                // frame we carried in is judged by the ordering-aware tail
+                // below, and evaluating it here as well would re-light J4's
+                // over-fire — `cd ~/.openfang/agents` then `env rm -rf ~/x`,
+                // where the verb itself reads as a relative operand once the
+                // ordering filter is gone.
+                apply_hypothetical_frames(&landed, &tokens, ds_tokens, &states, hits);
                 let mut hypo_frames: Vec<Frame> = vec![frame.clone()];
+                for f in landed {
+                    if !hypo_frames.contains(&f) && hypo_frames.len() < MAX_HYPO_FRAMES {
+                        hypo_frames.push(f);
+                    }
+                }
                 let mut last_verb: Option<usize> = None;
                 for pos in 0..tokens.len() {
                     if hits.destroys_datastore && hits.destroys {
@@ -877,29 +930,10 @@ fn walk_statements(
                     }
                     last_verb = Some(verb_at);
                     hypo_frames = next;
-                    for hypo in &hypo_frames {
-                        if !hypo.inside() {
-                            continue;
-                        }
-                        let h_substrate = hypo.kind == Cwd::Substrate;
-                        if states.iter().any(|state| {
-                            segment_ends_datastore(
-                                ds_tokens,
-                                &datastore_target(true, h_substrate, state),
-                            )
-                        }) {
-                            hits.destroys_datastore = true;
-                        }
-                        if h_substrate
-                            && segment_destroys_tree(&tokens)
-                            && tokens
-                                .iter()
-                                .skip(verb_at + 1)
-                                .any(|t| is_relative_operand(strip_grouping(t)))
-                        {
-                            hits.destroys = true;
-                        }
-                    }
+                    apply_hypothetical_frames(&hypo_frames, &tokens, ds_tokens, &states, hits);
+                }
+                if real_move.is_some() {
+                    continue;
                 }
                 let verb_idx = cw_idx.unwrap_or(0);
                 let relative = tokens
@@ -1102,7 +1136,67 @@ fn overlap_prefix(prev: &[String], cur: &[(&str, &str)]) -> usize {
     0
 }
 
+/// Fire the hard arms against every frame this segment might have been running
+/// in.
+///
+/// Round-23 W3's arm, lifted out of the walk loop for round-25 Y2 so the
+/// frames a `cd` command word moved to are evaluated by the same code as the
+/// frames a *swallowed* `cd` moved to — one definition rather than two
+/// branches that drifted.
+///
+/// Two deliberate asymmetries, both stated here because they read as
+/// oversights:
+///
+/// * The arms are **ordering-blind**. The substrate half used to filter
+///   operands to those after the verb while the datastore half read the whole
+///   segment, so `cd ~/.openfang/data ; rm -f x` and `rm -f x ; cd
+///   ~/.openfang/data` were judged by different rules in adjacent branches.
+///   The filter is the half that can *miss*, and the segmenter does not model
+///   statement order inside a region it merged, so both halves are now blind
+///   to it. Cost is a prompt on a body that leaves the substrate and then
+///   destroys something relative; the alternative is a modelling change.
+/// * A hypothetical [`Cwd::Unknown`] **reports** rather than dropping.
+///   Round-25 Y3: `Frame::unknown().inside()` is false, so this loop used to
+///   discard exactly the reading that says "we cannot name the frame" — the
+///   one place W3's do-not-choose rule was still choosing, toward the weaker
+///   answer. The real-frame path has had this branch since round 11.
+fn apply_hypothetical_frames(
+    frames: &[Frame],
+    tokens: &[&str],
+    ds_tokens: &[&str],
+    states: &[&Taint],
+    hits: &mut CwdHits,
+) {
+    for hypo in frames {
+        if !hypo.inside() {
+            if hypo.kind == Cwd::Unknown
+                && states.iter().any(|state| {
+                    segment_ends_datastore(ds_tokens, &datastore_target(true, true, state))
+                })
+            {
+                hits.frame_blind = true;
+            }
+            continue;
+        }
+        let h_substrate = hypo.kind == Cwd::Substrate;
+        if states.iter().any(|state| {
+            segment_ends_datastore(ds_tokens, &datastore_target(true, h_substrate, state))
+        }) {
+            hits.destroys_datastore = true;
+        }
+        if h_substrate
+            && segment_destroys_tree(tokens)
+            && tokens
+                .iter()
+                .any(|t| is_relative_operand(strip_grouping(t)))
+        {
+            hits.destroys = true;
+        }
+    }
+}
+
 /// What a `cd` segment does to the frame.
+#[derive(Clone, PartialEq)]
 enum CdMove {
     To(Frame),
     /// `cd -`: back to the previous frame, which the walker holds.
@@ -1127,7 +1221,66 @@ enum CdMove {
 /// whatever frame preceded them — fail-open, and the reason H1 was worth a
 /// HIGH.
 fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove> {
-    let (base, idx) = command_word(tokens)?;
+    // Round-25 Y1. Round-24 X1 widened this function's *input* to every
+    // reading of the verb token and left its output a single answer, with the
+    // `popd` test running first over the OR-ed set:
+    //
+    // ```text
+    //   c=cd
+    //   C=popd
+    //   $c ~/.openfang/data
+    //   rm -f openfang.db      # removes the datastore
+    // ```
+    //
+    // One colliding reading that basenames to `popd` therefore overrode a real
+    // `cd` into the control plane, and [`Cwd::Unknown`] is strictly weaker
+    // than `Under(data)` — it buys `frame_blind` where the other fires a hard
+    // floor. S1's lesson, third instance: OR the input and then choose, and
+    // the choice is where the floor is lost.
+    //
+    // So the readings are a set ([`cd_moves`]) and the walker ORs over them.
+    // This wrapper survives for the one thing that genuinely needs a single
+    // answer — the frame the *next* segment inherits, which is one value —
+    // and it resolves disagreement toward the most-containing reading. That is
+    // the fail-closed direction under the ANAI-265 ledger: an over-containing
+    // frame costs a prompt, an under-containing one costs a floor.
+    cd_moves(tokens, current, tainted)
+        .into_iter()
+        .reduce(|a, b| {
+            if containment(&b) > containment(&a) {
+                b
+            } else {
+                a
+            }
+        })
+}
+
+/// How much of the control plane a move claims, most-containing highest.
+///
+/// Only used to pick the frame carried across a segment boundary when the
+/// verb's readings disagree; within a segment every reading is evaluated.
+fn containment(mv: &CdMove) -> u8 {
+    match mv {
+        CdMove::To(f) => match f.kind {
+            Cwd::Substrate => 4,
+            Cwd::ControlPlane => 3,
+            Cwd::Unknown => 1,
+            Cwd::Elsewhere => 0,
+        },
+        // The previous frame, which the walker holds and which is at least as
+        // resolved as `Unknown`.
+        CdMove::Back => 2,
+    }
+}
+
+/// Every frame the readings of this segment's verb could move to.
+///
+/// Empty when no reading is a frame mover. More than one entry means the verb
+/// token has colliding readings that are not the same mover — round-25 Y1.
+fn cd_moves(tokens: &[&str], current: &Frame, tainted: &Taint) -> Vec<CdMove> {
+    let Some((base, idx)) = command_word(tokens) else {
+        return Vec::new();
+    };
     // Round-24 X1 — the verb through the taint set, not just the argument.
     //
     // [`command_word`] resolves wrappers but never expansions, so a frame move
@@ -1177,12 +1330,29 @@ fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove
     // cosmetic — both ends of the swap are already unresolved or already
     // recorded — and making `prev` a stack to tidy it up buys a second place
     // for the frame to be silently wrong at depth two.
-    if bases.iter().any(|b| b == "popd") {
-        return Some(CdMove::To(Frame::unknown()));
+    let mut moves: Vec<CdMove> = Vec::new();
+    for b in &bases {
+        let mv = match b.as_str() {
+            "popd" => CdMove::To(Frame::unknown()),
+            "cd" | "pushd" => match cd_argument(tokens, idx, current, tainted) {
+                Some(mv) => mv,
+                None => continue,
+            },
+            _ => continue,
+        };
+        if !moves.contains(&mv) {
+            moves.push(mv);
+        }
     }
-    if !bases.iter().any(|b| matches!(b.as_str(), "cd" | "pushd")) {
-        return None;
-    }
+    moves
+}
+
+/// The frame the argument of a resolved `cd`/`pushd` names.
+///
+/// Split out of [`cd_target`] for round-25 Y1 so that a verb whose readings
+/// disagree resolves its argument once and contributes one move per reading,
+/// rather than letting the first matching verb name decide the answer.
+fn cd_argument(tokens: &[&str], idx: usize, current: &Frame, tainted: &Taint) -> Option<CdMove> {
     let args: Vec<&str> = tokens
         .iter()
         .skip(idx + 1)
@@ -6249,6 +6419,53 @@ mod tests {
             "cd \"$(dirname \"$0\")\"\ncargo build --release\n"
         ));
         assert!(!body_frame_blind("cd ~/.openfang/scripts\nrm -f *.log\n"));
+    }
+
+    /// Y1. `cd_target` OR-ed the readings of its verb and then chose between
+    /// them, with `popd` tested first — so one colliding reading that
+    /// basenames to `popd` overrode a real `cd` into the control plane and
+    /// turned a hard datastore floor into a `frame_blind` note.
+    ///
+    /// `Unknown` is strictly weaker than `Under(data)` here, which is what
+    /// makes this fail-open rather than merely imprecise. Round-24 X1's own
+    /// witness plus one assignment.
+    #[test]
+    fn a_colliding_verb_reading_cannot_veto_a_real_frame_move() {
+        assert!(body_destroys_datastore(
+            "c=cd\nC=popd\n$c ~/.openfang/data\nrm -f openfang.db\n"
+        ));
+        // The reading that is only `popd` still resolves to `Unknown`: the
+        // ranking prefers the more-containing frame, it does not invent one.
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/data\npushd /tmp\npopd\nrm openfang.db\n"
+        ));
+    }
+
+    /// Y2. The swallowed-`cd` arm sat behind the `cd` branch's `continue`, so
+    /// a merged segment whose *command word* was itself a frame mover skipped
+    /// it — the highest-value swallowed shape, since a merged region begins
+    /// with the statement that was already there.
+    ///
+    /// The merge here is an unbalanced quote in a `cd` segment's operand.
+    /// Bash would reject that exact body at EOF; the arm exists for the
+    /// divergence we have *not* found, and this is how it is reachable.
+    #[test]
+    fn a_swallowed_cd_is_read_even_when_the_command_word_is_also_a_cd() {
+        assert!(body_destroys_datastore(
+            "cd /tmp 'x\ncd ~/.openfang/data ; rm -f openfang.db\n"
+        ));
+    }
+
+    /// Y3. `Frame::unknown().inside()` is false, so the hypothetical arm
+    /// silently discarded the one reading that says the frame cannot be named
+    /// — W3's do-not-choose rule still choosing, toward the weaker answer.
+    /// The real-frame path has reported this since round 11.
+    #[test]
+    fn an_unresolvable_swallowed_cd_reports_rather_than_dropping() {
+        let swallowed = "cd /tmp\necho 'x ; cd \"$workdir\" ; rm -f openfang.db'\n";
+        assert!(body_frame_blind(swallowed));
+        // It is blindness, not a floor: we cannot say we were in the substrate.
+        assert!(!body_destroys_datastore(swallowed));
     }
 
     /// W1. `$$` is the PID parameter, and bash consumes it before the next
