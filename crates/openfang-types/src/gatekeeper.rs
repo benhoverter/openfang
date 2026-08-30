@@ -1089,16 +1089,42 @@ struct Taint {
 }
 
 impl Taint {
-    /// Record a name and, when it resolves to a literal, its value.
-    fn record(&mut self, name: &str, value: &str) {
+    /// Record what a name expands to, for *any* syntactic assignment.
+    ///
+    /// # Round-16 N1 — expansion is a lowering step, evidence is a predicate
+    ///
+    /// These were one operation until now: a name was recorded only when the
+    /// caller's gate passed, so an assignment with no evidence *at assignment
+    /// time* was not expandable *at use time* either. The walk is forward-only
+    /// and shell assigns before entering a directory as often as after, so
+    /// round-15 M1 covered one order and was unreachable in the other:
+    ///
+    /// ```text
+    ///   f=openfang.db
+    ///   cd ~/.openfang/data
+    ///   rm -f "$f"
+    /// ```
+    ///
+    /// Splitting them puts every reading of a token at the use site, where
+    /// both arms of [`datastore_target`] already test the frame. The two sets
+    /// are kept separate on purpose: `values` widens *expansion*, which carries
+    /// no evidence of its own, while `names` stays evidence-gated because
+    /// [`references_tainted`] is frame-agnostic — feeding every assignment into
+    /// it would make any script that assigns a variable and touches a `.db` a
+    /// hard floor.
+    ///
+    /// Round-16 N4 falls out: recording unconditionally means a reassignment
+    /// overwrites, so `d=~/.openfang/agents; d=/tmp/x` no longer expands to the
+    /// value it used to have.
+    fn record_value(&mut self, name: &str, value: &str) {
         let name = name.to_ascii_lowercase();
         let value = self.expand(value);
-        self.record_name(&name);
-        // A value we could not fully expand is not a path we can `cd` to. Keep
-        // the name — `references_tainted` still fires — and drop the value, so
-        // `cd "$x"` reads as blind rather than as somewhere specific.
+        // A value we could not fully expand is not a path we can `cd` to. Drop
+        // it — and drop any earlier value for the same name with it, or the
+        // map would answer for a variable that has since been reassigned to
+        // something it cannot read.
+        self.values.retain(|(n, _)| n != &name);
         if !value.contains('$') {
-            self.values.retain(|(n, _)| n != &name);
             self.values.push((name, value));
         }
     }
@@ -2646,6 +2672,17 @@ fn deferred_control_plane_write(lines: &[LogicalLine]) -> bool {
 /// evidence [`datastore_target`] already accepts for a literal relative operand,
 /// arriving through a name instead of through the token. Outside it nothing
 /// changes: `f=openfang.db` in a checkout is still any project's scratch file.
+///
+/// # Round-16 N1 — the frame at assignment time is not the only frame
+///
+/// M1 read the frame at *assignment* time and the walk is forward-only, so the
+/// hoisted spelling — assign, then `cd`, then use — recorded nothing and both
+/// hard floors stayed clean. Recording and judging are now separate steps: the
+/// value is recorded for every syntactic assignment so it can be expanded
+/// later, and the frame evidence is applied at the use site by
+/// [`datastore_target`], which already tests it. `inside_control_plane`
+/// survives only as evidence for the *name* set, which is what
+/// [`references_tainted`] reads.
 fn taint_from_segment(tokens: &[&str], tainted: &mut Taint, inside_control_plane: bool) {
     for token in tokens {
         let token = strip_grouping(token);
@@ -2654,11 +2691,12 @@ fn taint_from_segment(tokens: &[&str], tainted: &mut Taint, inside_control_plane
                 continue;
             }
             let expanded = tainted.expand(value);
-            if names_control_plane(&expanded)
+            let evidence = names_control_plane(&expanded)
                 || references_tainted(value, tainted.names())
-                || (inside_control_plane && is_relative_operand(&expanded))
-            {
-                tainted.record(name, value);
+                || (inside_control_plane && is_relative_operand(&expanded));
+            tainted.record_value(name, value);
+            if evidence {
+                tainted.record_name(name);
             }
         }
     }
@@ -3722,6 +3760,16 @@ fn token_matches_verb(token: &str, verb: &str) -> bool {
     if token == verb {
         return true;
     }
+    // Round-16. `sqlite3` resolves an unambiguous *prefix* of a dot-command, so
+    // `.sy` runs `.system` and `.sh` runs `.shell` — verified against the
+    // installed sqlite3, where `.s` is ambiguous (it lands on `.scanstats`) and
+    // two characters after the dot is the shortest form that reaches these.
+    // Exact match left the whole opaque-executor pair one character from being
+    // bypassed. Matching any prefix of length >= 3 is fail-closed and adds no
+    // table: a shorter prefix than sqlite3 itself accepts simply never appears.
+    if verb.starts_with('.') {
+        return token.len() >= 3 && verb.starts_with(token);
+    }
     // `--in-place=.bak` is `--in-place`.
     if verb.starts_with("--") {
         if let Some(rest) = token.strip_prefix(verb) {
@@ -4592,6 +4640,115 @@ mod tests {
         ));
         assert!(body_destroys_datastore(
             "cd ~/.openfang/data\necho x | tee openfang.db\n"
+        ));
+    }
+
+    /// Round-16 N1. The assignment is hoisted above the `cd`, which is how
+    /// shell is written at least as often as the other order. M1 read the
+    /// frame at assignment time, so this recorded nothing at all and both hard
+    /// floors stayed clean on three lines of ordinary shell.
+    #[test]
+    fn a_name_assigned_before_the_cd_is_still_the_path_after_it() {
+        assert!(body_destroys_datastore(
+            "f=openfang.db\ncd ~/.openfang/data\nrm -f \"$f\"\n"
+        ));
+        assert!(body_destroys_datastore(
+            "f=openfang.db\ncd ~/.openfang\ncd data\nrm -f \"${f}\"\n"
+        ));
+        // Transitive across the hoist, same as within a frame.
+        assert!(body_destroys_datastore(
+            "f=openfang.db\ng=$f\ncd ~/.openfang/data\nrm -f \"$g\"\n"
+        ));
+        // The substrate half, which reaches the same taint values from any
+        // frame because it never needs one.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\nrm -rf \"$d\"\n"
+        ));
+    }
+
+    /// Round-16 Q2, refuted and pinned *with its reasoning*, because the
+    /// obvious over-correction for N1 — carrying the assignment-time frame
+    /// with the value and treating the result as absolute — breaks it.
+    ///
+    /// A relative value's meaning is frame-dependent and the map stores no
+    /// frame with it. `rm -f "$f"` from `/tmp` removes `/tmp/openfang.db`, not
+    /// the datastore, and the evidence conjunct re-tested at the *use* site is
+    /// what makes that come out right.
+    #[test]
+    fn a_relative_name_used_outside_the_frame_is_not_the_datastore() {
+        assert!(!body_destroys_datastore(
+            "cd ~/.openfang/data\nf=openfang.db\ncd /tmp\nrm -f \"$f\"\n"
+        ));
+        assert!(!body_destroys_datastore(
+            "f=openfang.db\ncd /tmp\nrm -f \"$f\"\n"
+        ));
+    }
+
+    /// Round-16 N4. [`Taint::record_value`] only reached the `retain` when the
+    /// caller's gate passed, so a reassignment whose new value failed the gate
+    /// left the *old* value in place and a later expansion answered for a
+    /// variable that had since been pointed somewhere harmless.
+    ///
+    /// Over-fire only in the order below, and correct already in the inverse
+    /// one — but a shadowed name is a landmine for the next predicate that
+    /// reads `expand()`.
+    #[test]
+    fn a_reassigned_name_does_not_keep_its_old_value() {
+        assert!(!body_destroys_substrate(
+            "d=~/.openfang/agents\nd=/tmp/x\nrm -rf \"$d\"\n"
+        ));
+        // The inverse order was always right and stays right.
+        assert!(body_destroys_substrate(
+            "d=/tmp/x\nd=~/.openfang/agents\nrm -rf \"$d\"\n"
+        ));
+        // Reassigned to something we cannot read: the value is dropped rather
+        // than kept, so the `cd` reads blind instead of reading the old path.
+        assert!(!body_destroys_datastore(
+            "d=~/.openfang/data\nd=$(cat f)\ncd \"$d\"\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// Round-16 Q3. sqlite3 resolves an unambiguous *prefix* of a dot-command,
+    /// so exact matching left the opaque-executor pair one character from a
+    /// bypass. Verified against the installed sqlite3: `.sy` runs `.system`,
+    /// `.sh` runs `.shell`, and `.s` is ambiguous.
+    #[test]
+    fn abbreviated_sqlite_dot_commands_are_still_opaque() {
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db \".sy rm -rf ~/.openfang/agents\"",
+            &[],
+            &[]
+        ));
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db \".she rm -rf ~/.openfang/agents\"",
+            &[],
+            &[]
+        ));
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db \".rea /tmp/payload.sql\"",
+            &[],
+            &[]
+        ));
+        // Not a prefix of anything in the table, and short prefixes sqlite3
+        // itself will not resolve stay out.
+        assert!(!has_opaque_execution(
+            "sqlite3 ~/.openfang/data/openfang.db .tab",
+            &[],
+            &[]
+        ));
+    }
+
+    /// Round-16 Q3, third item. A heredoc-fed dot-command is covered by the
+    /// commit-7 heredoc fold and by nothing else — the payload path asks
+    /// [`segment_writes`] of the *opening* line's tokens, which carry no verb.
+    /// Coverage that rests entirely on a fold two commits away is coverage
+    /// nobody can see; this is the test that makes it visible.
+    #[test]
+    fn a_heredoc_fed_dot_command_is_still_opaque() {
+        assert!(has_opaque_execution(
+            "sqlite3 /tmp/scratch.db <<'SQL'\n.shell rm -rf ~/.openfang/agents\nSQL\n",
+            &[],
+            &[]
         ));
     }
 
