@@ -797,7 +797,56 @@ fn walk_statements(
                 // the next person, and the next person is the one who narrows
                 // it. Take the operands from after the resolved verb, like
                 // every other operand walk in this module.
-                let verb_idx = command_word(&tokens).map_or(0, |(_, i)| i);
+                let cw_idx = command_word(&tokens).map(|(_, i)| i);
+                // Round-23 W1/W2/W3. A `cd` that appears in a segment as an
+                // *operand* rather than as the command word is a statement the
+                // segmenter did not honour — because a quote closed later here
+                // than in bash (`$$'x\'`), or because a comment we failed to
+                // recognise (`echo a;#note`) folded the rest of the body into
+                // one segment, or because of the next divergence of that shape.
+                //
+                // Chasing those spellings one at a time is a race with bash's
+                // lexer, and the direction is fail-*open* for the frame: a
+                // swallowed `cd` is a containment we would otherwise have
+                // proved. So do not choose. The frame this segment might have
+                // been running in is another reading, OR-ed into the arms
+                // exactly as the taint states are — the same "stop choosing"
+                // structure as round-19 S1 and round-17 P1.
+                for pos in 0..tokens.len() {
+                    if hits.destroys_datastore && hits.destroys {
+                        break;
+                    }
+                    if Some(pos) == cw_idx || basename(strip_grouping(tokens[pos])) != "cd" {
+                        continue;
+                    }
+                    let hypo = match cd_target(&tokens[pos..], frame, tainted) {
+                        Some(CdMove::To(next)) => next,
+                        Some(CdMove::Back) => prev.clone(),
+                        None => continue,
+                    };
+                    if !hypo.inside() {
+                        continue;
+                    }
+                    let h_substrate = hypo.kind == Cwd::Substrate;
+                    if states.iter().any(|state| {
+                        segment_ends_datastore(
+                            ds_tokens,
+                            &datastore_target(true, h_substrate, state),
+                        )
+                    }) {
+                        hits.destroys_datastore = true;
+                    }
+                    if h_substrate
+                        && segment_destroys_tree(&tokens)
+                        && tokens
+                            .iter()
+                            .skip(pos + 1)
+                            .any(|t| is_relative_operand(strip_grouping(t)))
+                    {
+                        hits.destroys = true;
+                    }
+                }
+                let verb_idx = cw_idx.unwrap_or(0);
                 let relative = tokens
                     .iter()
                     .skip(verb_idx + 1)
@@ -2462,6 +2511,10 @@ impl GateRequest {
                 .cloned()
                 .collect::<Vec<_>>(),
         ));
+        // The accidental-hit spelling still hits, for its accidental reason.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang\necho $$'x\\'\ncd data ; rm -f openfang.db\n"
+        ));
         let gated_tier = neutralize_header_field(&join_or_none(&self.allowed_commands));
         let base_list = neutralize_header_field(&join_or_none(&self.bases));
         let inner_list = neutralize_header_field(&join_or_none(&self.inner));
@@ -2673,6 +2726,17 @@ struct ShellChar {
 /// only before `$ \` `` ` `` `"` and newline. Treating it as a general escape
 /// can only make a separator *less* likely to be read as code, which is the
 /// safe direction here.
+///
+/// # Round-23 W3 — "safe direction" is per *consumer*, not per scanner
+///
+/// That last sentence is true for every evidence predicate, where merging two
+/// segments can only add tokens to a conjunction, and **false** for exactly
+/// one thing: the frame. A separator we mask is a statement we lose, and if
+/// the lost statement is a `cd`, we lose a containment we would otherwise have
+/// proved. Late-close is fail-closed for the arms and fail-*open* for
+/// [`cd_target`]. Both round-23 witnesses are that sentence being false, so
+/// the walker no longer relies on this scanner agreeing with bash — see the
+/// swallowed-`cd` arm in [`walk_statements`].
 fn scan_shell(line: &str) -> (Vec<ShellChar>, ShellQuote) {
     let mut out = Vec::with_capacity(line.len());
     let mut quote = ShellQuote::None;
@@ -2689,6 +2753,7 @@ fn scan_shell(line: &str) -> (Vec<ShellChar>, ShellQuote) {
             boundary,
         };
         let was_escaped = escaped;
+        let was_dollar = prev_dollar;
         if escaped {
             escaped = false;
             boundary = false;
@@ -2719,13 +2784,35 @@ fn scan_shell(line: &str) -> (Vec<ShellChar>, ShellQuote) {
                     boundary = false;
                 }
                 c if c.is_whitespace() && quote == ShellQuote::None => boundary = true,
+                // Round-23 W2. Bash: "a word beginning with # causes that word
+                // and all remaining characters on that line to be ignored" —
+                // and `; & | ( ) < >` are metacharacters that *delimit* words.
+                // So `echo a;#note` is a command plus a comment, and reading
+                // `#note` as code is not the harmless over-approximation it
+                // looks like: an apostrophe in the unstripped comment opened a
+                // quote that folded the rest of the body into one segment.
+                c if is_shell_metachar(c) && quote == ShellQuote::None => boundary = true,
                 _ => boundary = false,
             }
         }
-        prev_dollar = ch == '$' && !was_escaped && facts.quote == ShellQuote::None;
+        // Round-23 W1. `$$` is the PID parameter and bash consumes it as one
+        // word-expansion *before* the next character is read, so the `'` in
+        // `$$'x\'` opens a plain single quote where `\` is literal — not an
+        // ANSI-C string where it escapes. A `$` that is itself the second half
+        // of a `$$` therefore does not arm the next quote. `$$$'…'` stays
+        // correct: the third `$` is unconsumed and does arm it.
+        prev_dollar = ch == '$' && !was_escaped && facts.quote == ShellQuote::None && !was_dollar;
         out.push(facts);
     }
     (out, quote)
+}
+
+/// Unquoted characters that delimit a word, so the next one starts one.
+///
+/// The subset that matters here: bash's metacharacters minus whitespace, which
+/// the caller handles, and minus `!` and `#` themselves.
+fn is_shell_metachar(c: char) -> bool {
+    matches!(c, ';' | '&' | '|' | '(' | ')' | '<' | '>')
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -3105,6 +3192,16 @@ fn logical_lines(body: &str) -> Vec<LogicalLine> {
                     };
                     if let Some(head) = strip_continuation(&joined) {
                         payload_pending = Some(head.to_string());
+                    } else if ends_inside_quote(strip_line_comment(&joined)) {
+                        // Round-23, surface 3. The parent gets the quote-balance
+                        // fold and the payload did not, so a payload line that
+                        // left a quote open became its own statement and whether
+                        // the injected ` ; ` was then honoured or masked was
+                        // decided by the parity of what followed. The payload and
+                        // the parent have to agree about what a statement is.
+                        let mut acc = joined;
+                        acc.push('\n');
+                        payload_pending = Some(acc);
                     } else {
                         push_exec_statement(&mut out[idx], &joined);
                     }
@@ -6015,6 +6112,114 @@ mod tests {
             "cd \"$(dirname \"$0\")\"\ncargo build --release\n"
         ));
         assert!(!body_frame_blind("cd ~/.openfang/scripts\nrm -f *.log\n"));
+    }
+
+    /// W1. `$$` is the PID parameter, and bash consumes it before the next
+    /// character is read — so the `'` in `$$'x\'` opens a *plain* single quote,
+    /// where `\` is literal and the string closes at the second `'`. We armed
+    /// ANSI-C quoting off any preceding `$`, treated the `\'` as an escape, and
+    /// stayed open to end of line: the next physical line folded up, its real
+    /// separators were masked as string content, and the `cd` on it stopped
+    /// being a command word.
+    ///
+    /// Round 23's witness for this — `cd ~/.openfang` first, then a relative
+    /// `cd data` on the swallowed line — is **not** a bypass: the fold leaves
+    /// the frame inside the control plane, and the datastore suffix arm fires
+    /// from any control-plane frame, not only from `Substrate`. It hits by
+    /// accident, exactly as round 22's V2 spelling did. The spelling that
+    /// really clears the floor starts *outside* the control plane, so the
+    /// swallowed statement is the one that would have entered it at all.
+    #[test]
+    fn a_pid_expansion_does_not_arm_ansi_c_quoting() {
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho $$'x\\'\ncd ~/.openfang/data ; rm -f openfang.db\n"
+        ));
+        // At the scanner: `$'` arms, `$$'` does not, `$$$'` does again.
+        assert!(ends_inside_quote("echo $'x\\'"));
+        assert!(!ends_inside_quote("echo $$'x\\'"));
+        assert!(ends_inside_quote("echo $$$'x\\'"));
+        // And V2's ANSI-C handling is untouched: `\'` inside `$'…'` is a
+        // literal quote, not a close.
+        assert!(!ends_inside_quote("echo $'a\\'b ; cd /tmp ; '"));
+    }
+
+    /// W2. Bash: a word beginning with `#` starts a comment, and `; & | ( ) < >`
+    /// are metacharacters that delimit words — so `echo a;#note` is a command
+    /// plus a comment. `boundary` was whitespace-only, so the comment was read
+    /// as code.
+    ///
+    /// Not stripping a comment is normally fail-closed, and it is not here:
+    /// the apostrophe in `Ben's` opened a quote on a line the shell never
+    /// parsed, and the fold ran to end of body — every remaining statement in
+    /// one segment, every separator in it masked. V1's amplifier without V1's
+    /// backslash.
+    #[test]
+    fn a_comment_after_a_metacharacter_is_still_a_comment() {
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho hi;# Ben's cleanup\ncd ~/.openfang/data ; rm -f openfang.db\n"
+        ));
+        // The backslash spelling of the same divergence.
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho hi;# note \\\ncd ~/.openfang/data ; rm -f openfang.db\n"
+        ));
+        assert_eq!(strip_line_comment("echo a;#note"), "echo a;");
+        assert_eq!(strip_line_comment("echo a|#note"), "echo a|");
+        // Mid-word `#` is not a comment, and neither is a quoted one.
+        assert_eq!(
+            strip_line_comment("git show refs/heads/x#1"),
+            "git show refs/heads/x#1"
+        );
+        assert_eq!(strip_line_comment("echo 'a # b'"), "echo 'a # b'");
+    }
+
+    /// W3. The walker no longer needs this scanner to agree with bash.
+    ///
+    /// A `cd` sitting in a segment as an *operand* is a statement the segmenter
+    /// did not honour, whatever the reason — a quote that closed later here
+    /// than in the shell, a comment we failed to recognise, or the next
+    /// divergence of that shape. Chasing the spellings one at a time is a race
+    /// with bash's lexer; the frame that `cd` would have established is just
+    /// another reading, OR-ed into the arms like the taint states.
+    ///
+    /// The cost is stated rather than hidden: a genuinely quoted string that
+    /// contains `cd <dir>` *and* a destructive verb against a datastore-shaped
+    /// relative operand now fires. One prompt, on a shape nobody writes by
+    /// accident.
+    #[test]
+    fn a_swallowed_cd_is_another_frame_reading() {
+        assert!(body_destroys_datastore(
+            "cd /tmp\necho 'x ; cd ~/.openfang/data ; rm -f openfang.db'\n"
+        ));
+        assert!(body_destroys_substrate(
+            "cd /tmp\necho 'x ; cd ~/.openfang/agents ; rm -rf openfang-alpha'\n"
+        ));
+        // It is a *reading*, not a promotion: the hypothetical frame still has
+        // to land inside the control plane, and the operand still has to carry
+        // its own evidence.
+        assert!(!body_destroys_datastore(
+            "cd /tmp\necho 'x ; cd /var/data ; rm -f openfang.db'\n"
+        ));
+        assert!(!body_destroys_datastore(
+            "cd /tmp\necho 'x ; cd ~/.openfang/data ; rm -f notes.txt'\n"
+        ));
+    }
+
+    /// Round-23, surface 3. The parent got the quote-balance fold and the
+    /// payload did not, so a payload line that left a quote open became its own
+    /// statement and whether the injected ` ; ` was honoured or masked was
+    /// decided by the parity of whatever followed. The payload and the parent
+    /// have to agree about what a statement is.
+    ///
+    /// A **guard**, not a bypass witness: it passes with the fold reverted too.
+    /// Neither round 23 nor I could build a payload where the divergence
+    /// clears a floor — the shapes tried either fail in bash before running or
+    /// merge in the fail-closed direction. Structural, and pinned so the
+    /// agreement is not re-broken by accident.
+    #[test]
+    fn a_payload_string_that_spans_lines_is_one_statement() {
+        assert!(body_destroys_datastore(
+            "bash <<'EOF'\ncd ~/.openfang/data\necho 'a\nb ; cd /tmp'\nrm -f openfang.db\nEOF\n"
+        ));
     }
 
     // -- config --------------------------------------------------------------
