@@ -581,7 +581,7 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
     for line in lines {
         for unit in walk_units(&line.text) {
             let lowered = lower_for_segments(&unit);
-            for segment in split_segments(&lowered) {
+            for (segment, pipeline) in segments_with_pipelines(&lowered) {
                 let tokens: Vec<&str> = segment.split_whitespace().collect();
                 if tokens.is_empty() {
                     continue;
@@ -599,14 +599,35 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
                 let inside = frame.inside();
                 let substrate = frame.kind == Cwd::Substrate;
                 let blind = frame.kind == Cwd::Unknown;
-                if segment_ends_datastore(&tokens, &datastore_target(inside, substrate, &tainted)) {
+                // Round-14 L2. A segment that reads its operands off a pipe has
+                // its target in the segment on the *other* side of it.
+                let piped = pipeline_scoped_tokens(&tokens, pipeline);
+                let ds_tokens: &[&str] = piped.as_deref().unwrap_or(&tokens);
+                if segment_ends_datastore(ds_tokens, &datastore_target(inside, substrate, &tainted))
+                {
                     hits.destroys_datastore = true;
                 } else if blind
-                    && segment_ends_datastore(&tokens, &datastore_target(true, true, &tainted))
+                    && segment_ends_datastore(ds_tokens, &datastore_target(true, true, &tainted))
                 {
                     // Round-11: it would have hit from the substrate, and we
                     // cannot say we are not there. Record rather than guess.
                     hits.frame_blind = true;
+                }
+                // Round-14 L1, substrate half. Same defect, other predicate:
+                // `d=~/.openfang/agents; rm -rf "$d"` never changes directory,
+                // so the frame stays `Elsewhere` and the walk `continue`s below
+                // before the destroys arm is reached — while the command-line
+                // predicate sees no `.openfang` text anywhere in the line. The
+                // taint value is the evidence, so like the datastore arm above
+                // this is live from any frame and is ordered before the bail.
+                if segment_destroys_tree(&tokens)
+                    && tokens.iter().any(|t| {
+                        let raw = strip_grouping(t);
+                        let expanded = tainted.expand(raw);
+                        expanded != raw && names_substrate(&expanded)
+                    })
+                {
+                    hits.destroys = true;
                 }
                 match cd_target(&tokens, &frame, &tainted) {
                     // `cd -`: the walker holds the previous frame, so this is a
@@ -677,8 +698,38 @@ fn cwd_relative_hits(lines: &[LogicalLine]) -> CwdHits {
 fn datastore_target(inside: bool, substrate: bool, tainted: &Taint) -> impl Fn(&str) -> bool + '_ {
     move |t: &str| {
         let t = strip_grouping(t);
-        (has_datastore_extension(t) || (substrate && has_datastore_glob(t)))
+        let names = |s: &str| has_datastore_extension(s) || (substrate && has_datastore_glob(s));
+        if names(t)
             && ((inside && is_relative_operand(t)) || references_tainted(t, tainted.names()))
+        {
+            return true;
+        }
+        // Round-14 L1. The literal text of a token is one reading of it, not
+        // the only one — the same lesson W1/J1/K1 taught about the command
+        // word, arriving on the operand side:
+        //
+        // ```text
+        //   db=~/.openfang/data/openfang.db
+        //   rm -f "$db"
+        // ```
+        //
+        // `datastore_stem("$db")` finds no suffix, so the evidence conjunct
+        // above is never even consulted, and `references_tainted` cannot
+        // rescue it because it sits *inside* the second conjunct rather than
+        // beside the first. H1 gave `cd` the taint values; the operand tests
+        // kept reading the token. `dd of="$db"` is the same shape.
+        //
+        // The expanded reading has to carry its own evidence exactly as the
+        // literal one does, or `x=notes.db; rm "$x"` becomes a hard floor from
+        // any frame in any checkout. Naming the control plane is that
+        // evidence; a relative expansion inside a control-plane frame is the
+        // other half. A value we could not fully resolve keeps its name and
+        // loses its value (see `Taint`), so it still reaches the first arm
+        // through `references_tainted`.
+        let expanded = tainted.expand(t);
+        expanded != t
+            && names(&expanded)
+            && (names_control_plane(&expanded) || (inside && is_relative_operand(&expanded)))
     }
 }
 
@@ -2876,8 +2927,23 @@ const FILE_ENDING_BINS: &[&str] = &["rm", "rmdir", "shred", "truncate", "mv", "m
 /// can do anything with?" before it falls back to a token scan. Asking it
 /// against a list that omitted `dd`/`cp`/`install` would send a correctly
 /// resolved `dd of=…` down the scan path for no reason.
+///
+/// # Round-14 — `sqlite3`
+///
+/// The list had every verb that ends a database by accident and none that ends
+/// one on purpose. `sqlite3 ~/.openfang/data/openfang.db "drop table approvals"`
+/// leaves the file in place, ends the audit chain, and matches nothing here:
+/// no recursion, no redirect, no ending verb. Under the old posture a cautious
+/// judge caught it; under `permissive` nothing does, which is precisely the
+/// class of gap the flip is not allowed to open.
+///
+/// It is in with its eyes open: `sqlite3` takes its database as an operand
+/// whatever it then does with it, so a *read* of a datastore now costs one
+/// prompt. Under the ledger that is in scope — it closes a bypass rather than
+/// widening the surface for free — and the population is one binary against
+/// paths under `~/.openfang`.
 fn is_ending_verb(base: &str) -> bool {
-    FILE_ENDING_BINS.contains(&base) || matches!(base, "dd" | "cp" | "install")
+    FILE_ENDING_BINS.contains(&base) || matches!(base, "dd" | "cp" | "install" | "sqlite3")
 }
 
 /// True if `token` names a durable OpenFang datastore.
@@ -2930,9 +2996,9 @@ pub fn destroys_datastore(command: &str) -> bool {
         if !lowered.contains(CONTROL_PLANE_ROOT_BARE) {
             return false;
         }
-        split_segments(&lowered)
+        segments_with_pipelines(&lowered)
             .into_iter()
-            .any(segment_destroys_datastore)
+            .any(|(segment, pipeline)| segment_destroys_datastore(segment, pipeline))
     })
 }
 
@@ -2975,9 +3041,10 @@ fn lower_for_segments(s: &str) -> String {
     fold_clobber_redirect(&s.to_ascii_lowercase())
 }
 
-fn segment_destroys_datastore(segment: &str) -> bool {
+fn segment_destroys_datastore(segment: &str, pipeline: &str) -> bool {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
-    segment_ends_datastore(&tokens, &names_datastore)
+    let piped = pipeline_scoped_tokens(&tokens, pipeline);
+    segment_ends_datastore(piped.as_deref().unwrap_or(&tokens), &names_datastore)
 }
 
 /// The shape of "this segment ends a file", with the question of *which* files
@@ -3381,6 +3448,56 @@ fn split_segments(variant: &str) -> Vec<&str> {
     variant
         .split([';', '&', '|', '\n', '`', '(', ')'])
         .collect()
+}
+
+/// The same split, minus the pipe: one entry per *pipeline*.
+///
+/// Round-14 L2. [`split_segments`] is right that `|` separates commands, and
+/// wrong that it separates their operands. `xargs` takes its operands from the
+/// segment on the other side of the pipe, so a per-segment operand universe
+/// makes the target invisible to the verb and the verb invisible to the target:
+///
+/// ```text
+///   find ~/.openfang/data -name '*.db' -print0 | xargs -0 rm -f
+/// ```
+///
+/// The `find` segment has no ending verb; the `xargs -0 rm -f` segment has no
+/// operand at all. The `-exec` spelling survives only because
+/// [`segment_destroys_tree`] catches `find` + `-exec rm` independently, which
+/// says nothing about a datastore outside [`SUBSTRATE_SUBTREES`].
+fn split_pipelines(variant: &str) -> Vec<&str> {
+    variant.split([';', '&', '\n', '`', '(', ')']).collect()
+}
+
+/// Every segment, paired with the pipeline it came from.
+///
+/// Callers that only ever look at one command keep using [`split_segments`];
+/// this exists so the two predicates that need an operand universe wider than
+/// a segment can have one without every predicate paying for it.
+fn segments_with_pipelines(lowered: &str) -> Vec<(&str, &str)> {
+    split_pipelines(lowered)
+        .into_iter()
+        .flat_map(|pipeline| {
+            split_segments(pipeline)
+                .into_iter()
+                .map(move |segment| (segment, pipeline))
+        })
+        .collect()
+}
+
+/// The operand universe for a segment: itself, unless it reads its operands
+/// from the other side of a pipe, in which case it is the whole pipeline.
+///
+/// Returns `None` for the ordinary case so the caller keeps its own tokens
+/// rather than paying for a copy. Deliberately keyed on the verb that *takes*
+/// piped operands rather than on the presence of a pipe: widening every piped
+/// segment's universe would let `cat ~/.openfang/data/openfang.db | less` read
+/// as an ending.
+fn pipeline_scoped_tokens<'a>(tokens: &[&'a str], pipeline: &'a str) -> Option<Vec<&'a str>> {
+    tokens
+        .iter()
+        .any(|t| basename(strip_grouping(t)) == "xargs")
+        .then(|| pipeline.split_whitespace().collect())
 }
 
 /// True if this segment writes something.
@@ -4298,6 +4415,88 @@ mod tests {
         ));
         assert!(destroys_datastore(
             "find ~/.openfang/tmp -name x -exec shred ~/.openfang/tmp/openfang.db ;"
+        ));
+    }
+
+    /// Round-14 L1. The literal text of a token is one reading of it, not the
+    /// only one — the operand-side twin of W1/J1/K1.
+    ///
+    /// H1 gave `cd` the taint *values* and left the operand tests reading the
+    /// token, so the *shorter* spelling walked past both hard floors: put the
+    /// whole path in the variable and never change directory at all.
+    #[test]
+    fn a_whole_path_carried_in_a_variable_is_still_the_path() {
+        assert!(body_destroys_datastore(
+            "db=~/.openfang/data/openfang.db\nrm -f \"$db\"\n"
+        ));
+        assert!(body_destroys_datastore(
+            "db=~/.openfang/data/openfang.db\ndd if=/dev/zero of=\"$db\"\n"
+        ));
+        // Transitive, like the `cd` half: the value map closes over itself.
+        assert!(body_destroys_datastore(
+            "d=~/.openfang\ne=$d/data\nrm -f \"${e}/openfang.db\"\n"
+        ));
+        // Substrate half: same defect, other predicate. With no `cd` the frame
+        // is `Elsewhere` and the walk bailed before the destroys arm, while the
+        // command-line predicate saw no `.openfang` text in the line at all.
+        assert!(body_destroys_substrate(
+            "d=~/.openfang/agents\nrm -rf \"$d\"\n"
+        ));
+        // The expanded reading carries its own evidence or it does not count.
+        // A `.db` in a checkout is not this fleet's datastore, and a scratch
+        // tree is not its substrate.
+        assert!(!body_destroys_datastore("x=notes.db\nrm -f \"$x\"\n"));
+        assert!(!body_destroys_substrate("d=/tmp/scratch\nrm -rf \"$d\"\n"));
+    }
+
+    /// Round-14 L2. [`split_segments`] is right that `|` separates commands and
+    /// wrong that it separates their operands: `xargs` takes its target from
+    /// the segment on the other side of the pipe, so a per-segment operand
+    /// universe leaves the verb with no target and the target with no verb.
+    ///
+    /// Known and unclosed: `find ~/.openfang/data -name '*.db' -print0 | xargs
+    /// -0 rm -f` still contributes nothing here, because no single token in it
+    /// names a datastore — `~/.openfang/data` has neither an extension nor a
+    /// glob, and `'*.db'` has no `~/.openfang`. That shape is
+    /// [`destroys_substrate`]'s to catch through `find`, and it only reaches
+    /// this predicate when the pattern and the root are written as one token.
+    #[test]
+    fn a_piped_xargs_takes_its_target_from_the_other_side_of_the_pipe() {
+        assert!(destroys_datastore(
+            "echo ~/.openfang/data/openfang.db | xargs rm -f"
+        ));
+        assert!(destroys_datastore("ls ~/.openfang/data/*.db | xargs rm -f"));
+        // In a body, through the frame: the glob arm needs the substrate frame
+        // and the operand comes from the far side of the pipe.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\nls *.db | xargs rm -f\n"
+        ));
+        // Not every pipe — only the verb that reads its operands off one.
+        // Widening on the pipe itself would make a read into an ending.
+        assert!(!destroys_datastore(
+            "cat ~/.openfang/data/openfang.db | less"
+        ));
+    }
+
+    /// Round-14. The ending-verb set had every verb that ends a database by
+    /// accident and none that ends one on purpose.
+    ///
+    /// Deliberate over-fire: `sqlite3` takes its database as an operand
+    /// whatever it then does with it, so a read of a datastore costs one
+    /// prompt. Under the ledger that is in scope — it closes a bypass rather
+    /// than widening the surface for free.
+    #[test]
+    fn the_verb_built_for_ending_a_database_is_in_the_set() {
+        assert!(destroys_datastore(
+            "sqlite3 ~/.openfang/data/openfang.db \"drop table approvals\""
+        ));
+        assert!(destroys_datastore(
+            "sqlite3 ~/.openfang/data/openfang.db .recover"
+        ));
+        // Still both halves: a database that is not the fleet's is not this
+        // predicate's business.
+        assert!(!destroys_datastore(
+            "sqlite3 /tmp/scratch.db \"drop table x\""
         ));
     }
 
