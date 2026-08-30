@@ -11038,12 +11038,13 @@ impl KernelHandle for OpenFangKernel {
     /// permissive posture to strict. The shadow window would have recorded
     /// strict verdicts for the whole fleet while reporting itself as
     /// permissive. Name first (the ANAI-125 caller's contract, unchanged),
-    /// UUID resolved through the registry only on miss.
+    /// UUID resolved on miss through [`Self::resolve_agent_ref`] — the one
+    /// uuid-or-name resolver, rather than a fourth hand-rolled parse.
     fn channel_binding_route(&self, agent_ref: &str) -> Option<String> {
         if let Some(route) = self.agent_channel_binding_route(agent_ref) {
             return Some(route);
         }
-        let id: AgentId = agent_ref.parse().ok()?;
+        let id = self.resolve_agent_ref(agent_ref)?;
         let name = self.registry.get(id)?.name.clone();
         self.agent_channel_binding_route(&name)
     }
@@ -11065,11 +11066,11 @@ impl KernelHandle for OpenFangKernel {
     /// the safe direction — the wrong answer degrades to today's behaviour
     /// instead of blocking a legitimate wake.
     fn agent_tool_names(&self, agent_id: &str) -> Option<Vec<String>> {
-        let id: AgentId = match agent_id.parse() {
-            Ok(id) => id,
-            Err(_) => self.registry.find_by_name(agent_id).map(|e| e.id)?,
-        };
-        self.registry.get(id)?;
+        // ANAI-265: same resolver as every other uuid-or-name caller. The
+        // hand-rolled version this replaces answered `None` for a well-formed
+        // uuid that is not registered instead of falling through to the name
+        // table; `resolve_agent_ref` requires registration on both paths.
+        let id = self.resolve_agent_ref(agent_id)?;
         Some(
             self.available_tools_with_registry(id, None)
                 .into_iter()
