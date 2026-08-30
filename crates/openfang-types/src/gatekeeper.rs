@@ -492,6 +492,18 @@ struct Frame {
 /// choosing one, so a segment with several fold-colliding `cd "$d"` moves could
 /// in principle widen without bound. Reaching this is a shape no shell writes:
 /// it needs more than eight distinct resolutions of the same swallowed region.
+///
+/// Round-26 Z3, the two caps separately:
+///
+/// * The *seed* is unreachable by arithmetic rather than by luck. [`cd_moves`]
+///   yields at most two distinct moves per state — one [`cd_argument`] answer
+///   plus `popd`'s [`Cwd::Unknown`] — and there are at most three states, so
+///   six.
+/// * The *loop* is `|hypo_frames| * |states|` per verb position, up to
+///   twenty-four candidates for eight slots, and it *replaces* `hypo_frames`
+///   rather than unioning — so a frame dropped at one position is dropped for
+///   every position after it. Both now report `frame_blind` on a drop instead
+///   of narrowing in silence.
 const MAX_HYPO_FRAMES: usize = 8;
 
 impl Frame {
@@ -798,7 +810,33 @@ fn walk_statements(
                 // below is still skipped for a `cd` segment, so nothing else
                 // about this branch changes.
                 let base_frame = frame.clone();
-                let real_move = cd_target(&tokens, frame, tainted);
+                let prev_frame = prev.clone();
+                // Round-26 Z1. The frame carried *across* the segment boundary
+                // used to be computed from the post-segment taint alone, while
+                // every arm inside the segment ORs over `states` and the
+                // hypothetical seed below already reads all three. So a frame
+                // move that only exists in `pre` (P1) or in `entry` (U2) was
+                // seen by the arms, evaluated against its own segment — which
+                // holds a `cd` and no destructive verb — and then thrown away.
+                // The next segment inherited a frame the shell never had:
+                //
+                // ```text
+                //   f=~/.openfang/data
+                //   f=/tmp/x cd "$f"      # bash expands argv before the
+                //   rm -f openfang.db     # prefix assignment takes effect
+                // ```
+                //
+                // P1's own witness with `rm` changed to `cd`. Same fix as P1
+                // and S1: reduce the readings, do not read one of them.
+                let mut all_moves: Vec<CdMove> = Vec::new();
+                for state in &states {
+                    for mv in cd_moves(&tokens, &base_frame, state) {
+                        if !all_moves.contains(&mv) {
+                            all_moves.push(mv);
+                        }
+                    }
+                }
+                let real_move = boundary_move(&all_moves, &prev_frame);
                 if let Some(mv) = &real_move {
                     // Round-18 R3: a replayed segment already moved the frame
                     // in the previous chunk. `cd ..` is not idempotent.
@@ -872,15 +910,27 @@ fn walk_statements(
                 // across the boundary, and including the move itself, which
                 // used to be evaluated by nobody.
                 let mut landed: Vec<Frame> = Vec::new();
-                for state in &states {
-                    for mv in cd_moves(&tokens, &base_frame, state) {
-                        let f = match mv {
-                            CdMove::Back => prev.clone(),
-                            CdMove::To(f) => f,
-                        };
-                        if !landed.contains(&f) && landed.len() < MAX_HYPO_FRAMES {
-                            landed.push(f);
-                        }
+                for mv in &all_moves {
+                    // `prev` before the move, not after: a `cd -` reading
+                    // targets the frame the walker was holding, and the swap
+                    // below is about to overwrite it.
+                    let f = match mv {
+                        CdMove::Back => prev_frame.clone(),
+                        CdMove::To(f) => f.clone(),
+                    };
+                    if landed.contains(&f) {
+                        continue;
+                    }
+                    if landed.len() < MAX_HYPO_FRAMES {
+                        landed.push(f);
+                    } else {
+                        // Round-26 Z3. A reading we dropped at the cap is a
+                        // reading we did not test, and an arm that ORs cannot
+                        // tell that from a miss. Same rule as the T6
+                        // truncation report above. Unreachable here by
+                        // arithmetic (see `MAX_HYPO_FRAMES`) — present so the
+                        // two caps say the same thing.
+                        hits.frame_blind = true;
                     }
                 }
                 // Only the frames a move *landed* on are evaluated here. The
@@ -912,16 +962,33 @@ fn walk_statements(
                     if Some(verb_at) == cw_idx || last_verb == Some(verb_at) {
                         continue;
                     }
+                    // Round-26 Z3. The seed above keeps every reading and
+                    // this loop used to keep one ranked answer per (base,
+                    // state) — a widening arm that narrowed halfway through,
+                    // on the swallowed-region path, which is exactly where the
+                    // readings disagree most. Both or neither; this is both.
                     let mut next: Vec<Frame> = Vec::new();
                     for base in &hypo_frames {
                         for state in &states {
-                            let moved = match cd_target(&tokens[pos..], base, state) {
-                                Some(CdMove::To(f)) => f,
-                                Some(CdMove::Back) => prev.clone(),
-                                None => continue,
-                            };
-                            if !next.contains(&moved) && next.len() < MAX_HYPO_FRAMES {
-                                next.push(moved);
+                            for mv in cd_moves(&tokens[pos..], base, state) {
+                                let moved = match mv {
+                                    CdMove::To(f) => f,
+                                    CdMove::Back => prev.clone(),
+                                };
+                                if next.contains(&moved) {
+                                    continue;
+                                }
+                                if next.len() < MAX_HYPO_FRAMES {
+                                    next.push(moved);
+                                } else {
+                                    // Reachable, unlike the seed: this set is
+                                    // `|hypo_frames| * |states|` per verb
+                                    // position and `next` *replaces*
+                                    // `hypo_frames`, so a frame dropped here
+                                    // is dropped for every position after it.
+                                    // T6 one level up.
+                                    hits.frame_blind = true;
+                                }
                             }
                         }
                     }
@@ -1203,7 +1270,18 @@ enum CdMove {
     Back,
 }
 
-/// The frame this segment moves to, or `None` if it is not a `cd`.
+/// The one frame the *next* segment inherits, chosen from every reading of
+/// this segment's verb across every taint state.
+///
+/// A choice point, not a resolution — round-26 Z2. Within a segment every
+/// reading is evaluated ([`apply_hypothetical_frames`]); the frame crossing a
+/// boundary is a single value because the walk carries a single `Frame`, and
+/// [`containment`] is how the disagreement is spent. The honest end state is a
+/// set here too, like the taint readings and the hypothetical frames.
+///
+/// The contract below is the one [`cd_moves`] and [`cd_argument`] implement —
+/// it is recorded here because this is where all four round-11 spellings were
+/// found.
 ///
 /// # Contract
 ///
@@ -1220,7 +1298,7 @@ enum CdMove {
 /// current frame. `cd "$(cat f)"`, `cd "$WORKDIR"` and `cd $1` used to *keep*
 /// whatever frame preceded them — fail-open, and the reason H1 was worth a
 /// HIGH.
-fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove> {
+fn boundary_move(moves: &[CdMove], prev: &Frame) -> Option<CdMove> {
     // Round-25 Y1. Round-24 X1 widened this function's *input* to every
     // reading of the verb token and left its output a single answer, with the
     // `popd` test running first over the OR-ed set:
@@ -1244,32 +1322,57 @@ fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove
     // and it resolves disagreement toward the most-containing reading. That is
     // the fail-closed direction under the ANAI-265 ledger: an over-containing
     // frame costs a prompt, an under-containing one costs a floor.
-    cd_moves(tokens, current, tainted)
-        .into_iter()
-        .reduce(|a, b| {
-            if containment(&b) > containment(&a) {
-                b
-            } else {
-                a
-            }
-        })
+    //
+    // Round-26 Z2. Z1 widened this function's input from one taint state to
+    // three, which is what made the ranking's two constants start to matter:
+    // `Back`'s rank now consults `prev` rather than sitting at a constant, and
+    // a tie between two distinct frames of equal rank is broken toward the
+    // deeper one rather than toward whichever state came first in `states`.
+    moves.iter().cloned().reduce(|a, b| {
+        if containment(&b, prev) > containment(&a, prev) {
+            b
+        } else {
+            a
+        }
+    })
 }
 
 /// How much of the control plane a move claims, most-containing highest.
 ///
-/// Only used to pick the frame carried across a segment boundary when the
-/// verb's readings disagree; within a segment every reading is evaluated.
-fn containment(mv: &CdMove) -> u8 {
-    match mv {
-        CdMove::To(f) => match f.kind {
+/// Only used by [`boundary_move`] to pick the frame carried across a segment
+/// boundary when the verb's readings disagree; within a segment every reading
+/// is evaluated.
+///
+/// Round-26 Z2, both entries:
+///
+/// * `Back` was a constant 2, which read as "at least as resolved as
+///   `Unknown`" and ignored where `prev` actually points. It is also the only
+///   move with a *side effect* — the walker swaps rather than assigns, so
+///   taking it writes `prev` as well as the frame and poisons a later `cd -`.
+///   Ranked by `prev` now, saturated below `ControlPlane` so a reading that
+///   names the control plane outright always outranks a swap into one.
+/// * Equal ranks used to be broken by the order of `states`, and two distinct
+///   `Substrate` frames rank equally while their `under_root`s are what a
+///   later relative `cd ..` joins against. Broken toward the deeper path: it
+///   is the reading that keeps the more specific containment under a join,
+///   which is the fail-closed direction under this ledger.
+///
+/// Neither entry was reachable before Z1 widened the input to three states —
+/// [`cd_argument`] is called once per segment and answers identically for `cd`
+/// and `pushd`.
+fn containment(mv: &CdMove, prev: &Frame) -> (u8, usize) {
+    let rank = |f: &Frame| -> u8 {
+        match f.kind {
             Cwd::Substrate => 4,
             Cwd::ControlPlane => 3,
             Cwd::Unknown => 1,
             Cwd::Elsewhere => 0,
-        },
-        // The previous frame, which the walker holds and which is at least as
-        // resolved as `Unknown`.
-        CdMove::Back => 2,
+        }
+    };
+    let depth = |f: &Frame| f.under_root.as_ref().map_or(0, Vec::len);
+    match mv {
+        CdMove::To(f) => (rank(f), depth(f)),
+        CdMove::Back => (rank(prev).min(2), depth(prev)),
     }
 }
 
@@ -5422,7 +5525,10 @@ mod tests {
     #[test]
     fn cd_frames_resolve_where_the_glob_arm_assumes_they_do() {
         let nothing = Taint::default();
-        let from = |tokens: &[&str], current: &Frame| match cd_target(tokens, current, &nothing) {
+        let from = |tokens: &[&str], current: &Frame| match boundary_move(
+            &cd_moves(tokens, current, &nothing),
+            &Frame::elsewhere(),
+        ) {
             Some(CdMove::To(frame)) => frame.kind,
             Some(CdMove::Back) => panic!("expected a path, got `cd -`"),
             None => panic!("expected a cd"),
@@ -5467,7 +5573,10 @@ mod tests {
         assert_eq!(from(&["cd", "$(cat", "f)"], &data), Cwd::Unknown);
         // `cd -` is a move the walker resolves, not a path.
         assert!(matches!(
-            cd_target(&["cd", "-"], &data, &nothing),
+            boundary_move(
+                &cd_moves(&["cd", "-"], &data, &nothing),
+                &Frame::elsewhere()
+            ),
             Some(CdMove::Back)
         ));
     }
@@ -6368,7 +6477,7 @@ mod tests {
         let nothing = Taint::default();
         let data = Frame::under(vec!["data".to_string()]);
         assert!(matches!(
-            cd_target(&["popd"], &data, &nothing),
+            boundary_move(&cd_moves(&["popd"], &data, &nothing), &Frame::elsewhere()),
             Some(CdMove::To(Frame {
                 kind: Cwd::Unknown,
                 ..
@@ -6466,6 +6575,60 @@ mod tests {
         assert!(body_frame_blind(swallowed));
         // It is blindness, not a floor: we cannot say we were in the substrate.
         assert!(!body_destroys_datastore(swallowed));
+    }
+
+    /// Z1. The frame carried across a segment boundary was computed from the
+    /// post-segment taint alone while every arm inside the segment ORs over
+    /// all three states. A `cd` that only exists in the pre-segment reading —
+    /// which is the reading bash actually expands, because argv is built
+    /// before a command-prefix assignment takes effect — was evaluated against
+    /// its own segment, which holds no destructive verb, and then discarded.
+    ///
+    /// Round-17 P1's witness with `rm` changed to `cd`.
+    #[test]
+    fn the_frame_crossing_a_boundary_reads_every_taint_state() {
+        assert!(body_destroys_datastore(
+            "f=~/.openfang/data\nf=/tmp/x cd \"$f\"\nrm -f openfang.db\n"
+        ));
+        // The over-containing direction is a prompt, not a floor: a body that
+        // never names the control plane in any reading still fires nothing.
+        assert!(!body_destroys_datastore(
+            "f=/tmp/a\nf=/tmp/x cd \"$f\"\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// Z2. `CdMove::Back` was ranked at a constant 2 without consulting where
+    /// `prev` points, so a `cd -` reading outranked the one reading that says
+    /// the frame cannot be named — and `Back` is the only move with a side
+    /// effect, since the walker swaps rather than assigns.
+    ///
+    /// Reachable only because X1 made the *verb* a set: `$c` reads as both
+    /// `cd` (a literal `-` operand, so `Back`) and `popd` (`Unknown`). With
+    /// `prev` outside the control plane the swap resolves to `Elsewhere` and
+    /// the walk bails silently; the honest answer is that we cannot say.
+    #[test]
+    fn a_cd_dash_reading_is_ranked_by_where_prev_points() {
+        assert!(body_frame_blind(
+            "c=cd\nC=popd\ncd /tmp\n$c -\nrm -rf agents\n"
+        ));
+        // A real `cd -` back into the substrate is still taken, and is still
+        // stronger than the `popd` reading beside it.
+        assert!(body_destroys_datastore(
+            "cd ~/.openfang/data\ncd /tmp\ncd -\nrm -f openfang.db\n"
+        ));
+    }
+
+    /// Z3, guard half. The swallowed-`cd` loop keeps every reading now instead
+    /// of one ranked answer per base, and reports rather than narrows when the
+    /// cap drops one. Neither change may move the benign population: ordinary
+    /// bodies have one reading per `cd` and never approach the cap.
+    #[test]
+    fn keeping_every_swallowed_reading_leaves_ordinary_bodies_alone() {
+        assert!(!body_frame_blind("cd ~/.openfang/scripts\nrm -f *.log\n"));
+        assert!(!body_frame_blind(
+            "cd ~/.openfang\ncd scripts\ncd ../agents\nls\n"
+        ));
+        assert!(!body_destroys_datastore("cd /tmp\nrm -f openfang.db\n"));
     }
 
     /// W1. `$$` is the PID parameter, and bash consumes it before the next
@@ -6620,10 +6783,13 @@ mod tests {
         // control plane, so the composed frame is `Elsewhere` and no arm fires
         // *from it*.
         assert!(matches!(
-            cd_target(
-                &["cd", "../../"],
-                &Frame::under(vec!["agents".to_string()]),
-                &Taint::default()
+            boundary_move(
+                &cd_moves(
+                    &["cd", "../../"],
+                    &Frame::under(vec!["agents".to_string()]),
+                    &Taint::default()
+                ),
+                &Frame::elsewhere()
             ),
             Some(CdMove::To(f)) if f == Frame::elsewhere()
         ));
