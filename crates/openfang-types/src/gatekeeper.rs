@@ -764,6 +764,14 @@ fn cd_target(tokens: &[&str], current: &Frame, tainted: &Taint) -> Option<CdMove
     // depth two, which is the worse failure because it looks resolved.
     // [`Cwd::Unknown`] is the honest state, and since the round-11 narrowing it
     // no longer means "escalate" — it means "record that we cannot say".
+    //
+    // Round-13 K5, and this is the line that stops the next reader from
+    // "fixing" it: a `popd` is a [`CdMove::To`], so the walker records the
+    // pre-`popd` frame as `prev`. A following `cd -` therefore swaps into
+    // whatever `popd` left, not into what preceded the `pushd`. That is
+    // cosmetic — both ends of the swap are already unresolved or already
+    // recorded — and making `prev` a stack to tidy it up buys a second place
+    // for the frame to be silently wrong at depth two.
     if base == "popd" {
         return Some(CdMove::To(Frame::unknown()));
     }
@@ -3044,41 +3052,74 @@ fn segment_ends_datastore(tokens: &[&str], is_target: &dyn Fn(&str) -> bool) -> 
     // in the segment now supplies the verb, so `grep rm <datastore>` reads as
     // an ending. The target test still has to match, which keeps the
     // population small, and one prompt is the right price for a hard floor.
-    let scanned = || {
-        tokens.iter().enumerate().find_map(|(i, t)| {
-            let base = basename(strip_grouping(t));
-            is_ending_verb(&base).then_some((base, i))
-        })
-    };
-    let resolved = match command_word(tokens) {
-        Some((base, idx)) if is_ending_verb(&base) => Some((base, idx)),
-        other => scanned().or(other),
-    };
-    let Some((base, idx)) = resolved else {
-        return false;
-    };
-    let operands = || {
+    //
+    // Round-13 K1. The J1 fallback above was one winner picked by `find_map`,
+    // and it deferred to [`command_word`] whenever that answer *happened* to be
+    // an ending verb. Choosing a flag-argument that is itself in the set
+    // defeats the entire fix:
+    //
+    // ```text
+    //   env -u dd rm ~/.openfang/data/openfang.db
+    // ```
+    //
+    // `dd` breaks the wrapper skip loop, `is_ending_verb("dd")` is true, so the
+    // scan never ran — and `dd`'s branch looks only for `of=` operands, of
+    // which there are none. Both hard floors clear, on nine characters, with no
+    // metacharacter and no obfuscation. `env -u cp rm <db> /tmp/x` is the same
+    // shape through the last-operand rule, and `env -u install` likewise.
+    //
+    // The invariant, which this function has now relearned three rounds
+    // running: **no single resolution of the command word may be trusted to be
+    // the only verb in the segment.** Every ending-verb token is a candidate;
+    // each is evaluated against its *own* index; the results are OR-ed.
+    // Fail-closed in both directions — an early spurious `cp` can no longer
+    // suppress a later real `rm`, and a late spurious verb can no longer narrow
+    // the operand rule out from under an earlier one. `cp <db> /tmp/backup`
+    // still has exactly one candidate and still reads its destination only.
+    //
+    // [`command_word`] gets no separate seat: it resolves its base with the
+    // same `basename(strip_grouping(..))`, so any answer it returns that is an
+    // ending verb is already a token this scan sees, and an answer that is not
+    // one matched no branch below in any case. It keeps its real job —
+    // operand indexing for the *frame* tests — and stops being a verb
+    // authority here at all.
+    //
+    // Round-13 K2. `find` and `xargs` put the target *before* the verb:
+    // `find ~/.openfang/data -name '*.db' -exec rm {} +` leaves `{}` and `+` as
+    // the only operands after `rm`. It survives today only because
+    // [`segment_destroys_tree`] catches `find` + `-exec rm` independently —
+    // aim the same idiom at a datastore outside `SUBSTRATE_SUBTREES` and this
+    // predicate contributes nothing. For those two bases the operand set is the
+    // whole segment, not the suffix.
+    let target_precedes_verb = tokens
+        .iter()
+        .any(|t| matches!(basename(strip_grouping(t)).as_str(), "find" | "xargs"));
+    let operands = |idx: usize| {
+        let skip = if target_precedes_verb { 0 } else { idx + 1 };
         tokens
             .iter()
-            .skip(idx + 1)
+            .skip(skip)
             .map(|t| strip_grouping(t))
             .filter(|t| !t.is_empty() && !t.starts_with('-'))
     };
 
-    if FILE_ENDING_BINS.contains(&base.as_str()) {
-        return operands().any(is_target);
-    }
-    if base == "dd" {
-        return tokens
-            .iter()
-            .filter_map(|t| strip_grouping(t).strip_prefix("of="))
-            .any(is_target);
-    }
-    if base == "cp" || base == "install" {
-        // Destination only — the last operand.
-        return operands().next_back().is_some_and(is_target);
-    }
-    false
+    tokens.iter().enumerate().any(|(idx, tok)| {
+        let base = basename(strip_grouping(tok));
+        if !is_ending_verb(&base) {
+            return false;
+        }
+        if base == "dd" {
+            return tokens
+                .iter()
+                .filter_map(|t| strip_grouping(t).strip_prefix("of="))
+                .any(is_target);
+        }
+        if base == "cp" || base == "install" {
+            // Destination only — the last operand.
+            return operands(idx).next_back().is_some_and(is_target);
+        }
+        operands(idx).any(is_target)
+    })
 }
 
 /// True if this segment destroys a whole tree.
@@ -3135,7 +3176,12 @@ fn segment_destroys_tree(tokens: &[&str]) -> bool {
     let mut saw_find = false;
     let mut saw_rsync = false;
     for token in tokens {
-        let base = basename(token);
+        // Round-13 K3, minor: the sibling scan in [`segment_ends_datastore`]
+        // lowers with `strip_grouping` before `basename` and this one did not.
+        // Unreachable today — [`split_segments`] separates on `(`/`)` and the
+        // verbs below are never `$`-bearing — but two spellings of the same
+        // lowering is exactly the seam E4 folded into one place for `>|`.
+        let base = basename(strip_grouping(token));
         match base.as_str() {
             "rm" => saw_rm = true,
             "mv" | "truncate" | "shred" => return true,
@@ -4200,6 +4246,90 @@ mod tests {
         // A verb the scan cannot find is still not a verb.
         assert!(!destroys_datastore(
             "sudo -u ben cat ~/.openfang/data/openfang.db"
+        ));
+    }
+
+    /// K1. J1's fallback picked one winner and deferred to [`command_word`]
+    /// whenever its answer happened to be an ending verb — so a wrapper flag
+    /// whose *argument* is itself an ending verb selected a narrower branch
+    /// rule and the scan never ran.
+    ///
+    /// `env -u dd` is the cheapest because `dd`'s branch ignores position
+    /// entirely: it wants an `of=` operand, finds none, and answers no.
+    #[test]
+    fn no_single_verb_resolution_is_trusted_to_be_the_only_one() {
+        assert!(destroys_datastore(
+            "env -u dd rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "env -u cp rm ~/.openfang/data/openfang.db /tmp/x"
+        ));
+        assert!(destroys_datastore(
+            "env -u install rm ~/.openfang/data/openfang.db"
+        ));
+        assert!(destroys_datastore(
+            "sudo -u shred rm ~/.openfang/data/openfang.db"
+        ));
+        // An early spurious candidate cannot suppress a later real one, and a
+        // late one cannot narrow the earlier one's operand rule.
+        assert!(destroys_datastore(
+            "cp /tmp/a /tmp/b && rm ~/.openfang/data/openfang.db"
+        ));
+        // The backup case has exactly one candidate and still reads its
+        // destination only.
+        assert!(!destroys_datastore(
+            "cp ~/.openfang/data/openfang.db /tmp/backup"
+        ));
+        assert!(destroys_datastore(
+            "dd if=/dev/zero of=~/.openfang/data/openfang.db"
+        ));
+    }
+
+    /// K2. `find` and `xargs` put the target *before* the verb, so an operand
+    /// walk that starts after the verb sees only `{}` and `+`.
+    ///
+    /// The substrate half survives independently — [`segment_destroys_tree`]
+    /// catches `find` + `-exec rm` — so this is the datastore predicate
+    /// contributing nothing on a datastore outside `SUBSTRATE_SUBTREES`.
+    #[test]
+    fn find_exec_targets_precede_the_verb() {
+        assert!(destroys_datastore(
+            "find ~/.openfang/tmp/openfang.db -exec rm {} +"
+        ));
+        assert!(destroys_datastore(
+            "find ~/.openfang/tmp -name x -exec shred ~/.openfang/tmp/openfang.db ;"
+        ));
+    }
+
+    /// K5. The `$`-bearing early return in [`strip_grouping`] exists so H2′'s
+    /// tail-trim cannot tear `${d}` apart and defeat H1. Round 12 could not
+    /// break it, and pinning it matters because the reason it holds lives two
+    /// functions away — which is exactly the kind of reason that stops being
+    /// true after someone edits `names_substrate`.
+    ///
+    /// The mechanism is *not* the one round 12 traced. `${d}}` expands to
+    /// `~/.openfang/data}`, and `control_boundary` accepts `}` as a component
+    /// boundary — so `names_substrate` says **yes** and the frame stays
+    /// [`Cwd::Substrate`]. That is wider than round 12 predicted
+    /// (`ControlPlane`) and still the safe direction: a stray brace can only
+    /// cost a prompt on a directory that does not exist, never buy silence.
+    #[test]
+    fn a_trailing_brace_on_an_expansion_cannot_cost_the_floor() {
+        assert!(body_destroys_datastore(
+            "d=~/.openfang/data\ncd \"${d}\"\nrm openfang.db\n"
+        ));
+        assert!(body_destroys_datastore(
+            "d=~/.openfang/data\ncd \"${d}}\"\nrm openfang.db\n"
+        ));
+        // The frame is Substrate, not ControlPlane: `*.log` isolates the glob
+        // arm, which only Substrate satisfies. Over-fire, not bypass.
+        assert!(body_destroys_datastore(
+            "d=~/.openfang/data\ncd \"${d}}\"\nrm -f *.log\n"
+        ));
+        // And the tail-trim still does not tear the expansion: a torn `${d`
+        // would resolve to nothing and land the walk in `Unknown`.
+        assert!(body_destroys_datastore(
+            "d=~/.openfang/data\ncd ${d}\nrm openfang.db\n"
         ));
     }
 
