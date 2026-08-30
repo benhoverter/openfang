@@ -7729,6 +7729,19 @@ impl OpenFangKernel {
         self.sweep_memory_md_with(SweepMode::Apply).report
     }
 
+    /// ANAI-212: re-render one agent's block, now.
+    ///
+    /// The periodic sweep is a *cadence*; a fact write is an *event*, and the
+    /// agent that just wrote a claim is the one entity that will notice
+    /// immediately if its own file disagrees with the slot it just set. Other
+    /// members of the same project pick the change up on the next sweep: a
+    /// hundred-file walk inside a tool call would make one agent pay for the
+    /// whole fleet to learn something it asked about.
+    pub(crate) fn sweep_memory_md_for(&self, agent_id: AgentId) -> MemoryMdSweepReport {
+        self.sweep_memory_md_inner(SweepMode::Apply, Some(agent_id))
+            .report
+    }
+
     /// Plan a sweep without touching a single file (ANAI-168, dry run).
     ///
     /// Same registry walk, same query, same render, same splice -- it just
@@ -7743,13 +7756,28 @@ impl OpenFangKernel {
     /// the write itself -- so a dry run cannot drift from what an apply run
     /// would actually do.
     pub fn sweep_memory_md_with(&self, mode: SweepMode) -> MemoryMdSweepOutcome {
+        self.sweep_memory_md_inner(mode, None)
+    }
+
+    /// The walk itself. `only` narrows it to a single agent (ANAI-212); `None`
+    /// is the whole registry.
+    fn sweep_memory_md_inner(
+        &self,
+        mode: SweepMode,
+        only: Option<AgentId>,
+    ) -> MemoryMdSweepOutcome {
         use openfang_memory::memory_md::{
             managed_block_keys, render_managed_block, splice_managed_block, MANAGED_BEGIN,
         };
 
-        /// Upper bound on facts pulled per agent. The block's own char budget
-        /// cuts in well before this; the limit only bounds the query.
+        /// Upper bound on claim slots pulled per agent. The block's own char
+        /// budget cuts in well before this; the limit only bounds the query.
         const FACT_LIMIT: usize = 200;
+
+        // One instant dates every line of one sweep. Reading the clock per
+        // fact would let a slot on the staleness boundary render differently
+        // from its neighbour for no reason a reader could explain.
+        let now = chrono::Utc::now();
 
         /// Skeleton plan for one agent; the arms below fill in the outcome.
         fn base_plan(agent: &str, agent_id: String, path: &Path) -> MemoryMdSweepPlan {
@@ -7772,6 +7800,9 @@ impl OpenFangKernel {
         let mut plans: Vec<MemoryMdSweepPlan> = Vec::new();
 
         for entry in self.registry.list() {
+            if only.is_some_and(|wanted| entry.id != wanted) {
+                continue;
+            }
             let Some(state_dir) = entry.manifest.state_dir.as_ref() else {
                 continue;
             };
@@ -7795,12 +7826,23 @@ impl OpenFangKernel {
             plan.bytes_before = existing.len();
             plan.bytes_after = existing.len();
 
-            let facts = match self.memory.list_kv_ranked(entry.id, FACT_LIMIT) {
+            // ANAI-212: tier-3 open loops, not `kv_store`. The membership gate
+            // is the same one the rehydration pack applies, passed in for the
+            // same reason — the registry lives here, and a block that
+            // inherited a claim its agent would be refused by name would be
+            // the read gate leaking through the file system instead of the
+            // prompt.
+            let facts = match self.memory.open_claim_slots(
+                entry.id,
+                &entry.manifest.projects,
+                &|ancestor: &str| may_read_project(&self.registry, entry.id, ancestor),
+                FACT_LIMIT,
+            ) {
                 Ok(f) => f,
                 Err(e) => {
-                    warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: KV query failed");
+                    warn!(agent = %entry.name, error = %e, "MEMORY.md sweep: claim query failed");
                     report.errors += 1;
-                    plan.detail = Some(format!("KV query failed: {e}"));
+                    plan.detail = Some(format!("claim query failed: {e}"));
                     plans.push(plan);
                     continue;
                 }
@@ -7816,7 +7858,7 @@ impl OpenFangKernel {
                 continue;
             }
 
-            let block = render_managed_block(&facts);
+            let block = render_managed_block(&facts, now);
             let updated = match splice_managed_block(&existing, &block) {
                 Ok(s) => s,
                 Err(e) => {
@@ -11495,6 +11537,22 @@ impl KernelHandle for OpenFangKernel {
                     .map(|entry| entry.claim),
             ),
         };
+
+        // ANAI-212: the block is a view of the slot store, so a write that
+        // changes a slot must change the view. Gated on the same config flag
+        // the periodic sweep is: one switch decides whether the fleet's
+        // MEMORY.md files are managed at all, and a write path that ignored it
+        // would half-manage them.
+        //
+        // Scoped to the writer, and best-effort: an unwritable workspace must
+        // not fail a claim that is already durable in the database. The sweep
+        // logs its own failures.
+        if self.config.memory.memory_md_sweep {
+            let report = self.sweep_memory_md_for(agent_id);
+            if report.written > 0 {
+                debug!(agent_id = %agent_id, "MEMORY.md re-rendered after fact write");
+            }
+        }
 
         Ok(serde_json::json!({
             "outcome": outcome_name,
@@ -15231,8 +15289,20 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 
-    /// The sweep renders the agent's own KV facts into the managed block and
-    /// leaves every byte of hand-written prose alone.
+    /// ANAI-212: write one **open** claim slot for `agent`, the sweep's only
+    /// source. Settled slots are deliberately not rendered, so a helper that
+    /// wrote them would make every sweep test pass for the wrong reason.
+    fn seed_open_slot(kernel: &OpenFangKernel, agent: AgentId, key: &str, claim: &str) {
+        use openfang_memory::fact::{FactStatus, FactWrite};
+        kernel
+            .memory
+            .facts()
+            .upsert(FactWrite::new(agent, "agent", key, claim).with_status(FactStatus::Open))
+            .unwrap();
+    }
+
+    /// The sweep renders the agent's own open claim slots into the managed
+    /// block and leaves every byte of hand-written prose alone.
     #[test]
     fn test_memory_md_sweep_writes_block_and_preserves_prose() {
         let (tmp, kernel) = sweep_test_kernel("of-sweep-write");
@@ -15243,14 +15313,7 @@ system_prompt = "You are a test agent."
         let prose = "# Long-Term Memory\n\nFORGE transform layer is Erik's.\n";
         std::fs::write(&path, prose).unwrap();
 
-        kernel
-            .memory
-            .structured_set(
-                agent,
-                "forge_build_cmd",
-                serde_json::json!("cargo xtask forge"),
-            )
-            .unwrap();
+        seed_open_slot(&kernel, agent, "build.forge_cmd", "cargo xtask forge");
 
         let report = kernel.sweep_memory_md();
         assert_eq!(report.written, 1, "one file should be rewritten");
@@ -15258,8 +15321,72 @@ system_prompt = "You are a test agent."
 
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(out.starts_with(prose), "hand prose must survive verbatim");
-        assert!(out.contains("forge_build_cmd"));
+        assert!(out.contains("build.forge_cmd"));
         assert!(out.contains(openfang_memory::memory_md::MANAGED_BEGIN));
+
+        kernel.shutdown();
+    }
+
+    /// ANAI-212, the Done-when pin: a claim the store no longer believes can
+    /// never appear in the block. Supersession moves the old text to
+    /// `fact_history` and the sweep reads live slots, so this holds by
+    /// construction — which is exactly the property worth a regression test,
+    /// because a future "render history too" change would look harmless.
+    #[test]
+    fn test_memory_md_sweep_never_renders_a_superseded_claim() {
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-superseded");
+        let ws = tmp.path().join("ws-superseded");
+        let agent = register_agent_with_state_dir(&kernel, "superseded", &ws);
+        let path = ws.join("MEMORY.md");
+        std::fs::write(&path, "# Long-Term Memory\n").unwrap();
+
+        seed_open_slot(&kernel, agent, "repo.trunk_head", "main @ deadbee");
+        assert_eq!(kernel.sweep_memory_md().written, 1);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("deadbee"));
+
+        seed_open_slot(&kernel, agent, "repo.trunk_head", "main @ cafef00");
+        assert_eq!(kernel.sweep_memory_md().written, 1);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("cafef00"), "the live claim must render");
+        assert!(
+            !out.contains("deadbee"),
+            "a superseded claim must not survive in the block"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// A settled claim is retrieved, not pasted (ADR 0002 §2.5). An agent
+    /// whose only slots are settled must be treated exactly like one with no
+    /// slots at all — including the scaffold-untouched rule.
+    #[test]
+    fn test_memory_md_sweep_renders_open_loops_only() {
+        use openfang_memory::fact::FactWrite;
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-open-only");
+        let ws = tmp.path().join("ws-open-only");
+        let agent = register_agent_with_state_dir(&kernel, "open-only", &ws);
+        let path = ws.join("MEMORY.md");
+        let scaffold = "# Long-Term Memory\n";
+        std::fs::write(&path, scaffold).unwrap();
+
+        kernel
+            .memory
+            .facts()
+            .upsert(FactWrite::new(
+                agent,
+                "agent",
+                "memory.settled_background",
+                "settled, therefore retrieved rather than pasted",
+            ))
+            .unwrap();
+        assert_eq!(kernel.sweep_memory_md().written, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), scaffold);
+
+        seed_open_slot(&kernel, agent, "memory.open_loop", "unfinished");
+        assert_eq!(kernel.sweep_memory_md().written, 1);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("memory.open_loop"));
+        assert!(!out.contains("memory.settled_background"));
 
         kernel.shutdown();
     }
@@ -15291,7 +15418,7 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 
-    /// Re-sweeping with unchanged facts performs no write at all.
+    /// Re-sweeping with unchanged claims performs no write at all.
     #[test]
     fn test_memory_md_sweep_is_idempotent() {
         let (tmp, kernel) = sweep_test_kernel("of-sweep-idem");
@@ -15299,17 +15426,14 @@ system_prompt = "You are a test agent."
         let agent = register_agent_with_state_dir(&kernel, "idem", &ws);
         let path = ws.join("MEMORY.md");
         std::fs::write(&path, "# Long-Term Memory\n").unwrap();
-        kernel
-            .memory
-            .structured_set(agent, "k", serde_json::json!("v"))
-            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.k", "v");
 
         let first = kernel.sweep_memory_md();
         assert_eq!(first.written, 1);
         let after_first = std::fs::read_to_string(&path).unwrap();
 
         let second = kernel.sweep_memory_md();
-        assert_eq!(second.written, 0, "no facts changed, so no write");
+        assert_eq!(second.written, 0, "no claim changed, so no write");
         assert_eq!(second.unchanged, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
         assert!(second.is_noop());
@@ -15330,10 +15454,7 @@ system_prompt = "You are a test agent."
             openfang_memory::memory_md::MANAGED_BEGIN
         );
         std::fs::write(&path, &mangled).unwrap();
-        kernel
-            .memory
-            .structured_set(agent, "k", serde_json::json!("v"))
-            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.k", "v");
 
         let report = kernel.sweep_memory_md();
         assert_eq!(report.skipped_malformed, 1);
@@ -15344,8 +15465,8 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 
-    /// The block is rendered from the agent's OWN namespace (ANAI-165). A
-    /// value living in the legacy shared bucket must not leak into it.
+    /// The block is rendered from the agent's OWN slot space (ANAI-165). A
+    /// claim belonging to the legacy shared agent must not leak into it.
     #[test]
     fn test_memory_md_sweep_uses_own_namespace_not_shared() {
         let (tmp, kernel) = sweep_test_kernel("of-sweep-scope");
@@ -15354,25 +15475,20 @@ system_prompt = "You are a test agent."
         let path = ws.join("MEMORY.md");
         std::fs::write(&path, "# Long-Term Memory\n").unwrap();
 
-        kernel
-            .memory
-            .structured_set(agent, "mine", serde_json::json!("own-value"))
-            .unwrap();
-        kernel
-            .memory
-            .structured_set(
-                super::shared_memory_agent_id(),
-                "theirs",
-                serde_json::json!("shared-value"),
-            )
-            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.mine", "own-value");
+        seed_open_slot(
+            &kernel,
+            super::shared_memory_agent_id(),
+            "memory.theirs",
+            "shared-value",
+        );
 
         kernel.sweep_memory_md();
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(out.contains("own-value"));
         assert!(
             !out.contains("shared-value"),
-            "shared-namespace rows must not appear in an agent's block"
+            "another agent's slots must not appear in this agent's block"
         );
 
         kernel.shutdown();
@@ -15390,10 +15506,7 @@ system_prompt = "You are a test agent."
         std::fs::write(&path, prose).unwrap();
         let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        kernel
-            .memory
-            .structured_set(agent, "dry_key", serde_json::json!("dry-value"))
-            .unwrap();
+        seed_open_slot(&kernel, agent, "tool.dry_key", "dry-value");
 
         let outcome = kernel.plan_memory_md_sweep();
         assert_eq!(outcome.report.written, 1, "it would write one file");
@@ -15415,7 +15528,7 @@ system_prompt = "You are a test agent."
             .expect("the agent must appear in the plan");
         assert_eq!(plan.action, MemoryMdAction::Write);
         assert_eq!(plan.facts, 1);
-        assert_eq!(plan.keys_added, vec!["dry_key".to_string()]);
+        assert_eq!(plan.keys_added, vec!["tool.dry_key".to_string()]);
         assert!(plan.keys_removed.is_empty());
         assert_eq!(plan.bytes_before, prose.len());
         assert!(plan.bytes_after > plan.bytes_before);
@@ -15452,14 +15565,8 @@ system_prompt = "You are a test agent."
             ),
         )
         .unwrap();
-        kernel
-            .memory
-            .structured_set(agent, "k", serde_json::json!("v"))
-            .unwrap();
-        kernel
-            .memory
-            .structured_set(bad_agent, "k", serde_json::json!("v"))
-            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.k", "v");
+        seed_open_slot(&kernel, bad_agent, "memory.k", "v");
 
         let planned = kernel.plan_memory_md_sweep();
         let applied = kernel.sweep_memory_md_with(SweepMode::Apply);
@@ -15488,17 +15595,22 @@ system_prompt = "You are a test agent."
         let path = ws.join("MEMORY.md");
         std::fs::write(&path, "# Long-Term Memory\n").unwrap();
 
-        kernel
-            .memory
-            .structured_set(agent, "gone_soon", serde_json::json!("v"))
-            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.gone_soon", "v");
         assert_eq!(kernel.sweep_memory_md().written, 1);
 
-        kernel.memory.structured_delete(agent, "gone_soon").unwrap();
+        // Settling a loop is how a slot leaves the block: the claim is still
+        // true and still readable, it just stops being unfinished business.
         kernel
             .memory
-            .structured_set(agent, "brand_new", serde_json::json!("v"))
+            .facts()
+            .upsert(openfang_memory::fact::FactWrite::new(
+                agent,
+                "agent",
+                "memory.gone_soon",
+                "resolved",
+            ))
             .unwrap();
+        seed_open_slot(&kernel, agent, "memory.brand_new", "v");
 
         let outcome = kernel.plan_memory_md_sweep();
         let plan = outcome
@@ -15506,8 +15618,8 @@ system_prompt = "You are a test agent."
             .iter()
             .find(|p| p.agent == "removed")
             .expect("agent present in plan");
-        assert_eq!(plan.keys_added, vec!["brand_new".to_string()]);
-        assert_eq!(plan.keys_removed, vec!["gone_soon".to_string()]);
+        assert_eq!(plan.keys_added, vec!["memory.brand_new".to_string()]);
+        assert_eq!(plan.keys_removed, vec!["memory.gone_soon".to_string()]);
         // ...and it still has not written anything.
         assert!(std::fs::read_to_string(&path)
             .unwrap()

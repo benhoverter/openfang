@@ -5,7 +5,7 @@
 
 use crate::consolidation::ConsolidationEngine;
 use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore};
-use crate::fact::{FactOutcome, FactStore, FactWrite};
+use crate::fact::{Fact, FactOutcome, FactStore, FactWrite};
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
 use crate::rehydration;
@@ -24,7 +24,7 @@ use openfang_types::memory::{
     MemoryFilter, MemoryFragment, MemoryId, MemorySource, Relation,
 };
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -412,16 +412,6 @@ impl MemorySubstrate {
         self.structured.list_kv(agent_id)
     }
 
-    /// List an agent's KV pairs ranked by write recency, for the MEMORY.md
-    /// managed-block sweep (ANAI-168).
-    pub fn list_kv_ranked(
-        &self,
-        agent_id: AgentId,
-        limit: usize,
-    ) -> OpenFangResult<Vec<crate::memory_md::KvFact>> {
-        self.structured.list_kv_ranked(agent_id, limit)
-    }
-
     /// Delete a KV entry for an agent.
     pub fn structured_delete(&self, agent_id: AgentId, key: &str) -> OpenFangResult<()> {
         self.structured.delete(agent_id, key)
@@ -669,6 +659,65 @@ impl MemorySubstrate {
             rehydration::MAX_FACTS,
         )?;
         Ok((closed, facts.len()))
+    }
+
+    /// ANAI-212: every **open** claim slot this agent should see in its
+    /// MEMORY.md managed block — its own agent-scope loops first, then the
+    /// projects it declares.
+    ///
+    /// Assembled here rather than in the sweep for the reason
+    /// [`Self::rehydration_pack`] is: the two are the same question asked at
+    /// two moments ("what does this agent durably know"), and a second
+    /// hand-rolled walk would be a second answer. `may_read_project` gates each
+    /// ancestor exactly as the pack does, so a block cannot show a claim its
+    /// agent would be refused if it asked for the slot by name.
+    ///
+    /// Only open loops. Settled claims are retrieved by key or by recall;
+    /// pasting them into every prompt spends the window on background nobody
+    /// asked for (ADR 0002 §2.5). Filtering here rather than in SQL keeps the
+    /// store's ordering — open loops first, most recently verified first —
+    /// which is also the order a truncated block should keep.
+    ///
+    /// Duplicate slot addresses are impossible across scopes but not across
+    /// declared projects, whose lineages can overlap, so the union is deduped
+    /// on the full `(scope, scope_ref, claim_key)` address rather than on the
+    /// claim key alone: two projects may legitimately hold the same key.
+    pub fn open_claim_slots(
+        &self,
+        agent_id: AgentId,
+        declared_projects: &[String],
+        may_read_project: &dyn Fn(&str) -> bool,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        let mut out: Vec<Fact> = Vec::new();
+        let mut push = |fact: Fact, out: &mut Vec<Fact>| {
+            let addr = (
+                fact.scope.clone(),
+                fact.scope_ref.clone(),
+                fact.claim_key.clone(),
+            );
+            if seen.insert(addr) {
+                out.push(fact);
+            }
+        };
+
+        for fact in self
+            .facts()
+            .list_for_scope("agent", &agent_id.to_string(), limit)?
+        {
+            push(fact, &mut out);
+        }
+        for declared in declared_projects {
+            let readable = readable_lineage(declared, may_read_project);
+            for fact in self.facts().list_for_scopes("project", &readable, limit)? {
+                push(fact, &mut out);
+            }
+        }
+
+        let mut open = crate::memory_md::open_loops(out);
+        open.truncate(limit);
+        Ok(open)
     }
 
     /// Set or clear a session label.
@@ -1625,6 +1674,138 @@ mod tests {
             .rehydration_pack(AgentId::new(), &|_: &str| true)
             .unwrap()
             .is_none());
+    }
+
+    // --- ANAI-212: what the MEMORY.md block is allowed to say --------------
+
+    /// An open slot writer used by the ANAI-212 tests. Settled is the default,
+    /// and a helper that wrote settled claims would make every one of these
+    /// pass for the wrong reason.
+    fn open_slot(
+        substrate: &MemorySubstrate,
+        agent_id: AgentId,
+        scope: &str,
+        scope_ref: Option<&str>,
+        key: &str,
+        claim: &str,
+    ) {
+        let mut write = crate::fact::FactWrite::new(agent_id, scope, key, claim)
+            .with_status(crate::fact::FactStatus::Open);
+        if let Some(r) = scope_ref {
+            write = write.with_scope_ref(r);
+        }
+        substrate.facts().upsert(write).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_block_carries_open_loops_from_the_agent_and_its_projects() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(&substrate, agent_id, "agent", None, "memory.mine", "mine");
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let slots = substrate
+            .open_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| true, 50)
+            .unwrap();
+        let keys: Vec<&str> = slots.iter().map(|f| f.claim_key.as_str()).collect();
+        assert!(keys.contains(&"memory.mine"));
+        assert!(keys.contains(&"repo.trunk_head"));
+    }
+
+    /// Settled claims are retrieved, not pasted (ADR 0002 §2.5) — the block
+    /// exists to carry what a cold reader cannot reconstruct.
+    #[tokio::test]
+    async fn the_block_leaves_settled_claims_to_retrieval() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        substrate
+            .facts()
+            .upsert(crate::fact::FactWrite::new(
+                agent_id,
+                "agent",
+                "memory.settled",
+                "background",
+            ))
+            .unwrap();
+        open_slot(&substrate, agent_id, "agent", None, "memory.loop", "open");
+
+        let slots = substrate
+            .open_claim_slots(agent_id, &[], &|_: &str| true, 50)
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].claim_key, "memory.loop");
+    }
+
+    /// The same gate the pack applies. A block that showed a claim its agent
+    /// would be refused by name is the read gate leaking through the file
+    /// system instead of the prompt.
+    #[tokio::test]
+    async fn the_block_withholds_projects_the_agent_may_not_address() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let slots = substrate
+            .open_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| false, 50)
+            .unwrap();
+        assert!(
+            slots.is_empty(),
+            "a denied reader resolves no project claims"
+        );
+    }
+
+    /// An agent that declares nothing still gets its own loops: agent-scope
+    /// slots have no membership relation at all, and punishing the undeclared
+    /// half of the fleet for a rule about projects would empty their blocks
+    /// for no reason.
+    #[tokio::test]
+    async fn an_undeclared_agent_still_sees_its_own_loops() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(&substrate, agent_id, "agent", None, "memory.mine", "mine");
+
+        let slots = substrate
+            .open_claim_slots(agent_id, &[], &|_: &str| false, 50)
+            .unwrap();
+        assert_eq!(slots.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_project_lineages_do_not_duplicate_a_slot() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let slots = substrate
+            .open_claim_slots(
+                agent_id,
+                &["openfang.memory".to_string(), "openfang".to_string()],
+                &|_: &str| true,
+                50,
+            )
+            .unwrap();
+        assert_eq!(slots.len(), 1, "one slot, reached twice, renders once");
     }
 
     #[tokio::test]
