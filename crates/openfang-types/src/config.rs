@@ -100,6 +100,71 @@ impl Default for ContextConfig {
     }
 }
 
+/// Kind-aware recall ranking, exposed in the `[recall]` config section
+/// (ANAI-233).
+///
+/// Vector recall ranks its candidate window on raw cosine similarity, where a
+/// distilled episode summary competes against transcript sediment that
+/// outnumbers it by three orders of magnitude and loses. ANAI-232's shadow
+/// mode measured the fix before shipping it: in one log window every logged
+/// recall differed under the weights, the direction never reversed (summaries
+/// and facts in, turns out), and the deepest corpus in the fleet surfaced
+/// **zero** summaries in its top-5 under pure cosine.
+///
+/// The values live here rather than as constants because the final test of
+/// this work is qualitative — the log can prove the composition changed, not
+/// that the answers got better — so the operator needs to sweep them without
+/// a rebuild. Same reasoning as [`ContextConfig::working_set_ratio`] and
+/// [`FactStalenessConfig`].
+///
+/// Fleet-wide, deliberately not per-agent: a per-agent ranking policy would
+/// need someone to know that agent's corpus mix, and the realistic outcome is
+/// a hundred manifests carrying the default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecallConfig {
+    /// Apply the per-kind weights to what recall actually returns.
+    ///
+    /// Ships `false`, so landing ANAI-233 changes no behaviour: recall stays
+    /// on pure cosine and the shadow log keeps reporting what the weights
+    /// would have done. Flip it on a second bounce — the two-bounce rule, so
+    /// a regression has one candidate cause instead of two.
+    ///
+    /// Shadow logging is unaffected by this switch. Turning the weights off
+    /// does not blind the instrument.
+    pub kind_weights_enabled: bool,
+    /// Multiplier for `summary` rows. Defaults to `1.25`.
+    ///
+    /// Raised from shadow mode's timid 1.15: `baseline_summaries=0` on a
+    /// 130-candidate window is a summary corpus that never reaches the cut
+    /// line, not one arriving just under it.
+    pub summary_weight: f64,
+    /// Multiplier for `fact` rows. Defaults to `1.0` — neutral.
+    ///
+    /// Lowered from shadow mode's 1.25, and the inversion is deliberate:
+    /// facts now reach the prompt through the rehydration pack (ANAI-247),
+    /// through `memory_fact` reads (ANAI-259) and through the managed
+    /// `MEMORY.md` block (ANAI-212). Boosting them in recall as well spends
+    /// the window twice on the same handful of claims, displacing the one
+    /// kind that has no other door.
+    ///
+    /// Must be `>= 1.0`: weighting promotes a kind, it never demotes one. A
+    /// value outside `1.0 ..= 3.0` is refused at install time — the compiled
+    /// defaults stay live and an error is logged — rather than clamped into
+    /// something the operator did not ask for.
+    pub fact_weight: f64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            kind_weights_enabled: false,
+            summary_weight: 1.25,
+            fact_weight: 1.0,
+        }
+    }
+}
+
 /// DM (direct message) policy for a channel.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1666,6 +1731,10 @@ pub struct KernelConfig {
     /// via `openfang_memory::staleness::install_policy`.
     #[serde(default)]
     pub fact_staleness: FactStalenessConfig,
+    /// Kind-aware recall ranking ([recall], ANAI-233). Global, installed at
+    /// boot via `openfang_memory::ranking::install_weights`.
+    #[serde(default)]
+    pub recall: RecallConfig,
 }
 
 /// Per-turn context envelope settings exposed in the `[turn_context]` config
@@ -2069,6 +2138,7 @@ impl Default for KernelConfig {
             turn_context: TurnContextConfig::default(),
             context: ContextConfig::default(),
             fact_staleness: FactStalenessConfig::default(),
+            recall: RecallConfig::default(),
         }
     }
 }
@@ -5511,6 +5581,49 @@ mod tests {
         "#;
         let c: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(c.context.working_set_ratio, 0.40);
+    }
+
+    // -- [recall] kind-aware ranking (ANAI-233)
+
+    #[test]
+    fn test_recall_config_lands_inert() {
+        // The switch ships off, so landing ANAI-233 changes no behaviour and
+        // the operator flips it on a second bounce.
+        let c = KernelConfig::default();
+        assert!(!c.recall.kind_weights_enabled);
+        assert_eq!(c.recall.summary_weight, 1.25);
+        assert_eq!(c.recall.fact_weight, 1.0);
+    }
+
+    #[test]
+    fn test_recall_config_absent_section_uses_defaults() {
+        let c: KernelConfig = toml::from_str("").unwrap();
+        assert!(!c.recall.kind_weights_enabled);
+        assert_eq!(c.recall.summary_weight, 1.25);
+    }
+
+    #[test]
+    fn test_recall_config_from_toml() {
+        let toml_str = r#"
+            [recall]
+            kind_weights_enabled = true
+            summary_weight = 1.4
+            fact_weight = 1.0
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert!(c.recall.kind_weights_enabled);
+        assert_eq!(c.recall.summary_weight, 1.4);
+        assert_eq!(c.recall.fact_weight, 1.0);
+    }
+
+    /// A partial section must not silently reset the weights: an operator who
+    /// flips only the switch gets the recommended values, not zeroes.
+    #[test]
+    fn test_recall_config_partial_section_keeps_defaults() {
+        let c: KernelConfig = toml::from_str("[recall]\nkind_weights_enabled = true\n").unwrap();
+        assert!(c.recall.kind_weights_enabled);
+        assert_eq!(c.recall.summary_weight, 1.25);
+        assert_eq!(c.recall.fact_weight, 1.0);
     }
 
     #[test]

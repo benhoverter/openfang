@@ -5812,6 +5812,31 @@ impl OpenFangKernel {
             }
         }
 
+        // Install the operator-configured recall weights ([recall], ANAI-233).
+        // Same trade again: a refused value leaves the compiled defaults live —
+        // which includes `enabled: false`, so a typo drops recall back to pure
+        // cosine rather than half-applying an operator's intent.
+        {
+            let cfg = self.config.recall;
+            let weights = openfang_memory::ranking::RecallWeights {
+                enabled: cfg.kind_weights_enabled,
+                summary: cfg.summary_weight as f32,
+                fact: cfg.fact_weight as f32,
+            };
+            match openfang_memory::ranking::install_weights(weights) {
+                Ok(()) => info!(
+                    kind_weights_enabled = cfg.kind_weights_enabled,
+                    summary_weight = cfg.summary_weight,
+                    fact_weight = cfg.fact_weight,
+                    "Recall kind weights installed (ANAI-233)"
+                ),
+                Err(e) => error!(
+                    "Refusing [recall] weights, keeping the compiled defaults \
+                     (disabled, summary 1.25 / fact 1.0): {e}"
+                ),
+            }
+        }
+
         // Install operator-configured agent-wake limits ([agent_wake] config,
         // ANAI-111) so the producer's rate backstops and the wake-consumer's
         // concurrency cap resolve them. Idempotent; must precede
