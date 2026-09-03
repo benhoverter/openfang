@@ -1277,6 +1277,25 @@ struct ClaudeJsonOutput {
     cost_usd: Option<f64>,
 }
 
+/// ANAI-266: model/cost accounting fields the CLI emits alongside the body.
+/// Kept in their own struct so the text-reassembly path (`ClaudeJsonOutput`)
+/// stays byte-for-byte the shape the ANAI-113 fidelity gate diffs.
+#[derive(Debug, Deserialize, Default)]
+struct ClaudeJsonAccounting {
+    /// Served model id, when the CLI reports one at top level.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<ClaudeUsage>,
+    #[serde(default)]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    /// `{ "<served-model-id>": { inputTokens, outputTokens, costUSD, ... } }`
+    #[serde(default, rename = "modelUsage")]
+    model_usage: Option<std::collections::HashMap<String, ClaudeModelUsage>>,
+}
+
 /// Usage stats from Claude CLI JSON output.
 #[derive(Debug, Deserialize, Default)]
 struct ClaudeUsage {
@@ -1284,6 +1303,30 @@ struct ClaudeUsage {
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    /// Prompt-cache reads — billed at a fraction of the input rate, so they
+    /// are tracked separately rather than folded into `input_tokens`.
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    /// Prompt-cache writes — billed above the input rate.
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+/// Per-model usage entry from the CLI's `modelUsage` map (camelCase, unlike
+/// the flat `usage` object). The map key is the *served* model id — the only
+/// authoritative statement of which model actually answered.
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ClaudeModelUsage {
+    #[serde(default, rename = "inputTokens")]
+    input_tokens: u64,
+    #[serde(default, rename = "outputTokens")]
+    output_tokens: u64,
+    #[serde(default, rename = "cacheReadInputTokens")]
+    cache_read_input_tokens: u64,
+    #[serde(default, rename = "cacheCreationInputTokens")]
+    cache_creation_input_tokens: u64,
+    #[serde(default, rename = "costUSD")]
+    cost_usd: f64,
 }
 
 /// A single content block inside an `assistant` stream-json event.
@@ -1307,6 +1350,13 @@ struct ClaudeMessageBlock {
 struct ClaudeAssistantMessage {
     #[serde(default)]
     content: Vec<ClaudeMessageBlock>,
+    /// ANAI-266: the served model for THIS message. Per-message rather than
+    /// per-session, because a single CC turn can route sub-calls to a cheaper
+    /// model than the one the flag asked for.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<ClaudeUsage>,
 }
 
 /// Stream JSON event from `claude -p --output-format stream-json --verbose`.
@@ -1330,6 +1380,15 @@ struct ClaudeStreamEvent {
     message: Option<ClaudeAssistantMessage>,
     #[serde(default)]
     usage: Option<ClaudeUsage>,
+    /// Top-level served model — emitted on `system`/init events.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    cost_usd: Option<f64>,
+    #[serde(default)]
+    total_cost_usd: Option<f64>,
+    #[serde(default, rename = "modelUsage")]
+    model_usage: Option<std::collections::HashMap<String, ClaudeModelUsage>>,
 }
 
 /// Reassemble `(text, usage)` from the stdout of
@@ -1363,6 +1422,273 @@ fn parse_complete_stdout(stdout: &str) -> (String, TokenUsage) {
             output_tokens: 0,
         },
     )
+}
+
+/// ANAI-266: per-request model and cost accounting recovered from the Claude
+/// Code CLI's own output.
+///
+/// `--model opus` is a *request*, not a guarantee: the CLI decides what it
+/// actually calls, and the only party that knows the answer is the CLI itself.
+/// Every field here is read back out of the response — nothing is inferred
+/// from `request.model`, which is exactly the assumption this struct exists to
+/// stop making.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CcAccounting {
+    /// Every distinct model id seen in the response, in first-seen order.
+    /// More than one is normal: CC routes its own sub-calls (title, summary,
+    /// small tool steps) to cheaper models than the top-level turn.
+    served_models: Vec<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    /// Cost as reported by the CLI, when it reports one. Authoritative for
+    /// API-key billing; notional under a subscription plan.
+    cli_cost_usd: Option<f64>,
+    /// True when token counts came from summing per-message events because no
+    /// terminal `result` event carried usage (the documented ANAI-113 gap).
+    usage_from_stream_sum: bool,
+}
+
+/// Coarse capability rank of an Anthropic model family. Used only to decide
+/// whether the served model is *below* the requested one; never to pick a
+/// model.
+fn model_rank(model_id: &str) -> Option<u8> {
+    let m = model_id.to_ascii_lowercase();
+    if m.contains("haiku") {
+        Some(1)
+    } else if m.contains("sonnet") {
+        Some(2)
+    } else if m.contains("opus") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// List price in USD per million tokens, `(input, output)`, for the Anthropic
+/// families the CC CLI can serve. Approximate by construction — it keys off
+/// the family and generation in the model id, and it is only ever used for the
+/// *derived* cost column. When the CLI reports its own cost, that number is
+/// logged alongside and should be preferred.
+fn cc_list_price(model_id: &str) -> Option<(f64, f64)> {
+    let m = model_id.to_ascii_lowercase();
+    if m.contains("haiku") {
+        if m.contains("haiku-4") {
+            Some((1.00, 5.00))
+        } else if m.contains("haiku-3-5") {
+            Some((0.80, 4.00))
+        } else {
+            Some((0.25, 1.25))
+        }
+    } else if m.contains("sonnet") {
+        Some((3.00, 15.00))
+    } else if m.contains("opus") {
+        if m.contains("opus-4-5") {
+            Some((5.00, 25.00))
+        } else {
+            Some((15.00, 75.00))
+        }
+    } else {
+        None
+    }
+}
+
+impl CcAccounting {
+    fn note_model(&mut self, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        if !self.served_models.iter().any(|m| m == model) {
+            self.served_models.push(model.to_string());
+        }
+    }
+
+    /// Overwrite token counts from an authoritative `usage` object (the flat
+    /// blob in `complete()`, or a terminal stream event).
+    fn set_usage(&mut self, u: &ClaudeUsage) {
+        self.input_tokens = u.input_tokens;
+        self.output_tokens = u.output_tokens;
+        self.cache_read_tokens = u.cache_read_input_tokens;
+        self.cache_write_tokens = u.cache_creation_input_tokens;
+        self.usage_from_stream_sum = false;
+    }
+
+    /// Add a per-message `usage` seen mid-stream. Only kept as a fallback:
+    /// a later terminal `usage` replaces the sum wholesale via `set_usage`.
+    fn add_stream_usage(&mut self, u: &ClaudeUsage) {
+        if !self.usage_from_stream_sum && (self.input_tokens > 0 || self.output_tokens > 0) {
+            // A terminal usage already landed — it wins.
+            return;
+        }
+        self.usage_from_stream_sum = true;
+        self.input_tokens += u.input_tokens;
+        self.output_tokens += u.output_tokens;
+        self.cache_read_tokens += u.cache_read_input_tokens;
+        self.cache_write_tokens += u.cache_creation_input_tokens;
+    }
+
+    fn absorb_model_usage(&mut self, map: &std::collections::HashMap<String, ClaudeModelUsage>) {
+        // Deterministic order — a HashMap iteration order would make the log
+        // line (and its tests) shuffle between runs.
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        let mut cost = 0.0;
+        let mut any_cost = false;
+        let (mut sum_in, mut sum_out, mut sum_cr, mut sum_cw) = (0u64, 0u64, 0u64, 0u64);
+        for k in keys {
+            self.note_model(k);
+            if let Some(v) = map.get(k) {
+                if v.cost_usd > 0.0 {
+                    cost += v.cost_usd;
+                    any_cost = true;
+                }
+                sum_in += v.input_tokens;
+                sum_out += v.output_tokens;
+                sum_cr += v.cache_read_input_tokens;
+                sum_cw += v.cache_creation_input_tokens;
+            }
+        }
+        if any_cost && self.cli_cost_usd.is_none() {
+            self.cli_cost_usd = Some(cost);
+        }
+        // Gap-fill only: a flat `usage` object (or a terminal stream usage)
+        // always wins. The per-model map is the last place token counts can
+        // still be recovered from when neither shipped.
+        if self.input_tokens == 0 && self.output_tokens == 0 {
+            self.input_tokens = sum_in;
+            self.output_tokens = sum_out;
+            self.cache_read_tokens = sum_cr;
+            self.cache_write_tokens = sum_cw;
+        }
+    }
+
+    /// Derived cost from list price, using the highest-ranked served model.
+    /// `None` when no served model was reported — in which case we decline to
+    /// guess rather than price it as the model we asked for.
+    fn derived_cost_usd(&self) -> Option<f64> {
+        let model = self.top_served()?;
+        let (in_per_m, out_per_m) = cc_list_price(model)?;
+        // Anthropic prompt-cache multipliers: reads 0.1x input, writes 1.25x.
+        let cost = (self.input_tokens as f64 * in_per_m
+            + self.cache_read_tokens as f64 * in_per_m * 0.1
+            + self.cache_write_tokens as f64 * in_per_m * 1.25
+            + self.output_tokens as f64 * out_per_m)
+            / 1_000_000.0;
+        Some(cost)
+    }
+
+    /// The most capable model that actually served any part of this request.
+    fn top_served(&self) -> Option<&str> {
+        self.served_models
+            .iter()
+            .max_by_key(|m| model_rank(m).unwrap_or(0))
+            .map(|s| s.as_str())
+    }
+
+    /// True when the best model that served this request ranks *below* the
+    /// model that was asked for.
+    ///
+    /// Deliberately compares against the best served model, not every served
+    /// model: CC legitimately routes its own sub-calls to Haiku, and flagging
+    /// those would make the column noise. This fires only when the requested
+    /// tier was never reached at all. `None` when either side is unknown.
+    fn downgraded(&self, requested_model: &str) -> Option<bool> {
+        let want = model_rank(requested_model)?;
+        let got = model_rank(self.top_served()?)?;
+        Some(got < want)
+    }
+}
+
+/// Parse the accounting fields out of `claude -p --output-format json` stdout.
+/// Independent of `parse_complete_stdout` on purpose — the fidelity gate diffs
+/// that function against the streaming fold, and this must not perturb it.
+fn parse_complete_accounting(stdout: &str) -> CcAccounting {
+    let mut acc = CcAccounting::default();
+    let Ok(parsed) = serde_json::from_str::<ClaudeJsonAccounting>(stdout) else {
+        return acc;
+    };
+    if let Some(m) = parsed.model.as_deref() {
+        acc.note_model(m);
+    }
+    if let Some(u) = parsed.usage.as_ref() {
+        acc.set_usage(u);
+    }
+    acc.cli_cost_usd = parsed.total_cost_usd.or(parsed.cost_usd);
+    if let Some(map) = parsed.model_usage.as_ref() {
+        acc.absorb_model_usage(map);
+    }
+    acc
+}
+
+/// Fold one stream-json line into the accounting accumulator.
+///
+/// A second parse of the same line, separate from `fold_stream_line`, so the
+/// ANAI-113 fidelity harness keeps comparing exactly the two functions it was
+/// written to compare. Cost is one extra `serde_json` parse per line, which is
+/// noise next to the subprocess it is measuring.
+fn fold_stream_accounting(line: &str, acc: &mut CcAccounting) {
+    let Ok(event) = serde_json::from_str::<ClaudeStreamEvent>(line) else {
+        return;
+    };
+    if let Some(m) = event.model.as_deref() {
+        acc.note_model(m);
+    }
+    if let Some(msg) = event.message.as_ref() {
+        if let Some(m) = msg.model.as_deref() {
+            acc.note_model(m);
+        }
+        if let Some(u) = msg.usage.as_ref() {
+            acc.add_stream_usage(u);
+        }
+    }
+    if let Some(map) = event.model_usage.as_ref() {
+        acc.absorb_model_usage(map);
+    }
+    if let Some(c) = event.total_cost_usd.or(event.cost_usd) {
+        acc.cli_cost_usd = Some(c);
+    }
+    if matches!(event.r#type.as_str(), "result" | "done" | "complete") {
+        if let Some(u) = event.usage.as_ref() {
+            acc.set_usage(u);
+        }
+    }
+}
+
+/// Emit the per-request accounting row to stderr at INFO.
+///
+/// One line per model call, greppable on `cc_model_accounting`. `served` is
+/// what answered; `requested` is what we asked for; `downgraded=true` means
+/// the request never reached the tier it asked for.
+fn log_model_accounting(path: &'static str, requested: &str, acc: &CcAccounting) {
+    let served = acc.top_served().unwrap_or("unknown");
+    let downgraded = acc.downgraded(requested);
+    let derived = acc.derived_cost_usd();
+    info!(
+        event = "cc_model_accounting",
+        path = path,
+        requested = %requested,
+        served = %served,
+        served_all = %acc.served_models.join(","),
+        downgraded = downgraded.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        tokens_in = acc.input_tokens,
+        tokens_out = acc.output_tokens,
+        cache_read = acc.cache_read_tokens,
+        cache_write = acc.cache_write_tokens,
+        usage_source = if acc.usage_from_stream_sum { "stream-sum" } else { "terminal" },
+        cost_usd_cli = acc.cli_cost_usd.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".to_string()),
+        cost_usd_listprice = derived.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".to_string()),
+        "Claude Code request accounting"
+    );
+    if downgraded == Some(true) {
+        warn!(
+            event = "cc_model_downgrade",
+            requested = %requested,
+            served = %served,
+            served_all = %acc.served_models.join(","),
+            "Claude Code served a lower-tier model than requested"
+        );
+    }
 }
 
 /// Outcome of folding one stream-json line: the reply-body text to surface
@@ -1747,6 +2073,11 @@ impl LlmDriver for ClaudeCodeDriver {
         // reassembly (`fold_stream_line`) can be diffed against this exact
         // logic in tests — the ANAI-113 fidelity gate. Behavior unchanged.
         let (text, usage) = parse_complete_stdout(&stdout);
+        // ANAI-266: read back which model actually served the request, what it
+        // cost, and how many tokens moved. The CLI is the only source of truth
+        // for the served model — `request.model` is what we asked for.
+        let accounting = parse_complete_accounting(&stdout);
+        log_model_accounting("complete", &request.model, &accounting);
         // ANAI-77x: recover the tools observed inside the CC subprocess from
         // the per-spawn sideband before `_cc_settings` drops (which removes
         // it). Bridge tools execute inside CC and never round-trip as
@@ -1908,6 +2239,8 @@ impl LlmDriver for ClaudeCodeDriver {
             input_tokens: 0,
             output_tokens: 0,
         };
+        // ANAI-266: model/cost accounting accumulated alongside the reply.
+        let mut accounting = CcAccounting::default();
 
         // ANAI-116: the per-event idle watchdog and the absolute backstop both
         // moved up to the driver-agnostic channel layer (`stream_with_idle_watchdog`
@@ -1928,6 +2261,7 @@ impl LlmDriver for ClaudeCodeDriver {
                     // ANAI-113 fidelity gate. Returns the text chunk to surface
                     // as a TextDelta, if any.
                     let outcome = fold_stream_line(&line, &mut full_text, &mut final_usage);
+                    fold_stream_accounting(&line, &mut accounting);
                     // Reply text -> TextDelta (also accumulated into full_text).
                     if let Some(delta) = outcome.text {
                         let _ = tx.send(StreamEvent::TextDelta { text: delta }).await;
@@ -2033,6 +2367,9 @@ impl LlmDriver for ClaudeCodeDriver {
                 usage: final_usage,
             })
             .await;
+
+        // ANAI-266: one accounting row per request, same shape as `complete()`.
+        log_model_accounting("stream", &request.model, &accounting);
 
         // ANAI-77x: same sideband recovery as `complete()` — read before
         // `_cc_settings` drops. Heartbeats route through `complete()`, but
@@ -2273,6 +2610,104 @@ mod tests {
             ClaudeCodeDriver::model_flag("custom-model"),
             Some("custom-model".to_string())
         );
+    }
+
+    // ---- ANAI-266: model/cost accounting -------------------------------
+
+    #[test]
+    fn accounting_complete_reads_served_model_and_cost() {
+        let json = r#"{"result":"hi","model":"claude-opus-4-5-20260101",
+            "usage":{"input_tokens":100,"output_tokens":20,
+                     "cache_read_input_tokens":900,"cache_creation_input_tokens":50},
+            "total_cost_usd":0.0123}"#;
+        let acc = parse_complete_accounting(json);
+        assert_eq!(acc.served_models, vec!["claude-opus-4-5-20260101"]);
+        assert_eq!((acc.input_tokens, acc.output_tokens), (100, 20));
+        assert_eq!((acc.cache_read_tokens, acc.cache_write_tokens), (900, 50));
+        assert_eq!(acc.cli_cost_usd, Some(0.0123));
+        // Asked for opus, got opus.
+        assert_eq!(acc.downgraded("claude-code/opus"), Some(false));
+    }
+
+    #[test]
+    fn accounting_flags_a_haiku_downgrade() {
+        // The row this whole change exists to produce: opus was requested and
+        // only Haiku ever answered.
+        let json = r#"{"result":"hi",
+            "modelUsage":{"claude-haiku-4-5-20260101":
+                {"inputTokens":10,"outputTokens":5,"costUSD":0.0001}},
+            "usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let acc = parse_complete_accounting(json);
+        assert_eq!(acc.top_served(), Some("claude-haiku-4-5-20260101"));
+        assert_eq!(acc.downgraded("claude-code/opus"), Some(true));
+        assert_eq!(acc.downgraded("claude-code/haiku"), Some(false));
+    }
+
+    #[test]
+    fn accounting_ignores_haiku_subcalls_when_the_tier_was_reached() {
+        // CC routing its own side-calls to Haiku is normal and must not read
+        // as a downgrade — only "never reached the requested tier" does.
+        let json = r#"{"result":"hi","modelUsage":{
+            "claude-haiku-4-5-20260101":{"inputTokens":10,"outputTokens":5,"costUSD":0.0001},
+            "claude-opus-4-5-20260101":{"inputTokens":900,"outputTokens":80,"costUSD":0.06}}}"#;
+        let acc = parse_complete_accounting(json);
+        assert_eq!(acc.top_served(), Some("claude-opus-4-5-20260101"));
+        assert_eq!(acc.downgraded("claude-code/opus"), Some(false));
+        assert_eq!(acc.served_models.len(), 2);
+        // Costs from the per-model map are summed when no top-level cost ships.
+        assert!((acc.cli_cost_usd.unwrap() - 0.0601).abs() < 1e-9);
+    }
+
+    #[test]
+    fn accounting_stream_prefers_terminal_usage_over_the_sum() {
+        let lines = [
+            r#"{"type":"system","subtype":"init","model":"claude-haiku-4-5-20260101"}"#,
+            r#"{"type":"assistant","message":{"model":"claude-haiku-4-5-20260101","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            r#"{"type":"result","result":"hi","usage":{"input_tokens":40,"output_tokens":9},"total_cost_usd":0.002}"#,
+        ];
+        let mut acc = CcAccounting::default();
+        for l in lines {
+            fold_stream_accounting(l, &mut acc);
+        }
+        assert_eq!((acc.input_tokens, acc.output_tokens), (40, 9));
+        assert!(!acc.usage_from_stream_sum);
+        assert_eq!(acc.cli_cost_usd, Some(0.002));
+        assert_eq!(acc.downgraded("claude-code/sonnet"), Some(true));
+    }
+
+    #[test]
+    fn accounting_stream_falls_back_to_summed_usage() {
+        // The documented ANAI-113 gap: terminal event carries no usage. The
+        // counts survive as a sum, labelled as such.
+        let lines = [
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":4,"output_tokens":2}}}"#,
+            r#"{"type":"result","result":"done"}"#,
+        ];
+        let mut acc = CcAccounting::default();
+        for l in lines {
+            fold_stream_accounting(l, &mut acc);
+        }
+        assert_eq!((acc.input_tokens, acc.output_tokens), (7, 3));
+        assert!(acc.usage_from_stream_sum);
+    }
+
+    #[test]
+    fn accounting_derived_cost_uses_the_served_model_not_the_requested_one() {
+        let json = r#"{"result":"x","model":"claude-haiku-4-5-20260101",
+            "usage":{"input_tokens":1000000,"output_tokens":0}}"#;
+        let acc = parse_complete_accounting(json);
+        // Haiku 4.5 list price: $1.00 per million input.
+        let cost = acc.derived_cost_usd().unwrap();
+        assert!((cost - 1.00).abs() < 1e-9, "got {cost}");
+    }
+
+    #[test]
+    fn accounting_unknown_served_model_declines_to_guess() {
+        let acc = parse_complete_accounting(r#"{"result":"x"}"#);
+        assert_eq!(acc.top_served(), None);
+        assert_eq!(acc.downgraded("claude-code/opus"), None);
+        assert_eq!(acc.derived_cost_usd(), None);
     }
 
     #[test]
