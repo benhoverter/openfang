@@ -886,6 +886,22 @@ impl OpenFangKernel {
 
         use openfang_types::config::KernelMode;
 
+        // Convention check: `safe_bins` is global-only (config.toml),
+        // `trusted_commands` is per-agent (agent.toml). A global
+        // `trusted_commands` has no coherent scope — it would apply to exactly
+        // the agents that declare no `[exec_policy]` table of their own — so
+        // it is ignored at resolution. Warn rather than fail: it is dead
+        // config, not a dangerous one.
+        if config.exec_policy.declares_misplaced_trusted_commands() {
+            warn!(
+                count = config.exec_policy.trusted_commands.len(),
+                "config.toml [exec_policy] declares trusted_commands; \
+                 that field is per-agent (agent.toml) only and is ignored. \
+                 Move the entries into the agents that need them, or into \
+                 safe_bins if they should apply fleet-wide."
+            );
+        }
+
         // Env var overrides — useful for Docker where config.toml is baked in.
         if let Ok(listen) = std::env::var("OPENFANG_LISTEN") {
             config.api_listen = listen;
@@ -1722,15 +1738,20 @@ impl OpenFangKernel {
                     //      otherwise pin the agent to the inherited mode at
                     //      first spawn (typically Allowlist) regardless of
                     //      later config edits.
-                    if !disk_has_exec_policy_override {
-                        restored_entry.manifest.exec_policy =
-                            Some(kernel.config.exec_policy.clone());
-                    } else if restored_entry.manifest.exec_policy.is_none() {
-                        // Defensive: should not happen given the flag, but keep
-                        // the manifest non-None for the runtime check.
-                        restored_entry.manifest.exec_policy =
-                            Some(kernel.config.exec_policy.clone());
-                    }
+                    //
+                    // A disk override is now merged over the global rather
+                    // than replacing it wholesale, so unspecified lists
+                    // inherit (mirrors the spawn path).
+                    let ep_override = if disk_has_exec_policy_override {
+                        restored_entry.manifest.exec_policy.take()
+                    } else {
+                        None
+                    };
+                    restored_entry.manifest.exec_policy =
+                        Some(openfang_types::config::ExecPolicy::resolve_over_global(
+                            &kernel.config.exec_policy,
+                            ep_override,
+                        ));
 
                     // F2: re-resolve file_policy under the current global floor
                     // on every restart (mirrors exec_policy #1132) so config
@@ -2008,11 +2029,18 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
         let session_id = session.id;
 
-        // Inherit kernel exec_policy as fallback if agent manifest doesn't have one
+        // Resolve exec_policy: the agent's optional manifest override merged
+        // OVER the global `[exec_policy]`. With no override the global applies
+        // wholesale; with one, unspecified list fields (`safe_bins`,
+        // `allowed_commands`) inherit the global list instead of falling back
+        // to the hardcoded defaults. Whole-struct replacement used to mean an
+        // agent that declared `[exec_policy]` only to set `mode` silently lost
+        // most of its read-only bins.
         let mut manifest = manifest;
-        if manifest.exec_policy.is_none() {
-            manifest.exec_policy = Some(self.config.exec_policy.clone());
-        }
+        manifest.exec_policy = Some(openfang_types::config::ExecPolicy::resolve_over_global(
+            &self.config.exec_policy,
+            manifest.exec_policy.take(),
+        ));
         info!(agent = %name, id = %agent_id, exec_mode = ?manifest.exec_policy.as_ref().map(|p| &p.mode), "Agent exec_policy resolved");
 
         // F2: resolve file_policy under the global floor. The global
@@ -4165,6 +4193,20 @@ impl OpenFangKernel {
                 .is_some_and(|p| p == &self.config.exec_policy)
             {
                 manifest_for_disk.exec_policy = None;
+            }
+            // A genuine per-agent override no longer compares equal to the
+            // global (it now carries the *merged* lists), so strip the
+            // inherited halves individually. Empty lists are omitted on
+            // serialize and re-read as "unspecified — inherit", so the round
+            // trip preserves the override without copying the global bins
+            // into every agent.toml.
+            if let Some(p) = manifest_for_disk.exec_policy.as_mut() {
+                if p.safe_bins == self.config.exec_policy.safe_bins {
+                    p.safe_bins.clear();
+                }
+                if p.allowed_commands == self.config.exec_policy.allowed_commands {
+                    p.allowed_commands.clear();
+                }
             }
             // F2: same treatment for the inherited file_policy. The wholesale
             // global-inherit case (== global) is stripped so a later config

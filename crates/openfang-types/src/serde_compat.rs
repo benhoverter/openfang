@@ -157,10 +157,60 @@ where
     deserializer.deserialize_any(MapLenientVisitor(PhantomData))
 }
 
+/// Shadow of [`crate::config::ExecPolicy`] with every field optional.
+///
+/// The real struct is `#[serde(default)]`, so a missing `safe_bins` inside a
+/// present `[exec_policy]` table deserializes to the *hardcoded* default bin
+/// list — indistinguishable from an operator writing that list out. That is
+/// fine for the global `config.toml`, where the hardcoded list is the
+/// intended fallback, and wrong for an agent manifest, where the intended
+/// fallback is the global list.
+///
+/// This shadow makes "absent" observable on the manifest path only: absent
+/// list fields become **empty**, which
+/// [`crate::config::ExecPolicy::merged_over`] reads as "unspecified —
+/// inherit". Absent scalars keep their existing defaults.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ExecPolicyShadow {
+    mode: Option<crate::config::ExecSecurityMode>,
+    safe_bins: Option<Vec<String>>,
+    allowed_commands: Option<Vec<String>>,
+    trusted_commands: Option<Vec<String>>,
+    timeout_secs: Option<u64>,
+    max_output_bytes: Option<usize>,
+    no_output_timeout_secs: Option<u64>,
+    #[serde(alias = "env_passthrough", alias = "env_allowlist")]
+    shell_env_passthrough: Option<Vec<String>>,
+}
+
+impl ExecPolicyShadow {
+    fn into_policy(self) -> crate::config::ExecPolicy {
+        let d = crate::config::ExecPolicy::default();
+        crate::config::ExecPolicy {
+            mode: self.mode.unwrap_or(d.mode),
+            safe_bins: self.safe_bins.unwrap_or_default(),
+            allowed_commands: self.allowed_commands.unwrap_or_default(),
+            trusted_commands: self.trusted_commands.unwrap_or_default(),
+            timeout_secs: self.timeout_secs.unwrap_or(d.timeout_secs),
+            max_output_bytes: self.max_output_bytes.unwrap_or(d.max_output_bytes),
+            no_output_timeout_secs: self
+                .no_output_timeout_secs
+                .unwrap_or(d.no_output_timeout_secs),
+            shell_env_passthrough: self.shell_env_passthrough.unwrap_or_default(),
+        }
+    }
+}
+
 /// Deserialize an `Option<ExecPolicy>` leniently: accepts either a string
 /// shorthand (e.g., `"allow"`, `"deny"`, `"full"`, `"allowlist"`) which maps
-/// to `ExecPolicy { mode: <parsed>, ..Default::default() }`, or the full
+/// to `ExecPolicy { mode: <parsed>, ..unspecified }`, or the full
 /// struct/table form. Returns `None` for null/missing.
+///
+/// Unspecified list fields come back empty rather than `Default`-populated —
+/// see [`ExecPolicyShadow`]. This is the *agent manifest* path; the global
+/// `[exec_policy]` in `config.toml` still deserializes through the plain
+/// derive and still gets the hardcoded defaults.
 pub fn exec_policy_lenient<'de, D>(
     deserializer: D,
 ) -> Result<Option<crate::config::ExecPolicy>, D::Error>
@@ -202,7 +252,7 @@ where
             };
             Ok(Some(crate::config::ExecPolicy {
                 mode,
-                ..Default::default()
+                ..ExecPolicyShadow::default().into_policy()
             }))
         }
 
@@ -210,9 +260,8 @@ where
         where
             A: MapAccess<'de>,
         {
-            let policy =
-                crate::config::ExecPolicy::deserialize(de::value::MapAccessDeserializer::new(map))?;
-            Ok(Some(policy))
+            let shadow = ExecPolicyShadow::deserialize(de::value::MapAccessDeserializer::new(map))?;
+            Ok(Some(shadow.into_policy()))
         }
 
         fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -429,8 +478,9 @@ mod tests {
         let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
         let policy = parsed.exec_policy.unwrap();
         assert_eq!(policy.mode, crate::config::ExecSecurityMode::Full);
-        // Should have default safe_bins, timeout, etc.
-        assert!(!policy.safe_bins.is_empty());
+        // Unspecified lists are empty — the "inherit the global" sentinel
+        // that ExecPolicy::merged_over reads. Scalars keep their defaults.
+        assert!(policy.safe_bins.is_empty());
         assert_eq!(policy.timeout_secs, 30);
     }
 
@@ -469,6 +519,57 @@ timeout_secs = 60
         let policy = parsed.exec_policy.unwrap();
         assert_eq!(policy.mode, crate::config::ExecSecurityMode::Full);
         assert_eq!(policy.timeout_secs, 60);
+    }
+
+    /// A manifest that declares `[exec_policy]` to set `mode` and nothing
+    /// else must leave the lists empty, so resolution inherits the global
+    /// ones rather than silently dropping to the hardcoded defaults.
+    #[test]
+    fn exec_policy_table_absent_lists_are_empty_not_default() {
+        let toml_str = r#"
+[exec_policy]
+mode = "allowlist"
+"#;
+        let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
+        let policy = parsed.exec_policy.unwrap();
+        assert!(policy.safe_bins.is_empty(), "unspecified means inherit");
+        assert!(policy.allowed_commands.is_empty());
+        assert!(policy.trusted_commands.is_empty());
+        assert_eq!(policy.max_output_bytes, 100 * 1024, "scalars keep defaults");
+
+        // ...and it resolves back to the global list.
+        let global = crate::config::ExecPolicy {
+            safe_bins: vec!["rg".to_string(), "jq".to_string()],
+            ..crate::config::ExecPolicy::default()
+        };
+        let eff = crate::config::ExecPolicy::resolve_over_global(&global, Some(policy));
+        assert_eq!(eff.safe_bins, global.safe_bins);
+    }
+
+    /// The global `[exec_policy]` still goes through the plain derive, where
+    /// an absent `safe_bins` means the hardcoded fallback list.
+    #[test]
+    fn global_exec_policy_absent_safe_bins_still_defaults() {
+        let toml_str = r#"
+mode = "allowlist"
+"#;
+        let policy: crate::config::ExecPolicy = toml::from_str(toml_str).unwrap();
+        assert!(!policy.safe_bins.is_empty());
+    }
+
+    /// Explicitly written lists survive; only absence means inherit.
+    #[test]
+    fn exec_policy_table_explicit_lists_are_preserved() {
+        let toml_str = r#"
+[exec_policy]
+mode = "allowlist"
+safe_bins = ["cat"]
+trusted_commands = ["cargo"]
+"#;
+        let parsed: TestExecPolicy = toml::from_str(toml_str).unwrap();
+        let policy = parsed.exec_policy.unwrap();
+        assert_eq!(policy.safe_bins, vec!["cat".to_string()]);
+        assert_eq!(policy.trusted_commands, vec!["cargo".to_string()]);
     }
 
     #[test]

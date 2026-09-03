@@ -1278,13 +1278,27 @@ pub struct ExecPolicy {
     /// "full" allows all (unsafe, dev only).
     pub mode: ExecSecurityMode,
     /// Commands that bypass allowlist (stdin-only utilities).
+    ///
+    /// Global-only by convention: declare this once in `config.toml`. An
+    /// empty list in an *agent* manifest means "unspecified" and inherits the
+    /// global list (see [`ExecPolicy::merged_over`]), which is why empty lists
+    /// are omitted on serialize rather than written back as `[]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub safe_bins: Vec<String>,
     /// Global command allowlist (when mode = allowlist).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_commands: Vec<String>,
     /// Per-agent commands that are AUTO-APPROVED by the gate (no prompt) in
     /// allowlist mode. Like `safe_bins` (the global "inherently safe" list)
     /// but scoped to this agent: a base here suppresses the approval prompt
     /// AND satisfies the allowlist wall.
+    ///
+    /// Agent-only by convention: declare this in `agent.toml`, never in the
+    /// global `config.toml`, where it would apply to exactly the agents that
+    /// have no `[exec_policy]` table. A global one is ignored and warned
+    /// about at boot. Note this is not *weaker* than `safe_bins` — the split
+    /// is about scope (fleet-wide vs per-agent), not trust level.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_commands: Vec<String>,
     /// Max execution timeout in seconds. Default: 30.
     pub timeout_secs: u64,
@@ -1311,7 +1325,12 @@ pub struct ExecPolicy {
     /// Aliases `env_passthrough` and `env_allowlist` are accepted for
     /// backwards compatibility with users who configured these names
     /// before the field existed (issue #1169).
-    #[serde(default, alias = "env_passthrough", alias = "env_allowlist")]
+    #[serde(
+        default,
+        alias = "env_passthrough",
+        alias = "env_allowlist",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub shell_env_passthrough: Vec<String>,
 }
 
@@ -1337,6 +1356,90 @@ impl Default for ExecPolicy {
             no_output_timeout_secs: default_no_output_timeout(),
             shell_env_passthrough: Vec::new(),
         }
+    }
+}
+
+impl ExecPolicy {
+    /// Merge this per-agent override *over* `global`, field by field.
+    ///
+    /// Convention: `safe_bins` is a **global** list, declared once in
+    /// `config.toml`; `trusted_commands` is **per-agent**, declared only in
+    /// `agent.toml`. For that split to be safe the resolution has to be a
+    /// merge rather than a whole-struct replace — otherwise a manifest that
+    /// declares `[exec_policy]` to set `mode` and nothing else falls back to
+    /// the hardcoded [`Default`] bins and silently loses `ls`, `grep`, `rg`,
+    /// `jq`, `ps`, `stat` and `diff`, with no error and one denial at a time.
+    ///
+    /// Field by field:
+    /// - `mode` — hard override. This is the field the per-agent table exists
+    ///   for, and narrowing it is the fail-closed direction.
+    /// - `safe_bins`, `allowed_commands` — empty in the override means
+    ///   "unspecified" and inherits the global list; a non-empty list replaces
+    ///   it wholesale. The cost of that encoding is that an agent cannot
+    ///   express "empty safe_bins" — nothing does, and `mode = "none"` says
+    ///   the same thing more clearly.
+    /// - `trusted_commands` — taken from the override only, never inherited.
+    ///   A global `trusted_commands` has no well-defined scope under the
+    ///   convention (it would apply to exactly the agents with no
+    ///   `[exec_policy]` table) and is ignored; the kernel warns at boot.
+    /// - `timeout_secs`, `max_output_bytes`, `no_output_timeout_secs`,
+    ///   `shell_env_passthrough` — override as-is, no inheritance. The scalars
+    ///   have meaningful non-sentinel defaults, so "unspecified" is not
+    ///   distinguishable from "explicitly set to the default"; and
+    ///   `shell_env_passthrough` is a secret-leak surface where empty is a
+    ///   deliberate, safe value rather than a blank to be filled in.
+    ///
+    /// Note this is *not* the `FilePolicy` floor relationship: exec inherits
+    /// unspecified lists downward, it does not cap the override upward.
+    #[must_use]
+    pub fn merged_over(&self, global: &ExecPolicy) -> ExecPolicy {
+        ExecPolicy {
+            mode: self.mode,
+            safe_bins: if self.safe_bins.is_empty() {
+                global.safe_bins.clone()
+            } else {
+                self.safe_bins.clone()
+            },
+            allowed_commands: if self.allowed_commands.is_empty() {
+                global.allowed_commands.clone()
+            } else {
+                self.allowed_commands.clone()
+            },
+            trusted_commands: self.trusted_commands.clone(),
+            timeout_secs: self.timeout_secs,
+            max_output_bytes: self.max_output_bytes,
+            no_output_timeout_secs: self.no_output_timeout_secs,
+            shell_env_passthrough: self.shell_env_passthrough.clone(),
+        }
+    }
+
+    /// Resolve the effective in-memory exec policy for an agent: the agent's
+    /// optional manifest `[exec_policy]` merged over the global one.
+    ///
+    /// With no override the global applies wholesale, minus
+    /// `trusted_commands` (see [`Self::merged_over`]). Mirrors
+    /// [`FilePolicy::resolve_under_floor`]'s call shape so the two resolution
+    /// sites in the kernel read the same way.
+    #[must_use]
+    pub fn resolve_over_global(
+        global: &ExecPolicy,
+        manifest_override: Option<ExecPolicy>,
+    ) -> ExecPolicy {
+        match manifest_override {
+            None => ExecPolicy {
+                trusted_commands: Vec::new(),
+                ..global.clone()
+            },
+            Some(ov) => ov.merged_over(global),
+        }
+    }
+
+    /// True when this policy declares `trusted_commands` in a position where
+    /// the convention gives them no scope — i.e. in the global
+    /// `config.toml`. Callers warn; the field is ignored either way.
+    #[must_use]
+    pub fn declares_misplaced_trusted_commands(&self) -> bool {
+        !self.trusted_commands.is_empty()
     }
 }
 
@@ -5678,6 +5781,82 @@ shell_env_passthrough = ["*"]
         };
         let eff = FilePolicy::resolve_under_floor(&global, None);
         assert_eq!(eff, global);
+    }
+
+    // -- exec_policy resolution (global safe_bins / per-agent trusted_commands)
+
+    fn exec_global() -> ExecPolicy {
+        ExecPolicy {
+            mode: ExecSecurityMode::Allowlist,
+            safe_bins: ["ls", "grep", "rg", "jq", "ps", "stat", "diff"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            allowed_commands: vec!["docker".to_string()],
+            ..ExecPolicy::default()
+        }
+    }
+
+    /// The blocker this change exists for: a manifest that declares
+    /// `[exec_policy]` to set `mode` and nothing else must keep the global
+    /// bins, not silently drop to the hardcoded `Default` list.
+    #[test]
+    fn exec_policy_mode_only_override_keeps_global_safe_bins() {
+        let global = exec_global();
+        // What `exec_policy_lenient` yields for `[exec_policy] mode = "deny"`:
+        // unspecified lists are empty, not `Default`-populated.
+        let ov = ExecPolicy {
+            mode: ExecSecurityMode::Deny,
+            safe_bins: Vec::new(),
+            allowed_commands: Vec::new(),
+            trusted_commands: Vec::new(),
+            shell_env_passthrough: Vec::new(),
+            ..ExecPolicy::default()
+        };
+        let eff = ExecPolicy::resolve_over_global(&global, Some(ov));
+        assert_eq!(eff.mode, ExecSecurityMode::Deny, "mode is a hard override");
+        assert_eq!(eff.safe_bins, global.safe_bins, "safe_bins inherited");
+        assert_eq!(eff.allowed_commands, global.allowed_commands);
+    }
+
+    #[test]
+    fn exec_policy_nonempty_override_lists_replace_global() {
+        let global = exec_global();
+        let ov = ExecPolicy {
+            safe_bins: vec!["cat".to_string()],
+            allowed_commands: vec!["rm".to_string()],
+            ..ExecPolicy::default()
+        };
+        let eff = ExecPolicy::resolve_over_global(&global, Some(ov));
+        assert_eq!(eff.safe_bins, vec!["cat".to_string()]);
+        assert_eq!(eff.allowed_commands, vec!["rm".to_string()]);
+    }
+
+    #[test]
+    fn exec_policy_trusted_commands_are_agent_only() {
+        let global = ExecPolicy {
+            trusted_commands: vec!["git".to_string()],
+            ..exec_global()
+        };
+        // No override: the global's misplaced trusted_commands are dropped.
+        let eff = ExecPolicy::resolve_over_global(&global, None);
+        assert!(eff.trusted_commands.is_empty());
+        assert_eq!(eff.safe_bins, global.safe_bins);
+        assert!(global.declares_misplaced_trusted_commands());
+
+        // With an override: the agent's list stands alone, never unioned.
+        let ov = ExecPolicy {
+            trusted_commands: vec!["cargo".to_string()],
+            ..ExecPolicy::default()
+        };
+        let eff = ExecPolicy::resolve_over_global(&global, Some(ov));
+        assert_eq!(eff.trusted_commands, vec!["cargo".to_string()]);
+    }
+
+    #[test]
+    fn exec_policy_no_override_is_global_wholesale() {
+        let global = exec_global();
+        assert_eq!(ExecPolicy::resolve_over_global(&global, None), global);
     }
 
     #[test]
