@@ -603,8 +603,17 @@ impl SemanticStore {
                 })
                 .collect();
 
-            // Shadow ranking: log-only, changes nothing below. See
-            // `crate::ranking` for why the measurement precedes the weights.
+            // Kinds, computed once: the shadow diff needs them, and so does
+            // the shipped sort when the weights are live.
+            let kinds: Vec<Option<String>> = fragments
+                .iter()
+                .map(|f| kind_from_metadata(&f.metadata))
+                .collect();
+
+            // Shadow ranking (ANAI-232). Always logged, whether or not the
+            // weights are live: with them off it says what recall declined to
+            // do, with them on it says what recall did, and the line carries
+            // `weights_live` so a reader never has to guess which.
             let shadow_agent = filter
                 .as_ref()
                 .and_then(|f| f.agent_id)
@@ -612,22 +621,40 @@ impl SemanticStore {
                 .unwrap_or_else(|| "<unfiltered>".to_string());
             let shadow_candidates: Vec<crate::ranking::ShadowCandidate> = fragments
                 .iter()
+                .zip(kinds.iter())
                 .zip(sims.iter())
-                .map(|(f, &similarity)| crate::ranking::ShadowCandidate {
+                .map(|((f, kind), &similarity)| crate::ranking::ShadowCandidate {
                     id: f.id.0.to_string(),
-                    kind: kind_from_metadata(&f.metadata),
+                    kind: kind.clone(),
                     similarity,
                 })
                 .collect();
             crate::ranking::log_shadow_delta(&shadow_agent, &shadow_candidates, limit);
 
-            // The shipped ranking, unchanged: descending similarity, stable,
-            // so ties keep the candidate-window order the SQL ORDER BY chose.
-            let mut scored: Vec<(f32, MemoryFragment)> = sims.into_iter().zip(fragments).collect();
+            // The shipped ranking: descending score, stable, so ties keep the
+            // candidate-window order the SQL ORDER BY chose.
+            //
+            // ANAI-233: the sort key is the weighted score when the operator
+            // has enabled the weights, and raw cosine otherwise. The *sort* is
+            // the only thing that changes — the score is never written back to
+            // the fragment, so nothing downstream can mistake a promoted row
+            // for a better-matching one.
+            let weights_live = crate::ranking::weights_enabled();
+            let scores: Vec<f32> = if weights_live {
+                sims.iter()
+                    .zip(kinds.iter())
+                    .map(|(&s, k)| crate::ranking::weighted_score(s, k.as_deref()))
+                    .collect()
+            } else {
+                sims
+            };
+            let mut scored: Vec<(f32, MemoryFragment)> =
+                scores.into_iter().zip(fragments).collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             scored.truncate(limit);
             fragments = scored.into_iter().map(|(_, f)| f).collect();
             debug!(
+                weights_live,
                 "Vector recall: {} results from {} candidates",
                 fragments.len(),
                 fetch_limit
@@ -1341,6 +1368,78 @@ mod tests {
         assert!(results[0].content.contains("Rust"));
         // Python memory should be last (lowest similarity)
         assert!(results[2].content.contains("Python"));
+    }
+
+    /// ANAI-233 at the layer that ships: the enabled switch must change what
+    /// `recall_with_embedding` actually returns, not merely what the shadow
+    /// log says it would.
+    ///
+    /// This test installs process-global weights, which every other test in
+    /// this binary reads through. It is safe only because it installs the
+    /// *compiled defaults* (changing nothing for a reader of `weight_for_kind`)
+    /// and because no other test stores a `summary`- or `fact`-kinded row with
+    /// an embedding — unkinded rows take the 1.0 identity either way. Keep
+    /// both of those true or this stops being a local decision.
+    #[test]
+    fn weights_change_what_recall_returns_only_when_enabled() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        // A turn that matches the query slightly better than the summary does.
+        // Under pure cosine the turn wins; under a 1.25x summary weight it
+        // does not. This is ANAI-230's failure in miniature.
+        let emb_turn = vec![0.90, 0.10, 0.0, 0.0];
+        let emb_summary = vec![0.80, 0.20, 0.0, 0.0];
+        store
+            .remember_with_embedding(
+                agent_id,
+                "raw transcript line",
+                MemorySource::Conversation,
+                "episodic",
+                kind_meta(serde_json::json!(KIND_TURN)),
+                Some(&emb_turn),
+            )
+            .unwrap();
+        store
+            .remember_with_embedding(
+                agent_id,
+                "distilled episode summary",
+                MemorySource::Conversation,
+                "episodic",
+                kind_meta(serde_json::json!(crate::episode::SUMMARY_KIND)),
+                Some(&emb_summary),
+            )
+            .unwrap();
+
+        let query = vec![0.95, 0.05, 0.0, 0.0];
+        let top = |store: &SemanticStore| {
+            store
+                .recall_with_embedding("", 1, None, Some(&query))
+                .unwrap()
+                .remove(0)
+                .content
+        };
+
+        // Off (the shipped default): pure cosine, the turn wins.
+        crate::ranking::install_weights(crate::ranking::RecallWeights::default()).unwrap();
+        assert!(
+            top(&store).contains("transcript"),
+            "with weights disabled recall must rank on raw cosine"
+        );
+
+        // On: the summary is promoted past it.
+        crate::ranking::install_weights(crate::ranking::RecallWeights {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            top(&store).contains("summary"),
+            "with weights enabled a summary must outrank a marginally closer turn"
+        );
+
+        // Leave the global as the fleet ships it.
+        crate::ranking::install_weights(crate::ranking::RecallWeights::default()).unwrap();
     }
 
     #[test]
