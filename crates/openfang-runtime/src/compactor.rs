@@ -1834,6 +1834,51 @@ mod tests {
         );
     }
 
+    /// ANAI-263 reopen: the live pathology behind "queued, then nothing".
+    ///
+    /// `spawn_background_compaction` estimated with the **built** system prompt
+    /// (`prompt_builder::build_system_prompt`, which the turn paths write back
+    /// into `manifest.model.system_prompt`); the locked body re-derived from
+    /// `entry.manifest`, i.e. the **raw** prompt on disk. Same session, same
+    /// function, opposite verdicts — and the decline was silent, so it read as
+    /// a quiet system rather than a broken one.
+    ///
+    /// This pins that the difference is real and load-bearing, which is why the
+    /// basis is now carried from the gate into the body rather than rebuilt.
+    #[test]
+    fn test_built_and_raw_system_prompts_disagree_about_the_same_session() {
+        let mut session = make_session(0);
+        session.messages = (0..40)
+            .map(|i| Message::user(format!("{i:.<4000}")))
+            .collect();
+        let config = CompactionConfig::default();
+
+        // ~160k chars of messages: on its own, under the count trigger's
+        // 25%-of-window token floor (50k on a 200k window).
+        let raw_prompt = "you are a helpful agent".repeat(8);
+        let raw = estimate_token_count(&session.messages, Some(&raw_prompt), None);
+        assert!(
+            raw < count_trigger_token_floor(&config),
+            "raw-prompt estimate {raw} should sit under the {} floor",
+            count_trigger_token_floor(&config)
+        );
+        assert_eq!(
+            compaction_reason(&session, raw, &config),
+            None,
+            "the body declined on this estimate for weeks"
+        );
+
+        // The prompt the turn actually ran with — identity, memory, tools,
+        // workspace files. 60k chars is conservative for this fleet.
+        let built_prompt = "x".repeat(60_000);
+        let built = estimate_token_count(&session.messages, Some(&built_prompt), None);
+        assert_eq!(
+            compaction_reason(&session, built, &config),
+            Some(CompactionReason::Messages),
+            "the gate authorized the spawn on this estimate"
+        );
+    }
+
     #[test]
     fn test_needs_compaction_by_tokens_below() {
         let config = CompactionConfig::default();
