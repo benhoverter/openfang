@@ -812,6 +812,33 @@ fn gethostname() -> Option<String> {
     }
 }
 
+/// The measurement inputs a compaction gate used when it decided to compact
+/// (ANAI-263).
+///
+/// `spawn_background_compaction` and `compact_agent_session_locked` both call
+/// `compaction_reason`, and each used to derive its own inputs — the spawn site
+/// from the manifest it was handed, the body from `entry.manifest`. Those are
+/// not the same manifest. `execute_llm_agent` and the streaming loop both
+/// **replace** `manifest.model.system_prompt` with the built prompt
+/// (`prompt_builder::build_system_prompt`) before running the turn, while
+/// `entry.manifest` still carries the raw prompt from disk. The built prompt is
+/// an order of magnitude larger, so the body measured the same session as
+/// materially smaller than the gate did and declined — silently, on every turn,
+/// for any agent whose margin over the count trigger's token floor was narrower
+/// than its own system prompt.
+///
+/// Carrying the basis forward lets the body re-read the *session* (which may
+/// legitimately have changed while the call queued on the turn lock) without
+/// re-deriving the *ruler*. Same defect class as ANAI-260 step 1: one decision,
+/// two implementations, only one of them current.
+#[derive(Clone)]
+struct CompactionBasis {
+    config: openfang_runtime::compactor::CompactionConfig,
+    /// The system prompt the gate measured with — built, not raw, on both turn
+    /// paths.
+    system_prompt: String,
+}
+
 impl OpenFangKernel {
     /// Boot the kernel with configuration from the given path.
     pub fn boot(config_path: Option<&Path>) -> KernelResult<Self> {
@@ -3020,7 +3047,13 @@ impl OpenFangKernel {
             if needs_compact {
                 info!(agent_id = %agent_id, messages = session.messages.len(), "Auto-compacting session");
                 // `_locked`: we hold the turn lock above.
-                match kernel_clone.compact_agent_session_locked(agent_id).await {
+                // `None` basis: this gate ran before the system prompt was
+                // built, so the body's own manifest-derived yardstick is the
+                // same one this check used (ANAI-263).
+                match kernel_clone
+                    .compact_agent_session_locked(agent_id, None)
+                    .await
+                {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         // Reload the session after compaction
@@ -3451,10 +3484,22 @@ impl OpenFangKernel {
             };
             if needs_blocking_compaction(estimated, &config) || by_quota {
                 info!(agent_id = %agent_id, messages = session.messages.len(), estimated_tokens = estimated, context_window = config.context_window_tokens, reason = ?reason, by_quota, "Pre-emptive compaction before LLM call");
+                // Hand the body the ruler this gate just used, rather than
+                // letting it derive its own (ANAI-263). Identical here — the
+                // prompt is not built yet — but the invariant is that the
+                // decision which authorized a compaction is the decision the
+                // body re-checks.
+                let basis = CompactionBasis {
+                    config: config.clone(),
+                    system_prompt: entry.manifest.model.system_prompt.clone(),
+                };
                 // `_locked`: we are inside the turn's `agent_msg_locks` guard,
                 // taken in `send_message_with_handle_and_blocks`. The public
                 // entry would try to re-acquire it and deadlock (ANAI-263).
-                match self.compact_agent_session_locked(agent_id).await {
+                match self
+                    .compact_agent_session_locked(agent_id, Some(&basis))
+                    .await
+                {
                     Ok(msg) => {
                         info!(agent_id = %agent_id, "{msg}");
                         if let Ok(Some(reloaded)) = self.memory.get_session(session.id) {
@@ -4627,19 +4672,42 @@ impl OpenFangKernel {
     /// [`Self::compact_agent_session_locked`] instead. Calling this one there
     /// deadlocks instantly, and the compiler cannot see it.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
+        self.compact_agent_session_with(agent_id, None).await
+    }
+
+    /// [`Self::compact_agent_session`], carrying forward the gate's yardstick.
+    ///
+    /// Used by [`Self::spawn_background_compaction`], whose gate ran against
+    /// the *built* system prompt. See [`CompactionBasis`].
+    async fn compact_agent_session_with(
+        &self,
+        agent_id: AgentId,
+        basis: Option<CompactionBasis>,
+    ) -> KernelResult<String> {
         let lock = self
             .agent_msg_locks
             .entry(agent_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
-        self.compact_agent_session_locked(agent_id).await
+        self.compact_agent_session_locked(agent_id, basis.as_ref())
+            .await
     }
 
     /// Compaction body. **The caller must already hold `agent_msg_locks` for
     /// this agent.** See [`Self::compact_agent_session`] for the locking
     /// contract and the reentrancy hazard.
-    async fn compact_agent_session_locked(&self, agent_id: AgentId) -> KernelResult<String> {
+    ///
+    /// `basis` is the gate's measurement inputs, if the caller had any. The
+    /// session is always re-read here — it may legitimately have changed while
+    /// this call queued on the turn lock — but the *ruler* comes from the
+    /// caller when it has one, so the re-check cannot disagree with the check
+    /// that authorized it (ANAI-263). See [`CompactionBasis`].
+    async fn compact_agent_session_locked(
+        &self,
+        agent_id: AgentId,
+        basis: Option<&CompactionBasis>,
+    ) -> KernelResult<String> {
         use openfang_runtime::compactor::{
             compact_session, compaction_reason, count_trigger_token_floor, estimate_token_count,
         };
@@ -4660,18 +4728,43 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config =
-            self.compaction_config_for(&entry.manifest.model.model, &entry.manifest.model.provider);
+        // ANAI-263: inherit the gate's ruler when there is one. Deriving it
+        // here instead is what made background compaction a silent no-op —
+        // `entry.manifest.model.system_prompt` is the raw prompt from disk,
+        // while the spawn site measured with the built one.
+        let (config, system_prompt, basis_source) = match basis {
+            Some(b) => (b.config.clone(), b.system_prompt.as_str(), "gate"),
+            None => (
+                self.compaction_config_for(
+                    &entry.manifest.model.model,
+                    &entry.manifest.model.provider,
+                ),
+                entry.manifest.model.system_prompt.as_str(),
+                "manifest",
+            ),
+        };
 
         // ANAI-243: this gate used to be message-count only, so a session that
         // tripped the *token* trigger upstream was turned away here. The token
         // path could fire but never actually compact.
-        let estimated = estimate_token_count(
-            &session.messages,
-            Some(&entry.manifest.model.system_prompt),
-            None,
-        );
+        let estimated = estimate_token_count(&session.messages, Some(system_prompt), None);
         let Some(reason) = compaction_reason(&session, estimated, &config) else {
+            // ANAI-263: this was the one exit in the whole ladder that produced
+            // no log at all, and the background caller discarded the `Ok`. A
+            // decline has to be a line, not an absence — otherwise a gate that
+            // authorizes and a body that refuses look exactly like a quiet
+            // system with nothing to do.
+            debug!(
+                agent_id = %agent_id,
+                messages = session.messages.len(),
+                estimated_tokens = estimated,
+                context_window = config.context_window_tokens,
+                count_threshold = config.threshold,
+                count_token_floor = count_trigger_token_floor(&config),
+                token_threshold_ratio = config.token_threshold_ratio,
+                basis_source,
+                "Compaction declined at the locked re-check"
+            );
             return Ok(format!(
                 "No compaction needed ({} messages / ~{} tokens; count threshold {} above a {} token floor, token threshold {} of a {} window)",
                 session.messages.len(),
@@ -4762,9 +4855,24 @@ impl OpenFangKernel {
         let estimated =
             estimate_token_count(&session.messages, Some(&manifest.model.system_prompt), None);
         let Some(reason) = compaction_reason(session, estimated, &config) else {
+            debug!(
+                agent_id = %agent_id,
+                messages = session.messages.len(),
+                estimated_tokens = estimated,
+                context_window = config.context_window_tokens,
+                "No background compaction needed"
+            );
             return;
         };
         let message_count = session.messages.len();
+
+        // ANAI-263: hand the body the ruler this gate used. Re-deriving it there
+        // measured against the raw manifest prompt instead of the built one and
+        // turned every spawn into a silent no-op. See `CompactionBasis`.
+        let basis = CompactionBasis {
+            config,
+            system_prompt: manifest.model.system_prompt.clone(),
+        };
 
         let Some(kernel) = self.self_handle.get().and_then(|w| w.upgrade()) else {
             debug!(agent_id = %agent_id, "No kernel handle; skipping background compaction");
@@ -4793,8 +4901,15 @@ impl OpenFangKernel {
                 reason = ?reason,
                 "Background compaction queued behind the turn lock"
             );
-            if let Err(e) = kernel.compact_agent_session(agent_id).await {
-                warn!(agent_id = %agent_id, "Background compaction failed: {e}");
+            // ANAI-263: log the `Ok` too. Matching only on `Err` discarded the
+            // "No compaction needed" message, which is exactly the outcome that
+            // needed to be visible.
+            match kernel
+                .compact_agent_session_with(agent_id, Some(basis))
+                .await
+            {
+                Ok(msg) => info!(agent_id = %agent_id, "{msg}"),
+                Err(e) => warn!(agent_id = %agent_id, "Background compaction failed: {e}"),
             }
         });
     }
