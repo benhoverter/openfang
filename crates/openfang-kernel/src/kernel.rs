@@ -63,6 +63,23 @@ use tracing::{debug, error, info, warn};
 /// ANAI-122: `agent_reply_async` is inert without the reply-right token.
 const ALWAYS_ON_BUILTIN_TOOLS: &[&str] = &["agent_reply_async"];
 
+/// Tracing target for every "compaction did not happen" line in the kernel.
+///
+/// ANAI-263 made the background-compaction ladder's declines log at `debug!`
+/// on the default `openfang_kernel::kernel` target — which the daemon runs at
+/// `info`, so the lines it added to kill a silent exit could never print. The
+/// runtime already owns a target for exactly this axis, and the deployed
+/// `RUST_LOG` already carries it at `debug`
+/// (`ai.openfang.daemon.plist`: `context_pressure=debug`), so borrow it rather
+/// than promote the level or edit the plist. Declines then sit in the same
+/// stream as the pressure line that preceded them, and
+/// `RUST_LOG=context_pressure=debug` is the single knob for the whole ladder.
+///
+/// Only the *decline* paths move here. The lines that report work actually
+/// happening (`Background compaction queued…`, `Compacting session`) are
+/// `info!` on the kernel target and stay there.
+const COMPACTION_LOG_TARGET: &str = openfang_runtime::history_trim::TARGET;
+
 /// The main OpenFang kernel — coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
 /// Returns a helpful error so the dashboard still boots and users can configure providers.
@@ -4755,6 +4772,7 @@ impl OpenFangKernel {
             // authorizes and a body that refuses look exactly like a quiet
             // system with nothing to do.
             debug!(
+                target: COMPACTION_LOG_TARGET,
                 agent_id = %agent_id,
                 messages = session.messages.len(),
                 estimated_tokens = estimated,
@@ -4856,6 +4874,7 @@ impl OpenFangKernel {
             estimate_token_count(&session.messages, Some(&manifest.model.system_prompt), None);
         let Some(reason) = compaction_reason(session, estimated, &config) else {
             debug!(
+                target: COMPACTION_LOG_TARGET,
                 agent_id = %agent_id,
                 messages = session.messages.len(),
                 estimated_tokens = estimated,
@@ -4875,13 +4894,13 @@ impl OpenFangKernel {
         };
 
         let Some(kernel) = self.self_handle.get().and_then(|w| w.upgrade()) else {
-            debug!(agent_id = %agent_id, "No kernel handle; skipping background compaction");
+            debug!(target: COMPACTION_LOG_TARGET, agent_id = %agent_id, "No kernel handle; skipping background compaction");
             return;
         };
 
         // Atomic claim: `insert` returns false when the key was already there.
         if !kernel.compacting.insert(agent_id) {
-            debug!(agent_id = %agent_id, "Background compaction already in flight; skipping");
+            debug!(target: COMPACTION_LOG_TARGET, agent_id = %agent_id, "Background compaction already in flight; skipping");
             return;
         }
 
@@ -16874,5 +16893,30 @@ system_prompt = "You are a test agent."
         let body = auto_close_body("worker", "corr-5", &test_turn_result(&short, false));
         assert!(!body.contains("TRUNCATED"));
         assert!(body.contains(&short));
+    }
+
+    // -----------------------------------------------------------------------
+    // ANAI-263: the decline lines have to land on a target the daemon listens to
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compaction_declines_log_on_the_runtime_pressure_target() {
+        // The first cut of this fix logged the decline at `debug!` on the
+        // default `openfang_kernel::kernel` target. The deployed RUST_LOG runs
+        // that target at `info`, so the line built to end a silent exit was
+        // itself unprintable. Borrowing the runtime's target fixes it without a
+        // level bump or an operator edit.
+        assert_eq!(
+            COMPACTION_LOG_TARGET,
+            openfang_runtime::history_trim::TARGET,
+            "the decline target must be the runtime's pressure axis, not a copy"
+        );
+
+        // Pinned as a literal on purpose. The operator side of this contract
+        // lives outside the repo — `ai.openfang.daemon.plist` names
+        // `context_pressure=debug` in RUST_LOG — so nothing in CI can observe
+        // it. This asserts our half of the handshake and marks the string as
+        // load-bearing; it cannot catch a plist that renames the target.
+        assert_eq!(COMPACTION_LOG_TARGET, "context_pressure");
     }
 }
