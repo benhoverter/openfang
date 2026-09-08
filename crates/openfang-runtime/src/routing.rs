@@ -189,6 +189,7 @@ mod tests {
             system: None,
             thinking: None,
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         }
     }

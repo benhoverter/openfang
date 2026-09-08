@@ -87,6 +87,18 @@ pub struct CompletionRequest {
     /// per-spawn token, but the field stays in place as the integration
     /// point.
     pub caller_agent_id: Option<String>,
+    /// Human-readable name of the OpenFang agent issuing this request, if any.
+    ///
+    /// Sibling of [`Self::caller_agent_id`], which carries the UUID. Both
+    /// exist because they answer different questions: the UUID is identity
+    /// (bridge binding, registry lookups), the name is attribution (log rows
+    /// a human greps). ANAI-266 needs the latter -- accounting rows land in
+    /// one fleet-wide stderr stream interleaved across ~50 agents, and a
+    /// UUID-only column is unreadable at a glance.
+    ///
+    /// Populated by the agent loop from `manifest.name`. Background/internal
+    /// callers leave it `None`, which the driver renders as `-`.
+    pub caller_agent_name: Option<String>,
     /// Per-agent tool allowlist for the bridge subprocess, if any.
     ///
     /// Sourced from the agent's resolved `available_tools` (which in turn
@@ -441,6 +453,7 @@ mod tests {
             system: None,
             thinking: None,
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         };
 

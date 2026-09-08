@@ -3752,6 +3752,7 @@ impl OpenFangKernel {
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
                 caller_agent_id: None,
+                caller_agent_name: None,
                 allowed_tools: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);

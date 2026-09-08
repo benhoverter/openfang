@@ -667,6 +667,7 @@ async fn summarize_messages(
         ),
         thinking: None,
         caller_agent_id: None,
+        caller_agent_name: None,
         allowed_tools: None,
     };
 
@@ -808,6 +809,7 @@ async fn summarize_in_chunks(
         ),
         thinking: None,
         caller_agent_id: None,
+        caller_agent_name: None,
         allowed_tools: None,
     };
 
