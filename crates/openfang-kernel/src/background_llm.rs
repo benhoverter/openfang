@@ -177,6 +177,7 @@ impl OpenFangKernel {
             // No caller attribution: this call is the daemon's, and must not
             // inherit any agent's identity or tools.
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         };
 

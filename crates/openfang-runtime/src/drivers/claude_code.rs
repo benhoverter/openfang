@@ -1660,31 +1660,83 @@ fn fold_stream_accounting(line: &str, acc: &mut CcAccounting) {
 /// One line per model call, greppable on `cc_model_accounting`. `served` is
 /// what answered; `requested` is what we asked for; `downgraded=true` means
 /// the request never reached the tier it asked for.
-fn log_model_accounting(path: &'static str, requested: &str, acc: &CcAccounting) {
+/// Family label for a model id -- the same three-way split `model_rank` uses,
+/// rendered for the log. Emitted alongside the raw ids so a row is greppable
+/// by tier without knowing which alias or dated id the caller happened to pass
+/// (`opus`, `claude-opus-4-5`, `claude-opus-4-5-20260101` all -> `opus`).
+fn model_family(model_id: &str) -> &'static str {
+    match model_rank(model_id) {
+        Some(1) => "haiku",
+        Some(2) => "sonnet",
+        Some(3) => "opus",
+        _ => "unknown",
+    }
+}
+
+fn log_model_accounting(
+    path: &'static str,
+    requested: &str,
+    agent_name: Option<&str>,
+    agent_id: Option<&str>,
+    pid: Option<u32>,
+    acc: &CcAccounting,
+) {
     let served = acc.top_served().unwrap_or("unknown");
     let downgraded = acc.downgraded(requested);
     let derived = acc.derived_cost_usd();
+    // Pre-rendered so every field below goes out through `Display`. A
+    // string-typed `tracing` value renders *quoted*, which is why the obvious
+    // `grep 'event=cc_model_accounting'` matched nothing. Every value here is
+    // a single token with no spaces, so unquoted is unambiguous.
+    let pid_s = pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let downgraded_s = downgraded
+        .map(|b| b.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let usage_source = if acc.usage_from_stream_sum {
+        "stream-sum"
+    } else {
+        "terminal"
+    };
+    let cost_cli = acc
+        .cli_cost_usd
+        .map(|c| format!("{c:.6}"))
+        .unwrap_or_else(|| "-".to_string());
+    let cost_list = derived
+        .map(|c| format!("{c:.6}"))
+        .unwrap_or_else(|| "-".to_string());
     info!(
-        event = "cc_model_accounting",
-        path = path,
+        event = %"cc_model_accounting",
+        agent = %agent_name.unwrap_or("-"),
+        agent_id = %agent_id.unwrap_or("-"),
+        pid = %pid_s,
+        path = %path,
         requested = %requested,
+        requested_family = %model_family(requested),
         served = %served,
+        served_family = %model_family(served),
         served_all = %acc.served_models.join(","),
-        downgraded = downgraded.map(|b| b.to_string()).unwrap_or_else(|| "unknown".to_string()),
+        downgraded = %downgraded_s,
         tokens_in = acc.input_tokens,
         tokens_out = acc.output_tokens,
         cache_read = acc.cache_read_tokens,
         cache_write = acc.cache_write_tokens,
-        usage_source = if acc.usage_from_stream_sum { "stream-sum" } else { "terminal" },
-        cost_usd_cli = acc.cli_cost_usd.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".to_string()),
-        cost_usd_listprice = derived.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".to_string()),
+        usage_source = %usage_source,
+        cost_usd_cli = %cost_cli,
+        cost_usd_listprice = %cost_list,
         "Claude Code request accounting"
     );
     if downgraded == Some(true) {
         warn!(
-            event = "cc_model_downgrade",
+            event = %"cc_model_downgrade",
+            agent = %agent_name.unwrap_or("-"),
+            agent_id = %agent_id.unwrap_or("-"),
+            pid = %pid_s,
             requested = %requested,
+            requested_family = %model_family(requested),
             served = %served,
+            served_family = %model_family(served),
             served_all = %acc.served_models.join(","),
             "Claude Code served a lower-tier model than requested"
         );
@@ -1941,7 +1993,11 @@ impl LlmDriver for ClaudeCodeDriver {
 
         // Track the PID using the model name as label (best identifier available)
         let pid_label = request.model.clone();
-        if let Some(pid) = child.id() {
+        // ANAI-266: hold the PID past the tracking block so the accounting row
+        // can carry it -- that is what ties one row to its `subprocess started`
+        // / `completed successfully` lines in the interleaved fleet log.
+        let cc_pid = child.id();
+        if let Some(pid) = cc_pid {
             self.active_pids.insert(pid_label.clone(), pid);
             debug!(pid = pid, model = %pid_label, "Claude Code CLI subprocess started");
         }
@@ -2077,7 +2133,14 @@ impl LlmDriver for ClaudeCodeDriver {
         // cost, and how many tokens moved. The CLI is the only source of truth
         // for the served model — `request.model` is what we asked for.
         let accounting = parse_complete_accounting(&stdout);
-        log_model_accounting("complete", &request.model, &accounting);
+        log_model_accounting(
+            "complete",
+            &request.model,
+            request.caller_agent_name.as_deref(),
+            request.caller_agent_id.as_deref(),
+            cc_pid,
+            &accounting,
+        );
         // ANAI-77x: recover the tools observed inside the CC subprocess from
         // the per-spawn sideband before `_cc_settings` drops (which removes
         // it). Bridge tools execute inside CC and never round-trip as
@@ -2192,7 +2255,9 @@ impl LlmDriver for ClaudeCodeDriver {
 
         // Track PID
         let pid_label = format!("{}-stream", request.model);
-        if let Some(pid) = child.id() {
+        // ANAI-266: see `complete()` -- same correlator, streaming path.
+        let cc_pid = child.id();
+        if let Some(pid) = cc_pid {
             self.active_pids.insert(pid_label.clone(), pid);
             debug!(pid = pid, model = %pid_label, "Claude Code CLI streaming subprocess started");
         }
@@ -2369,7 +2434,14 @@ impl LlmDriver for ClaudeCodeDriver {
             .await;
 
         // ANAI-266: one accounting row per request, same shape as `complete()`.
-        log_model_accounting("stream", &request.model, &accounting);
+        log_model_accounting(
+            "stream",
+            &request.model,
+            request.caller_agent_name.as_deref(),
+            request.caller_agent_id.as_deref(),
+            cc_pid,
+            &accounting,
+        );
 
         // ANAI-77x: same sideband recovery as `complete()` — read before
         // `_cc_settings` drops. Heartbeats route through `complete()`, but
@@ -2499,6 +2571,7 @@ mod tests {
             system: Some("You are helpful.".to_string()),
             thinking: None,
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         };
 
@@ -2538,6 +2611,7 @@ mod tests {
             system: None,
             thinking: None,
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         };
 
@@ -2578,6 +2652,7 @@ mod tests {
             system: None,
             thinking: None,
             caller_agent_id: None,
+            caller_agent_name: None,
             allowed_tools: None,
         };
 
@@ -3767,5 +3842,33 @@ mod tests {
             full_text.is_empty(),
             "unknown-event content must never reach the reply body"
         );
+    }
+}
+
+#[cfg(test)]
+mod anai266_accounting_labels {
+    use super::*;
+
+    /// The family label is what makes a row greppable by tier: aliases, plain
+    /// ids and dated ids all have to land on the same three words, and
+    /// anything we cannot classify has to say so rather than guess.
+    #[test]
+    fn model_family_collapses_aliases_and_dated_ids() {
+        for id in ["opus", "claude-opus-4-5", "claude-opus-4-5-20260101"] {
+            assert_eq!(model_family(id), "opus", "{id}");
+        }
+        assert_eq!(model_family("claude-sonnet-4-6"), "sonnet");
+        assert_eq!(model_family("claude-haiku-4-5-20251001"), "haiku");
+        assert_eq!(model_family("gpt-5"), "unknown");
+        assert_eq!(model_family(""), "unknown");
+    }
+
+    /// `model_family` must agree with `model_rank` on ordering, since the
+    /// `downgraded` column and the family columns are read against each other.
+    #[test]
+    fn family_agrees_with_rank() {
+        assert!(model_rank("claude-haiku-4-5").unwrap() < model_rank("claude-opus-4-5").unwrap());
+        assert_eq!(model_family("claude-haiku-4-5"), "haiku");
+        assert_eq!(model_family("claude-opus-4-5"), "opus");
     }
 }
