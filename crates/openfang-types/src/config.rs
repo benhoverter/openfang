@@ -153,6 +153,29 @@ pub struct RecallConfig {
     /// defaults stay live and an error is logged — rather than clamped into
     /// something the operator did not ask for.
     pub fact_weight: f64,
+    /// Largest share of a recall's returned rows that `summary` may hold.
+    /// Defaults to `0.6` — three slots of five.
+    ///
+    /// A weight cannot express mix. `summary_weight` multiplies every summary
+    /// by the same factor, so on a corpus whose summaries score in one band it
+    /// does not move the cut line, it replaces the returned set: the fleet log
+    /// showed 25 of 43 live recalls returning five summaries and zero verbatim
+    /// rows. An agent in that state has nothing exact left to quote — ids,
+    /// names and precise wording survive only in the verbatim rows — which is
+    /// ANAI-230's failure inverted rather than fixed.
+    ///
+    /// So the cap is structural: the weights still decide which summaries and
+    /// in what order, the cap decides only how many slots they may hold.
+    /// Deferred summaries are re-ordered, never dropped — if there are too few
+    /// non-summary candidates to fill the set they come back at the tail, so
+    /// the cap can never shrink a result.
+    ///
+    /// Unlike the weights this ships **live**, because it is a bound on a
+    /// change that is already live and observed misbehaving. `1.0` is the
+    /// off-switch and restores the pre-cap behaviour without a rebuild; a
+    /// value outside `0.2 ..= 1.0` is refused at install time and the compiled
+    /// default stays in force.
+    pub summary_slot_ratio: f64,
 }
 
 impl Default for RecallConfig {
@@ -161,6 +184,7 @@ impl Default for RecallConfig {
             kind_weights_enabled: false,
             summary_weight: 1.25,
             fact_weight: 1.0,
+            summary_slot_ratio: 0.6,
         }
     }
 }
@@ -5727,6 +5751,33 @@ mod tests {
         assert!(c.recall.kind_weights_enabled);
         assert_eq!(c.recall.summary_weight, 1.25);
         assert_eq!(c.recall.fact_weight, 1.0);
+        // And the cap is not a weight: it stays in force when only the switch
+        // is written, which is exactly the config an operator sweeping
+        // `summary_weight` will have on disk.
+        assert_eq!(c.recall.summary_slot_ratio, 0.6);
+    }
+
+    /// The slot cap ships **live**, unlike the weights — it bounds a
+    /// behaviour that is already in production. `1.0` is its off-switch.
+    #[test]
+    fn test_recall_summary_slot_ratio_ships_live() {
+        let c = KernelConfig::default();
+        assert_eq!(c.recall.summary_slot_ratio, 0.6);
+        assert!(
+            c.recall.summary_slot_ratio < 1.0,
+            "0.6 must actually cap something; 1.0 means no cap"
+        );
+        let c: KernelConfig = toml::from_str("").unwrap();
+        assert_eq!(c.recall.summary_slot_ratio, 0.6);
+    }
+
+    #[test]
+    fn test_recall_summary_slot_ratio_from_toml() {
+        let c: KernelConfig = toml::from_str("[recall]\nsummary_slot_ratio = 1.0\n").unwrap();
+        assert_eq!(c.recall.summary_slot_ratio, 1.0);
+        // Untouched siblings keep their defaults.
+        assert!(!c.recall.kind_weights_enabled);
+        assert_eq!(c.recall.summary_weight, 1.25);
     }
 
     #[test]

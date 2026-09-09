@@ -6012,6 +6012,25 @@ impl OpenFangKernel {
                      (disabled, summary 1.25 / fact 1.0): {e}"
                 ),
             }
+
+            // The summary slot cap. Installed separately from the weights so a
+            // bad weight cannot silently uninstall the cap that bounds it —
+            // and, unlike the weights, this one ships live: it constrains a
+            // behaviour that is already in production and already observed
+            // returning five summaries and no verbatim row.
+            match openfang_memory::ranking::install_summary_slot_ratio(
+                cfg.summary_slot_ratio as f32,
+            ) {
+                Ok(()) => info!(
+                    summary_slot_ratio = cfg.summary_slot_ratio,
+                    cap_at_limit_5 = openfang_memory::ranking::summary_slot_cap(5),
+                    "Recall summary slot cap installed (ANAI-233)"
+                ),
+                Err(e) => error!(
+                    "Refusing [recall] summary_slot_ratio, keeping the compiled default \
+                     (0.6, i.e. 3 of 5): {e}"
+                ),
+            }
         }
 
         // Install operator-configured agent-wake limits ([agent_wake] config,
