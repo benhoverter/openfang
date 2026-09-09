@@ -648,13 +648,41 @@ impl SemanticStore {
             } else {
                 sims
             };
-            let mut scored: Vec<(f32, MemoryFragment)> =
-                scores.into_iter().zip(fragments).collect();
+            // The kind rides along through the sort: the slot cap below reads
+            // kinds in *shipped* order, and recomputing them from metadata
+            // afterwards would be a second parse of the same JSON.
+            let mut scored: Vec<(f32, Option<String>, MemoryFragment)> = scores
+                .into_iter()
+                .zip(kinds)
+                .zip(fragments)
+                .map(|((s, k), f)| (s, k, f))
+                .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(limit);
-            fragments = scored.into_iter().map(|(_, f)| f).collect();
+
+            // Summary slot cap: mix is enforced here, not by the weights.
+            //
+            // This replaces the plain `truncate(limit)` and is a superset of
+            // it — at `summary_slot_ratio = 1.0` the selection is exactly
+            // `0..limit`. It cannot return fewer rows than the truncate did;
+            // capped summaries move to the tail of the returned set if there
+            // is nothing else to fill it with.
+            let sorted_kinds: Vec<Option<&str>> =
+                scored.iter().map(|(_, k, _)| k.as_deref()).collect();
+            let selection = crate::ranking::select_with_slot_cap(&sorted_kinds, limit);
+            crate::ranking::log_slot_cap(&shadow_agent, &selection, limit);
+
+            // Move the chosen fragments out by index without cloning them.
+            let mut slots: Vec<Option<MemoryFragment>> =
+                scored.into_iter().map(|(_, _, f)| Some(f)).collect();
+            fragments = selection
+                .selected
+                .iter()
+                .filter_map(|&i| slots[i].take())
+                .collect();
             debug!(
                 weights_live,
+                slot_cap = selection.cap,
+                summaries = selection.summaries_admitted,
                 "Vector recall: {} results from {} candidates",
                 fragments.len(),
                 fetch_limit

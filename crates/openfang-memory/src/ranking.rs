@@ -215,6 +215,254 @@ pub fn weights_enabled() -> bool {
     WEIGHTS_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Compiled default share of the returned set that `summary` rows may occupy.
+///
+/// **0.6 — three slots of five.** A weight cannot express this. `summary =
+/// 1.25` promotes every summary by the same factor, so on a corpus where the
+/// summary rows all score in the same band it does not re-order the cut line,
+/// it *replaces* the returned set: the fleet log shows 25 of 43 live recalls
+/// returning `summary ×5` against `turn ×5` leaving, with
+/// `baseline_summaries=0`. That is the ANAI-230 failure inverted rather than
+/// fixed — an agent whose recall block is five paragraphs of compressed prose
+/// has no verbatim line left to quote, and the specifics (ids, names, exact
+/// wording) live only in the verbatim rows.
+///
+/// So mix is enforced structurally, where a multiplier cannot reach it. The
+/// weights still decide *which* summaries and in what order; the cap decides
+/// only how many of the slots they are allowed to hold.
+pub const DEFAULT_SUMMARY_SLOT_RATIO: f32 = 0.6;
+
+/// Floor for a configured slot ratio.
+///
+/// 0.2 keeps one slot of five for summaries. Below that the cap stops being a
+/// mix policy and becomes a near-ban on the one kind that has no other door
+/// into the prompt — which is what [`DEFAULT_WEIGHT_SUMMARY`] exists to
+/// prevent. Zero summaries is expressible by turning the *weights* off, not
+/// by starving the slots.
+pub const MIN_SUMMARY_SLOT_RATIO: f32 = 0.2;
+
+/// Ceiling for a configured slot ratio: **1.0, the off-switch.**
+///
+/// At 1.0 the cap equals the limit, [`select_with_slot_cap`] short-circuits,
+/// and recall returns exactly what the sort produced. That is the knob an
+/// operator reaches for to get the pre-cap behaviour back without a rebuild,
+/// which is why the disable lives in the same number rather than in a
+/// separate `enabled` flag that could disagree with it.
+pub const MAX_SUMMARY_SLOT_RATIO: f32 = 1.0;
+
+static SUMMARY_SLOT_RATIO_BITS: AtomicU32 = AtomicU32::new(0);
+
+/// Reject a slot ratio that is not a share of the returned set.
+///
+/// Pure, for the same reason [`validate_weights`] is.
+pub fn validate_summary_slot_ratio(ratio: f32) -> Result<(), String> {
+    if !ratio.is_finite() {
+        return Err(format!(
+            "recall summary_slot_ratio must be a finite number, got {ratio}"
+        ));
+    }
+    if ratio < MIN_SUMMARY_SLOT_RATIO {
+        return Err(format!(
+            "recall summary_slot_ratio ({ratio}) is below the {MIN_SUMMARY_SLOT_RATIO} floor: \
+             summaries reach the prompt through recall and nowhere else — to stop promoting \
+             them, disable the weights instead"
+        ));
+    }
+    if ratio > MAX_SUMMARY_SLOT_RATIO {
+        return Err(format!(
+            "recall summary_slot_ratio ({ratio}) is above {MAX_SUMMARY_SLOT_RATIO}: the ratio \
+             is a share of the returned set, and {MAX_SUMMARY_SLOT_RATIO} already means \
+             \"no cap\""
+        ));
+    }
+    Ok(())
+}
+
+/// Install the fleet slot ratio at boot. Refuses the value, not the boot.
+///
+/// Same trade as [`install_weights`]: a refused ratio leaves
+/// [`DEFAULT_SUMMARY_SLOT_RATIO`] live rather than taking the fleet offline
+/// over a config typo. Note the asymmetry with the weights, and it is
+/// deliberate — a refused *weight* falls back to `enabled: false`, i.e. to
+/// doing less, whereas a refused *ratio* falls back to the cap still being
+/// enforced. Both directions fall back to the conservative behaviour, which
+/// for a cap means keeping it.
+pub fn install_summary_slot_ratio(ratio: f32) -> Result<(), String> {
+    validate_summary_slot_ratio(ratio)?;
+    SUMMARY_SLOT_RATIO_BITS.store(ratio.to_bits(), Ordering::Relaxed);
+    Ok(())
+}
+
+/// The live slot ratio: whatever was installed, else the compiled default.
+pub fn summary_slot_ratio() -> f32 {
+    load(&SUMMARY_SLOT_RATIO_BITS, DEFAULT_SUMMARY_SLOT_RATIO)
+}
+
+/// How many of `limit` slots `summary` rows may hold.
+///
+/// Truncating rather than rounding: 0.6 × 5 is 3, and 0.6 × 4 is 2, so the
+/// non-summary side never gets squeezed below its share by rounding up.
+///
+/// Clamped to at least 1 whenever `limit >= 1`. A recall for a single row must
+/// still be allowed to return a summary — a cap that reads "0 of 1" would ban
+/// the kind outright at small limits, which is [`MIN_SUMMARY_SLOT_RATIO`]'s
+/// objection restated.
+pub fn summary_slot_cap(limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let cap = (limit as f32 * summary_slot_ratio()).floor() as usize;
+    cap.clamp(1, limit)
+}
+
+/// What the slot cap did to one recall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotSelection {
+    /// Positions to return, in output order — indices into the score-sorted
+    /// candidate list the caller passed in.
+    pub selected: Vec<usize>,
+    /// The cap that was in force, for the log.
+    pub cap: usize,
+    /// Summary rows in `selected`.
+    pub summaries_admitted: usize,
+    /// Summary rows the cap pushed *out* of the returned set entirely.
+    pub summaries_displaced: usize,
+    /// Summary rows the cap pushed down the order but which still shipped,
+    /// because there were not enough non-summary candidates to fill the set.
+    ///
+    /// This is the backfill, and it is the reason the cap can never shrink a
+    /// result: an agent whose whole corpus is summaries gets the same rows it
+    /// always got.
+    pub summaries_demoted: usize,
+}
+
+impl SlotSelection {
+    /// Did the cap change what recall returns, or its order?
+    pub fn is_noop(&self) -> bool {
+        self.summaries_displaced == 0 && self.summaries_demoted == 0
+    }
+}
+
+/// Is this the kind the slot cap governs?
+///
+/// One place, so the cap and [`weight_for_kind`] cannot disagree about the
+/// spelling — [`kind_spellings_match_the_constants`] guards both.
+///
+/// [`kind_spellings_match_the_constants`]: self::tests
+pub fn is_summary_kind(kind: Option<&str>) -> bool {
+    kind == Some(crate::episode::SUMMARY_KIND)
+}
+
+/// Pick up to `limit` rows from `kinds`, enforcing the summary slot cap.
+///
+/// `kinds` must already be in the order the shipped ranking produced — this
+/// function does not score anything. It walks that order once, taking every
+/// non-summary row and taking summary rows only while the cap has room;
+/// summaries that hit the cap are deferred, then appended in their original
+/// relative order if the set is still short.
+///
+/// Two properties are load-bearing, and the tests pin both:
+///
+/// - **It never returns fewer rows than a plain truncate would.** Deferral is
+///   re-ordering, not filtering. Anything else would make a mix policy into a
+///   silent result-set shrink.
+/// - **It preserves relative order within each group.** The recall block is
+///   read top-down and ANAI-231's per-kind budget is spent in order, so a
+///   stable pass is the only kind that composes with what is downstream.
+pub fn select_with_slot_cap(kinds: &[Option<&str>], limit: usize) -> SlotSelection {
+    let n = limit.min(kinds.len());
+    let cap = summary_slot_cap(limit);
+
+    // Fast path: an uncapped ratio (1.0) must be byte-for-byte the old
+    // truncate, not merely equivalent to it.
+    if cap >= limit {
+        let selected: Vec<usize> = (0..n).collect();
+        let admitted = selected
+            .iter()
+            .filter(|&&i| is_summary_kind(kinds[i]))
+            .count();
+        return SlotSelection {
+            selected,
+            cap,
+            summaries_admitted: admitted,
+            summaries_displaced: 0,
+            summaries_demoted: 0,
+        };
+    }
+
+    let mut selected: Vec<usize> = Vec::with_capacity(n);
+    let mut deferred: Vec<usize> = Vec::new();
+    let mut admitted = 0usize;
+
+    for (i, kind) in kinds.iter().enumerate() {
+        if selected.len() == n {
+            // Full. Everything past here is below the cut line a plain
+            // truncate would also have drawn, so it is not the cap's doing and
+            // must not be counted as displaced.
+            break;
+        }
+        if is_summary_kind(*kind) {
+            if admitted < cap {
+                selected.push(i);
+                admitted += 1;
+            } else {
+                deferred.push(i);
+            }
+        } else {
+            selected.push(i);
+        }
+    }
+
+    // Backfill: a corpus with too few non-summary rows gets its summaries
+    // back rather than a short result.
+    let mut demoted = 0usize;
+    for i in deferred.iter().copied() {
+        if selected.len() == n {
+            break;
+        }
+        selected.push(i);
+        admitted += 1;
+        demoted += 1;
+    }
+
+    SlotSelection {
+        cap,
+        summaries_admitted: admitted,
+        summaries_displaced: deferred.len() - demoted,
+        summaries_demoted: demoted,
+        selected,
+    }
+}
+
+/// Log one line per recall where the slot cap actually bit.
+///
+/// Quiet on the no-op, unlike [`log_shadow_delta`] — the denominator argument
+/// that justifies logging shadow no-ops does not apply here, because the
+/// shadow line already reports every recall and carries the composition this
+/// cap is reacting to. Two lines per recall to say "nothing happened" is how
+/// a useful target becomes one nobody greps.
+///
+/// Same `shadow_rank` target as the shadow diff, deliberately: the two lines
+/// describe one decision and belong in one stream, and the plist already
+/// carries that target.
+pub fn log_slot_cap(agent_id: &str, sel: &SlotSelection, limit: usize) {
+    if sel.is_noop() {
+        return;
+    }
+    info!(
+        target: "shadow_rank",
+        agent = agent_id,
+        limit,
+        cap = sel.cap,
+        returned = sel.selected.len(),
+        summaries_admitted = sel.summaries_admitted,
+        summaries_displaced = sel.summaries_displaced,
+        summaries_demoted = sel.summaries_demoted,
+        ratio = summary_slot_ratio(),
+        "recall slot cap: summary share capped"
+    );
+}
+
 /// Multiplier for a row's `kind`, under the live weights.
 ///
 /// `None` — the ~46k pre-v13 rows that carry no discriminator at all — takes
@@ -634,6 +882,136 @@ mod tests {
         let d = shadow_delta(&[], 5);
         assert_eq!(d.returned, 0);
         assert!(d.is_noop());
+    }
+
+    // -- summary slot cap ---------------------------------------------------
+    //
+    // No test in this module installs a ratio, so the compiled default (0.6)
+    // is what is live here — same convention as the weights above.
+
+    const SUM: Option<&str> = Some(crate::episode::SUMMARY_KIND);
+    const TURN: Option<&str> = Some(crate::semantic::KIND_TURN);
+
+    #[test]
+    fn cap_defaults_to_three_of_five() {
+        assert_eq!(summary_slot_ratio(), DEFAULT_SUMMARY_SLOT_RATIO);
+        assert_eq!(summary_slot_cap(5), 3);
+        assert_eq!(summary_slot_cap(4), 2);
+        assert_eq!(summary_slot_cap(10), 6);
+    }
+
+    /// A one-row recall must still be allowed to be a summary. `floor(1 ×
+    /// 0.6)` is 0, and 0 would be a ban.
+    #[test]
+    fn cap_never_bans_the_kind_at_small_limits() {
+        assert_eq!(summary_slot_cap(1), 1);
+        assert_eq!(summary_slot_cap(2), 1);
+        assert_eq!(summary_slot_cap(0), 0);
+    }
+
+    /// The live failure this exists for: five summaries out-scoring five turns
+    /// returned `summary ×5` and no verbatim line at all.
+    #[test]
+    fn five_summaries_are_capped_at_three_and_turns_fill_the_rest() {
+        let kinds = [SUM, SUM, SUM, SUM, SUM, TURN, TURN, TURN];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1, 2, 5, 6]);
+        assert_eq!(sel.cap, 3);
+        assert_eq!(sel.summaries_admitted, 3);
+        assert_eq!(sel.summaries_displaced, 2);
+        assert_eq!(sel.summaries_demoted, 0);
+        assert!(!sel.is_noop());
+    }
+
+    /// Deferral is re-ordering, never filtering: a corpus with only one
+    /// non-summary row still returns `limit` rows.
+    #[test]
+    fn backfill_keeps_the_result_full() {
+        let kinds = [SUM, SUM, SUM, SUM, TURN];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected.len(), 5, "the cap must not shrink a result");
+        // Turn is admitted in its own position; the fourth summary is demoted
+        // to the tail rather than dropped.
+        assert_eq!(sel.selected, vec![0, 1, 2, 4, 3]);
+        assert_eq!(sel.summaries_admitted, 4);
+        assert_eq!(sel.summaries_displaced, 0);
+        assert_eq!(sel.summaries_demoted, 1);
+        assert!(!sel.is_noop());
+    }
+
+    /// An all-summary corpus is unchanged. The cap governs mix; it cannot
+    /// invent a kind that is not there.
+    #[test]
+    fn all_summary_corpus_is_untouched() {
+        let kinds = [SUM, SUM, SUM, SUM, SUM];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1, 2, 3, 4]);
+        assert_eq!(sel.summaries_admitted, 5);
+        assert_eq!(sel.summaries_displaced, 0);
+    }
+
+    /// Already-mixed results are a no-op — the common case, and it must not
+    /// perturb order.
+    #[test]
+    fn a_result_under_the_cap_is_a_noop() {
+        let kinds = [TURN, SUM, TURN, SUM, TURN];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1, 2, 3, 4]);
+        assert!(sel.is_noop());
+    }
+
+    /// Rows below the cut line a plain truncate would also have drawn are not
+    /// the cap's doing, and must not be reported as displaced.
+    #[test]
+    fn rows_past_the_limit_are_not_counted_as_displaced() {
+        let kinds = [TURN, TURN, TURN, TURN, TURN, SUM, SUM];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1, 2, 3, 4]);
+        assert_eq!(sel.summaries_displaced, 0);
+        assert!(sel.is_noop());
+    }
+
+    /// `None`-kind rows (pre-v13, no discriminator) are not summaries and are
+    /// never deferred — the same opt-in rule [`weight_for_kind`] applies.
+    #[test]
+    fn unlabelled_rows_are_not_summaries() {
+        assert!(!is_summary_kind(None));
+        assert!(!is_summary_kind(Some("some-future-kind")));
+        let kinds = [SUM, SUM, SUM, SUM, None];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1, 2, 4, 3]);
+        assert_eq!(sel.summaries_demoted, 1);
+    }
+
+    #[test]
+    fn fewer_candidates_than_limit_are_clamped() {
+        let kinds = [SUM, SUM];
+        let sel = select_with_slot_cap(&kinds, 5);
+        assert_eq!(sel.selected, vec![0, 1]);
+        assert!(sel.is_noop());
+        let sel = select_with_slot_cap(&[], 5);
+        assert!(sel.selected.is_empty());
+        assert!(sel.is_noop());
+    }
+
+    #[test]
+    fn slot_ratio_validation_bounds() {
+        assert!(validate_summary_slot_ratio(DEFAULT_SUMMARY_SLOT_RATIO).is_ok());
+        assert!(validate_summary_slot_ratio(MIN_SUMMARY_SLOT_RATIO).is_ok());
+        assert!(validate_summary_slot_ratio(MAX_SUMMARY_SLOT_RATIO).is_ok());
+        let e = validate_summary_slot_ratio(0.0).unwrap_err();
+        assert!(e.contains("floor"), "{e}");
+        assert!(validate_summary_slot_ratio(1.5).is_err());
+        assert!(validate_summary_slot_ratio(f32::NAN).is_err());
+    }
+
+    /// The `[recall]` default for the ratio mirrors the compiled constant,
+    /// same hand-written mirror as the weights and pinned for the same reason.
+    #[test]
+    fn config_default_mirrors_the_compiled_slot_ratio() {
+        let cfg = openfang_types::config::RecallConfig::default();
+        assert_eq!(cfg.summary_slot_ratio as f32, DEFAULT_SUMMARY_SLOT_RATIO);
+        assert!(validate_summary_slot_ratio(cfg.summary_slot_ratio as f32).is_ok());
     }
 
     /// The inversion, at the ranking layer. This test previously asserted the
