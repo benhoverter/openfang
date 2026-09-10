@@ -199,6 +199,7 @@ mod tests {
             summary: summary.map(str::to_string),
             close_reason: Some(CloseReason::Explicit),
             turn_count: 4,
+            skip_reason: None,
         }
     }
 

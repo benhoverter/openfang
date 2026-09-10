@@ -184,6 +184,64 @@ impl std::fmt::Display for CloseReason {
     }
 }
 
+/// Why an episode will never earn a derived summary (ANAI-273).
+///
+/// `episodes.summary IS NULL` meant five things at once: pending, two distinct
+/// declines, aged out, and a failed provider call. This column separates the
+/// **terminal** ones — a stamped episode is one the summariser is finished
+/// with, and [`EpisodeStore::awaiting_summary`] stops offering it.
+///
+/// **A provider failure is deliberately not a variant.** A failed call leaves
+/// both `summary` and `skip_reason` null, which keeps the episode in the queue
+/// for a later tick to retry; stamping it would take it out. So the column
+/// means "terminally declined", not "something went wrong" — the cleaner
+/// contract, and the reason this change never had to touch the breaker path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Fewer than [`MIN_MATERIAL_ROWS`] linked rows: nothing to compress.
+    NoMaterial,
+    /// Under the configured `consolidation.min_rows_to_summarize` floor
+    /// (ANAI-272): compressible, but not worth a recall slot.
+    Thin,
+    /// Aged past [`SUMMARY_LOOKBACK_MINUTES`] unsummarised. Not a judgment
+    /// about the episode — it is the value a future backfill should look for.
+    Orphaned,
+}
+
+impl SkipReason {
+    /// Stable wire/DB spelling.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::NoMaterial => "no_material",
+            SkipReason::Thin => "thin",
+            SkipReason::Orphaned => "orphaned",
+        }
+    }
+
+    /// Parse the DB spelling. Unknown values are rejected rather than coerced,
+    /// same rule as [`CloseReason::parse`].
+    ///
+    /// Note the read-side consequence: an unrecognised stamp reads back as
+    /// `None`, which *looks* pending, while the SQL selector still excludes it
+    /// on `skip_reason IS NULL`. Nothing can currently write a value this does
+    /// not know — keep it that way by adding the variant in the same commit
+    /// that starts writing it.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "no_material" => Some(SkipReason::NoMaterial),
+            "thin" => Some(SkipReason::Thin),
+            "orphaned" => Some(SkipReason::Orphaned),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One episode row.
 #[derive(Debug, Clone)]
 pub struct Episode {
@@ -212,6 +270,14 @@ pub struct Episode {
     pub close_reason: Option<CloseReason>,
     /// Turns captured into this episode.
     pub turn_count: u64,
+    /// Why this episode will never earn a derived summary, or `None` when it
+    /// still might.
+    ///
+    /// `None` covers both a fresh close the summariser has not reached yet and
+    /// a close whose summary call failed — those are the same thing to the
+    /// queue, which is why a provider failure is not a [`SkipReason`]. Always
+    /// `None` once `summary` is set.
+    pub skip_reason: Option<SkipReason>,
 }
 
 impl Episode {
@@ -474,6 +540,14 @@ impl EpisodeStore {
     /// `cutoff` is the caller's, but it is not optional by design: see
     /// [`SUMMARY_LOOKBACK_MINUTES`] for why an unbounded version of this query
     /// is the backfill and not this.
+    ///
+    /// `skip_reason IS NULL` is the second half of the selector (ANAI-273) and
+    /// the reason a decline is now terminal: before it, an episode the
+    /// summariser had already refused re-entered this set on every 60-second
+    /// tick for the life of the lookback window and was refused again, ~60
+    /// times for one close. A failed provider call is *not* stamped, so it
+    /// stays here and is retried — which is the distinction the column exists
+    /// to draw.
     pub fn awaiting_summary(
         &self,
         cutoff: DateTime<Utc>,
@@ -488,7 +562,8 @@ impl EpisodeStore {
         let pending: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM episodes \
-                 WHERE closed_at IS NOT NULL AND summary IS NULL AND closed_at >= ?1",
+                 WHERE closed_at IS NOT NULL AND summary IS NULL AND skip_reason IS NULL \
+                   AND closed_at >= ?1",
                 rusqlite::params![cutoff],
                 |row| row.get(0),
             )
@@ -497,7 +572,7 @@ impl EpisodeStore {
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_COLS} WHERE closed_at IS NOT NULL AND summary IS NULL \
-                 AND closed_at >= ?1 ORDER BY closed_at ASC LIMIT ?2"
+                 AND skip_reason IS NULL AND closed_at >= ?1 ORDER BY closed_at ASC LIMIT ?2"
             ))
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         let rows = stmt
@@ -608,6 +683,12 @@ impl EpisodeStore {
     /// Deliberately separate from the close: the close commits first with a
     /// null summary and this runs afterwards, out of transaction, so a provider
     /// outage costs a summary and never a close.
+    ///
+    /// Clears `skip_reason` on the way through (ANAI-273). A stamp means "no
+    /// summary is coming"; once one arrives the stamp is false, and leaving it
+    /// would make a row readable as both declined and summarised. It also
+    /// keeps a deliberate backfill able to claim an `orphaned` episode — the
+    /// stamp records why nothing came, never a refusal to accept anything.
     pub fn set_summary(
         &self,
         id: Uuid,
@@ -620,12 +701,85 @@ impl EpisodeStore {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let n = conn
             .execute(
-                "UPDATE episodes SET title = COALESCE(title, ?2), summary = ?3 \
+                "UPDATE episodes SET title = COALESCE(title, ?2), summary = ?3, \
+                 skip_reason = NULL \
                  WHERE id = ?1 AND closed_at IS NOT NULL AND summary IS NULL",
                 rusqlite::params![id.to_string(), title, summary],
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(n > 0)
+    }
+
+    /// Stamp a terminal decline onto a closed, unsummarised episode. Returns
+    /// whether this call is the one that wrote it.
+    ///
+    /// The guard mirrors [`Self::set_summary`]'s exactly — closed, no summary,
+    /// no existing stamp — so the two can race and the loser is a no-op rather
+    /// than an overwrite. A summarised episode cannot be stamped; a stamp
+    /// cannot be rewritten with a second reason.
+    ///
+    /// Stamping is what makes a decline terminal: see
+    /// [`Self::awaiting_summary`] for the ~60-refusals-per-close it replaces.
+    pub fn mark_skipped(&self, id: Uuid, reason: SkipReason) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE episodes SET skip_reason = ?2 \
+                 WHERE id = ?1 AND closed_at IS NOT NULL AND summary IS NULL \
+                   AND skip_reason IS NULL",
+                rusqlite::params![id.to_string(), reason.as_str()],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// Stamp [`SkipReason::Orphaned`] on every closed, unsummarised, unstamped
+    /// episode whose close falls in `[floor, ceiling)`. Returns how many.
+    ///
+    /// **Both bounds are required, and the floor is the load-bearing half.**
+    /// The unbounded form of this statement — `closed_at < ceiling` — is the
+    /// retroactive backfill: on its first run it would stamp every historical
+    /// null-summary episode `orphaned`. That is worse than leaving them
+    /// unclassified, because it destroys the only remaining chance of telling a
+    /// one-turn non-episode from an hour of real work that lost its summary to
+    /// an outage. Same hazard [`SUMMARY_LOOKBACK_MINUTES`] guards on the read
+    /// side, same answer.
+    ///
+    /// The floor's cost is a hole: episodes that age out while the daemon is
+    /// down for longer than the band stay unstamped and read as pending
+    /// forever. That is precisely the state every episode is in without this
+    /// column, so the hole loses nothing that exists today.
+    pub fn mark_orphaned(
+        &self,
+        ceiling: DateTime<Utc>,
+        floor: DateTime<Utc>,
+    ) -> OpenFangResult<usize> {
+        // An inverted band is a caller bug, and the one shape of it that must
+        // never reach SQLite is `floor` ahead of `ceiling` — refuse rather than
+        // trust the statement to match nothing.
+        if floor >= ceiling {
+            return Ok(0);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE episodes SET skip_reason = ?1 \
+                 WHERE closed_at IS NOT NULL AND summary IS NULL AND skip_reason IS NULL \
+                   AND closed_at < ?2 AND closed_at >= ?3",
+                rusqlite::params![
+                    SkipReason::Orphaned.as_str(),
+                    ceiling.to_rfc3339(),
+                    floor.to_rfc3339()
+                ],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(n)
     }
 
     /// Most recent episodes for an agent, newest first.
@@ -657,7 +811,7 @@ impl EpisodeStore {
 }
 
 const SELECT_COLS: &str = "SELECT id, agent_id, opened_at, last_activity_at, closed_at, title, \
-                           summary, close_reason, turn_count FROM episodes";
+                           summary, close_reason, turn_count, skip_reason FROM episodes";
 
 fn current_open(conn: &Connection, agent_id: AgentId) -> OpenFangResult<Option<Episode>> {
     let mut stmt = conn
@@ -716,6 +870,7 @@ fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
     let summary: Option<String> = row.get(6)?;
     let close_reason: Option<String> = row.get(7)?;
     let turn_count: i64 = row.get(8)?;
+    let skip_reason: Option<String> = row.get(9)?;
 
     Ok(Episode {
         id: Uuid::parse_str(&id).unwrap_or_default(),
@@ -727,6 +882,7 @@ fn row_to_episode(row: &rusqlite::Row<'_>) -> rusqlite::Result<Episode> {
         summary,
         close_reason: close_reason.as_deref().and_then(CloseReason::parse),
         turn_count: turn_count.max(0) as u64,
+        skip_reason: skip_reason.as_deref().and_then(SkipReason::parse),
     })
 }
 
@@ -1332,5 +1488,135 @@ mod tests {
         let ep = s.ensure_open(a).unwrap();
         assert!(!s.set_summary(ep, None, "premature").unwrap());
         assert_eq!(s.get(ep).unwrap().unwrap().summary, None);
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-273: why a closed episode has no summary
+    // -----------------------------------------------------------------
+
+    /// A stamped decline leaves the queue. This is the whole point of the
+    /// column: before it, a refused episode was re-selected and re-refused on
+    /// every 60-second tick for the life of the lookback window.
+    #[test]
+    fn a_stamped_decline_leaves_the_awaiting_summary_queue() {
+        let (s, _c) = store(120);
+        let declined = close_now(&s, AgentId::new());
+        let still_pending = close_now(&s, AgentId::new());
+
+        assert!(s.mark_skipped(declined, SkipReason::Thin).unwrap());
+
+        let (found, pending) = s
+            .awaiting_summary(Utc::now() - Duration::hours(1), 10)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, still_pending);
+        assert_eq!(
+            pending, 1,
+            "the unclipped count must not report a decline as backlog"
+        );
+        assert_eq!(
+            s.get(declined).unwrap().unwrap().skip_reason,
+            Some(SkipReason::Thin),
+            "and the reason round-trips through the column"
+        );
+    }
+
+    /// The stamp's guard mirrors `set_summary`'s, so the two cannot fight: a
+    /// summarised episode is never stamped, an open one is not stamped either,
+    /// and a stamp is written exactly once.
+    #[test]
+    fn a_stamp_is_written_once_and_never_over_a_summary() {
+        let (s, _c) = store(120);
+        let ep = close_now(&s, AgentId::new());
+
+        assert!(s.mark_skipped(ep, SkipReason::Thin).unwrap());
+        assert!(
+            !s.mark_skipped(ep, SkipReason::NoMaterial).unwrap(),
+            "a second stamp must not rewrite the first"
+        );
+        assert_eq!(
+            s.get(ep).unwrap().unwrap().skip_reason,
+            Some(SkipReason::Thin)
+        );
+
+        let summarised = close_now(&s, AgentId::new());
+        assert!(s.set_summary(summarised, None, "derived").unwrap());
+        assert!(
+            !s.mark_skipped(summarised, SkipReason::Thin).unwrap(),
+            "a summarised episode is finished, not declined"
+        );
+
+        let open = s.ensure_open(AgentId::new()).unwrap();
+        assert!(
+            !s.mark_skipped(open, SkipReason::Thin).unwrap(),
+            "an open episode has not been declined yet either"
+        );
+    }
+
+    /// A backfill must still be able to claim an orphan, and a row must never
+    /// read as both declined and summarised.
+    #[test]
+    fn writing_a_summary_clears_the_stamp() {
+        let (s, _c) = store(120);
+        let ep = close_now(&s, AgentId::new());
+        assert!(s.mark_skipped(ep, SkipReason::Orphaned).unwrap());
+
+        assert!(
+            s.set_summary(ep, Some("late"), "a backfill got here")
+                .unwrap(),
+            "a stamp records why nothing came, not a refusal to accept anything"
+        );
+        let row = s.get(ep).unwrap().unwrap();
+        assert_eq!(row.summary.as_deref(), Some("a backfill got here"));
+        assert_eq!(row.skip_reason, None, "a summarised row carries no decline");
+    }
+
+    /// **The backfill guard, write side.** Unbounded, `mark_orphaned` stamps
+    /// every null-summary episode in history on its first run. Deleting the
+    /// floor is how a diagnostic column becomes a destructive relabelling of
+    /// work nobody chose to classify.
+    #[test]
+    fn mark_orphaned_touches_only_the_band_it_was_given() {
+        let (s, c) = store(120);
+        let fresh = close_now(&s, AgentId::new());
+        let aged_out = close_now(&s, AgentId::new());
+        let ancient = close_now(&s, AgentId::new());
+        backdate_close(&c, aged_out, SUMMARY_LOOKBACK_MINUTES + 5);
+        backdate_close(&c, ancient, SUMMARY_LOOKBACK_MINUTES * 10);
+
+        let ceiling = Utc::now() - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+        let floor = ceiling - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+        assert_eq!(s.mark_orphaned(ceiling, floor).unwrap(), 1);
+
+        assert_eq!(
+            s.get(aged_out).unwrap().unwrap().skip_reason,
+            Some(SkipReason::Orphaned)
+        );
+        assert_eq!(
+            s.get(fresh).unwrap().unwrap().skip_reason,
+            None,
+            "an episode still inside the window is pending, not orphaned"
+        );
+        assert_eq!(
+            s.get(ancient).unwrap().unwrap().skip_reason,
+            None,
+            "history below the floor is left exactly as it was found"
+        );
+
+        // Idempotent: everything in the band is already stamped.
+        assert_eq!(s.mark_orphaned(ceiling, floor).unwrap(), 0);
+    }
+
+    /// An inverted band is a caller bug that must not reach SQLite as a
+    /// fleet-wide UPDATE.
+    #[test]
+    fn mark_orphaned_refuses_an_inverted_band() {
+        let (s, c) = store(120);
+        let aged_out = close_now(&s, AgentId::new());
+        backdate_close(&c, aged_out, SUMMARY_LOOKBACK_MINUTES + 5);
+
+        let now = Utc::now();
+        assert_eq!(s.mark_orphaned(now - Duration::hours(2), now).unwrap(), 0);
+        assert_eq!(s.get(aged_out).unwrap().unwrap().skip_reason, None);
     }
 }

@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -73,6 +73,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 16 {
         migrate_v16(conn)?;
+    }
+
+    if current_version < 17 {
+        migrate_v17(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -762,6 +766,34 @@ fn migrate_v16(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 17: `episodes.skip_reason` — why a closed episode will never be
+/// summarised (ANAI-273).
+///
+/// One nullable column, no backfill, no row rewritten. NULL keeps exactly the
+/// meaning it has today — "the summariser is not finished with this" — so every
+/// historical null-summary close is left unclassified on purpose. A retroactive
+/// stamp would have to guess, and guessing `orphaned` for a one-turn
+/// non-episode destroys the only evidence that could ever have called it
+/// `thin`. Measured before writing this: 120 null-summary closes, 118 of them
+/// `turn_count = 1`, and the two fat ones are the rows worth keeping
+/// recoverable.
+///
+/// Note what is *not* here: a CHECK constraint on the value. The vocabulary
+/// lives in [`crate::episode::SkipReason`] and is parsed on read; a DDL
+/// constraint would mean rebuilding the table that holds the fleet's entire
+/// episode history every time the enum grows.
+fn migrate_v17(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "episodes", "skip_reason") {
+        conn.execute("ALTER TABLE episodes ADD COLUMN skip_reason TEXT", [])?;
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (17, datetime('now'), 'Add episodes.skip_reason: why a closed episode has no summary (ANAI-273)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,6 +840,41 @@ mod tests {
             crate::staleness::PersistenceClass::from_stored(class.as_deref()),
             crate::staleness::PersistenceClass::Active,
             "and reads back as the middling clock, not as permanent"
+        );
+    }
+
+    /// v17 must be additive on a live `episodes` table **and** must leave
+    /// every existing null-summary close unclassified. Stamping history is the
+    /// one thing this migration is forbidden to do — see `migrate_v17`.
+    #[test]
+    fn v17_adds_skip_reason_and_stamps_no_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO episodes (id, agent_id, opened_at, last_activity_at, closed_at,
+                                   close_reason, turn_count)
+             VALUES ('e1', 'a1', '2026-09-01T00:00:00Z', '2026-09-01T00:10:00Z',
+                     '2026-09-01T00:11:00Z', 'timer', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Re-running is a no-op: `column_exists` guards the ALTER, so a second
+        // boot on an already-migrated database must not error.
+        migrate_v17(&conn).unwrap();
+
+        assert!(column_exists(&conn, "episodes", "skip_reason"));
+        let (summary, skip): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT summary, skip_reason FROM episodes WHERE id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(summary, None);
+        assert_eq!(
+            skip, None,
+            "no retroactive stamp: history stays unclassified"
         );
     }
 
