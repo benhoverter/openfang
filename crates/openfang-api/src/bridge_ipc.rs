@@ -273,6 +273,30 @@ struct HandshakeIdentity {
     token_fingerprint: Option<String>,
 }
 
+/// Placeholder rendered in place of an agent name we could not resolve.
+///
+/// Attribution only — never feeds authorization.
+const UNKNOWN_AGENT_NAME: &str = "<unknown>";
+
+/// Resolve an agent's manifest name for log attribution.
+///
+/// Returns [`UNKNOWN_AGENT_NAME`] when the id has no registry entry (dead
+/// spawn, spoofed id). Names resolved here are *display only*: the registry
+/// entry stays the source of truth for capabilities, and a name resolved from
+/// an unauthenticated (legacy-lane) id is rendered `<claimed:...>` by the
+/// caller so a spoofable name never reads as an attributed one.
+///
+/// Emitted as its own `agent_name=` field rather than a parenthetical inside
+/// `agent=`: a space inside a `tracing` field value terminates the value for
+/// every `key=value` reader, including grep.
+fn agent_name_for_log(kernel: &Arc<OpenFangKernel>, id: AgentId) -> String {
+    kernel
+        .registry
+        .get(id)
+        .map(|e| e.manifest.name.clone())
+        .unwrap_or_else(|| UNKNOWN_AGENT_NAME.to_string())
+}
+
 /// Handle a single bridge connection: Hello/HelloAck handshake, then a loop
 /// of CallRequest → CallResponse frames until the peer closes.
 async fn handle_connection(
@@ -320,10 +344,19 @@ async fn handle_connection(
         .token_fingerprint
         .clone()
         .unwrap_or_else(|| "<legacy>".to_string());
+    // The authenticated identity is fixed for the life of the socket, so
+    // resolve its name once here rather than per request. The legacy lane has
+    // no authenticated identity; its name is derived per call from the
+    // self-claimed id and marked `<claimed:...>`.
+    let authed_name: Option<String> = identity.agent_id.map(|id| agent_name_for_log(&kernel, id));
+    let authed_name_display = authed_name
+        .clone()
+        .unwrap_or_else(|| "<legacy-unauthenticated>".to_string());
     info!(
         bridge_version = %hello.bridge_version,
         token_fingerprint = %fingerprint_display,
         authenticated_agent = %authed_display,
+        authenticated_agent_name = %authed_name_display,
         "bridge IPC: handshake complete"
     );
 
@@ -340,10 +373,20 @@ async fn handle_connection(
 
         match frame {
             Frame::Call(call) => {
+                let call_agent_name = match &authed_name {
+                    Some(name) => name.clone(),
+                    None => match call.agent_id.parse::<AgentId>() {
+                        Ok(claimed) => {
+                            format!("<claimed:{}>", agent_name_for_log(&kernel, claimed))
+                        }
+                        Err(_) => UNKNOWN_AGENT_NAME.to_string(),
+                    },
+                };
                 info!(
                     request_id = call.request_id,
                     tool = %call.tool_name,
                     agent = %call.agent_id,
+                    agent_name = %call_agent_name,
                     "bridge IPC: dispatching call"
                 );
 
@@ -358,6 +401,8 @@ async fn handle_connection(
                 info!(
                     request_id = call.request_id,
                     tool = %call.tool_name,
+                    agent = %call.agent_id,
+                    agent_name = %call_agent_name,
                     outcome = result_kind,
                     "bridge IPC: call complete"
                 );
@@ -370,6 +415,8 @@ async fn handle_connection(
             Frame::ListUpstream(req) => {
                 info!(
                     request_id = req.request_id,
+                    agent = %authed_display,
+                    agent_name = %authed_name_display,
                     "bridge IPC: dispatching list_upstream"
                 );
                 let response =
@@ -382,6 +429,8 @@ async fn handle_connection(
                 };
                 info!(
                     request_id = response.request_id,
+                    agent = %authed_display,
+                    agent_name = %authed_name_display,
                     outcome = %outcome,
                     "bridge IPC: list_upstream complete"
                 );
@@ -486,6 +535,7 @@ async fn dispatch_call(
                 request_id = call.request_id,
                 tool = %call.tool_name,
                 agent = %resolved_agent_id_string,
+                agent_name = %UNKNOWN_AGENT_NAME,
                 "bridge IPC: rejecting call — no registry entry for resolved agent"
             );
             return CallResult::Error {
@@ -494,6 +544,15 @@ async fn dispatch_call(
                 ),
             };
         }
+    };
+
+    // Attribution only. `<claimed:...>` marks a name resolved from a
+    // self-claimed (legacy-lane) id, which is spoofable - the same reason the
+    // legacy lane's claimed *id* never feeds authorization.
+    let agent_name_log = if authenticated_agent_id.is_some() {
+        entry.manifest.name.clone()
+    } else {
+        format!("<claimed:{}>", entry.manifest.name)
     };
 
     // --- Workspace-aware skill snapshot ------------------------------------
@@ -514,6 +573,7 @@ async fn dispatch_call(
                 if let Err(e) = snapshot.load_workspace_skills(&ws_skills) {
                     warn!(
                         agent = %resolved_agent_id_string,
+                        agent_name = %agent_name_log,
                         error = %e,
                         "bridge IPC: failed to load workspace skills for permission gate"
                     );
@@ -544,6 +604,7 @@ async fn dispatch_call(
             request_id = call.request_id,
             tool = %call.tool_name,
             agent = %resolved_agent_id_string,
+            agent_name = %agent_name_log,
             mode = ?entry.mode,
             permitted_count = permitted.len(),
             "bridge IPC: rejecting tool not in agent's permitted set"
@@ -577,6 +638,7 @@ async fn dispatch_call(
             request_id = call.request_id,
             tool = %call.tool_name,
             agent = %resolved_agent_id_string,
+            agent_name = %agent_name_log,
             "bridge IPC: refusing filesystem tool — no workspace registered for agent"
         );
         return CallResult::Error {
@@ -721,6 +783,7 @@ async fn dispatch_upstream_mcp_call(
                 request_id = call.request_id,
                 tool = %call.tool_name,
                 agent = %resolved_agent_id_string,
+                agent_name = %UNKNOWN_AGENT_NAME,
                 "bridge IPC (upstream MCP): no registry entry for resolved agent"
             );
             return CallResult::Error {
@@ -731,6 +794,9 @@ async fn dispatch_upstream_mcp_call(
         }
     };
 
+    // Hardened lane only (asserted above), so the name is authenticated.
+    let agent_name_log = entry.manifest.name.clone();
+
     // Default-deny: empty `mcp_servers` → no upstream tools allowed.
     // This is the bridge-path semantic; the in-process path's
     // `[] = all` convention is left undisturbed for now (see design
@@ -740,6 +806,7 @@ async fn dispatch_upstream_mcp_call(
             request_id = call.request_id,
             tool = %call.tool_name,
             agent = %resolved_agent_id_string,
+            agent_name = %agent_name_log,
             "bridge IPC (upstream MCP): agent has no mcp_servers allowlist; refusing"
         );
         return CallResult::Error {
@@ -765,6 +832,7 @@ async fn dispatch_upstream_mcp_call(
                 request_id = call.request_id,
                 tool = %call.tool_name,
                 agent = %resolved_agent_id_string,
+                agent_name = %agent_name_log,
                 allowlist = ?entry.manifest.mcp_servers,
                 "bridge IPC (upstream MCP): tool's server prefix not in agent allowlist"
             );
@@ -794,6 +862,7 @@ async fn dispatch_upstream_mcp_call(
                     request_id = call.request_id,
                     tool = %call.tool_name,
                     agent = %resolved_agent_id_string,
+                    agent_name = %agent_name_log,
                     server = %server_name,
                     "bridge IPC (upstream MCP): server allowlisted but not connected"
                 );
@@ -819,6 +888,7 @@ async fn dispatch_upstream_mcp_call(
                     request_id = call.request_id,
                     tool = %call.tool_name,
                     agent = %resolved_agent_id_string,
+                    agent_name = %agent_name_log,
                     bytes = content.len(),
                     budget = CONTENT_BUDGET,
                     "bridge IPC (upstream MCP): truncating oversized result"
@@ -856,6 +926,7 @@ async fn dispatch_upstream_mcp_call(
                 request_id = call.request_id,
                 tool = %call.tool_name,
                 agent = %resolved_agent_id_string,
+                agent_name = %agent_name_log,
                 error = %e,
                 "bridge IPC (upstream MCP): tool call failed"
             );
@@ -906,6 +977,7 @@ async fn handle_list_upstream(
             warn!(
                 request_id = req.request_id,
                 agent = %resolved_agent_id_string,
+                agent_name = %UNKNOWN_AGENT_NAME,
                 "bridge IPC: list_upstream — no registry entry for resolved agent"
             );
             return UpstreamListResponse {
