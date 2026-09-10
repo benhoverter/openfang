@@ -15,6 +15,27 @@ use openfang_memory::{episode, fact};
 /// kind is exactly the drift ANAI-229 warned about.
 const KIND_NOTE: &str = "note";
 
+// ---------------------------------------------------------------------------
+// ANAI-267 — the write doctrine's vocabulary.
+//
+// Tool names are spelled once, here, so doctrine that points at a tool the
+// registry has renamed is a one-line fix rather than five scattered string
+// literals. Every doctrine line is gated on the tool actually being granted:
+// telling an agent to call something it does not have produces failed calls
+// and teaches it to distrust the whole section.
+// ---------------------------------------------------------------------------
+const TOOL_NOTE: &str = "memory_note";
+const TOOL_FACT: &str = "memory_fact";
+const TOOL_STORE: &str = "memory_store";
+const TOOL_EPISODE_CLOSE: &str = "memory_episode_close";
+const TOOL_STATUS: &str = "memory_status";
+const TOOL_HISTORY: &str = "memory_history";
+
+/// Is `name` in the agent's granted tool list?
+fn is_granted(granted_tools: &[String], name: &str) -> bool {
+    granted_tools.iter().any(|t| t == name)
+}
+
 /// One recalled memory row as the prompt builder needs it.
 ///
 /// Replaces the old `(key, content)` pair so the row's `kind` can reach the
@@ -240,7 +261,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     }
 
     // Section 4 — Memory Protocol (always present)
-    let mem_section = build_memory_section(&ctx.recalled_memories);
+    let mem_section = build_memory_section(&ctx.recalled_memories, &ctx.granted_tools);
     sections.push(mem_section);
 
     // Section 5 — Skills (only if skills available)
@@ -476,23 +497,131 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
     }
 }
 
+/// The write half of the memory doctrine (ANAI-267).
+///
+/// Measured cause, 2026-09-10: the standing prompt named exactly one write
+/// tool — `memory_store` — whose rows a query-recall can never reach
+/// (`semantic.rs` contains no reference to `kv_store`; ANAI-166 routes a
+/// keyed-less recall to vector search). Fleet state under that text was 1,395
+/// kv rows against 21 notes and 8 facts across 48 agents, and four deliberate
+/// episode closes in the system's lifetime against 266 timer closes. That is
+/// what obedience to the old wording looks like, not laziness — so the fix is
+/// the wording.
+///
+/// Two things every line here is trying to do: name the RIGHT tool for the
+/// shape of the thing being written, and supply the *trigger* the old text
+/// lacked ("for future use" has no when).
+fn build_write_doctrine(granted_tools: &[String]) -> String {
+    let has_note = is_granted(granted_tools, TOOL_NOTE);
+    let has_fact = is_granted(granted_tools, TOOL_FACT);
+    let has_store = is_granted(granted_tools, TOOL_STORE);
+    let has_close = is_granted(granted_tools, TOOL_EPISODE_CLOSE);
+    let has_status = is_granted(granted_tools, TOOL_STATUS);
+    let has_history = is_granted(granted_tools, TOOL_HISTORY);
+
+    // No write tool at all: say nothing. A trigger with no verb attached is
+    // worse than silence — it asks for an action the agent cannot take.
+    if !(has_note || has_fact || has_store || has_close) {
+        return String::new();
+    }
+
+    let mut out = String::new();
+
+    if has_note || has_fact {
+        out.push_str(
+            "- Write it down in the SAME turn you learn it. The trigger: you learned something \
+             that will still be true next week — a decision and why, a correction, a preference, \
+             a measured number, how a system actually behaves. There is no later pass that \
+             captures this for you.\n",
+        );
+    }
+    if has_note {
+        out.push_str(
+            "- memory_note — the default. One observation, lesson, or piece of context in your \
+             own words. Cheap and recallable: write it rather than wonder whether it is worth \
+             writing.\n",
+        );
+    }
+    if has_fact {
+        out.push_str(
+            "- memory_fact — a single durable claim that gets REVISED over time (a status, an \
+             owner, a current value). Writing the same slot again supersedes the old value and \
+             keeps the history, so update the slot instead of adding a second note that \
+             contradicts the first.\n",
+        );
+    }
+    if has_store {
+        if has_note || has_fact {
+            out.push_str(
+                "- memory_store — for handing a payload to another agent under a key the other \
+                 side already knows. It is a key-value drawer, not a notebook: a recall QUERY \
+                 cannot find it, only an exact key can. Use memory_note or memory_fact for \
+                 anything you want to find again yourself.\n",
+            );
+        } else {
+            // No note/fact granted — the drawer is all this agent has, so the
+            // old instruction is still the correct one for it.
+            out.push_str(
+                "- Store important preferences, decisions, and context with memory_store for \
+                 future use.\n",
+            );
+        }
+    }
+    if has_close {
+        out.push_str(
+            "- memory_episode_close — when a piece of work is genuinely FINISHED and you are \
+             moving to something unrelated, close the episode and title it. Never mid-task. Pass \
+             reset_context to start the next one on a clean window, and prime_for with the \
+             project slug you are moving to so that window opens with what durable memory \
+             already knows about it.\n",
+        );
+    }
+    if has_status || has_history {
+        let mut names: Vec<&str> = Vec::with_capacity(2);
+        if has_status {
+            names.push(TOOL_STATUS);
+        }
+        if has_history {
+            names.push(TOOL_HISTORY);
+        }
+        out.push_str(&format!(
+            "- {} — check what you already hold before writing it again.\n",
+            names.join(" / ")
+        ));
+    }
+
+    out
+}
+
+/// The per-turn recall append used by `agent_loop.rs` after the DB lookup.
+///
+/// Deliberately passes no granted tools: the write doctrine already lives in
+/// the base prompt that `build_system_prompt` produced, and the kernel hands
+/// that prompt to the loop verbatim. Emitting the doctrine here too would
+/// duplicate it in every turn that recalls anything.
+pub fn build_recalled_memory_section(memories: &[RecalledMemory]) -> String {
+    build_memory_section(memories, &[])
+}
+
 /// Build the memory section (Section 4).
 ///
-/// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
-pub fn build_memory_section(memories: &[RecalledMemory]) -> String {
+/// `granted_tools` gates the write doctrine — see `build_write_doctrine`. The
+/// read guidance is unconditional, as it has always been.
+pub fn build_memory_section(memories: &[RecalledMemory], granted_tools: &[String]) -> String {
     let mut out = String::from("## Memory\n");
     if memories.is_empty() {
         out.push_str(
-            "- When the user asks about something from a previous conversation, use memory_recall first.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
+            "- When the user asks about something from a previous conversation, use memory_recall first.\n",
         );
     } else {
         out.push_str(
             "- Use the recalled memories below to inform your responses.\n\
-             - Only call memory_recall if you need information not already shown here.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
+             - Only call memory_recall if you need information not already shown here.\n",
         );
-        out.push_str("\n\nRecalled memories:\n");
+    }
+    out.push_str(&build_write_doctrine(granted_tools));
+    if !memories.is_empty() {
+        out.push_str("\nRecalled memories:\n");
         for mem in memories.iter().take(5) {
             let kind = mem.kind.as_deref();
             // The label carries the kind so the truncation marker (and its
@@ -1101,7 +1230,7 @@ mod tests {
 
     #[test]
     fn test_memory_section_empty() {
-        let section = build_memory_section(&[]);
+        let section = build_memory_section(&[], &[]);
         assert!(section.contains("## Memory"));
         assert!(section.contains("use memory_recall first"));
         assert!(!section.contains("Recalled memories"));
@@ -1113,7 +1242,7 @@ mod tests {
             RecalledMemory::keyed("pref", "User likes dark mode"),
             RecalledMemory::keyed("ctx", "Working on Rust project"),
         ];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         assert!(section.contains("Recalled memories"));
         assert!(section.contains("[pref] User likes dark mode"));
         assert!(section.contains("[ctx] Working on Rust project"));
@@ -1126,7 +1255,7 @@ mod tests {
         let memories: Vec<RecalledMemory> = (0..10)
             .map(|i| RecalledMemory::keyed(format!("k{i}"), format!("value {i}")))
             .collect();
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         assert!(section.contains("[k0]"));
         assert!(section.contains("[k4]"));
         assert!(!section.contains("[k5]"));
@@ -1136,7 +1265,7 @@ mod tests {
     fn test_memory_content_capped() {
         let long_content = "x".repeat(1000);
         let memories = vec![RecalledMemory::keyed("k", long_content)];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         // A row with no `kind` is budgeted as a turn: 500, unchanged.
         assert!(section.contains("recalled memory truncated"));
         assert!(section.contains("500 of 1000 chars shown, 500 omitted"));
@@ -1152,7 +1281,7 @@ mod tests {
             Some("summary".to_string()),
             &summary,
         )];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         assert!(
             !section.contains("truncated"),
             "a 1120-char summary must survive the 1500 budget whole"
@@ -1169,7 +1298,7 @@ mod tests {
             Some("turn".to_string()),
             "t".repeat(1000),
         )];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         assert!(section.contains("recalled turn truncated"));
         assert!(section.contains("500 of 1000 chars shown"));
     }
@@ -1182,7 +1311,7 @@ mod tests {
             Some("note".to_string()),
             "n".repeat(2000),
         )];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, &[]);
         assert!(section.contains("recalled note truncated"));
         assert!(section.contains("1000 of 2000 chars shown"));
     }
@@ -1196,6 +1325,124 @@ mod tests {
         assert_eq!(budget_for_kind(Some("summary")), BUDGET_RECALLED_SUMMARY);
         assert_eq!(budget_for_kind(Some("fact")), BUDGET_RECALLED_FACT);
         assert_eq!(budget_for_kind(Some("note")), BUDGET_RECALLED_NOTE);
+    }
+
+    // --- ANAI-267: the write doctrine ------------------------------------
+
+    /// The full memory suite, as the on-disk fleet carries it since the
+    /// 2026-09-08 grant.
+    fn full_suite() -> Vec<String> {
+        [
+            "memory_recall",
+            "memory_store",
+            "memory_note",
+            "memory_fact",
+            "memory_episode_close",
+            "memory_status",
+            "memory_history",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+    }
+
+    /// The defect ANAI-267 exists for: the standing prompt named `memory_store`
+    /// and nothing else, so the fleet wrote 1,395 rows into a store that a
+    /// query-recall cannot read. The doctrine must name the recallable tools.
+    #[test]
+    fn the_doctrine_names_note_and_fact() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("memory_note"));
+        assert!(section.contains("memory_fact"));
+    }
+
+    /// The trigger clause is the other half. "for future use" has no *when*;
+    /// the replacement must say the write happens in the same turn.
+    #[test]
+    fn the_doctrine_carries_a_trigger() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("SAME turn"));
+    }
+
+    /// `memory_store` is demoted, not deleted — ANAI-269 leaves the rows and
+    /// the code alone. But the prompt must say a query cannot reach them.
+    #[test]
+    fn memory_store_is_demoted_when_note_or_fact_exists() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("recall QUERY"));
+        assert!(
+            !section.contains("Store important preferences"),
+            "the old blanket instruction must not survive alongside note/fact"
+        );
+    }
+
+    /// An agent granted only the drawer still gets the old instruction: the
+    /// drawer is genuinely all it has, and demoting it would leave that agent
+    /// with no write doctrine at all.
+    #[test]
+    fn a_store_only_agent_keeps_the_old_instruction() {
+        let tools = vec!["memory_recall".to_string(), "memory_store".to_string()];
+        let section = build_memory_section(&[], &tools);
+        assert!(section.contains("Store important preferences"));
+        assert!(!section.contains("memory_note"));
+        assert!(!section.contains("recall QUERY"));
+    }
+
+    /// Doctrine that names a tool the agent does not have produces failed
+    /// calls. Every line is gated.
+    #[test]
+    fn ungranted_tools_are_never_named() {
+        let tools = vec!["memory_recall".to_string(), "memory_note".to_string()];
+        let section = build_memory_section(&[], &tools);
+        assert!(section.contains("memory_note"));
+        assert!(!section.contains("memory_fact"));
+        assert!(!section.contains("memory_episode_close"));
+        assert!(!section.contains("memory_status"));
+        assert!(!section.contains("memory_history"));
+    }
+
+    /// No write tool at all: a trigger with no verb is worse than silence.
+    /// The read guidance still stands.
+    #[test]
+    fn an_agent_with_no_write_tools_gets_no_doctrine() {
+        let tools = vec!["memory_recall".to_string()];
+        let section = build_memory_section(&[], &tools);
+        assert!(section.contains("use memory_recall first"));
+        assert!(!section.contains("SAME turn"));
+        assert!(!section.contains("Store important preferences"));
+    }
+
+    /// ANAI-247's `prime_for` is named nowhere an agent reads — four explicit
+    /// closes in the system's lifetime is the measurement of that absence.
+    #[test]
+    fn the_close_doctrine_names_reset_context_and_prime_for() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("memory_episode_close"));
+        assert!(section.contains("reset_context"));
+        assert!(section.contains("prime_for"));
+    }
+
+    /// The kernel builds the base prompt (doctrine included) and `agent_loop`
+    /// appends recalled rows to it on every turn that recalls anything. If the
+    /// append carried the doctrine too it would appear twice in that prompt.
+    #[test]
+    fn the_recall_append_does_not_repeat_the_doctrine() {
+        let memories = vec![RecalledMemory::of_kind(Some("note".to_string()), "a thing")];
+        let section = build_recalled_memory_section(&memories);
+        assert!(section.contains("a thing"));
+        assert!(!section.contains("SAME turn"));
+        assert!(!section.contains("memory_episode_close"));
+    }
+
+    /// The doctrine is a function of the granted tool list alone — no clock,
+    /// no session state — so it is byte-stable across turns and cannot break
+    /// provider prompt caching (the reason canonical context was moved out of
+    /// the system prompt in the first place).
+    #[test]
+    fn the_doctrine_is_stable_across_calls() {
+        let a = build_memory_section(&[], &full_suite());
+        let b = build_memory_section(&[], &full_suite());
+        assert_eq!(a, b);
     }
 
     /// The kind constants this module budgets against are the same spellings

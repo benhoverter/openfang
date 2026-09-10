@@ -740,7 +740,9 @@ pub async fn run_agent_loop(
             })
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_rows));
+        system_prompt.push_str(&crate::prompt_builder::build_recalled_memory_section(
+            &mem_rows,
+        ));
     }
 
     // Add the user message to session history.
@@ -2481,7 +2483,9 @@ pub async fn run_agent_loop_streaming(
             })
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_rows));
+        system_prompt.push_str(&crate::prompt_builder::build_recalled_memory_section(
+            &mem_rows,
+        ));
     }
 
     // Add the user message to session history.
