@@ -6288,6 +6288,12 @@ impl OpenFangKernel {
             if self.config.memory.consolidation.enabled {
                 let kernel = Arc::clone(self);
                 let model = self.config.memory.consolidation.model.clone();
+                // ANAI-272: reported at boot rather than per-skip. A thin
+                // episode re-selects every tick for the life of the lookback
+                // window, so a per-skip line would say the same thing ~60 times
+                // an hour about work that costs nothing. The armed value here
+                // plus `skipped_thin` on the tick summary is the whole witness.
+                let min_rows = self.config.memory.consolidation.min_rows_to_summarize;
                 tokio::spawn(async move {
                     let mut state = crate::episode_summary::EpisodeSummarizer::new();
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -6307,6 +6313,7 @@ impl OpenFangKernel {
                 });
                 info!(
                     model = %model,
+                    min_rows_to_summarize = min_rows,
                     "Episode consolidation scheduled every {}s",
                     crate::episode_summary::CONSOLIDATION_TICK_SECS
                 );

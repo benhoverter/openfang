@@ -2646,6 +2646,27 @@ pub struct ConsolidationConfig {
     /// one.** Whatever the cap defers must be logged, never silently dropped:
     /// a silent cap reads as "we did them all".
     pub max_per_tick: u32,
+    /// Minimum stored rows an episode must carry before it earns a summary.
+    ///
+    /// **This is a corpus-quality floor, not a cost control.** Measured on the
+    /// live fleet: of 268 timer closes, 149 were 1–2 turns, and 55% of the
+    /// entire summary corpus was derived from five turns or fewer — ~725-char
+    /// paragraphs compressing a single exchange. Those rows then get boosted by
+    /// `recall.summary_weight` and hand up to `summary_slot_ratio` of every
+    /// recall's slots, displacing the verbatim turn the exchange actually
+    /// produced. The idle timer manufactures them: a wall clock cannot know
+    /// whether a topic ended, so an agent that answers one question and goes
+    /// quiet gets an "episode".
+    ///
+    /// The episode still **closes**; it just does not earn a recall slot. Set
+    /// `0` to disable the floor entirely and restore pre-ANAI-272 behaviour —
+    /// [`openfang_memory::episode::MIN_MATERIAL_ROWS`] remains the hard floor
+    /// beneath it either way, since one row is not material to summarise.
+    ///
+    /// Counted on **stored rows**, never `turn_count`: rows are what actually
+    /// feed the model, they exclude soft-deletes, and a turn that stored
+    /// nothing is a turn with nothing to summarise.
+    pub min_rows_to_summarize: u32,
 }
 
 impl Default for ConsolidationConfig {
@@ -2658,6 +2679,7 @@ impl Default for ConsolidationConfig {
             max_tokens: 512,
             failure_threshold: 3,
             max_per_tick: 8,
+            min_rows_to_summarize: 3,
         }
     }
 }
@@ -2693,6 +2715,18 @@ mod consolidation_config_tests {
         let mem: MemoryConfig = toml::from_str("consolidation_interval_hours = 24").unwrap();
         assert!(!mem.consolidation.enabled);
         assert_eq!(mem.consolidation.max_per_tick, 8);
+    }
+
+    /// ANAI-272: the thin-episode floor ships **on**, unlike the rest of the
+    /// consolidation block. It spends nothing and only declines to write — the
+    /// inert-by-default argument covers unattended model calls, and this is the
+    /// absence of one.
+    #[test]
+    fn the_thin_episode_floor_ships_armed_and_is_disablable() {
+        assert_eq!(ConsolidationConfig::default().min_rows_to_summarize, 3);
+        let mem: MemoryConfig =
+            toml::from_str("[consolidation]\nmin_rows_to_summarize = 0\n").unwrap();
+        assert_eq!(mem.consolidation.min_rows_to_summarize, 0);
     }
 
     /// `[memory.consolidation]` is a nested table under `[memory]`, so it has to

@@ -117,6 +117,11 @@ struct Tally {
     summarized: u32,
     /// Skipped for having less than [`MIN_MATERIAL_ROWS`] linked rows.
     no_material: u32,
+    /// Skipped for falling under the configured thin-episode floor
+    /// (`consolidation.min_rows_to_summarize`, ANAI-272). Distinct from
+    /// `no_material`: that one is "nothing to compress", this one is "not
+    /// worth a recall slot".
+    too_thin: u32,
     /// The model was called and produced nothing usable.
     failed: u32,
 }
@@ -175,6 +180,7 @@ impl OpenFangKernel {
         }
 
         let mut tally = Tally::default();
+        let thin_floor = thin_floor(cfg.min_rows_to_summarize);
         for ep in &candidates {
             let material = match self
                 .memory
@@ -207,6 +213,25 @@ impl OpenFangKernel {
             // Trusting `turn_count` would spend a model call on a polished null.
             if material.len() < MIN_MATERIAL_ROWS {
                 tally.no_material += 1;
+                continue;
+            }
+
+            // ANAI-272: the thin-episode floor, and it is a *corpus-quality*
+            // decision, not a cost one.
+            //
+            // The idle timer manufactures episodes out of silence — 149 of 268
+            // live timer closes were 1–2 turns — and a wall clock cannot know
+            // whether a topic ended. Summarising those produced ~725-char
+            // paragraphs compressing a single exchange, which `summary_weight`
+            // then boosts into recall slots that `summary_slot_ratio` reserves,
+            // displacing the verbatim turn the exchange actually produced. 55%
+            // of the live summary corpus came from five turns or fewer.
+            //
+            // The episode is left closed with a null summary — the same shape a
+            // provider outage leaves behind, and the same shape a future
+            // backfill can pick up if we ever decide these were worth having.
+            if material.len() < thin_floor {
+                tally.too_thin += 1;
                 continue;
             }
 
@@ -299,18 +324,24 @@ impl OpenFangKernel {
         // failure — is named here.
         let deferred = pending
             .saturating_sub(tally.summarized as usize)
-            .saturating_sub(tally.no_material as usize);
+            .saturating_sub(tally.no_material as usize)
+            .saturating_sub(tally.too_thin as usize);
         //
         // `no_material` deliberately does NOT fire this line on its own: a thin
         // episode re-selects every tick for the life of the lookback window, so
         // announcing it would `info!` ~60 times about work that costs nothing.
-        // It is still reported as a field whenever the line does fire.
+        // It is still reported as a field whenever the line does fire, and
+        // `skipped_thin` (ANAI-272) is subtracted and reported on exactly the
+        // same grounds — both are permanent declines, not deferred work, and
+        // counting them as deferred would make this line fire every tick
+        // forever claiming a backlog that will never drain.
         if tally.summarized > 0 || deferred > 0 {
             info!(
                 target: "openfang::consolidation",
                 summarized = tally.summarized,
                 deferred,
                 skipped_no_material = tally.no_material,
+                skipped_thin = tally.too_thin,
                 failed = tally.failed,
                 "consolidation: {} summarized, {deferred} deferred to next tick",
                 tally.summarized
@@ -415,6 +446,16 @@ impl OpenFangKernel {
     }
 }
 
+/// Effective stored-row floor for earning a summary (ANAI-272).
+///
+/// [`MIN_MATERIAL_ROWS`] is structural — below it there is nothing to
+/// compress — and is therefore a hard minimum an operator cannot configure
+/// away. `min_rows_to_summarize = 0` restores exactly the pre-ANAI-272
+/// behaviour rather than disabling the structural floor with it.
+fn thin_floor(configured: u32) -> usize {
+    (configured as usize).max(MIN_MATERIAL_ROWS)
+}
+
 /// Build the user-role body for one summary call.
 fn summary_prompt(ep: &Episode, material: &[String]) -> String {
     let mut out = String::new();
@@ -508,5 +549,38 @@ mod tests {
         let long = "x".repeat(400);
         let (title, _) = parse_summary(&format!("TITLE: {long}\nbody")).unwrap();
         assert!(title.unwrap().chars().count() <= 120);
+    }
+
+    /// ANAI-272: the shipped default declines a 1- or 2-row episode and admits
+    /// a 3-row one. This is the number that stops 55% of the summary corpus
+    /// being derived from five turns or fewer.
+    #[test]
+    fn the_default_floor_declines_one_and_two_row_episodes() {
+        let floor = thin_floor(
+            openfang_types::config::ConsolidationConfig::default().min_rows_to_summarize,
+        );
+        assert_eq!(floor, 3);
+        // Mirrors the live predicate: `material.len() < thin_floor` declines.
+        let declines = |rows: usize| rows < floor;
+        assert!(declines(1), "a one-row episode declines");
+        assert!(declines(2), "a two-row episode declines");
+        assert!(!declines(3), "a three-row episode still earns a summary");
+    }
+
+    /// The off switch restores the previous behaviour exactly — it does not
+    /// disable the structural floor along with the configured one. Zero rows
+    /// and one row have nothing to compress no matter what the operator wants.
+    #[test]
+    fn zero_restores_the_structural_floor_and_no_less() {
+        assert_eq!(thin_floor(0), MIN_MATERIAL_ROWS);
+        assert_eq!(thin_floor(1), MIN_MATERIAL_ROWS);
+        assert_eq!(thin_floor(2), MIN_MATERIAL_ROWS);
+    }
+
+    /// An operator who wants a stricter corpus gets one; the floor is a max,
+    /// not a clamp to some hidden ceiling.
+    #[test]
+    fn a_higher_floor_is_honoured() {
+        assert_eq!(thin_floor(10), 10);
     }
 }
