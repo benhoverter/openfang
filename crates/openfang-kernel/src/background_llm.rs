@@ -24,7 +24,7 @@ use openfang_runtime::background_llm::{
 };
 use openfang_runtime::drivers;
 use openfang_runtime::llm_driver::{CompletionRequest, DriverConfig};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// One purpose's slice of state.
 #[derive(Default)]
@@ -181,18 +181,43 @@ impl OpenFangKernel {
             allowed_tools: None,
         };
 
+        // ANAI-274: wall-clock per call, so fixed transport cost and variable
+        // model cost stop being a thing anyone has to infer by pairing
+        // `subprocess started` / `completed successfully` lines out of an
+        // interleaved fleet log. The measurement that motivated it: successful
+        // haiku summaries of *thin* episodes — the smallest prompt this path
+        // can send — took 9.6–17.4s end to end, against a 30s default budget.
+        // Nearly all of that is subprocess ceremony, not inference. Pair
+        // `elapsed_ms` with `prompt_chars` and the split is readable directly.
+        let started = std::time::Instant::now();
         let call = tokio::time::timeout(
             std::time::Duration::from_secs(req.timeout_secs),
             driver.complete(request),
         )
         .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        let prompt_chars = req.user.len() + req.system.as_ref().map_or(0, |s| s.len());
 
         match call {
-            Ok(Ok(response)) => BackgroundLlmOutcome::Answered(response.text()),
+            Ok(Ok(response)) => {
+                debug!(
+                    target: "openfang::background_llm",
+                    purpose = %purpose,
+                    model = %req.model,
+                    elapsed_ms,
+                    prompt_chars,
+                    timeout_secs = req.timeout_secs,
+                    "Background LLM call completed"
+                );
+                BackgroundLlmOutcome::Answered(response.text())
+            }
             Ok(Err(e)) => {
                 warn!(
                     target: "openfang::background_llm",
                     purpose = %purpose,
+                    model = %req.model,
+                    elapsed_ms,
+                    prompt_chars,
                     error = %e,
                     "Background LLM call failed"
                 );
@@ -202,6 +227,9 @@ impl OpenFangKernel {
                 warn!(
                     target: "openfang::background_llm",
                     purpose = %purpose,
+                    model = %req.model,
+                    elapsed_ms,
+                    prompt_chars,
                     timeout_secs = req.timeout_secs,
                     "Background LLM call timed out"
                 );

@@ -544,19 +544,25 @@ fn build_write_doctrine(granted_tools: &[String]) -> String {
     }
     if has_fact {
         out.push_str(
-            "- memory_fact — a single durable claim that gets REVISED over time (a status, an \
-             owner, a current value). Writing the same slot again supersedes the old value and \
-             keeps the history, so update the slot instead of adding a second note that \
-             contradicts the first.\n",
+            "- memory_fact — use this INSTEAD of a note whenever the thing you are writing has \
+             a CURRENT VALUE that can change later: a status, an owner, a version or commit, a \
+             count you will re-measure, a decision that may be revised. Name the slot for the \
+             thing and not for the moment — `repo.trunk_head`, not `trunk head as of Friday` — \
+             and write the same slot again when the value moves; that supersedes the old value \
+             and keeps the history. Two tells that you want a fact and not a note: you are about \
+             to correct or update something you wrote before, or the sentence you are writing \
+             would be wrong next month rather than merely old.\n",
         );
     }
     if has_store {
         if has_note || has_fact {
             out.push_str(
-                "- memory_store — for handing a payload to another agent under a key the other \
-                 side already knows. It is a key-value drawer, not a notebook: a recall QUERY \
-                 cannot find it, only an exact key can. Use memory_note or memory_fact for \
-                 anything you want to find again yourself.\n",
+                "- memory_store — NOT a memory tool for you. It is a drawer keyed by an exact \
+                 string: a recall QUERY cannot find it, only the literal key can, so anything \
+                 you put there is lost to you unless you later guess the key verbatim. Its one \
+                 legitimate use is handing a payload to another agent under a key that side \
+                 already knows. If you are writing for your own future self — which is almost \
+                 always — the tool is memory_note or memory_fact, never this one.\n",
             );
         } else {
             // No note/fact granted — the drawer is all this agent has, so the
@@ -955,7 +961,14 @@ pub fn tool_hint(name: &str) -> &'static str {
         "shell_background" => "run a command in the background",
 
         // Memory
-        "memory_store" => "save a key-value pair to memory",
+        // ANAI-274: this gloss read as "the memory write tool" and the fleet
+        // took it at its word — five agents were still writing fresh kv rows a
+        // day after the ANAI-267 doctrine demoted the tool. The doctrine and
+        // the gloss are two different places an agent reads; demoting one and
+        // not the other left the contradiction standing.
+        "memory_store" => {
+            "hand a payload to another agent under an exact key (recall cannot search it)"
+        }
         // ANAI-166: this line was already here and was a lie — the tool was
         // exact-key lookup. It is true as of stage 2; the fix was to make the
         // implementation match the description, not to downgrade the wording.
@@ -963,7 +976,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "search memory for relevant context",
         "memory_episode_close" => "close and label the current episode",
         "memory_status" => "check your open episode and idle countdown",
-        "memory_fact" => "read or write one durable claim slot",
+        "memory_fact" => "record or update a claim whose value changes over time",
         "memory_history" => "show what a claim slot used to say",
 
         // Agents
@@ -1373,6 +1386,70 @@ mod tests {
         assert!(
             !section.contains("Store important preferences"),
             "the old blanket instruction must not survive alongside note/fact"
+        );
+    }
+
+    /// ANAI-274. The ANAI-267 demotion listed `memory_store` as a peer bullet
+    /// with a caveat; a day later five agents were still writing fresh kv rows.
+    /// The bullet now leads with what the tool is *not* and closes by naming
+    /// the tool to use instead, so an agent skimming one line gets the
+    /// redirect rather than the caveat.
+    #[test]
+    fn the_store_bullet_redirects_instead_of_merely_warning() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(
+            section.contains("NOT a memory tool for you"),
+            "the demotion must lead with the negative, not bury it"
+        );
+        assert!(
+            section.contains("memory_note or memory_fact, never this one"),
+            "a demotion with no redirect leaves the agent with nowhere to go"
+        );
+    }
+
+    /// ANAI-274, the measured half: two boots after the ANAI-267 doctrine
+    /// shipped, note writes went 21 → 38 across three new agents and fact
+    /// writes stayed at 8, with the most recent fact eight days old. The fact
+    /// bullet's old wording ("a claim that gets REVISED over time") describes a
+    /// property an agent cannot evaluate at the moment of writing — nothing has
+    /// been revised yet. The replacement is recognisable in the moment: a
+    /// current value, a naming rule, and two concrete tells.
+    #[test]
+    fn the_fact_bullet_is_recognisable_at_write_time() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(
+            section.contains("CURRENT VALUE"),
+            "the trigger must be a property of the thing being written, not of its future"
+        );
+        assert!(
+            section.contains("INSTEAD of a note"),
+            "note and fact compete for the same impulse — the bullet must adjudicate"
+        );
+        assert!(
+            section.contains("correct or update something you wrote before"),
+            "the strongest tell is the one an agent actually notices"
+        );
+    }
+
+    /// The gloss in the tool list and the doctrine in the memory section are
+    /// two different places an agent reads. ANAI-267 demoted the doctrine and
+    /// left the gloss reading "save a key-value pair to memory" — i.e. *the*
+    /// memory write tool. A contradiction between them is resolved by the
+    /// shorter, more confident line, which was the wrong one.
+    #[test]
+    fn the_store_gloss_does_not_contradict_the_doctrine() {
+        let gloss = tool_hint("memory_store");
+        assert!(
+            !gloss.contains("save"),
+            "the gloss must not present the drawer as the way to save memory"
+        );
+        assert!(
+            gloss.contains("recall cannot search it"),
+            "the gloss carries the same unsearchability the doctrine does"
+        );
+        assert!(
+            !tool_hint("memory_fact").contains("slot"),
+            "\"claim slot\" is our vocabulary, not something an agent can act on"
         );
     }
 
