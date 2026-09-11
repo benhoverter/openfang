@@ -1392,7 +1392,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_status".to_string(),
-            description: "Report the state of your own memory: which episode is open, how many turns it has captured, how long it has been idle, and when it will close on its own. Use it to notice you have drifted onto unrelated work.".to_string(),
+            description: "Report the state of your own memory: which episode is open, how many turns it has captured, how long it has been idle, and when it will close on its own. Also lists every open claim slot you already hold - check those before writing a memory_fact, because correcting a slot you own supersedes it and keeps the history, while inventing a near-duplicate key splits one claim into two. Use it to notice you have drifted onto unrelated work.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}

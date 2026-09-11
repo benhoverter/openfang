@@ -105,7 +105,7 @@ pub fn open_loops(facts: Vec<Fact>) -> Vec<Fact> {
 /// which is noise in the agent's own file. Project slots carry their slug,
 /// because the same `claim_key` under two scopes is two different slots and a
 /// block that hid the difference would report one of them as the other.
-fn display_key(fact: &Fact) -> String {
+pub fn display_key(fact: &Fact) -> String {
     if fact.scope == "agent" {
         fact.claim_key.clone()
     } else {

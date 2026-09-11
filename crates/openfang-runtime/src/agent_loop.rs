@@ -596,6 +596,35 @@ fn inject_turn_context(
     }
 }
 
+/// Map recalled fragments onto the prompt builder's row shape, dating each one
+/// against `now` (ANAI-268).
+///
+/// `kind` is hydrated back into the fragment's metadata by the semantic store
+/// on recall (the column is the store of record, v13), so both the per-row
+/// character budget (ANAI-231) and the provenance tag are available here
+/// without a `MemoryFragment` change.
+///
+/// The clock is read by the caller, not by the prompt builder: the builder is
+/// pinned byte-stable across two calls with the same inputs, and a module that
+/// reads the clock cannot honour that.
+fn recalled_rows(
+    memories: &[openfang_types::memory::MemoryFragment],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::prompt_builder::RecalledMemory> {
+    memories
+        .iter()
+        .map(|m| {
+            let kind = m
+                .metadata
+                .get(openfang_memory::semantic::KIND_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            crate::prompt_builder::RecalledMemory::of_kind(kind, m.content.clone())
+                .aged((now - m.created_at).num_seconds())
+        })
+        .collect()
+}
+
 /// Run the agent execution loop for a single user message.
 ///
 /// This is the core of OpenFang: it loads session context, recalls memories,
@@ -723,22 +752,9 @@ pub async fn run_agent_loop(
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
     if !memories.is_empty() {
-        // `kind` is hydrated back into the fragment's metadata by the semantic
-        // store on recall (the column is the store of record, v13) — so it is
-        // available here without a MemoryFragment change. It drives the
-        // per-row character budget (ANAI-231).
-        let mem_rows: Vec<crate::prompt_builder::RecalledMemory> = memories
-            .iter()
-            .map(|m| {
-                crate::prompt_builder::RecalledMemory::of_kind(
-                    m.metadata
-                        .get(openfang_memory::semantic::KIND_KEY)
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    m.content.clone(),
-                )
-            })
-            .collect();
+        // ANAI-268: rows carry kind AND age now, so the clock is read here,
+        // once, and the prompt builder stays a pure function of its inputs.
+        let mem_rows = recalled_rows(&memories, chrono::Utc::now());
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_recalled_memory_section(
             &mem_rows,
@@ -2466,22 +2482,9 @@ pub async fn run_agent_loop_streaming(
     // we append recalled memories here since they are resolved at loop time.
     let mut system_prompt = manifest.model.system_prompt.clone();
     if !memories.is_empty() {
-        // `kind` is hydrated back into the fragment's metadata by the semantic
-        // store on recall (the column is the store of record, v13) — so it is
-        // available here without a MemoryFragment change. It drives the
-        // per-row character budget (ANAI-231).
-        let mem_rows: Vec<crate::prompt_builder::RecalledMemory> = memories
-            .iter()
-            .map(|m| {
-                crate::prompt_builder::RecalledMemory::of_kind(
-                    m.metadata
-                        .get(openfang_memory::semantic::KIND_KEY)
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    m.content.clone(),
-                )
-            })
-            .collect();
+        // ANAI-268: rows carry kind AND age now, so the clock is read here,
+        // once, and the prompt builder stays a pure function of its inputs.
+        let mem_rows = recalled_rows(&memories, chrono::Utc::now());
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&crate::prompt_builder::build_recalled_memory_section(
             &mem_rows,

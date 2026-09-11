@@ -10381,6 +10381,36 @@ fn fact_read_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
 /// enough that the tool result stays a status line rather than a log dump.
 const MEMORY_STATUS_RECENT_LIMIT: usize = 3;
 
+/// One open claim slot, rendered for `memory_status` (ANAI-268).
+///
+/// Built on [`fact_read_json`] rather than beside it: a slot the status call
+/// described differently from the read call would be the same claim wearing
+/// two faces. The three added keys are the *address*, which the read call has
+/// no need for (its caller supplied the address) and this one does — the whole
+/// point is telling an agent about slots it did not think to ask for.
+fn open_slot_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
+    let mut v = fact_read_json(f);
+    if let Some(obj) = v.as_object_mut() {
+        // Spelled the way the MEMORY.md managed block spells it — one
+        // convention for a slot address, not two.
+        obj.insert(
+            "slot".to_string(),
+            serde_json::json!(openfang_memory::memory_md::display_key(f)),
+        );
+        obj.insert("scope".to_string(), serde_json::json!(f.scope));
+        obj.insert("claim_key".to_string(), serde_json::json!(f.claim_key));
+    }
+    v
+}
+
+/// How many open claim slots `memory_status` reports (ANAI-268).
+///
+/// Bounded for the same reason the recent-episode list is: this is a status
+/// call an agent makes mid-turn, and a 200-slot dump would cost more window
+/// than the write it is meant to inform. Twenty is well above what any agent
+/// in the fleet currently holds, so the cap is a ceiling rather than a filter.
+const MEMORY_STATUS_SLOT_LIMIT: usize = 20;
+
 /// How often the episode idle sweep runs (ANAI-219).
 ///
 /// Fixed, not configurable: the knob that matters is
@@ -11632,12 +11662,55 @@ impl KernelHandle for OpenFangKernel {
             })
         };
 
+        // ANAI-268 — the durable layer.
+        //
+        // Until now this tool reported the episode timer and nothing else,
+        // which is the one part of memory an agent cannot act on. The part it
+        // can act on is the set of claim slots it already owns: a slot it can
+        // see makes the next `memory_fact` write recognition rather than
+        // invention. That is the gap that left facts at 8 rows fleet-wide
+        // through two rewrites of the write doctrine.
+        //
+        // Same query, same membership gate, same open-loops-only filter the
+        // MEMORY.md sweep uses (ANAI-212). Deliberately not a second walk: a
+        // status that disagreed with the managed block in the agent's own
+        // workspace would be two answers to one question.
+        let declared = self
+            .registry
+            .get(agent_id)
+            .map(|e| e.manifest.projects.clone())
+            .unwrap_or_default();
+        let (slots, slots_error) = match self.memory.open_claim_slots(
+            agent_id,
+            &declared,
+            &|ancestor: &str| may_read_project(&self.registry, agent_id, ancestor),
+            MEMORY_STATUS_SLOT_LIMIT,
+        ) {
+            Ok(s) => (s, None),
+            // Degrade rather than fail: the idle countdown worked before this
+            // field existed and must keep working if the fact store hiccups.
+            // But say so — an empty list that silently means "query failed"
+            // reads as "you hold no claims", which is a lie in exactly the
+            // direction that invents a duplicate slot.
+            Err(e) => {
+                warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "memory_status: open claim slot query failed"
+                );
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
+        let slots_json: Vec<serde_json::Value> = slots.iter().map(open_slot_json).collect();
+
         Ok(serde_json::json!({
             "episode": status.current.as_ref().map(episode_json),
             "idle_minutes": status.idle_minutes,
             "idle_timeout_minutes": status.idle_timeout_minutes,
             "minutes_until_timer_close": status.minutes_until_timer_close,
             "recent_episodes": status.recent.iter().map(episode_json).collect::<Vec<_>>(),
+            "open_claim_slots": slots_json,
+            "open_claim_slots_error": slots_error,
         }))
     }
 
@@ -13024,6 +13097,62 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    // -----------------------------------------------------------------------
+    // ANAI-268: the open claim slots `memory_status` reports
+    // -----------------------------------------------------------------------
+
+    fn slot_fixture(scope: &str, scope_ref: &str, claim_key: &str) -> openfang_memory::fact::Fact {
+        openfang_memory::fact::Fact {
+            id: openfang_types::memory::MemoryId(uuid::Uuid::nil()),
+            authored_by: Some("openfang-memory".to_string()),
+            scope: scope.to_string(),
+            scope_ref: scope_ref.to_string(),
+            claim_key: claim_key.to_string(),
+            claim: "some claim".to_string(),
+            status: openfang_memory::fact::FactStatus::Open,
+            confidence: 1.0,
+            episode_id: None,
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            last_affirmed_at: None,
+            persistence_class: openfang_memory::staleness::PersistenceClass::Active,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A status payload that named a slot differently from the MEMORY.md
+    /// managed block would send an agent to an address that does not exist,
+    /// and the failure mode is a duplicate slot rather than an error.
+    #[test]
+    fn a_reported_slot_is_addressed_the_way_the_managed_block_addresses_it() {
+        let agent = slot_fixture(
+            "agent",
+            "3aed2639-0000-0000-0000-000000000000",
+            "tool.status",
+        );
+        let v = open_slot_json(&agent);
+        assert_eq!(v["slot"], serde_json::json!("tool.status"));
+        assert_eq!(v["scope"], serde_json::json!("agent"));
+
+        let project = slot_fixture("project", "openfang", "repo.trunk_head");
+        let v = open_slot_json(&project);
+        assert_eq!(v["slot"], serde_json::json!("openfang/repo.trunk_head"));
+        assert_eq!(v["scope"], serde_json::json!("project"));
+    }
+
+    /// The slot payload is the read payload plus an address. If the two ever
+    /// diverge, the same claim describes itself two ways depending on which
+    /// call surfaced it.
+    #[test]
+    fn a_reported_slot_carries_everything_a_direct_read_would() {
+        let f = slot_fixture("project", "openfang", "repo.trunk_head");
+        let read = fact_read_json(&f);
+        let slot = open_slot_json(&f);
+        for (k, v) in read.as_object().unwrap() {
+            assert_eq!(slot.get(k), Some(v), "slot payload dropped `{k}`");
+        }
+        assert_eq!(slot["claim_key"], serde_json::json!("repo.trunk_head"));
+    }
 
     // -----------------------------------------------------------------------
     // ANAI-253: the policy ceiling on the context window
