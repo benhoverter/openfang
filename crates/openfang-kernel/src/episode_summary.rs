@@ -36,7 +36,7 @@
 use crate::kernel::OpenFangKernel;
 use chrono::{Duration, Utc};
 use openfang_memory::episode::{
-    Episode, EPISODE_ID_KEY, MAX_MATERIAL_ROWS, MIN_MATERIAL_ROWS, SUMMARY_KIND,
+    Episode, SkipReason, EPISODE_ID_KEY, MAX_MATERIAL_ROWS, MIN_MATERIAL_ROWS, SUMMARY_KIND,
     SUMMARY_LOOKBACK_MINUTES,
 };
 use openfang_runtime::background_llm::{
@@ -138,6 +138,34 @@ impl OpenFangKernel {
         // unbounded form of this query is the backfill; see
         // `SUMMARY_LOOKBACK_MINUTES`.
         let cutoff = Utc::now() - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+
+        // ANAI-273: stamp the episodes that just aged out of the window, so
+        // "nobody ever summarised this" stops being indistinguishable from
+        // "the tick has not reached it yet".
+        //
+        // The band's FLOOR is the load-bearing half. Unbounded, this would
+        // stamp every historical null-summary episode `orphaned` on its first
+        // run — the retroactive backfill we declined, and worse than declining
+        // it, since labelling yesterday's 118 one-turn closes `orphaned`
+        // destroys any later chance of calling them `thin`. One lookback wide,
+        // it can never reach anything closed more than two lookbacks ago.
+        //
+        // Runs before the select, so the candidate set is already clean, and
+        // before the `candidates.is_empty()` return, so an idle fleet still
+        // gets its aged-out episodes classified.
+        let horizon = cutoff - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+        match self
+            .memory
+            .mark_orphaned_episodes_async(cutoff, horizon)
+            .await
+        {
+            Ok(0) => {}
+            Ok(n) => info!(target: "openfang::consolidation", orphaned = n,
+                           "consolidation: {n} episodes aged out of the summary window"),
+            Err(e) => warn!(target: "openfang::consolidation", error = %e,
+                            "Could not stamp aged-out episodes"),
+        }
+
         let (candidates, pending) = match self
             .memory
             .episodes_awaiting_summary_async(cutoff, cfg.max_per_tick as usize)
@@ -213,6 +241,7 @@ impl OpenFangKernel {
             // Trusting `turn_count` would spend a model call on a polished null.
             if material.len() < MIN_MATERIAL_ROWS {
                 tally.no_material += 1;
+                self.stamp_skip(ep, SkipReason::NoMaterial).await;
                 continue;
             }
 
@@ -232,6 +261,7 @@ impl OpenFangKernel {
             // backfill can pick up if we ever decide these were worth having.
             if material.len() < thin_floor {
                 tally.too_thin += 1;
+                self.stamp_skip(ep, SkipReason::Thin).await;
                 continue;
             }
 
@@ -327,14 +357,17 @@ impl OpenFangKernel {
             .saturating_sub(tally.no_material as usize)
             .saturating_sub(tally.too_thin as usize);
         //
-        // `no_material` deliberately does NOT fire this line on its own: a thin
-        // episode re-selects every tick for the life of the lookback window, so
-        // announcing it would `info!` ~60 times about work that costs nothing.
-        // It is still reported as a field whenever the line does fire, and
-        // `skipped_thin` (ANAI-272) is subtracted and reported on exactly the
-        // same grounds — both are permanent declines, not deferred work, and
-        // counting them as deferred would make this line fire every tick
-        // forever claiming a backlog that will never drain.
+        // `no_material` and `skipped_thin` are subtracted because they are
+        // permanent declines, not deferred work: counting them as deferred
+        // would make this line fire every tick forever claiming a backlog that
+        // will never drain. Neither fires the line on its own either — they are
+        // reported as fields when it does fire, and nothing else.
+        //
+        // Since ANAI-273 a decline is stamped, so each one is counted in
+        // exactly one tick rather than re-counted for the life of the lookback
+        // window. That is what makes these fields readable as a rate. The
+        // per-skip log line ANAI-272 had to suppress is now affordable; it is
+        // still not here, because these two counters already say it.
         if tally.summarized > 0 || deferred > 0 {
             info!(
                 target: "openfang::consolidation",
@@ -346,6 +379,22 @@ impl OpenFangKernel {
                 "consolidation: {} summarized, {deferred} deferred to next tick",
                 tally.summarized
             );
+        }
+    }
+
+    /// Stamp a terminal decline so the episode stops re-entering the queue
+    /// (ANAI-273).
+    ///
+    /// A stamp failure is logged and otherwise ignored: the decline itself
+    /// already happened and is already tallied, and the cost of a missed stamp
+    /// is one re-declined episode per tick — exactly the behaviour that
+    /// predates this column. Failing the whole tick over a diagnostic write
+    /// would trade a cheap, self-correcting loss for an expensive one.
+    async fn stamp_skip(&self, ep: &Episode, reason: SkipReason) {
+        if let Err(e) = self.memory.mark_episode_skipped_async(ep.id, reason).await {
+            warn!(target: "openfang::consolidation", episode = %ep.id, skip_reason = %reason,
+                  error = %e,
+                  "Could not stamp the skip reason — the episode will re-select next tick");
         }
     }
 

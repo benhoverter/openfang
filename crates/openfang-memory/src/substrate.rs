@@ -4,7 +4,7 @@
 //! session store, and consolidation engine behind a single async API.
 
 use crate::consolidation::ConsolidationEngine;
-use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore};
+use crate::episode::{CloseReason, Episode, EpisodeStatus, EpisodeStore, SkipReason};
 use crate::fact::{Fact, FactOutcome, FactStore, FactWrite};
 use crate::knowledge::KnowledgeStore;
 use crate::migration::run_migrations;
@@ -338,6 +338,34 @@ impl MemorySubstrate {
     ) -> OpenFangResult<bool> {
         let store = self.episodes.clone();
         tokio::task::spawn_blocking(move || store.set_summary(id, title.as_deref(), &summary))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Stamp a terminal decline on a closed episode. `false` means something
+    /// got there first — see [`EpisodeStore::mark_skipped`].
+    pub async fn mark_episode_skipped_async(
+        &self,
+        id: uuid::Uuid,
+        reason: SkipReason,
+    ) -> OpenFangResult<bool> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.mark_skipped(id, reason))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Stamp `orphaned` on the episodes that aged out of the summary window
+    /// inside `[floor, ceiling)`. The band is not optional: see
+    /// [`EpisodeStore::mark_orphaned`], where the floor is the thing that keeps
+    /// this from becoming a retroactive relabelling of all history.
+    pub async fn mark_orphaned_episodes_async(
+        &self,
+        ceiling: chrono::DateTime<chrono::Utc>,
+        floor: chrono::DateTime<chrono::Utc>,
+    ) -> OpenFangResult<usize> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.mark_orphaned(ceiling, floor))
             .await
             .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
