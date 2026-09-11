@@ -49,6 +49,13 @@ pub struct RecalledMemory {
     pub kind: Option<String>,
     /// The recalled text.
     pub content: String,
+    /// Whole seconds between the row's `created_at` and the moment of recall,
+    /// or `None` when the caller could not date it (ANAI-268).
+    ///
+    /// Carried as an already-computed age rather than a timestamp so the
+    /// prompt builder stays a pure function of its inputs: the byte-stability
+    /// pin would be a coin flip if this module read the clock.
+    pub age_seconds: Option<i64>,
 }
 
 impl RecalledMemory {
@@ -58,7 +65,16 @@ impl RecalledMemory {
             key: key.into(),
             kind: None,
             content: content.into(),
+            age_seconds: None,
         }
+    }
+
+    /// Attach the row's age at recall time. Negative input — a clock that went
+    /// backwards between write and read — clamps to zero rather than
+    /// rendering a memory from the future.
+    pub fn aged(mut self, age_seconds: i64) -> Self {
+        self.age_seconds = Some(age_seconds.max(0));
+        self
     }
 
     /// A vector-recalled row: no key, but a kind we can budget against.
@@ -67,6 +83,7 @@ impl RecalledMemory {
             key: String::new(),
             kind,
             content: content.into(),
+            age_seconds: None,
         }
     }
 }
@@ -122,6 +139,49 @@ fn budget_for_kind(kind: Option<&str>) -> usize {
         Some(fact::KIND_FACT) => BUDGET_RECALLED_FACT,
         Some(KIND_NOTE) => BUDGET_RECALLED_NOTE,
         _ => BUDGET_RECALLED_TURN,
+    }
+}
+
+/// Render a recalled row's age as the coarsest unit that still says something
+/// (ANAI-268).
+///
+/// Coarse on purpose. The question a reader asks of a recalled row is "is this
+/// current?", and `2d` answers it; `2d 4h 11m` spends prompt characters
+/// pretending to a precision the retrieval order does not have. Anything under
+/// a minute reads as `just now` rather than `0m`, which looks like a bug.
+fn format_age(age_seconds: i64) -> String {
+    let s = age_seconds.max(0);
+    if s < 60 {
+        "just now".to_string()
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86_400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86_400)
+    }
+}
+
+/// The bracketed provenance tag for one recalled row — `[note · 2d]`.
+///
+/// Empty when the row has neither a key, a kind, nor an age, which is the
+/// pre-v13 corpus. Those rows keep the bare `- content` bullet they have
+/// always had rather than gaining an `[unknown]` label that says nothing.
+fn provenance_tag(mem: &RecalledMemory) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if !mem.key.is_empty() {
+        parts.push(mem.key.clone());
+    }
+    if let Some(kind) = mem.kind.as_deref() {
+        parts.push(kind.to_string());
+    }
+    if let Some(age) = mem.age_seconds {
+        parts.push(format_age(age));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", parts.join(" · "))
     }
 }
 /// Prompt context contributed by prompt-only skills.
@@ -624,6 +684,19 @@ pub fn build_memory_section(memories: &[RecalledMemory], granted_tools: &[String
             "- Use the recalled memories below to inform your responses.\n\
              - Only call memory_recall if you need information not already shown here.\n",
         );
+        // ANAI-268. Without this line the tags are decoration; with it they
+        // are the only place an agent is ever told that a row it is reading
+        // came from its own deliberate write. That is the reinforcement the
+        // write doctrine (ANAI-267) has been missing — doctrine says "write it
+        // down", and nothing downstream has ever shown the write arriving.
+        if memories.iter().any(|m| m.kind.is_some()) {
+            out.push_str(
+                "- Each row is tagged [kind · age]. `note` and `fact` are things YOU wrote \
+                 down deliberately — seeing one here is that write paying off. `summary` is a \
+                 compressed past episode; `turn` is a raw captured exchange. Prefer the \
+                 freshest row when two disagree.\n",
+            );
+        }
     }
     out.push_str(&build_write_doctrine(granted_tools));
     if !memories.is_empty() {
@@ -638,11 +711,7 @@ pub fn build_memory_section(memories: &[RecalledMemory], granted_tools: &[String
                 None => "recalled memory".to_string(),
             };
             let capped = cap_str(&mem.content, budget_for_kind(kind), &label);
-            if mem.key.is_empty() {
-                out.push_str(&format!("- {capped}\n"));
-            } else {
-                out.push_str(&format!("- [{}] {}\n", mem.key, capped));
-            }
+            out.push_str(&format!("- {}{}\n", provenance_tag(mem), capped));
         }
     }
     out
@@ -975,7 +1044,10 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_note" => "jot an unstructured note into memory",
         "memory_recall" => "search memory for relevant context",
         "memory_episode_close" => "close and label the current episode",
-        "memory_status" => "check your open episode and idle countdown",
+        "memory_status" => {
+            "check your open episode, idle countdown, and the claim slots you \
+                            already hold"
+        }
         "memory_fact" => "record or update a claim whose value changes over time",
         "memory_history" => "show what a claim slot used to say",
 
@@ -1327,6 +1399,103 @@ mod tests {
         let section = build_memory_section(&memories, &[]);
         assert!(section.contains("recalled note truncated"));
         assert!(section.contains("1000 of 2000 chars shown"));
+    }
+
+    // -----------------------------------------------------------------
+    // ANAI-268 — provenance labels on recalled rows.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn age_renders_as_the_coarsest_useful_unit() {
+        assert_eq!(format_age(0), "just now");
+        assert_eq!(format_age(59), "just now");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3_599), "59m");
+        assert_eq!(format_age(3_600), "1h");
+        assert_eq!(format_age(86_399), "23h");
+        assert_eq!(format_age(86_400), "1d");
+        assert_eq!(format_age(864_000), "10d");
+    }
+
+    /// A clock that went backwards between write and read must not produce a
+    /// memory from the future. Guarded twice: at the constructor and at the
+    /// formatter, because either one can be reached first.
+    #[test]
+    fn a_negative_age_clamps_rather_than_rendering_the_future() {
+        assert_eq!(format_age(-90), "just now");
+        let row = RecalledMemory::of_kind(Some("note".to_string()), "x").aged(-90);
+        assert_eq!(row.age_seconds, Some(0));
+    }
+
+    /// The reinforcement itself: an agent's own note comes back labelled as
+    /// its own note, with an age. Without this the write doctrine (ANAI-267)
+    /// asks for writes whose arrival is never once shown to the writer.
+    #[test]
+    fn a_recalled_note_is_tagged_with_its_kind_and_age() {
+        let memories =
+            vec![RecalledMemory::of_kind(Some("note".to_string()), "the thing").aged(2 * 86_400)];
+        let section = build_memory_section(&memories, &[]);
+        assert!(
+            section.contains("- [note · 2d] the thing"),
+            "got: {section}"
+        );
+    }
+
+    /// The legend is what turns the tag from decoration into instruction, and
+    /// it must not appear when there is nothing tagged to explain.
+    #[test]
+    fn the_legend_appears_only_when_a_row_carries_a_kind() {
+        let tagged = build_memory_section(
+            &[RecalledMemory::of_kind(Some("fact".to_string()), "x")],
+            &[],
+        );
+        assert!(tagged.contains("Each row is tagged"));
+
+        let untagged = build_memory_section(&[RecalledMemory::keyed("k", "x")], &[]);
+        assert!(!untagged.contains("Each row is tagged"));
+
+        let empty = build_memory_section(&[], &[]);
+        assert!(!empty.contains("Each row is tagged"));
+    }
+
+    /// The pre-v13 corpus has rows with no key, no kind and no date. Those
+    /// keep the bare bullet rather than gaining an `[unknown]` tag that would
+    /// spend characters saying nothing.
+    #[test]
+    fn an_undated_unkinded_row_keeps_its_bare_bullet() {
+        let section = build_memory_section(&[RecalledMemory::of_kind(None, "legacy")], &[]);
+        assert!(section.contains("- legacy\n"), "got: {section}");
+        assert!(!section.contains("["));
+    }
+
+    /// The keyed shape predates all of this and is still what `user_name` and
+    /// friends arrive as. Adding kind and age must extend the tag, not replace
+    /// the key inside it.
+    #[test]
+    fn a_key_survives_and_composes_with_kind_and_age() {
+        let bare = build_memory_section(&[RecalledMemory::keyed("pref", "dark mode")], &[]);
+        assert!(bare.contains("- [pref] dark mode"), "got: {bare}");
+
+        let mut row = RecalledMemory::keyed("pref", "dark mode");
+        row.kind = Some("fact".to_string());
+        let full = build_memory_section(&[row.aged(3_600)], &[]);
+        assert!(
+            full.contains("- [pref · fact · 1h] dark mode"),
+            "got: {full}"
+        );
+    }
+
+    /// The tag is prepended to already-capped content, so a truncated row
+    /// still says what it is — the case where knowing the kind matters most,
+    /// because the reader is looking at a fragment.
+    #[test]
+    fn a_truncated_row_still_carries_its_tag() {
+        let memories = vec![
+            RecalledMemory::of_kind(Some("turn".to_string()), "t".repeat(1000)).aged(7 * 86_400),
+        ];
+        let section = build_memory_section(&memories, &[]);
+        assert!(section.contains("- [turn · 7d] ttt"), "got: {section}");
+        assert!(section.contains("recalled turn truncated"));
     }
 
     /// An unrecognised kind falls back to the turn budget rather than to the

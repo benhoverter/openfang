@@ -649,8 +649,11 @@ pub fn built_in_tools() -> Vec<Tool> {
             "memory_status",
             "Report the state of your own memory: which episode is open, how \
              many turns it has captured, how long it has been idle, and when it \
-             will close on its own. Use it to notice you have drifted onto \
-             unrelated work.",
+             will close on its own. Also lists every open claim slot you already \
+             hold - check those before writing a memory_fact, because correcting \
+             a slot you own supersedes it and keeps the history, while inventing \
+             a near-duplicate key splits one claim into two. Use it to notice you \
+             have drifted onto unrelated work.",
             obj(json!({
                 "type": "object",
                 "properties": {}
