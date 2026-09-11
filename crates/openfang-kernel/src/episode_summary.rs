@@ -126,6 +126,21 @@ struct Tally {
     failed: u32,
 }
 
+impl Tally {
+    /// Did this tick do anything worth a line?
+    ///
+    /// Pulled out of the tick so it can be tested at all: the tick itself needs
+    /// a live kernel, a store and a provider, and there is no harness for that
+    /// yet (same gap the ANAI-263 race test is waiting on).
+    fn is_newsworthy(&self, deferred: usize) -> bool {
+        self.summarized > 0
+            || deferred > 0
+            || self.no_material > 0
+            || self.too_thin > 0
+            || self.failed > 0
+    }
+}
+
 impl OpenFangKernel {
     /// One summariser tick. Called from the task spawned in `kernel.rs`.
     pub(crate) async fn consolidate_closed_episodes(&self, state: &mut EpisodeSummarizer) {
@@ -368,7 +383,16 @@ impl OpenFangKernel {
         // window. That is what makes these fields readable as a rate. The
         // per-skip log line ANAI-272 had to suppress is now affordable; it is
         // still not here, because these two counters already say it.
-        if tally.summarized > 0 || deferred > 0 {
+        //
+        // The line fires on **any** work, including a tick that only declined
+        // or only failed. Gating it on `summarized || deferred` alone made the
+        // decline path silent in exactly the case it was built to explain: the
+        // first live `skip_reason='thin'` stamp (19:45:31Z, Sep 11) existed in
+        // SQL and nowhere in the log, because a thin-only tick summarises
+        // nothing and — since declines are subtracted — defers nothing either.
+        // `failed` is included for the same reason: a tick whose only event was
+        // a provider failure is the tick an operator most wants to see.
+        if tally.is_newsworthy(deferred) {
             info!(
                 target: "openfang::consolidation",
                 summarized = tally.summarized,
@@ -376,8 +400,9 @@ impl OpenFangKernel {
                 skipped_no_material = tally.no_material,
                 skipped_thin = tally.too_thin,
                 failed = tally.failed,
-                "consolidation: {} summarized, {deferred} deferred to next tick",
-                tally.summarized
+                "consolidation: {} summarized, {} declined, {deferred} deferred to next tick",
+                tally.summarized,
+                tally.no_material + tally.too_thin
             );
         }
     }
@@ -631,5 +656,42 @@ mod tests {
     #[test]
     fn a_higher_floor_is_honoured() {
         assert_eq!(thin_floor(10), 10);
+    }
+
+    /// The regression this change exists for: on Sep 11 the first live
+    /// `skip_reason='thin'` stamp was written and the tick logged nothing,
+    /// because a decline-only tick summarises nothing and — declines being
+    /// subtracted from `deferred` — defers nothing either.
+    #[test]
+    fn a_tick_that_only_declined_still_earns_a_line() {
+        let thin = Tally {
+            too_thin: 1,
+            ..Default::default()
+        };
+        assert!(thin.is_newsworthy(0));
+
+        let structural = Tally {
+            no_material: 1,
+            ..Default::default()
+        };
+        assert!(structural.is_newsworthy(0));
+    }
+
+    /// A tick whose only event was a provider failure is the one an operator
+    /// most wants to see.
+    #[test]
+    fn a_tick_that_only_failed_still_earns_a_line() {
+        let t = Tally {
+            failed: 1,
+            ..Default::default()
+        };
+        assert!(t.is_newsworthy(0));
+    }
+
+    /// The silence that must survive: the common case is a tick with no closed
+    /// episodes at all, once a minute, forever.
+    #[test]
+    fn an_empty_tick_stays_silent() {
+        assert!(!Tally::default().is_newsworthy(0));
     }
 }

@@ -6294,6 +6294,12 @@ impl OpenFangKernel {
                 // an hour about work that costs nothing. The armed value here
                 // plus `skipped_thin` on the tick summary is the whole witness.
                 let min_rows = self.config.memory.consolidation.min_rows_to_summarize;
+                // ANAI-272 follow-up: the two knobs that bound a tick's cost
+                // are reported here because nothing else prints them. Inferring
+                // that `config.toml` was re-read from a *sibling* subsystem's
+                // boot line is not a witness; these are.
+                let timeout_secs = self.config.memory.consolidation.timeout_secs;
+                let max_per_tick = self.config.memory.consolidation.max_per_tick;
                 tokio::spawn(async move {
                     let mut state = crate::episode_summary::EpisodeSummarizer::new();
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -6314,6 +6320,8 @@ impl OpenFangKernel {
                 info!(
                     model = %model,
                     min_rows_to_summarize = min_rows,
+                    timeout_secs,
+                    max_per_tick,
                     "Episode consolidation scheduled every {}s",
                     crate::episode_summary::CONSOLIDATION_TICK_SECS
                 );
