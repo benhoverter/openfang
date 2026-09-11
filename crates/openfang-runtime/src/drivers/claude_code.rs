@@ -1979,6 +1979,17 @@ impl LlmDriver for ClaudeCodeDriver {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // ANAI-274: reap the child if this future is DROPPED rather than
+        // returning. The in-band timeout below kills the process itself, but a
+        // caller that wraps `complete()` in its own `tokio::time::timeout`
+        // cancels us by dropping — and `message_timeout_secs` (300s) is far
+        // longer than any wrapper's budget, so without this the CLI keeps
+        // running and spending tokens for an answer nobody will read. Measured
+        // on the episode summariser, whose 30s outer budget orphaned a live
+        // `claude` process on every consolidation timeout. The streaming path
+        // has had this since ANAI-116; its absence here was an asymmetry, not
+        // a decision.
+        cmd.kill_on_drop(true);
 
         debug!(cli = %self.cli_path, skip_permissions = self.skip_permissions, bridge_wired, native_deny_wired, "Spawning Claude Code CLI");
 
