@@ -209,6 +209,19 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     // refused at the writer.
     "memory_fact",
     "memory_history",
+    // Browser automation, read-only subset. Default-safe: `navigate` is the
+    // only verb that reaches the network and it is SSRF-checked in
+    // `browser::tool_browser_navigate`; the other four only read or move
+    // within a page the agent already opened. The mutating verbs
+    // (`click`, `type`, `screenshot`) and `browser_run_js` (arbitrary JS in
+    // a live Chrome session — a different threat class from reading a page)
+    // are deliberately absent from `built_in_tools()` entirely, so they
+    // cannot be granted by a future `agent.toml` edit without a code change.
+    "browser_navigate",
+    "browser_read_page",
+    "browser_wait",
+    "browser_scroll",
+    "browser_close",
 ];
 
 /// Agent-lifecycle tools that are dispatchable by the daemon and advertised
@@ -714,6 +727,71 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "required": ["scope", "key"]
             })),
         ),
+        // --- Browser automation, read-only subset ---
+        //
+        // Mirrors `openfang_runtime::tool_runner` → `browser_*`. Dispatch is
+        // already plumbed: `bridge_ipc::dispatch_call` passes
+        // `Some(&kernel.browser_ctx)` into `execute_tool`, so these became
+        // reachable the moment the name cleared the gate tables. Sessions are
+        // keyed by agent id and reclaimed on idle by the BrowserManager; the
+        // bridge holds no state.
+        //
+        // Descriptions and schemas are copied verbatim from the runtime
+        // definitions — Invariant C
+        // (`openfang_api::bridge_ipc::tests::advertised_tool_schemas_match_runtime`)
+        // asserts property- and required-set equality per tool. Tail-appended,
+        // like every other bridge tool, because `built_in_tools_surface`
+        // asserts an exact ordered vec.
+        Tool::new(
+            "browser_navigate",
+            "Navigate a browser to a URL. Returns the page title and readable content as markdown. Opens a persistent browser session.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The URL to navigate to (http/https only)" }
+                },
+                "required": ["url"]
+            })),
+        ),
+        Tool::new(
+            "browser_read_page",
+            "Read the current browser page content as structured markdown. Use after clicking or navigating to see the updated page.",
+            obj(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        ),
+        Tool::new(
+            "browser_wait",
+            "Wait for a CSS selector to appear on the page. Useful for dynamic content that loads asynchronously.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector to wait for" },
+                    "timeout_ms": { "type": "integer", "description": "Max wait time in milliseconds (default: 5000, max: 30000)" }
+                },
+                "required": ["selector"]
+            })),
+        ),
+        Tool::new(
+            "browser_scroll",
+            "Scroll the browser page. Use this to see content below the fold or navigate long pages.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "direction": { "type": "string", "description": "Scroll direction: 'up', 'down', 'left', 'right' (default: 'down')" },
+                    "amount": { "type": "integer", "description": "Pixels to scroll (default: 600)" }
+                }
+            })),
+        ),
+        Tool::new(
+            "browser_close",
+            "Close the browser session. The browser will also auto-close when the agent loop ends.",
+            obj(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        ),
     ]
 }
 
@@ -963,6 +1041,11 @@ mod tests {
                 "memory_note",
                 "memory_fact",
                 "memory_history",
+                "browser_navigate",
+                "browser_read_page",
+                "browser_wait",
+                "browser_scroll",
+                "browser_close",
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"

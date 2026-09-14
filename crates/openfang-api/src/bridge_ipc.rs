@@ -95,6 +95,16 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     // slot, `memory_history` reads the supersession trail behind it.
     "memory_fact",
     "memory_history",
+    // Browser automation, read-only subset. `browser_ctx` was already
+    // threaded into `execute_tool` below; these five names are what let a
+    // subprocess agent reach it. `click`/`type`/`screenshot`/`run_js`/`back`
+    // stay off the bridge entirely — see the note in
+    // `openfang_mcp_bridge::DEFAULT_ALLOWED`.
+    "browser_navigate",
+    "browser_read_page",
+    "browser_wait",
+    "browser_scroll",
+    "browser_close",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -1845,10 +1855,11 @@ mod tests {
         use openfang_mcp_bridge::{built_in_tools, DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
         // ANAI-166: 22 -> 23 (`memory_note`).
         // ANAI-204: 23 -> 25 (`memory_fact`, `memory_history`).
-        assert_eq!(ALLOWED_TOOLS.len(), 25, "ALLOWED_TOOLS surface cardinality");
+        // Browser: 25 -> 30 (navigate / read_page / wait / scroll / close).
+        assert_eq!(ALLOWED_TOOLS.len(), 30, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            25,
+            30,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -1858,8 +1869,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            21,
-            "DEFAULT_ALLOWED bridge-default cardinality (25 − 4 privileged)"
+            26,
+            "DEFAULT_ALLOWED bridge-default cardinality (30 − 4 privileged)"
         );
     }
 

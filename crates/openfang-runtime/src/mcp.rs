@@ -380,6 +380,11 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "memory_note",
     "memory_fact",
     "memory_history",
+    "browser_navigate",
+    "browser_read_page",
+    "browser_wait",
+    "browser_scroll",
+    "browser_close",
 ];
 
 /// True if `name` shadows an OpenFang built-in tool.
