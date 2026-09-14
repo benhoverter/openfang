@@ -26,6 +26,31 @@ use openfang_runtime::drivers;
 use openfang_runtime::llm_driver::{CompletionRequest, DriverConfig};
 use tracing::{debug, warn};
 
+/// Target for background-LLM lines that belong to no other subsystem's stream.
+///
+/// Kept for the gatekeeper: it is not this lane's subsystem, and it fires once
+/// per gated command, so its per-call debug line must not inherit that volume
+/// onto a stream an operator greps for memory questions. Alpha can name her own
+/// directive when she wants the judge's timings.
+const BACKGROUND_LLM_LOG_TARGET: &str = "openfang::background_llm";
+
+/// Target for *consolidation's* per-call line — the memory ladder's stream.
+///
+/// ANAI-274 follow-up. `elapsed_ms` shipped on `BACKGROUND_LLM_LOG_TARGET`, a
+/// target no `RUST_LOG` directive in the deployed plist names, so it fell
+/// through to the base `info` filter and printed **zero** times across two days
+/// of healthy summaries — in the commit whose entire purpose was measurement.
+/// Same failure class as the pre-`6ab7307` compaction declines: the instrument
+/// existed and no query could reach it. `context_pressure` is already `debug`
+/// in the deployed `RUST_LOG`, so this needs no plist edit and no operator
+/// action, and consolidation timings land beside the rest of the ladder.
+///
+/// Note the shape below: `tracing` builds callsite metadata in a `static`, so a
+/// target is a compile-time string and **cannot** be chosen at runtime. That is
+/// why the success arm branches on `purpose` around a local macro instead of
+/// passing a target in.
+const CONSOLIDATION_LOG_TARGET: &str = openfang_runtime::history_trim::TARGET;
+
 /// One purpose's slice of state.
 #[derive(Default)]
 struct Slot {
@@ -143,7 +168,7 @@ impl OpenFangKernel {
                 Ok(d) => Some(d),
                 Err(e) => {
                     warn!(
-                        target: "openfang::background_llm",
+                        target: BACKGROUND_LLM_LOG_TARGET,
                         purpose = %purpose,
                         provider = %provider,
                         error = %e,
@@ -200,20 +225,33 @@ impl OpenFangKernel {
 
         match call {
             Ok(Ok(response)) => {
-                debug!(
-                    target: "openfang::background_llm",
-                    purpose = %purpose,
-                    model = %req.model,
-                    elapsed_ms,
-                    prompt_chars,
-                    timeout_secs = req.timeout_secs,
-                    "Background LLM call completed"
-                );
+                // One event, two callsites. `tracing` bakes the target into
+                // static callsite metadata, so it cannot be an expression —
+                // the branch is the only way to give one purpose a different
+                // stream, and the macro is what stops the two field lists
+                // drifting apart the way the two recall map blocks did.
+                macro_rules! completed {
+                    ($target:expr) => {
+                        debug!(
+                            target: $target,
+                            purpose = %purpose,
+                            model = %req.model,
+                            elapsed_ms,
+                            prompt_chars,
+                            timeout_secs = req.timeout_secs,
+                            "Background LLM call completed"
+                        )
+                    };
+                }
+                match purpose {
+                    BackgroundPurpose::Consolidation => completed!(CONSOLIDATION_LOG_TARGET),
+                    BackgroundPurpose::Gatekeeper => completed!(BACKGROUND_LLM_LOG_TARGET),
+                }
                 BackgroundLlmOutcome::Answered(response.text())
             }
             Ok(Err(e)) => {
                 warn!(
-                    target: "openfang::background_llm",
+                    target: BACKGROUND_LLM_LOG_TARGET,
                     purpose = %purpose,
                     model = %req.model,
                     elapsed_ms,
@@ -225,7 +263,7 @@ impl OpenFangKernel {
             }
             Err(_elapsed) => {
                 warn!(
-                    target: "openfang::background_llm",
+                    target: BACKGROUND_LLM_LOG_TARGET,
                     purpose = %purpose,
                     model = %req.model,
                     elapsed_ms,
@@ -284,5 +322,25 @@ mod tests {
         state.note_success(BackgroundPurpose::Gatekeeper);
         assert_eq!(state.failures(BackgroundPurpose::Gatekeeper), 0);
         assert_eq!(state.note_failure(BackgroundPurpose::Gatekeeper), 1);
+    }
+
+    /// ANAI-274 follow-up: pin the target the consolidation timing line is
+    /// emitted on, and pin that it is *not* the one the deployed `RUST_LOG`
+    /// leaves at `info`.
+    ///
+    /// Honest scope, same as `compaction_log_target_is_the_pressure_stream`:
+    /// this pins our half only. `ai.openfang.daemon.plist` lives outside the
+    /// repo, so an operator renaming the `context_pressure=debug` directive
+    /// still silences this line without failing a test. The literal is
+    /// asserted alongside the symbol precisely so the plist's spelling is
+    /// written down somewhere CI can see it.
+    #[test]
+    fn consolidation_timings_land_on_the_ladder_stream() {
+        assert_eq!(
+            CONSOLIDATION_LOG_TARGET,
+            openfang_runtime::history_trim::TARGET
+        );
+        assert_eq!(CONSOLIDATION_LOG_TARGET, "context_pressure");
+        assert_ne!(CONSOLIDATION_LOG_TARGET, BACKGROUND_LLM_LOG_TARGET);
     }
 }
