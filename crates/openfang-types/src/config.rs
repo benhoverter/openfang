@@ -548,6 +548,14 @@ pub struct BrowserConfig {
     pub idle_timeout_secs: u64,
     /// Maximum concurrent browser sessions.
     pub max_sessions: usize,
+    /// Maximum characters of extracted page content returned by
+    /// `browser_read_page`. Content longer than this is truncated with a
+    /// `... (truncated)` marker; the pre-truncation length is logged.
+    ///
+    /// A rendered page is denser than raw HTML and lands directly in the
+    /// agent's context window, so this is deliberately lower than
+    /// `[web.fetch] max_bytes`.
+    pub max_content_chars: usize,
     /// Path to Chromium/Chrome binary. Auto-detected if None.
     pub chromium_path: Option<String>,
 }
@@ -562,6 +570,7 @@ impl Default for BrowserConfig {
             timeout_secs: 30,
             idle_timeout_secs: 300,
             max_sessions: 5,
+            max_content_chars: 150_000,
             chromium_path: None,
         }
     }
@@ -4926,6 +4935,11 @@ impl KernelConfig {
             self.web.fetch.max_response_bytes = 50_000_000;
         }
 
+        // Browser content cap: min 1K chars, max 1M chars. Zero would return an
+        // empty page for every read; 1M chars is already ~250K tokens and would
+        // blow any agent's context window.
+        self.browser.max_content_chars = self.browser.max_content_chars.clamp(1_000, 1_000_000);
+
         // Web fetch timeout: min 5s, max 120s
         if self.web.fetch.timeout_secs == 0 {
             self.web.fetch.timeout_secs = 30;
@@ -5569,6 +5583,26 @@ mod tests {
         assert_eq!(config.browser.max_sessions, browser_sessions);
         assert_eq!(config.web.fetch.max_response_bytes, fetch_bytes);
         assert_eq!(config.web.fetch.timeout_secs, fetch_timeout);
+        // 150K chars must survive clamping — it is the shipped default.
+        assert_eq!(config.browser.max_content_chars, 150_000);
+    }
+
+    #[test]
+    fn test_browser_max_content_chars_is_configurable_and_clamped() {
+        let cfg: BrowserConfig = toml::from_str("max_content_chars = 200000").unwrap();
+        assert_eq!(cfg.max_content_chars, 200_000);
+
+        // Zero would return an empty page for every read.
+        let mut config = KernelConfig::default();
+        config.browser.max_content_chars = 0;
+        config.clamp_bounds();
+        assert_eq!(config.browser.max_content_chars, 1_000);
+
+        // And an absurd value is capped rather than blowing a context window.
+        let mut config = KernelConfig::default();
+        config.browser.max_content_chars = 50_000_000;
+        config.clamp_bounds();
+        assert_eq!(config.browser.max_content_chars, 1_000_000);
     }
 
     #[test]
