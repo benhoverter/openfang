@@ -212,11 +212,12 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     // Browser automation, read-only subset. Default-safe: `navigate` is the
     // only verb that reaches the network and it is SSRF-checked in
     // `browser::tool_browser_navigate`; the other four only read or move
-    // within a page the agent already opened. The mutating verbs
-    // (`click`, `type`, `screenshot`) and `browser_run_js` (arbitrary JS in
-    // a live Chrome session — a different threat class from reading a page)
-    // are deliberately absent from `built_in_tools()` entirely, so they
-    // cannot be granted by a future `agent.toml` edit without a code change.
+    // within a page the agent already opened. The page-driving verbs
+    // (`click`, `type`, `screenshot`, `back`) and `browser_run_js` are
+    // advertised too, but are classified into [`PRIVILEGED_DEFAULT_DENY`]
+    // rather than here: they are reachable only when an agent's manifest
+    // grants them via `OPENFANG_BRIDGE_ALLOWED`, never from the no-env-var
+    // fallback.
     "browser_navigate",
     "browser_read_page",
     "browser_wait",
@@ -224,9 +225,10 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     "browser_close",
 ];
 
-/// Agent-lifecycle tools that are dispatchable by the daemon and advertised
-/// by the bridge, **but excluded from [`DEFAULT_ALLOWED`]** so the
-/// no-env-var fallback path cannot reach them.
+/// Tools that are dispatchable by the daemon and advertised by the bridge,
+/// **but excluded from [`DEFAULT_ALLOWED`]** so the no-env-var fallback path
+/// cannot reach them. Two families live here: agent-lifecycle control, and
+/// the page-driving browser verbs.
 ///
 /// Closes S7-06 / S4-02 (bridge-side): in the legacy/dev path
 /// (`OPENFANG_BRIDGE_ALLOWED` unset) an agent's bridge would otherwise be
@@ -234,6 +236,14 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
 /// manifest. Production callers thread `OPENFANG_BRIDGE_ALLOWED` from the
 /// manifest-derived `available_tools`, so opted-in agents are unaffected;
 /// only the fallback is narrowed.
+///
+/// The browser entries follow the same rule for a different reason.
+/// `click` / `type` / `screenshot` / `back` mutate or capture a live page,
+/// and `run_js` executes arbitrary JavaScript in a real Chrome session —
+/// a materially different threat class from reading rendered markdown, and
+/// one that SSRF-checking on `navigate` does not cover. They are advertised
+/// so a manifest can grant them deliberately, and default-denied so nothing
+/// gets them by accident.
 ///
 /// Drift-pin: the `bridge_ipc::allowlist_*` tests assert that every entry
 /// here is **present** in `ALLOWED_TOOLS` and `built_in_tools()` and
@@ -243,6 +253,11 @@ pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
     "agent_kill",
     "agent_activate",
     "agent_send_async",
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+    "browser_run_js",
+    "browser_back",
 ];
 
 pub fn built_in_tools() -> Vec<Tool> {
@@ -792,6 +807,62 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "properties": {}
             })),
         ),
+        // --- Browser automation, page-driving subset ---
+        //
+        // Advertised so a manifest can grant them, but classified into
+        // `PRIVILEGED_DEFAULT_DENY` rather than `DEFAULT_ALLOWED`: these
+        // mutate, capture, or execute inside a live page. Schemas copied
+        // verbatim from the runtime definitions, same as above.
+        Tool::new(
+            "browser_click",
+            "Click an element on the current browser page by CSS selector or visible text. Returns the resulting page state.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector (e.g., '#submit-btn', '.add-to-cart') or visible text to click" }
+                },
+                "required": ["selector"]
+            })),
+        ),
+        Tool::new(
+            "browser_type",
+            "Type text into an input field on the current browser page.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector for the input field (e.g., 'input[name=\"email\"]', '#search-box')" },
+                    "text": { "type": "string", "description": "The text to type into the field" }
+                },
+                "required": ["selector", "text"]
+            })),
+        ),
+        Tool::new(
+            "browser_screenshot",
+            "Take a screenshot of the current browser page. Returns a base64-encoded PNG image.",
+            obj(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        ),
+        Tool::new(
+            "browser_run_js",
+            "Run JavaScript on the current browser page and return the result. For advanced interactions that other browser tools cannot handle.",
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "expression": { "type": "string", "description": "JavaScript expression to run in the page context" }
+                },
+                "required": ["expression"]
+            })),
+        ),
+        Tool::new(
+            "browser_back",
+            "Go back to the previous page in browser history.",
+            obj(json!({
+                "type": "object",
+                "properties": {}
+            })),
+        ),
     ]
 }
 
@@ -1046,6 +1117,11 @@ mod tests {
                 "browser_wait",
                 "browser_scroll",
                 "browser_close",
+                "browser_click",
+                "browser_type",
+                "browser_screenshot",
+                "browser_run_js",
+                "browser_back",
             ],
             "surface drift — update both this test and the runtime tool_runner \
              schema when adding or removing built-in bridge tools"

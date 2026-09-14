@@ -97,14 +97,21 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "memory_history",
     // Browser automation, read-only subset. `browser_ctx` was already
     // threaded into `execute_tool` below; these five names are what let a
-    // subprocess agent reach it. `click`/`type`/`screenshot`/`run_js`/`back`
-    // stay off the bridge entirely — see the note in
-    // `openfang_mcp_bridge::DEFAULT_ALLOWED`.
+    // subprocess agent reach it.
     "browser_navigate",
     "browser_read_page",
     "browser_wait",
     "browser_scroll",
     "browser_close",
+    // Browser automation, page-driving subset. Same dispatch path; these are
+    // classified into `openfang_mcp_bridge::PRIVILEGED_DEFAULT_DENY`, so they
+    // reach an agent only through a manifest-derived
+    // `OPENFANG_BRIDGE_ALLOWED` grant and never from the no-env-var fallback.
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+    "browser_run_js",
+    "browser_back",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -1588,10 +1595,13 @@ mod tests {
     ///
     /// **Invariant B (safe-by-default subset, S7-06 / S4-02):**
     /// `DEFAULT_ALLOWED ⊂ ALLOWED_TOOLS`, with the deliberate exclusion of
-    /// `PRIVILEGED_DEFAULT_DENY` — `agent_spawn`, `agent_kill`,
-    /// `agent_activate`. The runtime threads the manifest-derived allowlist
-    /// through `OPENFANG_BRIDGE_ALLOWED`, so opted-in agents still reach
-    /// these tools; only the no-env-var fallback is narrowed.
+    /// `PRIVILEGED_DEFAULT_DENY` — the agent-lifecycle verbs
+    /// (`agent_spawn`, `agent_kill`, `agent_activate`, `agent_send_async`)
+    /// and the page-driving browser verbs (`browser_click`, `browser_type`,
+    /// `browser_screenshot`, `browser_run_js`, `browser_back`). The runtime
+    /// threads the manifest-derived allowlist through
+    /// `OPENFANG_BRIDGE_ALLOWED`, so opted-in agents still reach these
+    /// tools; only the no-env-var fallback is narrowed.
     ///
     /// If you're here because this test failed: a bridge tool add or remove
     /// must touch `crates/openfang-api/src/bridge_ipc.rs` (`ALLOWED_TOOLS`)
@@ -1856,21 +1866,24 @@ mod tests {
         // ANAI-166: 22 -> 23 (`memory_note`).
         // ANAI-204: 23 -> 25 (`memory_fact`, `memory_history`).
         // Browser: 25 -> 30 (navigate / read_page / wait / scroll / close).
-        assert_eq!(ALLOWED_TOOLS.len(), 30, "ALLOWED_TOOLS surface cardinality");
+        // Browser, page-driving: 30 -> 35 (click / type / screenshot /
+        // run_js / back). All five are privileged-deny, so `DEFAULT_ALLOWED`
+        // is unchanged at 26 and `PRIVILEGED_DEFAULT_DENY` goes 4 -> 9.
+        assert_eq!(ALLOWED_TOOLS.len(), 35, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            30,
+            35,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
             PRIVILEGED_DEFAULT_DENY.len(),
-            4,
-            "PRIVILEGED_DEFAULT_DENY cardinality (agent_spawn/agent_kill/agent_activate/agent_send_async)"
+            9,
+            "PRIVILEGED_DEFAULT_DENY cardinality (agent lifecycle x4 + browser click/type/screenshot/run_js/back)"
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
             26,
-            "DEFAULT_ALLOWED bridge-default cardinality (30 − 4 privileged)"
+            "DEFAULT_ALLOWED bridge-default cardinality (35 − 9 privileged)"
         );
     }
 
@@ -1894,6 +1907,41 @@ mod tests {
                 !DEFAULT_ALLOWED.contains(&tool),
                 "S7-06/S4-02 regression: {tool} re-introduced into DEFAULT_ALLOWED. \
                  Privileged agent-lifecycle tools must only reach the bridge via \
+                 manifest-derived OPENFANG_BRIDGE_ALLOWED.",
+            );
+        }
+    }
+
+    /// Name-level pin for the page-driving browser verbs. The set-level test
+    /// above catches drift generically; this one names the five so a grep for
+    /// `browser_run_js` lands on the regression guard.
+    ///
+    /// The rule: reading a rendered page is default-safe, *driving* one is
+    /// not. `run_js` in particular executes arbitrary JavaScript in a live
+    /// Chrome session, which SSRF-checking on `browser_navigate` does not
+    /// cover. These must be granted per-agent in `agent.toml` or not at all.
+    #[test]
+    fn page_driving_browser_tools_excluded_from_default() {
+        use openfang_mcp_bridge::{DEFAULT_ALLOWED, PRIVILEGED_DEFAULT_DENY};
+        for tool in [
+            "browser_click",
+            "browser_type",
+            "browser_screenshot",
+            "browser_run_js",
+            "browser_back",
+        ] {
+            assert!(
+                ALLOWED_TOOLS.contains(&tool),
+                "{tool} must be daemon-dispatchable",
+            );
+            assert!(
+                PRIVILEGED_DEFAULT_DENY.contains(&tool),
+                "{tool} must be in PRIVILEGED_DEFAULT_DENY",
+            );
+            assert!(
+                !DEFAULT_ALLOWED.contains(&tool),
+                "regression: {tool} re-introduced into DEFAULT_ALLOWED. \
+                 Page-driving browser verbs must only reach the bridge via \
                  manifest-derived OPENFANG_BRIDGE_ALLOWED.",
             );
         }
