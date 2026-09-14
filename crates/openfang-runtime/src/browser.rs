@@ -229,6 +229,8 @@ struct BrowserSession {
     cdp: CdpConnection,
     #[allow(dead_code)]
     last_active: Instant,
+    /// Snapshot of `BrowserConfig::max_content_chars` taken at launch.
+    max_content_chars: usize,
 }
 
 impl BrowserSession {
@@ -327,6 +329,7 @@ impl BrowserSession {
             process: child,
             cdp,
             last_active: Instant::now(),
+            max_content_chars: config.max_content_chars,
         })
     }
 
@@ -460,6 +463,29 @@ impl BrowserSession {
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok())
                     .unwrap_or(val);
+                // Log what we extracted before truncation so a short read can be
+                // diagnosed as "cap hit" vs "selector missed the content".
+                let full_len = parsed["full_length"].as_u64().unwrap_or(0);
+                let returned = parsed["content"].as_str().map(str::len).unwrap_or(0);
+                let truncated = parsed["truncated"].as_bool().unwrap_or(false);
+                let root = parsed["root"].as_str().unwrap_or("unknown");
+                if truncated {
+                    warn!(
+                        full_length = full_len,
+                        returned_length = returned,
+                        max_content_chars = self.max_content_chars,
+                        root = %root,
+                        "browser_read_page truncated page content"
+                    );
+                } else {
+                    debug!(
+                        full_length = full_len,
+                        returned_length = returned,
+                        max_content_chars = self.max_content_chars,
+                        root = %root,
+                        "browser_read_page extracted page content"
+                    );
+                }
                 if parsed["success"].as_bool() == Some(false) {
                     return BrowserResponse::err(
                         parsed["error"]
@@ -540,7 +566,8 @@ impl BrowserSession {
     }
 
     async fn cmd_read_page(&self) -> BrowserResponse {
-        match self.cdp.run_js(EXTRACT_CONTENT_JS).await {
+        let js = extract_content_js(self.max_content_chars);
+        match self.cdp.run_js(&js).await {
             Ok(val) => {
                 let parsed: serde_json::Value = val
                     .as_str()
@@ -646,7 +673,7 @@ impl BrowserSession {
 
         let content_val = self
             .cdp
-            .run_js(EXTRACT_CONTENT_JS)
+            .run_js(&extract_content_js(self.max_content_chars))
             .await
             .unwrap_or_default();
         let content_obj: serde_json::Value = content_val
@@ -654,11 +681,23 @@ impl BrowserSession {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or(content_val);
         let content_text = content_obj["content"].as_str().unwrap_or("");
+        let full_length = content_obj["full_length"].as_u64().unwrap_or(0);
+        let truncated = content_obj["truncated"].as_bool().unwrap_or(false);
+        if truncated {
+            warn!(
+                full_length,
+                returned_length = content_text.len(),
+                max_content_chars = self.max_content_chars,
+                "browser page content truncated"
+            );
+        }
 
         Ok(serde_json::json!({
             "title": parsed["title"],
             "url": parsed["url"],
             "content": content_text,
+            "full_length": full_length,
+            "truncated": truncated,
         }))
     }
 }
@@ -870,6 +909,19 @@ impl BrowserManager {
 
 // ── Tool handler functions ─────────────────────────────────────────────────
 
+/// Render a one-line notice when the extractor hit the content cap, so the
+/// agent knows the page is incomplete rather than short. Empty when the whole
+/// page fit.
+fn truncation_notice(data: &serde_json::Value) -> String {
+    if !data["truncated"].as_bool().unwrap_or(false) {
+        return String::new();
+    }
+    let full = data["full_length"].as_u64().unwrap_or(0);
+    format!(
+        "\nNote: extracted content was {full} chars and has been truncated. Scroll or narrow the page if you need the rest."
+    )
+}
+
 /// browser_navigate: Navigate to a URL. SSRF-checked before sending.
 pub async fn tool_browser_navigate(
     input: &serde_json::Value,
@@ -896,9 +948,10 @@ pub async fn tool_browser_navigate(
     let page_url = data["url"].as_str().unwrap_or(url);
     let content = data["content"].as_str().unwrap_or("");
     let wrapped = crate::web_content::wrap_external_content(page_url, content);
+    let notice = truncation_notice(&data);
 
     Ok(format!(
-        "Navigated to: {page_url}\nTitle: {title}\n\n{wrapped}"
+        "Navigated to: {page_url}\nTitle: {title}{notice}\n\n{wrapped}"
     ))
 }
 
@@ -1014,7 +1067,9 @@ pub async fn tool_browser_read_page(
     let content = data["content"].as_str().unwrap_or("");
     let wrapped = crate::web_content::wrap_external_content(url, content);
 
-    Ok(format!("Page: {title}\nURL: {url}\n\n{wrapped}"))
+    let notice = truncation_notice(&data);
+
+    Ok(format!("Page: {title}\nURL: {url}{notice}\n\n{wrapped}"))
 }
 
 /// browser_close: Close the browser session.
@@ -1120,18 +1175,34 @@ pub async fn tool_browser_back(
 
 // ── Embedded JavaScript ────────────────────────────────────────────────────
 
+/// Placeholder substituted with the configured content cap before the
+/// extraction script is evaluated. Used instead of `format!` because the
+/// script is full of `{}` braces.
+const MAX_CHARS_PLACEHOLDER: &str = "__OPENFANG_MAX_CONTENT_CHARS__";
+
+/// Build the page-extraction script with the configured character cap.
+///
+/// The returned JSON also carries `full_length` (pre-truncation length),
+/// `truncated`, and `root` (which selector the extractor settled on) so a
+/// short read can be attributed to the cap or to the selector narrowing.
+fn extract_content_js(max_chars: usize) -> String {
+    EXTRACT_CONTENT_JS_TEMPLATE.replace(MAX_CHARS_PLACEHOLDER, &max_chars.to_string())
+}
+
 /// JavaScript to extract readable page content as markdown.
-const EXTRACT_CONTENT_JS: &str = r#"(() => {
+const EXTRACT_CONTENT_JS_TEMPLATE: &str = r#"(() => {
+    const MAX_CHARS = __OPENFANG_MAX_CONTENT_CHARS__;
     const title = document.title || '';
     const url = location.href || '';
     const body = document.body;
-    if (!body) return JSON.stringify({title, url, content: ''});
+    if (!body) return JSON.stringify({title, url, content: '', full_length: 0, truncated: false, root: 'none'});
 
     const clone = body.cloneNode(true);
     const remove = ['script','style','nav','footer','header','aside','iframe','noscript','svg','canvas'];
     remove.forEach(tag => clone.querySelectorAll(tag).forEach(el => el.remove()));
 
     let root = clone.querySelector('main, article, [role="main"], .content, #content');
+    let rootKind = root ? root.tagName.toLowerCase() : 'body';
     if (!root) root = clone;
 
     const lines = [];
@@ -1164,8 +1235,10 @@ const EXTRACT_CONTENT_JS: &str = r#"(() => {
     walk(root);
 
     let content = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    if (content.length > 50000) content = content.substring(0, 50000) + '\n... (truncated)';
-    return JSON.stringify({title, url, content});
+    const fullLength = content.length;
+    const truncated = fullLength > MAX_CHARS;
+    if (truncated) content = content.substring(0, MAX_CHARS) + '\n... (truncated)';
+    return JSON.stringify({title, url, content, full_length: fullLength, truncated, root: rootKind});
 })()"#;
 
 // ── Root detection ─────────────────────────────────────────────────────────
@@ -1213,7 +1286,29 @@ mod tests {
         assert_eq!(config.timeout_secs, 30);
         assert_eq!(config.idle_timeout_secs, 300);
         assert_eq!(config.max_sessions, 5);
+        assert_eq!(config.max_content_chars, 150_000);
         assert!(config.chromium_path.is_none());
+    }
+
+    #[test]
+    fn extract_script_substitutes_configured_cap() {
+        let js = extract_content_js(12_345);
+        assert!(
+            !js.contains(MAX_CHARS_PLACEHOLDER),
+            "placeholder must not survive into the evaluated script"
+        );
+        assert!(js.contains("const MAX_CHARS = 12345;"));
+    }
+
+    #[test]
+    fn extract_script_reports_pre_truncation_length() {
+        // The Rust side and the read_page tool both key off these field names;
+        // renaming one in the JS without the other silently loses the
+        // truncation diagnostics.
+        let js = extract_content_js(BrowserConfig::default().max_content_chars);
+        assert!(js.contains("full_length"));
+        assert!(js.contains("truncated"));
+        assert!(js.contains("root: rootKind"));
     }
 
     #[test]
