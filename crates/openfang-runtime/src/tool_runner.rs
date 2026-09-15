@@ -4092,10 +4092,64 @@ fn render_fact_body(fact: &serde_json::Value) -> String {
     out
 }
 
+/// ANAI-277: the addresses that already exist where a new slot was just
+/// minted.
+///
+/// Appended to the *created* message only, because that is the only outcome
+/// where the agent still has a choice to make. A supersession means the right
+/// address was already selected, and repeating the neighbourhood there would
+/// train the agent to skim past the one message that carries a decision.
+///
+/// Advisory throughout. The write has already committed and nothing here can
+/// or should undo it: a refusal at this point loses a claim the agent took the
+/// trouble to record, which is a far worse failure than a duplicate key.
+fn render_slot_neighbourhood(payload: &serde_json::Value) -> String {
+    let addresses: Vec<&str> = payload["existing_slots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if addresses.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "\nAddresses that already exist here. If one of them is this same claim under \
+         another name, write THAT key from now on — rewriting a slot supersedes it and \
+         keeps the history, while a second key splits one claim in two and surfaces both:\n",
+    );
+    for address in &addresses {
+        out.push_str(&format!("  - {address}\n"));
+    }
+
+    let total = payload["existing_slots_total"].as_u64().unwrap_or(0) as usize;
+    if total > addresses.len() {
+        // Say what was dropped rather than letting a capped list read as the
+        // whole address space — the omitted tail is where an old settled slot
+        // is most likely to be hiding.
+        out.push_str(&format!(
+            "  ({} more not shown; memory_status lists your open slots)\n",
+            total - addresses.len()
+        ));
+    }
+
+    if let Some(near) = payload["likely_duplicate_of"].as_str() {
+        out.push_str(&format!(
+            "NEAR-DUPLICATE: `{near}` is a close spelling of the key you just minted. This is \
+             a lexical guess, not a judgement about meaning — if the two are the same claim, \
+             make `{near}` the one you keep writing.\n"
+        ));
+    }
+
+    out
+}
+
 fn render_fact_write(payload: &serde_json::Value) -> String {
     let slot = fact_slot_label(payload);
     match payload["outcome"].as_str().unwrap_or("") {
-        "created" => format!("Created {slot}. This slot was empty; it now holds your claim."),
+        "created" => format!(
+            "Created {slot}. This slot was empty; it now holds your claim.{}",
+            render_slot_neighbourhood(payload)
+        ),
         // Named distinctly from "created" on purpose: an agent that cannot
         // tell "I already believed this" from "I have changed my mind" will
         // report a no-op as news.
@@ -8911,6 +8965,108 @@ mod tests {
                 "{name}: scope and key are the minimum addressable slot"
             );
         }
+    }
+
+    // --- ANAI-277: the write-time slot neighbourhood -----------------------
+
+    #[test]
+    fn a_created_slot_reports_the_addresses_around_it() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "project",
+            "scope_ref": "kimiya",
+            "claim_key": "project.kimiya.matrix_baseline_recording",
+            "existing_slots": [
+                "kimiya/project.kimiya.matrix_baseline_state",
+                "kimiya/repo.inference_vendor",
+            ],
+            "existing_slots_total": 2,
+            "likely_duplicate_of": "kimiya/project.kimiya.matrix_baseline_state",
+        }));
+        assert!(out.contains("Created"), "{out}");
+        assert!(
+            out.contains("kimiya/project.kimiya.matrix_baseline_state"),
+            "the near address must be named: {out}"
+        );
+        assert!(
+            out.contains("kimiya/repo.inference_vendor"),
+            "the full neighbourhood is shown, not just the ranked guess: {out}"
+        );
+        assert!(out.contains("NEAR-DUPLICATE"), "{out}");
+    }
+
+    /// The guess is lexical and says so. An advisory that presented itself as
+    /// a judgement about meaning would be trusted past what it can support,
+    /// and the cost of a wrong merge is two claims and their histories.
+    #[test]
+    fn the_near_duplicate_call_is_marked_as_a_guess() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "agent",
+            "scope_ref": "agent-x",
+            "claim_key": "repo.trunk_heads",
+            "existing_slots": ["repo.trunk_head"],
+            "existing_slots_total": 1,
+            "likely_duplicate_of": "repo.trunk_head",
+        }));
+        assert!(
+            out.contains("lexical guess, not a judgement about meaning"),
+            "{out}"
+        );
+    }
+
+    /// A capped list that read as the whole address space would be worse than
+    /// no list: the omitted tail is where an old settled slot hides.
+    #[test]
+    fn a_truncated_neighbourhood_says_what_it_dropped() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "agent",
+            "scope_ref": "agent-x",
+            "claim_key": "memory.new",
+            "existing_slots": ["a.one", "b.two"],
+            "existing_slots_total": 9,
+            "likely_duplicate_of": serde_json::Value::Null,
+        }));
+        assert!(out.contains("(7 more not shown"), "{out}");
+        assert!(!out.contains("NEAR-DUPLICATE"), "{out}");
+    }
+
+    /// A supersession means the right address was already chosen. Repeating
+    /// the neighbourhood there trains the agent to skim the one message that
+    /// carries a decision.
+    #[test]
+    fn a_supersession_carries_no_neighbourhood() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "superseded",
+            "scope": "agent",
+            "scope_ref": "agent-x",
+            "claim_key": "repo.trunk_head",
+            "previous_claim": "main @ deadbee",
+            "existing_slots": ["memory.other"],
+            "existing_slots_total": 1,
+        }));
+        assert!(out.contains("Superseded"), "{out}");
+        assert!(!out.contains("memory.other"), "{out}");
+        assert!(!out.contains("Addresses that already exist"), "{out}");
+    }
+
+    /// The first slot an agent ever writes has no neighbourhood, and a header
+    /// introducing an empty list reads as a malfunction.
+    #[test]
+    fn an_empty_neighbourhood_is_silent() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "agent",
+            "scope_ref": "agent-x",
+            "claim_key": "memory.first",
+            "existing_slots": [],
+            "existing_slots_total": 0,
+        }));
+        assert_eq!(
+            out,
+            "Created agent/agent-x memory.first. This slot was empty; it now holds your claim."
+        );
     }
 
     #[tokio::test]

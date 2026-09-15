@@ -10440,6 +10440,16 @@ fn open_slot_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
 /// in the fleet currently holds, so the cap is a ceiling rather than a filter.
 const MEMORY_STATUS_SLOT_LIMIT: usize = 20;
 
+/// How deep the write-time slot-neighbourhood scan reads (ANAI-277).
+///
+/// Deliberately larger than the handful of addresses the hint will render:
+/// the ranking has to *see* a neighbour before it can promote it, and the
+/// key most likely to be duplicated is an old settled one sitting well down
+/// the store's open-loops-first ordering. The read is a single indexed query
+/// on a created outcome only — the rarest of the three — so the width is
+/// cheap where a narrow scan would silently miss the case this exists for.
+const SLOT_HINT_SCAN_LIMIT: usize = 200;
+
 /// How often the episode idle sweep runs (ANAI-219).
 ///
 /// Fixed, not configurable: the knob that matters is
@@ -11876,6 +11886,42 @@ impl KernelHandle for OpenFangKernel {
             ),
         };
 
+        // ANAI-277. A created outcome is the only moment slot proliferation
+        // can still be corrected cheaply, and the only moment the agent has a
+        // reason to look. Hand back the addresses that already exist here so
+        // "prefer a key that already exists" stops being an instruction with
+        // no input.
+        //
+        // Best-effort by construction: the claim is already durable, and
+        // failing a successful write over a failed advisory would trade the
+        // thing we wanted for the hint about it. A failure logs and yields no
+        // hint — never a partial one, which would read as "you own nothing
+        // similar".
+        let neighbours = if outcome_name == "created" {
+            match self.memory.owned_slot_addresses(
+                agent_id,
+                scope.as_str(),
+                &scope_ref,
+                SLOT_HINT_SCAN_LIMIT,
+            ) {
+                Ok(addresses) => openfang_memory::slot_hints::rank_neighbours(
+                    &request.claim_key,
+                    &addresses,
+                    openfang_memory::slot_hints::NEIGHBOUR_CAP,
+                ),
+                Err(e) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Slot neighbourhood lookup failed; the write stands without a hint"
+                    );
+                    openfang_memory::slot_hints::RankedNeighbours::default()
+                }
+            }
+        } else {
+            openfang_memory::slot_hints::RankedNeighbours::default()
+        };
+
         // ANAI-212: the block is a view of the slot store, so a write that
         // changes a slot must change the view. Gated on the same config flag
         // the periodic sweep is: one switch decides whether the fleet's
@@ -11900,6 +11946,9 @@ impl KernelHandle for OpenFangKernel {
             "claim_key": request.claim_key,
             "previous_claim": previous_claim,
             "episode_id": episode_id.to_string(),
+            "existing_slots": neighbours.addresses,
+            "existing_slots_total": neighbours.total,
+            "likely_duplicate_of": neighbours.likely_duplicate,
         }))
     }
 

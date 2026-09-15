@@ -748,6 +748,62 @@ impl MemorySubstrate {
         Ok(open)
     }
 
+    /// ANAI-277: every slot address that already exists where a new claim was
+    /// just written, in [`crate::memory_md::display_key`] spelling.
+    ///
+    /// The input to the one decision this hint exists to enable: *is the key I
+    /// just minted a second spelling of a slot that is already here?* Returned
+    /// on a created outcome and nowhere else — on a supersession the agent has
+    /// already selected the right address, and repeating the neighbourhood
+    /// would teach it to skip the message that matters.
+    ///
+    /// Three deliberate choices:
+    ///
+    /// **All statuses.** [`Self::open_claim_slots`] filters to open loops
+    /// because injection spends window; this spends nothing and the settled
+    /// slots are exactly the ones a new key most often duplicates. Every fact
+    /// the fleet had written as of 2026-09-15 was `settled`, so an open-only
+    /// hint would have been empty for every agent it was built for.
+    ///
+    /// **Author-blind**, like [`crate::fact::FactStore::get`]: a slot belongs
+    /// to its subject, not to whoever last wrote it. ANAI-276 partitions the
+    /// managed block by authorship because injection is a budget fight; this
+    /// is an address space, and hiding a sibling's key here would invite the
+    /// exact collision the partition cannot fix.
+    ///
+    /// **Agent scope rides along** when the write went elsewhere. The measured
+    /// `repo.inference_vendor` → `project.kimiya.inference_pin` drift crossed
+    /// scopes, so a same-scope-only list would be blind to half the evidence.
+    /// Not the reverse: an agent-scope write does not enumerate every project
+    /// it belongs to, which would be a long list of slots it mostly cannot own.
+    pub fn owned_slot_addresses(
+        &self,
+        agent_id: AgentId,
+        scope: &str,
+        scope_ref: &str,
+        limit: usize,
+    ) -> OpenFangResult<Vec<String>> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |fact: &Fact, out: &mut Vec<String>| {
+            let addr = crate::memory_md::display_key(fact);
+            if seen.insert(addr.clone()) {
+                out.push(addr);
+            }
+        };
+
+        for fact in self.facts().list_for_scope(scope, scope_ref, limit)? {
+            push(&fact, &mut out);
+        }
+        let own = agent_id.to_string();
+        if scope != "agent" || scope_ref != own {
+            for fact in self.facts().list_for_scope("agent", &own, limit)? {
+                push(&fact, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
     /// Set or clear a session label.
     pub fn set_session_label(
         &self,
@@ -1810,6 +1866,107 @@ mod tests {
             .open_claim_slots(agent_id, &[], &|_: &str| false, 50)
             .unwrap();
         assert_eq!(slots.len(), 1);
+    }
+
+    // --- ANAI-277: the address space a new key was minted into -------------
+
+    /// Settled slots are the ones a new key most often duplicates — every
+    /// fact in the live corpus on 2026-09-15 was settled — so an open-only
+    /// hint would have been empty for every agent it was built for.
+    #[tokio::test]
+    async fn the_neighbourhood_includes_settled_slots() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        substrate
+            .facts()
+            .upsert(crate::fact::FactWrite::new(
+                agent_id,
+                "agent",
+                "repo.inference_vendor",
+                "anthropic",
+            ))
+            .unwrap();
+        open_slot(&substrate, agent_id, "agent", None, "memory.loop", "open");
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .unwrap();
+        assert!(addresses.contains(&"repo.inference_vendor".to_string()));
+        assert!(addresses.contains(&"memory.loop".to_string()));
+    }
+
+    /// The measured `repo.inference_vendor` → `project.kimiya.inference_pin`
+    /// drift crossed scopes. A same-scope-only neighbourhood is blind to it.
+    #[tokio::test]
+    async fn a_project_write_still_sees_the_agents_own_slots() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "agent",
+            None,
+            "repo.inference_vendor",
+            "anthropic",
+        );
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("kimiya"),
+            "project.kimiya.other",
+            "x",
+        );
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "project", "kimiya", 50)
+            .unwrap();
+        assert!(
+            addresses.contains(&"kimiya/project.kimiya.other".to_string()),
+            "project slots render with their slug: {addresses:?}"
+        );
+        assert!(
+            addresses.contains(&"repo.inference_vendor".to_string()),
+            "agent-scope slots ride along on a project write: {addresses:?}"
+        );
+    }
+
+    /// An agent-scope write must not enumerate every project the agent
+    /// belongs to — a long list of addresses it mostly cannot own is noise
+    /// that buries the handful it can.
+    #[tokio::test]
+    async fn an_agent_write_does_not_enumerate_projects() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(&substrate, agent_id, "agent", None, "memory.mine", "mine");
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .unwrap();
+        assert_eq!(addresses, vec!["memory.mine".to_string()]);
+    }
+
+    /// A slot reached by two paths is one address. The agent-scope pass runs
+    /// unconditionally on a non-agent write and would otherwise re-report
+    /// everything an `agent`-scoped caller had already collected.
+    #[tokio::test]
+    async fn the_neighbourhood_reports_each_address_once() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(&substrate, agent_id, "agent", None, "memory.mine", "mine");
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .unwrap();
+        assert_eq!(addresses.len(), 1, "{addresses:?}");
     }
 
     #[tokio::test]

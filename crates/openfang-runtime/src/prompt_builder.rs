@@ -611,7 +611,11 @@ fn build_write_doctrine(granted_tools: &[String]) -> String {
              and write the same slot again when the value moves; that supersedes the old value \
              and keeps the history. Two tells that you want a fact and not a note: you are about \
              to correct or update something you wrote before, or the sentence you are writing \
-             would be wrong next month rather than merely old.\n",
+             would be wrong next month rather than merely old. Prefer a slot address you already \
+             hold over a new one: the addresses are listed in your MEMORY.md managed block, and a \
+             write that mints a NEW slot answers with the addresses that already exist there. Two \
+             keys for one claim is not two facts — it splits the claim and both halves keep \
+             surfacing.\n",
         );
     }
     if has_store {
@@ -1555,6 +1559,29 @@ mod tests {
         assert!(
             !section.contains("Store important preferences"),
             "the old blanket instruction must not survive alongside note/fact"
+        );
+    }
+
+    /// ANAI-277. The supersession machinery had never fired once: agents mint
+    /// a new key rather than rewrite a slot, because nothing ever showed them
+    /// the keys they already hold. The bullet must point at the two surfaces
+    /// that now do — the managed block and the created-slot reply — rather
+    /// than at the abstraction "a key that already exists", which is what two
+    /// rounds of rewording already asked for and did not get.
+    #[test]
+    fn the_fact_bullet_points_at_the_addresses_an_agent_can_see() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(
+            section.contains("MEMORY.md managed block"),
+            "the clause must name where the addresses are listed"
+        );
+        assert!(
+            section.contains("mints a NEW slot"),
+            "the write-time surface must be named too: {section}"
+        );
+        assert!(
+            section.contains("splits the claim"),
+            "the cost of a duplicate key has to be stated, not implied"
         );
     }
 
