@@ -8030,6 +8030,17 @@ impl OpenFangKernel {
         // from its neighbour for no reason a reader could explain.
         let now = chrono::Utc::now();
 
+        // ANAI-276: sibling lines name their author, and the store holds ids.
+        // Built once per sweep rather than per agent: the registry walk below
+        // is already the expensive part, and a map that changed mid-sweep
+        // would name the same author two ways in two files.
+        let author_names: std::collections::HashMap<String, String> = self
+            .registry
+            .list()
+            .iter()
+            .map(|e| (e.id.to_string(), e.name.clone()))
+            .collect();
+
         /// Skeleton plan for one agent; the arms below fill in the outcome.
         fn base_plan(agent: &str, agent_id: String, path: &Path) -> MemoryMdSweepPlan {
             MemoryMdSweepPlan {
@@ -8109,7 +8120,10 @@ impl OpenFangKernel {
                 continue;
             }
 
-            let block = render_managed_block(&facts, now);
+            let self_id = entry.id.to_string();
+            let block = render_managed_block(&facts, now, &self_id, &|id: &str| {
+                author_names.get(id).cloned()
+            });
             let updated = match splice_managed_block(&existing, &block) {
                 Ok(s) => s,
                 Err(e) => {
@@ -14429,6 +14443,22 @@ mod tests {
         agent_id
     }
 
+    /// Same, but declaring one project — the membership the sweep's read gate
+    /// and ANAI-276's authorship partition both key off.
+    fn register_agent_in_project(
+        kernel: &OpenFangKernel,
+        name: &str,
+        state_dir: &std::path::Path,
+        project: &str,
+    ) -> AgentId {
+        let id = register_agent_with_state_dir(kernel, name, state_dir);
+        kernel
+            .registry
+            .update_projects(id, vec![project.to_string()])
+            .unwrap();
+        id
+    }
+
     #[test]
     fn test_migrate_shared_memory_schedules_imports_legacy_entries() {
         let tmp = tempfile::tempdir().unwrap();
@@ -15767,6 +15797,65 @@ system_prompt = "You are a test agent."
         let out = std::fs::read_to_string(&path).unwrap();
         assert!(out.contains("memory.open_loop"));
         assert!(!out.contains("memory.settled_background"));
+
+        kernel.shutdown();
+    }
+
+    /// ANAI-276: project scope is shared, so a prolific sibling used to fill
+    /// every other member's always-injected layer with its own claim text.
+    /// The address survives — cross-agent awareness is what project scope is
+    /// *for* — but the body does not, and the line names its author.
+    #[test]
+    fn test_memory_md_sweep_demotes_a_siblings_project_claim() {
+        use openfang_memory::fact::{FactStatus, FactWrite};
+        let (tmp, kernel) = sweep_test_kernel("of-sweep-authorship");
+
+        let mine_ws = tmp.path().join("ws-reader");
+        let theirs_ws = tmp.path().join("ws-author");
+        let reader = register_agent_in_project(&kernel, "reader", &mine_ws, "kimiya");
+        let author = register_agent_in_project(&kernel, "compliance", &theirs_ws, "kimiya");
+        std::fs::write(mine_ws.join("MEMORY.md"), "# Long-Term Memory\n").unwrap();
+        std::fs::write(theirs_ws.join("MEMORY.md"), "# Long-Term Memory\n").unwrap();
+
+        // The sibling's loop, and one of the reader's own.
+        kernel
+            .memory
+            .facts()
+            .upsert(
+                FactWrite::new(
+                    author,
+                    "project",
+                    "project.kimiya.dpa_status",
+                    "unsigned pending counsel",
+                )
+                .with_scope_ref("kimiya")
+                .with_status(FactStatus::Open),
+            )
+            .unwrap();
+        seed_open_slot(&kernel, reader, "build.schema_state", "v3 lands Tuesday");
+
+        assert_eq!(kernel.sweep_memory_md().errors, 0);
+
+        let mine = std::fs::read_to_string(mine_ws.join("MEMORY.md")).unwrap();
+        assert!(
+            mine.contains("`kimiya/project.kimiya.dpa_status`"),
+            "address survives"
+        );
+        assert!(
+            !mine.contains("unsigned pending counsel"),
+            "a sibling's claim body must not be injected into my prompt"
+        );
+        assert!(mine.contains("_open loop, compliance_"), "author is named");
+        assert!(
+            mine.contains("v3 lands Tuesday"),
+            "my own loop renders in full"
+        );
+
+        // The author's own file is unaffected by the partition: it is the one
+        // agent for whom that claim is not a sibling's.
+        let theirs = std::fs::read_to_string(theirs_ws.join("MEMORY.md")).unwrap();
+        assert!(theirs.contains("unsigned pending counsel"));
+        assert!(!theirs.contains("## Open in your projects"));
 
         kernel.shutdown();
     }

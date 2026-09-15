@@ -41,6 +41,23 @@
 //! * **A superseded claim can never render.** Supersession moves the old text
 //!   to `fact_history`, and this reads live slots, so the block cannot show a
 //!   claim the store no longer believes.
+//!
+//! # Why the block is partitioned by authorship (ANAI-276)
+//!
+//! Project-scope claims are *shared*: every member of a project can read every
+//! open slot under it. That is the point of project scope, and it is also how
+//! one agent's work ends up in another agent's always-injected layer. Measured
+//! live before this change: all nine slots rendered into `kimiya-alpha`'s
+//! MEMORY.md were authored by `kimiya-reviewer-compliance` — roughly 3 KB of
+//! compliance prose injected every turn into an agent working on swap schemas.
+//!
+//! The fix is a partition, not a quota. A cap rations the window between agents
+//! by volume, which is the wrong axis; authorship is the right one and it is
+//! already on the row. Self-authored loops render in full and are never capped.
+//! Everyone else's render *demoted*: address and author only, no claim body,
+//! capped at [`SIBLING_SLOT_CAP`]. An agent that needs a sibling's claim can
+//! read the slot by key — it does not need the prose pasted into every prompt
+//! to know the loop exists.
 
 use chrono::{DateTime, Utc};
 
@@ -60,6 +77,14 @@ pub const BLOCK_BUDGET_CHARS: usize = 4000;
 
 /// Maximum characters rendered for a single claim before elision.
 pub const VALUE_CAP_CHARS: usize = 240;
+
+/// Maximum number of sibling slots the demoted section will list.
+///
+/// Self-authored loops are never capped — an agent's own unfinished business
+/// is the thing this block exists to carry. Siblings are, because their count
+/// is bounded by how prolific the other members of a project happen to be,
+/// which is not a property of the agent reading the file.
+pub const SIBLING_SLOT_CAP: usize = 12;
 
 /// Why a splice was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +138,22 @@ pub fn display_key(fact: &Fact) -> String {
     }
 }
 
+/// Does this slot belong to the agent whose file is being rendered?
+///
+/// Agent-scope slots are the agent's own *by address* — `scope_ref` is its own
+/// id, and [`crate::substrate::Substrate::open_claim_slots`] only ever loads
+/// agent scope for the agent itself — so they count as self-authored even when
+/// `authored_by` is missing, which is the shape every row written before
+/// authorship was recorded has.
+///
+/// Project-scope slots are attributed strictly: an unattributed one is treated
+/// as a sibling's. The failure being fixed is other agents' work arriving as if
+/// it were yours, so the ambiguous case defaults to demotion rather than to
+/// promotion.
+pub fn is_self_authored(fact: &Fact, self_agent_id: &str) -> bool {
+    fact.scope == "agent" || fact.authored_by.as_deref() == Some(self_agent_id)
+}
+
 /// The age trailer, in the same shape the rehydration pack uses.
 ///
 /// Deliberately identical wording: a claim that says `verify` in a briefing and
@@ -158,17 +199,38 @@ fn cap(s: &str, max: usize) -> String {
 ///
 /// The output is deterministic: identical input renders byte-identical output,
 /// so a sweep that changes nothing rewrites nothing.
-pub fn render_managed_block(facts: &[Fact], now: DateTime<Utc>) -> String {
-    let header = "_Auto-generated from this agent's **open** claim slots (`memory_fact` with \
-                  `status: open`). Settled claims are not listed here — read them by key with \
-                  `memory_fact`, or find them with `memory_recall`. Correct a claim by writing \
-                  the slot, not by editing this block: edits inside it are overwritten by the \
-                  next sweep. Durable prose belongs below it._";
+/// `self_agent_id` names the agent whose file this is; slots authored by anyone
+/// else are demoted to the sibling section (ANAI-276). `author_label` resolves
+/// an author id to a display name — the store holds ids, and a uuid in a
+/// sibling line is noise a reader cannot act on. It returns `Option` so an
+/// author who has since been removed from the registry renders as an unnamed
+/// sibling rather than failing the sweep.
+///
+/// When nothing is sibling-authored the output has no section headings at all,
+/// which is byte-identical to what this rendered before the partition existed:
+/// a solo agent should not have to read about a distinction that does not
+/// apply to it.
+pub fn render_managed_block(
+    facts: &[Fact],
+    now: DateTime<Utc>,
+    self_agent_id: &str,
+    author_label: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    let header = "_Auto-generated from **open** claim slots (`memory_fact` with `status: open`). \
+                  Settled claims are not listed here — read them by key with `memory_fact`, or \
+                  find them with `memory_recall`. Correct a claim by writing the slot, not by \
+                  editing this block: edits inside it are overwritten by the next sweep. Durable \
+                  prose belongs below it._";
+
+    let (mine, siblings): (Vec<&Fact>, Vec<&Fact>) = facts
+        .iter()
+        .partition(|f| is_self_authored(f, self_agent_id));
 
     let mut body = String::new();
-    let mut rendered = 0usize;
+    let mut used = 0usize;
+    let mut rendered_mine = 0usize;
 
-    for fact in facts {
+    for fact in &mine {
         let line = format!(
             "- `{}` — {} {}\n",
             display_key(fact),
@@ -176,28 +238,83 @@ pub fn render_managed_block(facts: &[Fact], now: DateTime<Utc>) -> String {
             trailer(fact, now),
         );
         // Reserve room for the footer we may still need to append.
-        if body.chars().count() + line.chars().count() > BLOCK_BUDGET_CHARS {
+        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
             break;
         }
+        used += line.chars().count();
         body.push_str(&line);
-        rendered += 1;
+        rendered_mine += 1;
     }
 
-    let omitted = facts.len().saturating_sub(rendered);
-    let footer = if omitted > 0 {
-        format!(
-            "\n_[… {omitted} more open slot(s) omitted: managed block is at its \
-             {BLOCK_BUDGET_CHARS}-char budget. Use `memory_recall` for these.]_\n"
-        )
-    } else {
-        String::new()
-    };
+    let mut sibling_body = String::new();
+    let mut rendered_siblings = 0usize;
 
-    if rendered == 0 && omitted == 0 {
+    for fact in siblings.iter().take(SIBLING_SLOT_CAP) {
+        let who = fact
+            .authored_by
+            .as_deref()
+            .and_then(author_label)
+            .unwrap_or_else(|| "another agent".to_string());
+        // Address and author only: the demotion *is* the missing claim body.
+        let line = format!("- `{}` — _open loop, {}_\n", display_key(fact), who);
+        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
+            break;
+        }
+        used += line.chars().count();
+        sibling_body.push_str(&line);
+        rendered_siblings += 1;
+    }
+
+    let omitted_mine = mine.len().saturating_sub(rendered_mine);
+    let omitted_siblings = siblings.len().saturating_sub(rendered_siblings);
+
+    if mine.is_empty() && siblings.is_empty() {
         return format!("{MANAGED_BEGIN}\n{header}\n\n_No open claim slots._\n{MANAGED_END}");
     }
 
-    format!("{MANAGED_BEGIN}\n{header}\n\n{body}{footer}{MANAGED_END}")
+    let mut out = String::new();
+    if siblings.is_empty() {
+        out.push_str(&body);
+        if omitted_mine > 0 {
+            out.push_str(&omission_footer(omitted_mine, "open slot(s)"));
+        }
+    } else {
+        out.push_str("## Your open loops\n\n");
+        if rendered_mine == 0 {
+            out.push_str(
+                "_None. You have not written an open claim slot — `memory_fact` with \
+                 `status: open` records unfinished business you want your next window to \
+                 start with._\n",
+            );
+        } else {
+            out.push_str(&body);
+        }
+        if omitted_mine > 0 {
+            out.push_str(&omission_footer(omitted_mine, "of your open slot(s)"));
+        }
+        out.push_str(
+            "\n## Open in your projects\n\n_Other agents' open loops, listed by address only. \
+             Read one with `memory_fact` if you need it; do not write into a slot you do not \
+             own._\n",
+        );
+        out.push_str(&sibling_body);
+        if omitted_siblings > 0 {
+            out.push_str(&format!(
+                "\n_[… {omitted_siblings} more sibling slot(s) not listed: this section is \
+                 capped at {SIBLING_SLOT_CAP}. Use `memory_recall` for these.]_\n"
+            ));
+        }
+    }
+
+    format!("{MANAGED_BEGIN}\n{header}\n\n{out}{MANAGED_END}")
+}
+
+/// The visible "there was more" line. Omissions are reported, never silent.
+fn omission_footer(omitted: usize, what: &str) -> String {
+    format!(
+        "\n_[… {omitted} more {what} omitted: managed block is at its \
+         {BLOCK_BUDGET_CHARS}-char budget. Use `memory_recall` for these.]_\n"
+    )
 }
 
 /// Replace the managed region of `existing` with `block`, preserving every byte
@@ -296,6 +413,8 @@ mod tests {
     use uuid::Uuid;
 
     const NOW: &str = "2026-08-30T00:00:00Z";
+    const SELF_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const SIBLING_ID: &str = "22222222-2222-4222-8222-222222222222";
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(NOW)
@@ -303,10 +422,22 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// Render as the agent that authored everything, with no name resolver.
+    fn render(facts: &[Fact]) -> String {
+        render_managed_block(facts, now(), SELF_ID, &|_| None)
+    }
+
+    /// Render with a registry that can name the sibling.
+    fn render_named(facts: &[Fact]) -> String {
+        render_managed_block(facts, now(), SELF_ID, &|id| {
+            (id == SIBLING_ID).then(|| "kimiya-reviewer-compliance".to_string())
+        })
+    }
+
     fn slot(scope: &str, scope_ref: &str, key: &str, claim: &str) -> Fact {
         Fact {
             id: MemoryId(Uuid::new_v4()),
-            authored_by: None,
+            authored_by: Some(SELF_ID.to_string()),
             scope: scope.to_string(),
             scope_ref: scope_ref.to_string(),
             claim_key: key.to_string(),
@@ -325,10 +456,16 @@ mod tests {
         slot("agent", &Uuid::new_v4().to_string(), key, claim)
     }
 
+    /// A project slot someone else wrote — the shape ANAI-276 demotes.
+    fn sibling_slot(key: &str, claim: &str) -> Fact {
+        let mut f = slot("project", "kimiya", key, claim);
+        f.authored_by = Some(SIBLING_ID.to_string());
+        f
+    }
+
     #[test]
     fn renders_open_slots_between_markers() {
-        let block =
-            render_managed_block(&[agent_slot("build.forge_cmd", "cargo xtask forge")], now());
+        let block = render(&[agent_slot("build.forge_cmd", "cargo xtask forge")]);
         assert!(block.starts_with(MANAGED_BEGIN));
         assert!(block.ends_with(MANAGED_END));
         assert!(block.contains("`build.forge_cmd` — cargo xtask forge"));
@@ -337,21 +474,18 @@ mod tests {
     #[test]
     fn agent_scope_does_not_render_its_uuid() {
         let fact = agent_slot("memory.fact_tool_status", "live");
-        let block = render_managed_block(std::slice::from_ref(&fact), now());
+        let block = render(std::slice::from_ref(&fact));
         assert!(!block.contains(&fact.scope_ref));
     }
 
     #[test]
     fn project_scope_renders_its_slug() {
-        let block = render_managed_block(
-            &[slot(
-                "project",
-                "openfang",
-                "repo.trunk_head",
-                "main @ 3d6cd3c",
-            )],
-            now(),
-        );
+        let block = render(&[slot(
+            "project",
+            "openfang",
+            "repo.trunk_head",
+            "main @ 3d6cd3c",
+        )]);
         assert!(block.contains("`openfang/repo.trunk_head` — main @ 3d6cd3c"));
     }
 
@@ -370,14 +504,14 @@ mod tests {
         let mut fact = slot("project", "openfang", "deploy.live_binary", "pid 70484");
         fact.persistence_class = PersistenceClass::Volatile;
         fact.created_at = "2026-08-20T00:00:00Z".to_string();
-        let block = render_managed_block(&[fact], now());
+        let block = render(&[fact]);
         assert!(block.contains("· verify]"));
         assert!(block.contains("last verified 10d ago"));
     }
 
     #[test]
     fn a_fresh_claim_carries_its_class_and_no_marker() {
-        let block = render_managed_block(&[agent_slot("k", "v")], now());
+        let block = render(&[agent_slot("k", "v")]);
         assert!(block.contains("_[stable]_"));
         assert!(!block.contains("verify]"));
     }
@@ -386,13 +520,13 @@ mod tests {
     fn an_undateable_claim_is_flagged_rather_than_called_fresh() {
         let mut fact = agent_slot("k", "v");
         fact.created_at = "not-a-timestamp".to_string();
-        let block = render_managed_block(&[fact], now());
+        let block = render(&[fact]);
         assert!(block.contains("age unknown · verify"));
     }
 
     #[test]
     fn empty_slot_set_still_renders_a_valid_block() {
-        let block = render_managed_block(&[], now());
+        let block = render(&[]);
         assert!(block.contains("No open claim slots"));
         // Must still be spliceable, so the next sweep can find its own markers.
         let spliced = splice_managed_block("", &block).unwrap();
@@ -401,7 +535,7 @@ mod tests {
 
     #[test]
     fn multiline_claims_are_flattened_to_one_line() {
-        let block = render_managed_block(&[agent_slot("note", "line one\nline two")], now());
+        let block = render(&[agent_slot("note", "line one\nline two")]);
         assert!(block.contains("`note` — line one line two"));
         assert_eq!(block.matches("`note`").count(), 1);
     }
@@ -409,7 +543,7 @@ mod tests {
     #[test]
     fn oversized_claims_are_capped() {
         let long = "x".repeat(VALUE_CAP_CHARS * 2);
-        let block = render_managed_block(&[agent_slot("big", &long)], now());
+        let block = render(&[agent_slot("big", &long)]);
         assert!(block.contains('…'));
         assert!(!block.contains(&"x".repeat(VALUE_CAP_CHARS + 1)));
     }
@@ -419,7 +553,7 @@ mod tests {
         let facts: Vec<Fact> = (0..100)
             .map(|i| agent_slot(&format!("key_{i:03}"), &"v".repeat(VALUE_CAP_CHARS)))
             .collect();
-        let block = render_managed_block(&facts, now());
+        let block = render(&facts);
         assert!(block.chars().count() < BLOCK_BUDGET_CHARS + 700);
         assert!(block.contains("more open slot(s) omitted"));
     }
@@ -427,16 +561,13 @@ mod tests {
     #[test]
     fn render_is_deterministic() {
         let facts = vec![agent_slot("a", "1"), slot("project", "openfang", "b", "2")];
-        assert_eq!(
-            render_managed_block(&facts, now()),
-            render_managed_block(&facts, now())
-        );
+        assert_eq!(render(&facts), render(&facts));
     }
 
     #[test]
     fn append_when_no_markers_present() {
         let existing = "# Long-Term Memory\n\nHand-written prose.\n";
-        let block = render_managed_block(&[agent_slot("k", "v")], now());
+        let block = render(&[agent_slot("k", "v")]);
         let out = splice_managed_block(existing, &block).unwrap();
         assert!(out.starts_with(existing));
         assert!(out.contains(MANAGED_BEGIN));
@@ -447,7 +578,7 @@ mod tests {
         let before = "# Long-Term Memory\n\nBen prefers small diffs.\n\n";
         let after = "\n\n## Notes\nFORGE transform layer is Erik's.\n";
         let existing = format!("{before}{MANAGED_BEGIN}\nstale\n{MANAGED_END}{after}");
-        let block = render_managed_block(&[agent_slot("k", "v")], now());
+        let block = render(&[agent_slot("k", "v")]);
         let out = splice_managed_block(&existing, &block).unwrap();
         assert!(out.starts_with(before));
         assert!(out.ends_with(after));
@@ -456,7 +587,7 @@ mod tests {
 
     #[test]
     fn splice_is_idempotent() {
-        let block = render_managed_block(&[agent_slot("k", "v")], now());
+        let block = render(&[agent_slot("k", "v")]);
         let once = splice_managed_block("# Memory\n\nprose\n", &block).unwrap();
         let twice = splice_managed_block(&once, &block).unwrap();
         assert_eq!(once, twice);
@@ -465,7 +596,7 @@ mod tests {
     #[test]
     fn refuses_unterminated_block() {
         let existing = format!("prose\n{MANAGED_BEGIN}\nhalf a block\n");
-        let block = render_managed_block(&[], now());
+        let block = render(&[]);
         assert_eq!(
             splice_managed_block(&existing, &block),
             Err(SpliceError::UnterminatedBlock)
@@ -475,7 +606,7 @@ mod tests {
     #[test]
     fn refuses_orphaned_end_marker() {
         let existing = format!("prose\n{MANAGED_END}\nmore\n");
-        let block = render_managed_block(&[], now());
+        let block = render(&[]);
         assert_eq!(
             splice_managed_block(&existing, &block),
             Err(SpliceError::OrphanedEnd)
@@ -486,7 +617,7 @@ mod tests {
     fn refuses_duplicate_begin_markers() {
         let existing =
             format!("{MANAGED_BEGIN}\na\n{MANAGED_END}\n{MANAGED_BEGIN}\nb\n{MANAGED_END}\n");
-        let block = render_managed_block(&[], now());
+        let block = render(&[]);
         assert_eq!(
             splice_managed_block(&existing, &block),
             Err(SpliceError::DuplicateBegin)
@@ -495,26 +626,23 @@ mod tests {
 
     #[test]
     fn empty_file_gets_a_clean_block() {
-        let block = render_managed_block(&[agent_slot("k", "v")], now());
+        let block = render(&[agent_slot("k", "v")]);
         let out = splice_managed_block("", &block).unwrap();
         assert_eq!(out, format!("{block}\n"));
     }
 
     #[test]
     fn block_keys_round_trip_from_a_rendered_block() {
-        let block = render_managed_block(
-            &[
-                agent_slot("a_key", "v"),
-                slot("project", "openfang", "b_key", "v"),
-            ],
-            now(),
-        );
+        let block = render(&[
+            agent_slot("a_key", "v"),
+            slot("project", "openfang", "b_key", "v"),
+        ]);
         assert_eq!(managed_block_keys(&block), vec!["a_key", "openfang/b_key"]);
     }
 
     #[test]
     fn block_keys_ignores_prose_outside_and_inside_the_markers() {
-        let block = render_managed_block(&[agent_slot("real_key", "v")], now());
+        let block = render(&[agent_slot("real_key", "v")]);
         let file = format!(
             "# Memory\n\n- `not_a_fact` is prose above the block\n\n{block}\n\n\
              - `also_prose` below the block\n"
@@ -525,5 +653,91 @@ mod tests {
     #[test]
     fn block_keys_is_empty_when_no_block_present() {
         assert!(managed_block_keys("# Memory\n\njust prose\n").is_empty());
+    }
+
+    // --- ANAI-276: partition by authorship -------------------------------
+
+    /// The defect, stated as a test: a sibling's claim text must not be
+    /// pasted into this agent's always-injected layer. The *address* still
+    /// renders — cross-agent awareness of open project loops is the point of
+    /// project scope — but the prose does not.
+    #[test]
+    fn a_siblings_claim_body_is_not_injected() {
+        let block = render_named(&[sibling_slot(
+            "legal.dpa_status",
+            "DPA with the analytics vendor is unsigned pending counsel review",
+        )]);
+        assert!(block.contains("`kimiya/legal.dpa_status`"));
+        assert!(!block.contains("unsigned pending counsel"));
+        assert!(block.contains("kimiya-reviewer-compliance"));
+    }
+
+    #[test]
+    fn self_authored_slots_render_above_siblings_and_in_full() {
+        let block = render_named(&[
+            sibling_slot("legal.dpa_status", "someone else's business"),
+            slot("project", "kimiya", "swap.schema_state", "v3 lands Tuesday"),
+        ]);
+        let mine = block.find("swap.schema_state").unwrap();
+        let theirs = block.find("legal.dpa_status").unwrap();
+        assert!(mine < theirs, "self-authored loops come first");
+        assert!(block.contains("## Your open loops"));
+        assert!(block.contains("## Open in your projects"));
+        assert!(block.contains("v3 lands Tuesday"));
+    }
+
+    /// An author the registry no longer knows must not fail the sweep or leak
+    /// a uuid a reader cannot act on.
+    #[test]
+    fn an_unresolvable_author_renders_as_an_unnamed_sibling() {
+        let block = render(&[sibling_slot("legal.dpa_status", "x")]);
+        assert!(block.contains("_open loop, another agent_"));
+        assert!(!block.contains(SIBLING_ID));
+    }
+
+    /// The measured failure: one prolific author filling a sibling's block.
+    #[test]
+    fn the_sibling_section_is_capped_and_says_so() {
+        let facts: Vec<Fact> = (0..40)
+            .map(|i| sibling_slot(&format!("legal.item_{i:02}"), "body"))
+            .collect();
+        let block = render_named(&facts);
+        assert_eq!(
+            block
+                .matches("_open loop, kimiya-reviewer-compliance_")
+                .count(),
+            SIBLING_SLOT_CAP
+        );
+        assert!(block.contains("more sibling slot(s) not listed"));
+    }
+
+    /// Self-authored loops are never capped by the sibling budget: forty of
+    /// someone else's slots must not push my own out of my own file.
+    #[test]
+    fn siblings_cannot_displace_self_authored_loops() {
+        let mut facts: Vec<Fact> = (0..40)
+            .map(|i| sibling_slot(&format!("legal.item_{i:02}"), "body"))
+            .collect();
+        facts.push(agent_slot("mine.only_loop", "unfinished"));
+        let block = render_named(&facts);
+        assert!(block.contains("`mine.only_loop` — unfinished"));
+    }
+
+    /// A solo agent should see no section headings at all — the partition is
+    /// invisible when it does not apply.
+    #[test]
+    fn no_headings_when_nothing_is_sibling_authored() {
+        let block = render(&[agent_slot("k", "v")]);
+        assert!(!block.contains("## Your open loops"));
+        assert!(!block.contains("## Open in your projects"));
+    }
+
+    /// ANAI-279's witness lives here: an agent with siblings but no open
+    /// slots of its own is told what the section is for.
+    #[test]
+    fn an_agent_with_no_open_loops_of_its_own_is_nudged() {
+        let block = render_named(&[sibling_slot("legal.dpa_status", "x")]);
+        assert!(block.contains("## Your open loops"));
+        assert!(block.contains("You have not written an open claim slot"));
     }
 }
