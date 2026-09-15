@@ -91,6 +91,30 @@ pub struct ContextConfig {
     /// did not ask for.
     pub working_set_ratio: f64,
 
+    /// Fraction of the window below which the compactor's *message-count*
+    /// trigger is ignored (ANAI-278).
+    ///
+    /// The compactor has two triggers and only one of them has ever fired.
+    /// `working_set_ratio` (tokens) has never triggered a compaction in the
+    /// system's history; the count trigger fires whenever a session passes 30
+    /// messages *and* clears this floor, which for a working agent is roughly
+    /// every ninety minutes. On 2026-09-15 it spent 88 verbatim messages of
+    /// `kimiya-alpha`'s session at 50,050 tokens — exactly this floor — with
+    /// ~150,000 tokens of window unused.
+    ///
+    /// Ships at `0.25`, identical to the compiled default, so landing the
+    /// knob changes no behaviour. Raise it on a second bounce (`0.35` keeps
+    /// the count path as a real backstop slightly ahead of the token path;
+    /// setting it at or above `working_set_ratio` retires the count path
+    /// entirely) and watch `context_pressure` for a `reason=Tokens` line —
+    /// which the fleet has never yet logged.
+    ///
+    /// Must satisfy `0.10 <= count_trigger_min_token_ratio < 0.85`, refused
+    /// rather than clamped at install time. Below the floor is the
+    /// pre-ANAI-243 defect where near-empty sessions were compacted; at or
+    /// above the safety valve the dumb drain has already run.
+    pub count_trigger_min_token_ratio: f64,
+
     /// `[context.turn_context]` — the canonical home of the per-turn context
     /// envelope (ANAI-280). `None` means the section was not written here;
     /// the deprecated root `[turn_context]` is then used. See
@@ -107,6 +131,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             working_set_ratio: 0.70,
+            count_trigger_min_token_ratio: 0.25,
             turn_context: None,
         }
     }
@@ -5859,6 +5884,29 @@ mod tests {
         // equal the compactor's compiled trigger, so landing the knob moves
         // nothing until an operator turns it.
         let c = KernelConfig::default();
+        assert_eq!(c.context.working_set_ratio, 0.70);
+    }
+
+    /// ANAI-278, same discipline: the shipped floor must equal the compiled
+    /// one, so landing the knob is not itself the experiment.
+    #[test]
+    fn test_count_trigger_floor_defaults_to_the_compiled_value() {
+        let c = KernelConfig::default();
+        assert_eq!(c.context.count_trigger_min_token_ratio, 0.25);
+    }
+
+    /// And it must be settable on its own — `[context]` is `serde(default)`,
+    /// so writing one field may not reset the other.
+    #[test]
+    fn test_count_trigger_floor_from_toml_leaves_the_token_trigger_alone() {
+        let c: KernelConfig = toml::from_str(
+            r#"
+            [context]
+            count_trigger_min_token_ratio = 0.35
+        "#,
+        )
+        .unwrap();
+        assert_eq!(c.context.count_trigger_min_token_ratio, 0.35);
         assert_eq!(c.context.working_set_ratio, 0.70);
     }
 

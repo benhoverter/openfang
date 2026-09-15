@@ -120,6 +120,95 @@ pub fn working_set_ratio() -> f64 {
     }
 }
 
+/// Fraction of the context window below which the message-count trigger is
+/// ignored, by default.
+///
+/// ANAI-243 introduced this floor as a literal; ANAI-278 made it an operator
+/// knob and left the value where it was, so landing that ticket changes no
+/// behaviour. Read it through [`count_trigger_min_token_ratio`], never
+/// directly — see [`working_set_ratio`] for why the mirror is the bug.
+pub const DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO: f64 = 0.25;
+
+/// Operator-installed count-trigger floor, stored as raw `f64` bits.
+///
+/// Same `0`-is-unset sentinel as [`WORKING_SET_RATIO_BITS`]: `0.0` is below
+/// the accepted floor, so a zero here can only mean nothing was installed.
+static COUNT_TRIGGER_MIN_TOKEN_RATIO_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Install the operator-configured count-trigger floor (`[context]
+/// count_trigger_min_token_ratio`, ANAI-278).
+///
+/// The knob exists because the count trigger is still the primary compaction
+/// path, not the backstop ANAI-243 intended. Measured live on 2026-09-15:
+/// `kimiya-alpha` compacted 88 verbatim messages at 50,050 tokens — exactly
+/// 25.0% of the window — with ~150k tokens of headroom unused, while
+/// `working_set_ratio` has never fired once in the system's history. Raising
+/// this floor toward the token trigger is what demotes the count path; doing
+/// it from config is what lets the value be chosen from a day of live
+/// `context_pressure` data instead of from an argument.
+///
+/// Policy dial, not a safety one, and refused rather than clamped on the same
+/// terms as [`install_working_set_ratio`]: a refused install leaves the
+/// compiled default live and logs loudly.
+///
+/// A value at or above the live [`working_set_ratio`] is *accepted*, not
+/// refused — it means the token trigger always fires first and the count path
+/// is dead, which is a legitimate thing for an operator to ask for (step 3 of
+/// ANAI-278 asks whether the count path should exist at all). It is not
+/// silent: [`count_trigger_is_reachable`] lets the caller say so at boot.
+pub fn install_count_trigger_min_token_ratio(ratio: f64) -> Result<(), String> {
+    validate_count_trigger_min_token_ratio(ratio)?;
+    COUNT_TRIGGER_MIN_TOKEN_RATIO_BITS.store(ratio.to_bits(), Ordering::Relaxed);
+    Ok(())
+}
+
+/// The rules [`install_count_trigger_min_token_ratio`] enforces, as a pure
+/// function — split out for the same reason as
+/// [`validate_working_set_ratio`]: a test that installed a value would leak
+/// it into every other test in the binary.
+pub fn validate_count_trigger_min_token_ratio(ratio: f64) -> Result<(), String> {
+    if !ratio.is_finite() {
+        return Err(format!(
+            "count_trigger_min_token_ratio must be a finite number, got {ratio}"
+        ));
+    }
+    if ratio < MIN_WORKING_SET_RATIO {
+        return Err(format!(
+            "count_trigger_min_token_ratio {ratio} is below the {MIN_WORKING_SET_RATIO} floor; \
+             that is the pre-ANAI-243 defect, where the count trigger compacted \
+             near-empty sessions"
+        ));
+    }
+    if ratio >= crate::history_trim::TOKEN_TRIM_RATIO {
+        return Err(format!(
+            "count_trigger_min_token_ratio {ratio} would place the count trigger at or above \
+             the {} safety valve, where the dumb drain has already run",
+            crate::history_trim::TOKEN_TRIM_RATIO
+        ));
+    }
+    Ok(())
+}
+
+/// The live count-trigger floor: the operator's value if one was successfully
+/// installed, else [`DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO`].
+pub fn count_trigger_min_token_ratio() -> f64 {
+    let bits = COUNT_TRIGGER_MIN_TOKEN_RATIO_BITS.load(Ordering::Relaxed);
+    if bits == 0 {
+        DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO
+    } else {
+        f64::from_bits(bits)
+    }
+}
+
+/// Can the message-count trigger fire at all under this pair of ratios?
+///
+/// False when the floor sits at or above the token trigger: every session that
+/// clears the floor has already compacted for `Tokens`. Pure, so the boot path
+/// can report it without reaching into globals itself.
+pub fn count_trigger_is_reachable(min_token_ratio: f64, token_threshold_ratio: f64) -> bool {
+    min_token_ratio < token_threshold_ratio
+}
+
 /// Configuration for session compaction.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -151,6 +240,11 @@ pub struct CompactionConfig {
     /// 38 of 44 compactions ran on sessions holding ~1k tokens, i.e. 0.5% of
     /// the window. Each paid an LLM call to destroy 22 verbatim messages for
     /// no memory-pressure reason at all.
+    ///
+    /// ANAI-278: now sourced from [`count_trigger_min_token_ratio`], so the
+    /// operator can raise it toward the token trigger without a rebuild. At
+    /// 0.25 the count path is survivable but still primary — it fired on a
+    /// 50k-token session with 150k of window unused.
     pub min_token_ratio: f64,
     /// Model context window size in tokens.
     pub context_window_tokens: usize,
@@ -169,7 +263,7 @@ impl Default for CompactionConfig {
             max_chunk_chars: 80_000,
             max_retries: 3,
             token_threshold_ratio: working_set_ratio(),
-            min_token_ratio: 0.25,
+            min_token_ratio: count_trigger_min_token_ratio(),
             context_window_tokens: 200_000,
         }
     }
@@ -1059,6 +1153,88 @@ mod tests {
         assert_eq!(
             CompactionConfig::default().token_threshold_ratio,
             DEFAULT_TOKEN_THRESHOLD_RATIO
+        );
+    }
+
+    // ANAI-278: the count-trigger floor becomes the same shape of knob. Pure
+    // validator only, same reason as above.
+
+    #[test]
+    fn count_trigger_floor_accepts_the_useful_range() {
+        for r in [0.10, 0.25, 0.35, 0.40, 0.70, 0.84] {
+            assert!(
+                validate_count_trigger_min_token_ratio(r).is_ok(),
+                "{r} should be an acceptable count-trigger floor"
+            );
+        }
+    }
+
+    #[test]
+    fn count_trigger_floor_refuses_the_pre_243_defect_and_the_valve() {
+        // Below the floor is where 38 of 44 compactions ran on ~1k-token
+        // sessions; at or above the valve the dumb drain has already fired.
+        assert!(validate_count_trigger_min_token_ratio(0.005).is_err());
+        assert!(validate_count_trigger_min_token_ratio(0.0).is_err());
+        assert!(validate_count_trigger_min_token_ratio(-0.25).is_err());
+        assert!(
+            validate_count_trigger_min_token_ratio(crate::history_trim::TOKEN_TRIM_RATIO).is_err()
+        );
+        assert!(validate_count_trigger_min_token_ratio(f64::NAN).is_err());
+        assert!(validate_count_trigger_min_token_ratio(f64::INFINITY).is_err());
+    }
+
+    /// Setting the floor at or above the token trigger is legal and means the
+    /// count path is dead — that is the operator asking for it, not a
+    /// misconfiguration, but the boot path must be able to say so.
+    #[test]
+    fn count_trigger_reachability_is_a_comparison_not_a_refusal() {
+        assert!(validate_count_trigger_min_token_ratio(0.70).is_ok());
+        assert!(!count_trigger_is_reachable(0.70, 0.70));
+        assert!(!count_trigger_is_reachable(0.45, 0.40));
+        assert!(count_trigger_is_reachable(0.35, 0.40));
+        assert!(count_trigger_is_reachable(
+            DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO,
+            DEFAULT_TOKEN_THRESHOLD_RATIO
+        ));
+    }
+
+    #[test]
+    fn count_trigger_floor_defaults_when_nothing_installed() {
+        assert_eq!(
+            count_trigger_min_token_ratio(),
+            DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO
+        );
+        assert_eq!(
+            CompactionConfig::default().min_token_ratio,
+            DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO
+        );
+    }
+
+    /// The live 2026-09-15 event, as a test: 98 messages, 50,050 tokens on a
+    /// 200k window. At the shipped 0.25 floor it compacts for `Messages`; at
+    /// the 0.35 the ticket proposes it is left alone, and the token trigger
+    /// gets to be the thing that decides.
+    #[test]
+    fn raising_the_floor_demotes_the_kimiya_alpha_compaction() {
+        let session = make_session(98);
+        let shipped = CompactionConfig {
+            token_threshold_ratio: 0.40,
+            ..CompactionConfig::default()
+        };
+        assert_eq!(
+            compaction_reason(&session, 50_050, &shipped),
+            Some(CompactionReason::Messages)
+        );
+
+        let raised = CompactionConfig {
+            min_token_ratio: 0.35,
+            ..shipped
+        };
+        assert_eq!(compaction_reason(&session, 50_050, &raised), None);
+        // …and the token trigger still owns real pressure at 0.40.
+        assert_eq!(
+            compaction_reason(&session, 85_000, &raised),
+            Some(CompactionReason::Tokens)
         );
     }
 

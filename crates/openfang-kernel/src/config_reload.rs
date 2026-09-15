@@ -425,6 +425,12 @@ mod tests {
                 (|c: &mut KernelConfig| c.context.working_set_ratio = 0.40)
                     as fn(&mut KernelConfig),
             ),
+            // ANAI-278. Rides the same section, but pin it: it is a second
+            // OnceLock install and the reason the operator will touch
+            // [context] at all this release.
+            ("[context]", |c: &mut KernelConfig| {
+                c.context.count_trigger_min_token_ratio = 0.35
+            }),
             ("[recall]", |c: &mut KernelConfig| {
                 c.recall.summary_weight = 1.05
             }),

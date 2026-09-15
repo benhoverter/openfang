@@ -5958,6 +5958,37 @@ impl OpenFangKernel {
             ),
         }
 
+        // Install the operator-configured count-trigger floor ([context]
+        // count_trigger_min_token_ratio, ANAI-278). Same trade as the ratio
+        // above. The reachability line is the point of the knob: the count
+        // trigger has been the primary compaction path since it was written,
+        // and an operator raising this wants to see, at boot, whether they
+        // demoted it to a backstop or retired it outright.
+        {
+            let configured = self.config.context.count_trigger_min_token_ratio;
+            match openfang_runtime::compactor::install_count_trigger_min_token_ratio(configured) {
+                Ok(()) => {
+                    let token_trigger = openfang_runtime::compactor::working_set_ratio();
+                    info!(
+                        count_trigger_min_token_ratio = configured,
+                        token_trigger_ratio = token_trigger,
+                        count_trigger_reachable =
+                            openfang_runtime::compactor::count_trigger_is_reachable(
+                                configured,
+                                token_trigger
+                            ),
+                        "Compaction count-trigger floor installed"
+                    );
+                }
+                Err(e) => error!(
+                    configured,
+                    fallback = openfang_runtime::compactor::DEFAULT_COUNT_TRIGGER_MIN_TOKEN_RATIO,
+                    "Refusing [context] count_trigger_min_token_ratio, \
+                     keeping the compiled default: {e}"
+                ),
+            }
+        }
+
         // ANAI-264 step 4. The fleet's project namespace, logged once so an
         // operator can see what `prime_for` and project-scoped facts will
         // accept without reading 100 manifests. Derived, not configured —
