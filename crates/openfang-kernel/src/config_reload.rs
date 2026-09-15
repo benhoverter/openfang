@@ -166,6 +166,37 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
             .push("memory config changed".to_string());
     }
 
+    // ANAI-280. The boot-installed knob blocks: every one of these lands in a
+    // `OnceLock` during `Kernel::start`, so a running process cannot pick up a
+    // new value no matter what the plan says. They were absent from this
+    // classifier entirely, which meant `/reload` reported "no change" while
+    // the daemon kept serving the old numbers — worse than saying "bounce me",
+    // because it reads as confirmation.
+    //
+    // `[memory.recall]` and `[memory.fact_staleness]` are already covered by
+    // the `memory` comparison above; these three catch the deprecated root
+    // spellings and `[context]` itself.
+    if field_changed(&old.context, &new.context) {
+        plan.restart_required = true;
+        plan.restart_reasons
+            .push("[context] changed (installed at boot)".to_string());
+    }
+    if field_changed(&old.recall, &new.recall) {
+        plan.restart_required = true;
+        plan.restart_reasons
+            .push("[recall] changed (installed at boot)".to_string());
+    }
+    if field_changed(&old.fact_staleness, &new.fact_staleness) {
+        plan.restart_required = true;
+        plan.restart_reasons
+            .push("[fact_staleness] changed (installed at boot)".to_string());
+    }
+    if field_changed(&old.turn_context, &new.turn_context) {
+        plan.restart_required = true;
+        plan.restart_reasons
+            .push("[turn_context] changed (installed at boot)".to_string());
+    }
+
     // Default model — hot-reloadable (just swap config fields, new agents pick it up)
     if field_changed(&old.default_model, &new.default_model) {
         plan.hot_actions.push(HotAction::UpdateDefaultModel);
@@ -379,6 +410,60 @@ mod tests {
         let plan = build_reload_plan(&a, &b);
         assert!(plan.restart_required);
         assert!(plan.restart_reasons.iter().any(|r| r.contains("api_key")));
+    }
+
+    // ANAI-280. These four blocks install into `OnceLock`s at boot, so a
+    // reload that reported them as hot-reloadable — or, as it did before this,
+    // as no change at all — would be telling the operator their edit had taken
+    // effect while the daemon kept serving the old numbers.
+
+    #[test]
+    fn boot_installed_knobs_require_restart() {
+        for (label, mutate) in [
+            (
+                "[context]",
+                (|c: &mut KernelConfig| c.context.working_set_ratio = 0.40)
+                    as fn(&mut KernelConfig),
+            ),
+            ("[recall]", |c: &mut KernelConfig| {
+                c.recall.summary_weight = 1.05
+            }),
+            ("[fact_staleness]", |c: &mut KernelConfig| {
+                c.fact_staleness.volatile_days = 0.5
+            }),
+            ("[turn_context]", |c: &mut KernelConfig| {
+                c.turn_context.roster = true
+            }),
+        ] {
+            let a = default_cfg();
+            let mut b = default_cfg();
+            mutate(&mut b);
+            let plan = build_reload_plan(&a, &b);
+            assert!(
+                plan.restart_required,
+                "{label} must require a restart; it is installed at boot"
+            );
+            assert!(
+                plan.restart_reasons.iter().any(|r| r.contains(label)),
+                "{label} must name itself in the restart reason"
+            );
+        }
+    }
+
+    /// The nested spellings ride the existing `[memory]` comparison — but
+    /// only if that comparison actually sees them, which it does not if the
+    /// nested fields are ever moved off `MemoryConfig`.
+    #[test]
+    fn nested_memory_knobs_require_restart() {
+        let a = default_cfg();
+        let mut b = default_cfg();
+        b.memory.recall = Some(openfang_types::config::RecallConfig {
+            summary_weight: 1.05,
+            ..Default::default()
+        });
+        let plan = build_reload_plan(&a, &b);
+        assert!(plan.restart_required);
+        assert!(plan.restart_reasons.iter().any(|r| r.contains("memory")));
     }
 
     #[test]

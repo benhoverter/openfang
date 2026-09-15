@@ -5918,10 +5918,25 @@ impl OpenFangKernel {
             stream_idle_timeout_secs: self.config.watchdog.stream_idle_timeout_secs,
         });
 
-        // Install operator-configured per-turn context settings ([turn_context]
-        // config, ANAI-128) so the runtime envelope resolver picks them up.
-        // Idempotent: first call at boot wins. `TurnContextConfig` is `Copy`.
-        openfang_types::turn_context::install(self.config.turn_context);
+        // ANAI-280. Four knob blocks accreted at the root of config.toml; they
+        // now live under [memory] and [context]. The root spellings still
+        // parse, and an operator relying on one is told where it moved —
+        // loudly, once, at boot. Silence here is the failure mode: KernelConfig
+        // has no deny_unknown_fields, so an unread root table would revert to
+        // compiled defaults with a clean boot and no log line.
+        for (old, new) in self.config.deprecated_config_sections() {
+            warn!(
+                "config.toml: {old} is deprecated and moves to {new} (ANAI-280). \
+                 The root spelling is still honoured this release; move it before \
+                 the shim is removed."
+            );
+        }
+
+        // Install operator-configured per-turn context settings
+        // ([context.turn_context], ANAI-128/280) so the runtime envelope
+        // resolver picks them up. Idempotent: first call at boot wins.
+        // `TurnContextConfig` is `Copy`.
+        openfang_types::turn_context::install(self.config.turn_context_config());
 
         // Install the operator-configured working-set ratio ([context]
         // working_set_ratio, ANAI-260). Policy dial, not a safety one: it moves
@@ -5969,7 +5984,7 @@ impl OpenFangKernel {
         // refused value leaves the compiled 90/7/1 ladder live rather than
         // failing the boot over a tuning typo.
         {
-            let cfg = self.config.fact_staleness;
+            let cfg = self.config.fact_staleness_config();
             let policy = openfang_memory::staleness::StalenessPolicy {
                 stable_days: cfg.stable_days,
                 active_days: cfg.active_days,
@@ -5983,7 +5998,7 @@ impl OpenFangKernel {
                     "Fact staleness policy installed"
                 ),
                 Err(e) => error!(
-                    "Refusing [fact_staleness], keeping the compiled defaults \
+                    "Refusing [memory.fact_staleness], keeping the compiled defaults \
                      (stable 90d / active 7d / volatile 1d): {e}"
                 ),
             }
@@ -5994,7 +6009,7 @@ impl OpenFangKernel {
         // which includes `enabled: false`, so a typo drops recall back to pure
         // cosine rather than half-applying an operator's intent.
         {
-            let cfg = self.config.recall;
+            let cfg = self.config.recall_config();
             let weights = openfang_memory::ranking::RecallWeights {
                 enabled: cfg.kind_weights_enabled,
                 summary: cfg.summary_weight as f32,
@@ -6008,7 +6023,7 @@ impl OpenFangKernel {
                     "Recall kind weights installed (ANAI-233)"
                 ),
                 Err(e) => error!(
-                    "Refusing [recall] weights, keeping the compiled defaults \
+                    "Refusing [memory.recall] weights, keeping the compiled defaults \
                      (disabled, summary 1.25 / fact 1.0): {e}"
                 ),
             }
@@ -6027,7 +6042,7 @@ impl OpenFangKernel {
                     "Recall summary slot cap installed (ANAI-233)"
                 ),
                 Err(e) => error!(
-                    "Refusing [recall] summary_slot_ratio, keeping the compiled default \
+                    "Refusing [memory.recall] summary_slot_ratio, keeping the compiled default \
                      (0.6, i.e. 3 of 5): {e}"
                 ),
             }

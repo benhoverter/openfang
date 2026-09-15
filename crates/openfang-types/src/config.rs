@@ -40,7 +40,7 @@ where
 /// inverted config is refused at install time (the compiled defaults stay
 /// live and an error is logged) rather than quietly making `stable` the
 /// twitchiest class in the system.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FactStalenessConfig {
     /// Days before a `stable` claim is marked for re-verification.
@@ -71,7 +71,7 @@ impl Default for FactStalenessConfig {
 /// default and two hand-fiddled ones drifting out of sync with the code. The
 /// per-agent escape hatch already exists and is coarser on purpose:
 /// `max_history_messages` in a manifest is honoured verbatim.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextConfig {
     /// Fraction of the model's real context window we *want* to sit at.
@@ -90,12 +90,24 @@ pub struct ContextConfig {
     /// an error is logged — rather than clamped into something the operator
     /// did not ask for.
     pub working_set_ratio: f64,
+
+    /// `[context.turn_context]` — the canonical home of the per-turn context
+    /// envelope (ANAI-280). `None` means the section was not written here;
+    /// the deprecated root `[turn_context]` is then used. See
+    /// [`KernelConfig::turn_context_config`].
+    ///
+    /// Optional rather than defaulted on purpose: "absent" and "written with
+    /// the default values" have to be distinguishable, or the nested spelling
+    /// would silently outrank a deliberately-set root one.
+    #[serde(default)]
+    pub turn_context: Option<TurnContextConfig>,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             working_set_ratio: 0.70,
+            turn_context: None,
         }
     }
 }
@@ -120,7 +132,7 @@ impl Default for ContextConfig {
 /// Fleet-wide, deliberately not per-agent: a per-agent ranking policy would
 /// need someone to know that agent's corpus mix, and the realistic outcome is
 /// a hundred manifests carrying the default.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecallConfig {
     /// Apply the per-kind weights to what recall actually returns.
@@ -1878,7 +1890,7 @@ pub struct KernelConfig {
 /// boot via [`crate::turn_context::install`] and the runtime resolves them
 /// through that module without threading a config handle through the agent-loop
 /// signature (which would ripple across ~15 call/test sites).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TurnContextConfig {
     /// Master switch. When true, an ambient `<turn_context>` block (time,
@@ -2307,6 +2319,75 @@ impl KernelConfig {
         // 3. Convention: NVIDIA → NVIDIA_API_KEY
         format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"))
     }
+
+    // ----- ANAI-280: resolved config sections -----
+    //
+    // Four knob blocks accreted at the root of `config.toml` one ticket at a
+    // time (`[recall]` 233, `[fact_staleness]` 259, `[context]` 260,
+    // `[turn_context]` 128), each taking a root table because that was the
+    // cheapest thing to write. They now have canonical nested homes under
+    // `[memory]` and `[context]`.
+    //
+    // The root spellings stay readable rather than being renamed outright,
+    // because `KernelConfig` has no `deny_unknown_fields`: a hard rename would
+    // make every config file still carrying the old spelling revert silently
+    // to the compiled defaults, with a clean boot and no log line. That is
+    // exactly the failure mode this pair of accessors exists to prevent —
+    // `summary_weight` snapping 1.05 → 1.25 and the operator's fidelity fix
+    // un-shipping in silence.
+    //
+    // `#[serde(alias)]` cannot cover this: an alias renames a field within its
+    // parent, it cannot map a nested table onto a root one.
+
+    /// Kind-aware recall ranking, nested spelling preferred.
+    ///
+    /// `[memory.recall]` wins when present; otherwise the deprecated root
+    /// `[recall]` is used.
+    pub fn recall_config(&self) -> RecallConfig {
+        self.memory.recall.unwrap_or(self.recall)
+    }
+
+    /// Fact staleness ladder, nested spelling preferred.
+    ///
+    /// `[memory.fact_staleness]` wins when present; otherwise the deprecated
+    /// root `[fact_staleness]` is used.
+    pub fn fact_staleness_config(&self) -> FactStalenessConfig {
+        self.memory.fact_staleness.unwrap_or(self.fact_staleness)
+    }
+
+    /// Per-turn context envelope, nested spelling preferred.
+    ///
+    /// `[context.turn_context]` wins when present; otherwise the deprecated
+    /// root `[turn_context]` is used.
+    pub fn turn_context_config(&self) -> TurnContextConfig {
+        self.context.turn_context.unwrap_or(self.turn_context)
+    }
+
+    /// Root-table spellings this config still relies on, as
+    /// `(old_address, new_address)` pairs, for the boot-time deprecation
+    /// warning.
+    ///
+    /// A root section counts as "relied on" only when the nested spelling is
+    /// absent **and** the root values differ from the compiled defaults. An
+    /// operator who never wrote the section at all gets no warning; one who
+    /// wrote it with exactly the default values gets none either, which is
+    /// harmless — there is nothing to lose when the shim is deleted.
+    pub fn deprecated_config_sections(&self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.memory.recall.is_none() && self.recall != RecallConfig::default() {
+            out.push(("[recall]", "[memory.recall]"));
+        }
+        if self.memory.fact_staleness.is_none()
+            && self.fact_staleness != FactStalenessConfig::default()
+        {
+            out.push(("[fact_staleness]", "[memory.fact_staleness]"));
+        }
+        if self.context.turn_context.is_none() && self.turn_context != TurnContextConfig::default()
+        {
+            out.push(("[turn_context]", "[context.turn_context]"));
+        }
+        out
+    }
 }
 
 /// SECURITY: Custom Debug impl redacts sensitive fields (api_key).
@@ -2536,6 +2617,23 @@ pub struct MemoryConfig {
     /// spawns at boot: editing this does nothing until the daemon bounces.
     #[serde(default = "default_episode_idle_timeout")]
     pub episode_idle_timeout_minutes: i64,
+
+    /// `[memory.recall]` — the canonical home of kind-aware recall ranking
+    /// (ANAI-280). `None` means the section was not written here; the
+    /// deprecated root `[recall]` is then used. See
+    /// [`KernelConfig::recall_config`].
+    #[serde(default)]
+    pub recall: Option<RecallConfig>,
+
+    /// `[memory.fact_staleness]` — the canonical home of the tier-3 fact
+    /// staleness ladder (ANAI-280). `None` means the section was not written
+    /// here; the deprecated root `[fact_staleness]` is then used. See
+    /// [`KernelConfig::fact_staleness_config`].
+    ///
+    /// Nested under `[memory]` rather than `[context]` because staleness is a
+    /// property of a stored claim row, not of the window it is injected into.
+    #[serde(default)]
+    pub fact_staleness: Option<FactStalenessConfig>,
 }
 
 /// Episodes end when they end, not on a clock.
@@ -2576,6 +2674,8 @@ impl Default for MemoryConfig {
             http_url: None,
             http_token_env: None,
             episode_idle_timeout_minutes: default_episode_idle_timeout(),
+            recall: None,
+            fact_staleness: None,
         }
     }
 }
@@ -5782,6 +5882,111 @@ mod tests {
 
     #[test]
     fn test_recall_config_lands_inert() {
+        // The switch ships off, so landing ANAI-233 changes no behaviour and
+        // the operator flips it on a second bounce.
+        let c = KernelConfig::default();
+        assert!(!c.recall_config().kind_weights_enabled);
+        assert_eq!(c.recall_config().summary_weight, 1.25);
+        assert_eq!(c.recall_config().fact_weight, 1.0);
+    }
+
+    // -- ANAI-280: nested config sections, old spellings still honoured
+
+    /// Both spellings must parse to the same values. This is the guard
+    /// against the silent-revert failure: `KernelConfig` has no
+    /// `deny_unknown_fields`, so a hard rename would leave an old file
+    /// parsing cleanly into compiled defaults with no error anywhere.
+    #[test]
+    fn nested_and_root_spellings_resolve_equal() {
+        let nested: KernelConfig = toml::from_str(
+            r#"
+            [memory.recall]
+            kind_weights_enabled = true
+            summary_weight = 1.05
+
+            [memory.fact_staleness]
+            volatile_days = 0.5
+
+            [context.turn_context]
+            roster = true
+        "#,
+        )
+        .unwrap();
+        let root: KernelConfig = toml::from_str(
+            r#"
+            [recall]
+            kind_weights_enabled = true
+            summary_weight = 1.05
+
+            [fact_staleness]
+            volatile_days = 0.5
+
+            [turn_context]
+            roster = true
+        "#,
+        )
+        .unwrap();
+
+        assert_eq!(nested.recall_config(), root.recall_config());
+        assert_eq!(nested.fact_staleness_config(), root.fact_staleness_config());
+        assert_eq!(nested.turn_context_config(), root.turn_context_config());
+
+        // And the values are the operator's, not the compiled defaults.
+        assert!(nested.recall_config().kind_weights_enabled);
+        assert_eq!(nested.recall_config().summary_weight, 1.05);
+        assert_eq!(nested.fact_staleness_config().volatile_days, 0.5);
+        assert!(nested.turn_context_config().roster);
+    }
+
+    /// When an operator writes both, the nested spelling wins — otherwise
+    /// migrating a file would be a two-step dance where deleting the old
+    /// section is load-bearing.
+    #[test]
+    fn nested_spelling_outranks_the_root_one() {
+        let c: KernelConfig = toml::from_str(
+            "[recall]\nsummary_weight = 1.25\n\n[memory.recall]\nsummary_weight = 1.05\n",
+        )
+        .unwrap();
+        assert_eq!(c.recall_config().summary_weight, 1.05);
+    }
+
+    /// A partial nested section keeps the compiled defaults for the keys it
+    /// omits, exactly as the root spelling does.
+    #[test]
+    fn nested_partial_section_keeps_defaults() {
+        let c: KernelConfig =
+            toml::from_str("[memory.recall]\nkind_weights_enabled = true\n").unwrap();
+        assert!(c.recall_config().kind_weights_enabled);
+        assert_eq!(c.recall_config().summary_weight, 1.25);
+        assert_eq!(c.recall_config().summary_slot_ratio, 0.6);
+    }
+
+    /// The boot warning fires for a root section an operator is relying on,
+    /// and stays quiet for one they never wrote.
+    #[test]
+    fn deprecation_warns_only_for_a_root_section_in_use() {
+        let empty: KernelConfig = toml::from_str("").unwrap();
+        assert!(empty.deprecated_config_sections().is_empty());
+
+        let migrated: KernelConfig =
+            toml::from_str("[memory.recall]\nsummary_weight = 1.05\n").unwrap();
+        assert!(migrated.deprecated_config_sections().is_empty());
+
+        let legacy: KernelConfig = toml::from_str("[recall]\nsummary_weight = 1.05\n").unwrap();
+        assert_eq!(
+            legacy.deprecated_config_sections(),
+            vec![("[recall]", "[memory.recall]")]
+        );
+
+        // Writing the root section with exactly the default values is not
+        // "relying on" it: nothing is lost when the shim goes away.
+        let default_valued: KernelConfig =
+            toml::from_str("[recall]\nsummary_weight = 1.25\n").unwrap();
+        assert!(default_valued.deprecated_config_sections().is_empty());
+    }
+
+    #[test]
+    fn test_recall_config_lands_inert_via_accessor() {
         // The switch ships off, so landing ANAI-233 changes no behaviour and
         // the operator flips it on a second bounce.
         let c = KernelConfig::default();
