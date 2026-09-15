@@ -717,6 +717,38 @@ impl MemorySubstrate {
         may_read_project: &dyn Fn(&str) -> bool,
         limit: usize,
     ) -> OpenFangResult<Vec<Fact>> {
+        let visible =
+            self.visible_claim_slots(agent_id, declared_projects, may_read_project, limit)?;
+        let mut open = crate::memory_md::open_loops(visible);
+        open.truncate(limit);
+        Ok(open)
+    }
+
+    /// ANAI-279: the slots the MEMORY.md managed block renders — *every*
+    /// self-authored claim regardless of status, plus siblings' open loops.
+    ///
+    /// Split from [`Self::open_claim_slots`] rather than replacing it. The two
+    /// callers want different things and had been sharing one answer: the
+    /// status tool reports unfinished business, while the block is also the
+    /// only surface that shows an agent the *addresses* it already owns before
+    /// it mints a new one (ANAI-277's pre-write half). Every fact the fleet had
+    /// written as of 2026-09-15 was `settled`, so an open-only block was empty
+    /// for exactly the agents the address list was built for.
+    ///
+    /// Siblings stay open-only. Their count is bounded by how prolific the
+    /// other members of a project are, which is not a property of the agent
+    /// reading the file, and their addresses are not ones it may write.
+    ///
+    /// Ordering is stable by render rank — own open loops, own other slots,
+    /// siblings' open loops — so a truncation at `limit` cuts the tail the
+    /// renderer would have shown last rather than an arbitrary row.
+    pub fn visible_claim_slots(
+        &self,
+        agent_id: AgentId,
+        declared_projects: &[String],
+        may_read_project: &dyn Fn(&str) -> bool,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         let mut out: Vec<Fact> = Vec::new();
         let mut push = |fact: Fact, out: &mut Vec<Fact>| {
@@ -742,10 +774,23 @@ impl MemorySubstrate {
                 push(fact, &mut out);
             }
         }
+        Ok(out)
+    }
 
-        let mut open = crate::memory_md::open_loops(out);
-        open.truncate(limit);
-        Ok(open)
+    /// ANAI-279: [`Self::visible_claim_slots`], filtered and ordered the way
+    /// the managed block renders it.
+    pub fn block_claim_slots(
+        &self,
+        agent_id: AgentId,
+        declared_projects: &[String],
+        may_read_project: &dyn Fn(&str) -> bool,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Fact>> {
+        let visible =
+            self.visible_claim_slots(agent_id, declared_projects, may_read_project, limit)?;
+        let mut kept = crate::memory_md::block_claims(visible, &agent_id.to_string());
+        kept.truncate(limit);
+        Ok(kept)
     }
 
     /// ANAI-277: every slot address that already exists where a new claim was
@@ -1803,10 +1848,11 @@ mod tests {
         assert!(keys.contains(&"repo.trunk_head"));
     }
 
-    /// Settled claims are retrieved, not pasted (ADR 0002 §2.5) — the block
-    /// exists to carry what a cold reader cannot reconstruct.
+    /// `open_claim_slots` is the *status* answer and stays open-only: a status
+    /// report is about unfinished business. ANAI-279 moved the block off this
+    /// call rather than widening it, so this pin is what keeps the two apart.
     #[tokio::test]
-    async fn the_block_leaves_settled_claims_to_retrieval() {
+    async fn the_status_answer_leaves_settled_claims_to_retrieval() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
         let agent_id = AgentId::new();
         substrate
@@ -1825,6 +1871,65 @@ mod tests {
             .unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].claim_key, "memory.loop");
+    }
+
+    // --- ANAI-279: what the block adds on top of the status answer ---------
+
+    /// The pre-write surface. Every fact the fleet had written as of
+    /// 2026-09-15 was settled, so a block that rendered open loops only was
+    /// empty for exactly the agents that were minting duplicate keys.
+    #[tokio::test]
+    async fn the_block_lists_the_agents_own_settled_slots() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        substrate
+            .facts()
+            .upsert(crate::fact::FactWrite::new(
+                agent_id,
+                "agent",
+                "memory.settled",
+                "background",
+            ))
+            .unwrap();
+        open_slot(&substrate, agent_id, "agent", None, "memory.loop", "open");
+
+        let slots = substrate
+            .block_claim_slots(agent_id, &[], &|_: &str| true, 50)
+            .unwrap();
+        let keys: Vec<&str> = slots.iter().map(|f| f.claim_key.as_str()).collect();
+        // Open loops first: a truncation should cut vocabulary, not business.
+        assert_eq!(keys, vec!["memory.loop", "memory.settled"]);
+    }
+
+    /// Siblings stay open-only. Their settled slots are neither this agent's
+    /// business nor addresses it may write, and their count is bounded by how
+    /// prolific the rest of the project is.
+    #[tokio::test]
+    async fn the_block_does_not_carry_a_siblings_settled_slot() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        let sibling = AgentId::new();
+        substrate
+            .facts()
+            .upsert(
+                crate::fact::FactWrite::new(sibling, "project", "memory.sib_settled", "theirs")
+                    .with_scope_ref("openfang"),
+            )
+            .unwrap();
+        open_slot(
+            &substrate,
+            sibling,
+            "project",
+            Some("openfang"),
+            "memory.sib_open",
+            "their loop",
+        );
+
+        let slots = substrate
+            .block_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| true, 50)
+            .unwrap();
+        let keys: Vec<&str> = slots.iter().map(|f| f.claim_key.as_str()).collect();
+        assert_eq!(keys, vec!["memory.sib_open"]);
     }
 
     /// The same gate the pack applies. A block that showed a claim its agent

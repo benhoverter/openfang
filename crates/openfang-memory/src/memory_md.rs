@@ -58,6 +58,26 @@
 //! capped at [`SIBLING_SLOT_CAP`]. An agent that needs a sibling's claim can
 //! read the slot by key — it does not need the prose pasted into every prompt
 //! to know the loop exists.
+//!
+//! # Why your own settled slots are listed, by address (ANAI-279)
+//!
+//! ADR 0002 §2.5 is about *claims*, and it still holds: nobody's settled prose
+//! is injected. But the block is also the only surface that shows an agent the
+//! slot addresses it already owns, and it shows them *before* it writes —
+//! which is the one moment `memory_fact`'s "prefer a key that already exists"
+//! is executable. A tool result cannot do this: the call does not exist until
+//! the model has already committed to a name.
+//!
+//! Measured live: `kimiya-alpha` held nine slots, nine distinct keys, not one
+//! with a second version — `matrix_baselines` → `matrix_baseline_state` →
+//! `matrix_baseline_recording` is one claim under three addresses. Every fact
+//! the fleet had written was `settled`, so an open-only block was empty for
+//! exactly the agents minting duplicates.
+//!
+//! So: own open loops in full, own settled slots by address and status only,
+//! siblings' open loops by address and author. Siblings' settled slots are not
+//! listed at all — they are neither this agent's business nor addresses it may
+//! write.
 
 use chrono::{DateTime, Utc};
 
@@ -85,6 +105,14 @@ pub const VALUE_CAP_CHARS: usize = 240;
 /// is bounded by how prolific the other members of a project happen to be,
 /// which is not a property of the agent reading the file.
 pub const SIBLING_SLOT_CAP: usize = 12;
+
+/// Maximum number of the agent's own non-open slots listed by address.
+///
+/// Capped where open loops are not: this section exists so a new key can be
+/// recognised as a second spelling of an old one (ANAI-277/279), and an
+/// address list long enough to skim past stops serving that purpose. Open
+/// loops remain uncapped — they are business, not vocabulary.
+pub const OWNED_SLOT_CAP: usize = 24;
 
 /// Why a splice was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +150,34 @@ pub fn open_loops(facts: Vec<Fact>) -> Vec<Fact> {
         .into_iter()
         .filter(|f| matches!(f.status, FactStatus::Open))
         .collect()
+}
+
+/// Keep what the block may render, in the order it renders (ANAI-279).
+///
+/// Every self-authored slot survives whatever its status; everyone else's
+/// survives only while it is an open loop. The sort is stable, so within each
+/// rank the store's ordering — most recently verified first — is preserved,
+/// and a caller that truncates cuts the tail the renderer would have shown
+/// last rather than an arbitrary row.
+pub fn block_claims(facts: Vec<Fact>, self_agent_id: &str) -> Vec<Fact> {
+    let mut kept: Vec<Fact> = facts
+        .into_iter()
+        .filter(|f| is_self_authored(f, self_agent_id) || matches!(f.status, FactStatus::Open))
+        .collect();
+    kept.sort_by_key(|f| render_rank(f, self_agent_id));
+    kept
+}
+
+/// Which section a slot renders into: own open loop, own other slot, sibling.
+fn render_rank(fact: &Fact, self_agent_id: &str) -> u8 {
+    match (
+        is_self_authored(fact, self_agent_id),
+        matches!(fact.status, FactStatus::Open),
+    ) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, _) => 2,
+    }
 }
 
 /// How a slot is addressed in the block.
@@ -187,9 +243,9 @@ fn cap(s: &str, max: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
-/// Render the managed block — markers included — from open claim slots.
+/// Render the managed block — markers included — from an agent's claim slots.
 ///
-/// `facts` must already be filtered by [`open_loops`] and ordered the way the
+/// `facts` must already be filtered by [`block_claims`] and ordered the way the
 /// caller wants them displayed. Entries are emitted until
 /// [`BLOCK_BUDGET_CHARS`] would be exceeded; any remainder is reported in a
 /// visible footer rather than dropped silently.
@@ -206,25 +262,35 @@ fn cap(s: &str, max: usize) -> String {
 /// author who has since been removed from the registry renders as an unnamed
 /// sibling rather than failing the sweep.
 ///
-/// When nothing is sibling-authored the output has no section headings at all,
-/// which is byte-identical to what this rendered before the partition existed:
-/// a solo agent should not have to read about a distinction that does not
-/// apply to it.
+/// Three sections, and only the ones with content appear: own open loops in
+/// full, own non-open slots by address (ANAI-279 — the pre-write surface that
+/// makes "prefer a key that already exists" executable), and siblings' open
+/// loops by address and author. When an agent has nothing but its own open
+/// loops the output has no headings at all, byte-identical to what this
+/// rendered before the partition existed: a solo agent should not have to read
+/// about distinctions that do not apply to it.
 pub fn render_managed_block(
     facts: &[Fact],
     now: DateTime<Utc>,
     self_agent_id: &str,
     author_label: &dyn Fn(&str) -> Option<String>,
 ) -> String {
-    let header = "_Auto-generated from **open** claim slots (`memory_fact` with `status: open`). \
-                  Settled claims are not listed here — read them by key with `memory_fact`, or \
-                  find them with `memory_recall`. Correct a claim by writing the slot, not by \
-                  editing this block: edits inside it are overwritten by the next sweep. Durable \
-                  prose belongs below it._";
+    let header = "_Auto-generated from your claim slots (`memory_fact`). Your open loops render \
+                  in full; your other slots are listed by address so you can write the key that \
+                  already exists instead of minting a second spelling of it. Read any slot by \
+                  key with `memory_fact`. Correct a claim by writing the slot, not by editing \
+                  this block: edits inside it are overwritten by the next sweep. Durable prose \
+                  belongs below it._";
 
-    let (mine, siblings): (Vec<&Fact>, Vec<&Fact>) = facts
-        .iter()
-        .partition(|f| is_self_authored(f, self_agent_id));
+    let (mut mine, mut owned, mut siblings): (Vec<&Fact>, Vec<&Fact>, Vec<&Fact>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for fact in facts {
+        match render_rank(fact, self_agent_id) {
+            0 => mine.push(fact),
+            1 => owned.push(fact),
+            _ => siblings.push(fact),
+        }
+    }
 
     let mut body = String::new();
     let mut used = 0usize;
@@ -244,6 +310,25 @@ pub fn render_managed_block(
         used += line.chars().count();
         body.push_str(&line);
         rendered_mine += 1;
+    }
+
+    let mut owned_body = String::new();
+    let mut rendered_owned = 0usize;
+
+    for fact in owned.iter().take(OWNED_SLOT_CAP) {
+        // Address and status only. This section is vocabulary, not content:
+        // the claim is one `memory_fact` read away, and pasting settled prose
+        // into every prompt is the spend ADR 0002 §2.5 refuses. The trailing
+        // `— …` is not decoration: `managed_block_keys` only counts entries in
+        // that shape, so an address-only line would be invisible to the
+        // sweep's added/removed diff.
+        let line = format!("- `{}` — _{}_\n", display_key(fact), fact.status.as_str());
+        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
+            break;
+        }
+        used += line.chars().count();
+        owned_body.push_str(&line);
+        rendered_owned += 1;
     }
 
     let mut sibling_body = String::new();
@@ -266,14 +351,18 @@ pub fn render_managed_block(
     }
 
     let omitted_mine = mine.len().saturating_sub(rendered_mine);
+    let omitted_owned = owned.len().saturating_sub(rendered_owned);
     let omitted_siblings = siblings.len().saturating_sub(rendered_siblings);
 
-    if mine.is_empty() && siblings.is_empty() {
+    if mine.is_empty() && owned.is_empty() && siblings.is_empty() {
         return format!("{MANAGED_BEGIN}\n{header}\n\n_No open claim slots._\n{MANAGED_END}");
     }
 
     let mut out = String::new();
-    if siblings.is_empty() {
+    if owned.is_empty() && siblings.is_empty() {
+        // Byte-identical to the pre-partition render: an agent whose only slots
+        // are its own open loops should not have to read about distinctions
+        // that do not apply to it.
         out.push_str(&body);
         if omitted_mine > 0 {
             out.push_str(&omission_footer(omitted_mine, "open slot(s)"));
@@ -292,17 +381,34 @@ pub fn render_managed_block(
         if omitted_mine > 0 {
             out.push_str(&omission_footer(omitted_mine, "of your open slot(s)"));
         }
-        out.push_str(
-            "\n## Open in your projects\n\n_Other agents' open loops, listed by address only. \
-             Read one with `memory_fact` if you need it; do not write into a slot you do not \
-             own._\n",
-        );
-        out.push_str(&sibling_body);
-        if omitted_siblings > 0 {
-            out.push_str(&format!(
-                "\n_[… {omitted_siblings} more sibling slot(s) not listed: this section is \
-                 capped at {SIBLING_SLOT_CAP}. Use `memory_recall` for these.]_\n"
-            ));
+        if !owned.is_empty() {
+            out.push_str(
+                "\n## Slots you already own\n\n_Addresses only. Before you mint a new key, \
+                 check whether one of these is the same claim under another name — writing an \
+                 existing slot supersedes it and keeps the history, while a second key splits \
+                 one claim in two._\n",
+            );
+            out.push_str(&owned_body);
+            if omitted_owned > 0 {
+                out.push_str(&format!(
+                    "\n_[… {omitted_owned} more of your slot(s) not listed: this section is \
+                     capped at {OWNED_SLOT_CAP}. Use `memory_recall` for these.]_\n"
+                ));
+            }
+        }
+        if !siblings.is_empty() {
+            out.push_str(
+                "\n## Open in your projects\n\n_Other agents' open loops, listed by address \
+                 only. Read one with `memory_fact` if you need it; do not write into a slot you \
+                 do not own._\n",
+            );
+            out.push_str(&sibling_body);
+            if omitted_siblings > 0 {
+                out.push_str(&format!(
+                    "\n_[… {omitted_siblings} more sibling slot(s) not listed: this section is \
+                     capped at {SIBLING_SLOT_CAP}. Use `memory_recall` for these.]_\n"
+                ));
+            }
         }
     }
 
@@ -497,6 +603,86 @@ mod tests {
         let kept = open_loops(vec![settled, open]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].claim_key, "open.loop");
+    }
+
+    // --- ANAI-279: the agent's own settled slots, as vocabulary ------------
+
+    fn settled_agent_slot(key: &str, claim: &str) -> Fact {
+        let mut f = agent_slot(key, claim);
+        f.status = FactStatus::Settled;
+        f
+    }
+
+    /// The whole point of the section: an agent about to mint
+    /// `matrix_baseline_recording` should be looking at `matrix_baselines`
+    /// while it does. Address yes, claim body no.
+    #[test]
+    fn a_settled_slot_of_your_own_renders_as_an_address_not_a_body() {
+        let block = render(&[
+            agent_slot("memory.loop", "unfinished"),
+            settled_agent_slot("project.kimiya.matrix_baselines", "seven suites green"),
+        ]);
+        assert!(block.contains("## Slots you already own"));
+        assert!(block.contains("`project.kimiya.matrix_baselines` — _settled_"));
+        assert!(!block.contains("seven suites green"));
+        // The open loop keeps its body.
+        assert!(block.contains("`memory.loop` — unfinished"));
+    }
+
+    /// Every fact the fleet had written as of 2026-09-15 was settled. If the
+    /// block still needed one open loop to say anything, it would have stayed
+    /// empty for every agent it was built for.
+    #[test]
+    fn an_agent_whose_every_slot_is_settled_still_gets_its_addresses() {
+        let block = render(&[settled_agent_slot("repo.trunk_head", "main @ abc1234")]);
+        assert!(block.contains("`repo.trunk_head` — _settled_"));
+        assert!(block.contains("## Your open loops"));
+        assert!(block.contains("_None. You have not written an open claim slot"));
+    }
+
+    /// The sweep reports which keys a rewrite added and removed. An
+    /// address-only line would have been invisible to that diff.
+    #[test]
+    fn owned_addresses_are_visible_to_the_block_key_diff() {
+        let block = render(&[settled_agent_slot("repo.trunk_head", "main @ abc1234")]);
+        assert_eq!(managed_block_keys(&block), vec!["repo.trunk_head"]);
+    }
+
+    /// Vocabulary is capped where business is not.
+    #[test]
+    fn the_owned_section_is_capped_and_says_so() {
+        let facts: Vec<Fact> = (0..OWNED_SLOT_CAP + 3)
+            .map(|i| settled_agent_slot(&format!("memory.slot_{i}"), "v"))
+            .collect();
+        let block = render(&facts);
+        assert!(block.contains(&format!("capped at {OWNED_SLOT_CAP}")));
+        assert!(block.contains("3 more of your slot(s) not listed"));
+    }
+
+    /// `block_claims` is the filter the renderer's contract assumes: own slots
+    /// whatever their status, siblings' open loops only, own open loops first.
+    #[test]
+    fn block_claims_keeps_own_slots_and_only_open_siblings() {
+        let mut sibling_settled = sibling_slot("memory.theirs", "background");
+        sibling_settled.status = FactStatus::Settled;
+        let kept = block_claims(
+            vec![
+                settled_agent_slot("memory.mine_settled", "v"),
+                sibling_settled,
+                sibling_slot("memory.theirs_open", "their loop"),
+                agent_slot("memory.mine_open", "unfinished"),
+            ],
+            SELF_ID,
+        );
+        let keys: Vec<&str> = kept.iter().map(|f| f.claim_key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "memory.mine_open",
+                "memory.mine_settled",
+                "memory.theirs_open"
+            ]
+        );
     }
 
     #[test]

@@ -8094,7 +8094,13 @@ impl OpenFangKernel {
             // inherited a claim its agent would be refused by name would be
             // the read gate leaking through the file system instead of the
             // prompt.
-            let facts = match self.memory.open_claim_slots(
+            // ANAI-279: the block renders every slot this agent authored,
+            // whatever its status, plus siblings' open loops. `memory_status`
+            // still asks for open loops only — unfinished business is what a
+            // status report is for, while the block is also the only place an
+            // agent is shown the addresses it already owns *before* it mints a
+            // new one.
+            let facts = match self.memory.block_claim_slots(
                 entry.id,
                 &entry.manifest.projects,
                 &|ancestor: &str| may_read_project(&self.registry, entry.id, ancestor),
@@ -15815,11 +15821,13 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 
-    /// A settled claim is retrieved, not pasted (ADR 0002 §2.5). An agent
-    /// whose only slots are settled must be treated exactly like one with no
-    /// slots at all — including the scaffold-untouched rule.
+    /// ANAI-279: a settled claim of the agent's own renders as an *address*,
+    /// not as a body. The claim text is still retrieved rather than pasted
+    /// (ADR 0002 §2.5); what the block adds is the vocabulary an agent needs
+    /// before it mints a near-duplicate key. Supersedes the pre-279 rule that
+    /// a settled-only agent was treated as having no slots at all.
     #[test]
-    fn test_memory_md_sweep_renders_open_loops_only() {
+    fn test_memory_md_sweep_lists_a_settled_slot_by_address() {
         use openfang_memory::fact::FactWrite;
         let (tmp, kernel) = sweep_test_kernel("of-sweep-open-only");
         let ws = tmp.path().join("ws-open-only");
@@ -15838,14 +15846,27 @@ system_prompt = "You are a test agent."
                 "settled, therefore retrieved rather than pasted",
             ))
             .unwrap();
-        assert_eq!(kernel.sweep_memory_md().written, 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), scaffold);
+        assert_eq!(kernel.sweep_memory_md().written, 1);
+        let settled_only = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            settled_only.contains("`memory.settled_background` — _settled_"),
+            "the address is the point; every fact the fleet had written was settled"
+        );
+        assert!(
+            !settled_only.contains("retrieved rather than pasted"),
+            "the claim body is still not injected"
+        );
+        assert!(
+            settled_only.starts_with(scaffold),
+            "hand-written prose is preserved"
+        );
 
         seed_open_slot(&kernel, agent, "memory.open_loop", "unfinished");
         assert_eq!(kernel.sweep_memory_md().written, 1);
         let out = std::fs::read_to_string(&path).unwrap();
-        assert!(out.contains("memory.open_loop"));
-        assert!(!out.contains("memory.settled_background"));
+        assert!(out.contains("`memory.open_loop` — unfinished"));
+        assert!(out.contains("## Slots you already own"));
+        assert!(out.contains("`memory.settled_background` — _settled_"));
 
         kernel.shutdown();
     }
@@ -16103,30 +16124,45 @@ system_prompt = "You are a test agent."
         kernel.shutdown();
     }
 
-    /// A key that falls out of the namespace shows up as removed, so an
-    /// operator can see what a sweep would drop before it drops it.
+    /// A key that falls out of the block shows up as removed, so an operator
+    /// can see what a sweep would drop before it drops it.
+    ///
+    /// Post-ANAI-279 the removal event is a *sibling's* loop settling: the
+    /// agent's own slots stay listed whatever their status, because they are
+    /// the address space it writes into. A sibling's settled claim is neither.
     #[test]
     fn test_memory_md_dry_run_reports_removed_keys() {
+        use openfang_memory::fact::{FactStatus, FactWrite};
         let (tmp, kernel) = sweep_test_kernel("of-sweep-removed");
         let ws = tmp.path().join("ws-removed");
-        let agent = register_agent_with_state_dir(&kernel, "removed", &ws);
+        let theirs_ws = tmp.path().join("ws-removed-author");
+        let agent = register_agent_in_project(&kernel, "removed", &ws, "kimiya");
+        let author = register_agent_in_project(&kernel, "removed-author", &theirs_ws, "kimiya");
         let path = ws.join("MEMORY.md");
         std::fs::write(&path, "# Long-Term Memory\n").unwrap();
 
-        seed_open_slot(&kernel, agent, "memory.gone_soon", "v");
-        assert_eq!(kernel.sweep_memory_md().written, 1);
-
-        // Settling a loop is how a slot leaves the block: the claim is still
-        // true and still readable, it just stops being unfinished business.
+        let sibling_loop = |status: FactStatus| {
+            FactWrite::new(author, "project", "project.kimiya.gone_soon", "v")
+                .with_scope_ref("kimiya")
+                .with_status(status)
+        };
         kernel
             .memory
             .facts()
-            .upsert(openfang_memory::fact::FactWrite::new(
-                agent,
-                "agent",
-                "memory.gone_soon",
-                "resolved",
-            ))
+            .upsert(sibling_loop(FactStatus::Open))
+            .unwrap();
+        seed_open_slot(&kernel, agent, "memory.mine", "v");
+        assert_eq!(kernel.sweep_memory_md().errors, 0);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("gone_soon"));
+
+        // Settling is how someone else's loop leaves my block: still true,
+        // still readable by key, no longer unfinished business of mine.
+        kernel
+            .memory
+            .facts()
+            .upsert(sibling_loop(FactStatus::Settled))
             .unwrap();
         seed_open_slot(&kernel, agent, "memory.brand_new", "v");
 
@@ -16137,7 +16173,10 @@ system_prompt = "You are a test agent."
             .find(|p| p.agent == "removed")
             .expect("agent present in plan");
         assert_eq!(plan.keys_added, vec!["memory.brand_new".to_string()]);
-        assert_eq!(plan.keys_removed, vec!["memory.gone_soon".to_string()]);
+        assert_eq!(
+            plan.keys_removed,
+            vec!["kimiya/project.kimiya.gone_soon".to_string()]
+        );
         // ...and it still has not written anything.
         assert!(std::fs::read_to_string(&path)
             .unwrap()
