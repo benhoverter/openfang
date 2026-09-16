@@ -95,7 +95,9 @@
 //! store rather than a habit of its callers.
 
 use crate::staleness::{self, PersistenceClass, Staleness};
-use crate::vocabulary::{nearest_keys, resolve_scope_ref, ClaimKey, FactScope};
+use crate::vocabulary::{
+    check_key_addresses_scope, nearest_keys, resolve_scope_ref, ClaimKey, FactScope,
+};
 use chrono::{DateTime, Utc};
 use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
@@ -103,6 +105,7 @@ use openfang_types::memory::{MemoryId, MemorySource};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 use uuid::Uuid;
 
 /// `kind` value for a tier-3 claim row.
@@ -587,9 +590,15 @@ impl FactStore {
         // absent ref would silently switch off the constraint it is part of.
         let scope_ref = resolve_scope_ref(scope, &agent, write.scope_ref.as_deref())?;
 
-        let claim_key = ClaimKey::parse(&write.claim_key)
+        let parsed_key = ClaimKey::parse(&write.claim_key)
             .map_err(|e| Self::with_existing_keys(&conn, scope, &scope_ref, &write.claim_key, e))?;
-        let claim_key = claim_key.as_str().to_string();
+        let claim_key = parsed_key.as_str().to_string();
+
+        // ANAI-281. Does the key agree with the address it is being stored
+        // at? Computed here, acted on below, because the answer depends on
+        // something only the slot lookup knows: whether this key is NEW.
+        let coherence = check_key_addresses_scope(scope, &scope_ref, &parsed_key);
+
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
@@ -628,11 +637,30 @@ impl FactStore {
             .optional()
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
+        // An incoherent address on an EXISTING slot is grandfathered and said
+        // out loud. Refusing it would make a drifted slot permanently
+        // un-supersedable — the one repair path it has is a write to the
+        // address it already occupies — which is a worse failure than the
+        // drift. The line is what keeps the corpus's four known cases
+        // countable rather than forgotten.
+        if let (Err(ref e), Some(_)) = (&coherence, &live) {
+            warn!(
+                scope_ref = %scope_ref,
+                claim_key = %claim_key,
+                "Grandfathered an incoherent slot address on an existing slot: {e}"
+            );
+        }
+
         let outcome = match live {
             // Slot empty: a fresh claim. Also the path taken when the slot
             // holds only soft-deleted rows — the v14 index scopes uniqueness
             // to `deleted = 0` precisely so `forget` cannot poison a key.
             None => {
+                // Mint: the only moment the address can still be chosen, and
+                // therefore the only moment refusing it costs nothing. The
+                // transaction has opened but written nothing, so the early
+                // return rolls back an empty transaction.
+                coherence?;
                 let id = MemoryId::new();
                 tx.execute(
                     "INSERT INTO memories (id, agent_id, content, source, scope, confidence,
@@ -1182,6 +1210,44 @@ mod tests {
     /// a slot the same way the writer addressed it.
     fn aref(a: AgentId) -> String {
         a.0.to_string()
+    }
+
+    /// A row the current writer would refuse — planted the only way a
+    /// pre-ANAI-281 row can be reproduced, by going around the writer.
+    ///
+    /// Four of these are live in the corpus. They are the reason the coherence
+    /// check fires on mint and not on every write.
+    fn plant_drifted_row(
+        conn: &Arc<Mutex<Connection>>,
+        a: AgentId,
+        scope_ref: &str,
+        claim_key: &str,
+        claim: &str,
+    ) {
+        let guard = conn.lock().unwrap();
+        guard
+            .execute(
+                "INSERT INTO memories (id, agent_id, content, source, scope, confidence,
+                                       metadata, created_at, accessed_at, access_count,
+                                       deleted, embedding, episode_id, kind, claim_key,
+                                       status, last_affirmed_at, scope_ref, authored_by,
+                                       persistence_class)
+                 VALUES (?1, ?2, ?3, '\"conversation\"', 'project', 1.0,
+                         '{}', ?4, ?4, 0,
+                         0, NULL, NULL, ?5, ?6,
+                         'settled', ?4, ?7, ?2,
+                         'active')",
+                rusqlite::params![
+                    MemoryId::new().0.to_string(),
+                    a.0.to_string(),
+                    claim,
+                    Utc::now().to_rfc3339(),
+                    KIND_FACT,
+                    claim_key,
+                    scope_ref,
+                ],
+            )
+            .unwrap();
     }
 
     // --- ANAI-247: list_for_scope ------------------------------------------
@@ -2246,5 +2312,159 @@ mod tests {
             FactStatus::parse("superseded").is_err(),
             "there is no superseded status by design (ADR 0001 2.3.2)"
         );
+    }
+
+    // --- ANAI-281: the key and the ref are halves of one address ----------
+
+    /// The measured drift, refused at the mint — the one moment choosing a
+    /// different address costs nothing.
+    #[test]
+    fn a_new_key_naming_another_project_is_refused() {
+        let (store, _c) = store();
+        let a = agent();
+        let err = store
+            .upsert(
+                FactWrite::new(
+                    a,
+                    "project",
+                    "project.tttb.pip_scalar_dual_write",
+                    "dual write on",
+                )
+                .with_scope_ref("tabletop-toybox"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tabletop-toybox"), "{err}");
+        assert!(err.contains("tttb"), "{err}");
+        assert!(
+            store
+                .get(
+                    "project",
+                    "tabletop-toybox",
+                    "project.tttb.pip_scalar_dual_write"
+                )
+                .unwrap()
+                .is_none(),
+            "a refused mint must leave the slot empty and the transaction rolled back"
+        );
+    }
+
+    /// Both legal spellings mint. The bare form is live in the corpus
+    /// (`project.linear_auto_done_on_merge` at `tabletop-toybox`) and the
+    /// repeated form is the one the grammar hint blesses; refusing either
+    /// would be this check inventing a convention.
+    #[test]
+    fn both_coherent_spellings_are_accepted() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(
+                FactWrite::new(
+                    a,
+                    "project",
+                    "project.tabletop-toybox.active_branch",
+                    "main",
+                )
+                .with_scope_ref("tabletop-toybox"),
+            )
+            .unwrap();
+        store
+            .upsert(
+                FactWrite::new(a, "project", "project.linear_auto_done_on_merge", "yes")
+                    .with_scope_ref("tabletop-toybox"),
+            )
+            .unwrap();
+        // And an ancestor slug names a sub-project: a qualifier cannot hold a
+        // dot, so equality would lock the blessed shape out of the hierarchy.
+        store
+            .upsert(
+                FactWrite::new(a, "project", "project.openfang.memory_owner", "annabelle")
+                    .with_scope_ref("openfang.memory"),
+            )
+            .unwrap();
+    }
+
+    /// The load-bearing half. A slot that has already drifted must stay
+    /// writable at the address it occupies: that write is the only repair path
+    /// it has, and refusing it would strand the claim forever.
+    #[test]
+    fn an_existing_drifted_slot_can_still_be_superseded() {
+        let (store, conn) = store();
+        let a = agent();
+        plant_drifted_row(
+            &conn,
+            a,
+            "tabletop-toybox",
+            "project.tttb.pip_scalar_dual_write",
+            "dual write off",
+        );
+
+        let outcome = store
+            .upsert(
+                FactWrite::new(
+                    a,
+                    "project",
+                    "project.tttb.pip_scalar_dual_write",
+                    "dual write on",
+                )
+                .with_scope_ref("tabletop-toybox"),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, FactOutcome::Superseded { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            store
+                .get(
+                    "project",
+                    "tabletop-toybox",
+                    "project.tttb.pip_scalar_dual_write"
+                )
+                .unwrap()
+                .unwrap()
+                .claim,
+            "dual write on"
+        );
+    }
+
+    /// An affirmation of a drifted slot is a write too, and the same argument
+    /// covers it: the alternative is a claim that cannot be re-verified.
+    #[test]
+    fn an_existing_drifted_slot_can_still_be_affirmed() {
+        let (store, conn) = store();
+        let a = agent();
+        plant_drifted_row(&conn, a, "tabletop-toybox", "project.tttb.step", "step 3");
+        let outcome = store
+            .upsert(
+                FactWrite::new(a, "project", "project.tttb.step", "step 3")
+                    .with_scope_ref("tabletop-toybox"),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, FactOutcome::Affirmed { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    /// Non-project scopes have no slug for the key to agree with, and a
+    /// `project.*` key there is advisory-only (the kernel logs it). The store
+    /// must not refuse it: two of these are live rows.
+    #[test]
+    fn an_agent_scoped_project_key_is_not_refused() {
+        let (store, _c) = store();
+        let a = agent();
+        store
+            .upsert(FactWrite::new(
+                a,
+                "agent",
+                "project.membership_map",
+                "openfang, kimiya, aquilae, tabletop-toybox",
+            ))
+            .unwrap();
+        assert!(store
+            .get("agent", &aref(a), "project.membership_map")
+            .unwrap()
+            .is_some());
     }
 }

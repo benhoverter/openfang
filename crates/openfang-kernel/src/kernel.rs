@@ -11853,6 +11853,27 @@ impl KernelHandle for OpenFangKernel {
             );
         }
 
+        // ANAI-281 advisory. A `project.*` key filed outside `project` scope is
+        // legal — an agent may hold a private claim about a project — but it
+        // was silent, and both live instances (`project.fma_mod.step_status`,
+        // `project.membership_map`, 2026-09-16) look like mistakes: a project
+        // claim stored where no other member of the project can read it.
+        //
+        // A key that fails to parse falls through untouched. The store's own
+        // rejection carries the nearest existing keys, and pre-empting it here
+        // with a vaguer message would cost the caller that menu.
+        if let Ok(key) = openfang_memory::vocabulary::ClaimKey::parse(&request.claim_key) {
+            if openfang_memory::vocabulary::project_key_outside_project_scope(scope, &key) {
+                info!(
+                    agent_id = %agent_id,
+                    claim_key = %request.claim_key,
+                    scope = %scope,
+                    "A project.* claim was filed outside project scope: no other member of \
+                     the project can read it here"
+                );
+            }
+        }
+
         // A fact write is activity: it opens an episode if none is open and
         // extends one that is. Same reasoning as `memory_note` — the write
         // establishes the state, which is why ADR 0002 §2.6 refuses a separate
@@ -11939,6 +11960,7 @@ impl KernelHandle for OpenFangKernel {
                 agent_id,
                 scope.as_str(),
                 &scope_ref,
+                &|ancestor: &str| may_read_project(&self.registry, agent_id, ancestor),
                 SLOT_HINT_SCAN_LIMIT,
             ) {
                 Ok(addresses) => openfang_memory::slot_hints::rank_neighbours(
@@ -11957,6 +11979,33 @@ impl KernelHandle for OpenFangKernel {
             }
         } else {
             openfang_memory::slot_hints::RankedNeighbours::default()
+        };
+
+        // ANAI-281. Separate from the ranked neighbourhood because it is a
+        // different kind of claim: `likely_duplicate_of` is a lexical guess and
+        // says so, while this is decidable — the key just minted at a child
+        // scope already holds a live claim at an ancestor, so the lineage read
+        // will now return the new row and hide the old one. Created only, same
+        // seam and same best-effort rule: the claim is durable either way.
+        let shadowed = if outcome_name == "created" {
+            match self.memory.shadowed_ancestor_slot(
+                scope.as_str(),
+                &scope_ref,
+                &request.claim_key,
+                &|ancestor: &str| may_read_project(&self.registry, agent_id, ancestor),
+            ) {
+                Ok(found) => found,
+                Err(e) => {
+                    warn!(
+                        agent_id = %agent_id,
+                        error = %e,
+                        "Ancestor slot lookup failed; the write stands without a shadow warning"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
 
         // ANAI-212: the block is a view of the slot store, so a write that
@@ -11986,6 +12035,7 @@ impl KernelHandle for OpenFangKernel {
             "existing_slots": neighbours.addresses,
             "existing_slots_total": neighbours.total,
             "likely_duplicate_of": neighbours.likely_duplicate,
+            "shadows_ancestor_slot": shadowed,
         }))
     }
 

@@ -393,6 +393,100 @@ impl std::fmt::Display for ClaimKey {
     }
 }
 
+/// The project a claim key names in its own address segments, if it names one.
+///
+/// `project.kimiya.matrix_harness` yields `Some("kimiya")`; `repo.trunk_head`
+/// and a bare `project.membership_map` both yield `None`. The second case is
+/// the one worth spelling out: a two-segment `project.<slot>` key carries no
+/// project *name*, so there is nothing in it that can disagree with
+/// `scope_ref`, while three or more segments under the `project` namespace
+/// name a subject that can.
+pub fn project_qualifier_of(key: &ClaimKey) -> Option<&str> {
+    let mut segments = key.as_str().split('.');
+    if segments.next() != Some("project") {
+        return None;
+    }
+    let qualifier = segments.next()?;
+    // Only a third segment makes the second one an address rather than a slot
+    // name.
+    segments.next().map(|_| qualifier)
+}
+
+/// ANAI-281: does the key agree with the address it is being stored at?
+///
+/// # The failure this closes
+///
+/// [`ClaimKey::parse`] validates a key in isolation and [`check_scope_ref`]
+/// validates a ref in isolation, and nothing compared the two. So
+/// `project.tttb.pip_scalar_dual_write` stored at `scope_ref =
+/// tabletop-toybox` is two independently-legal halves naming two different
+/// projects, and the store accepted it. Read off the live corpus on
+/// 2026-09-16, one agent held five slots for one project under **three**
+/// spellings of its slug plus one key with no project segment at all — which
+/// is ADR 0001 §2.3.3's dedup miss arriving through the *address* rather than
+/// through the name, and therefore invisible to ANAI-277's ranker, which
+/// compares only the final segment.
+///
+/// # Why the rule is coverage and not equality
+///
+/// `scope_ref` is dot-hierarchical (ANAI-264): `openfang.memory` is a
+/// sub-project of `openfang`, and a qualifier cannot hold a dot. Requiring
+/// equality would make every claim at a sub-project unaddressable by the
+/// blessed `project.<slug>.<slot>` shape. So the test is
+/// [`openfang_types::agent::slug_covers`] — the same segment-boundary test the
+/// membership gate and the lineage walk use, which is what keeps one idea of
+/// "names this project" in one place.
+///
+/// # Enforced on mint only
+///
+/// The caller — [`crate::fact::FactStore::upsert`] — runs this on the empty-slot
+/// path and only there. The drifted keys are live rows, and a check that fired
+/// on every write would make them permanently un-supersedable: the slot could
+/// never be corrected in place, which is a worse failure than the drift it
+/// diagnoses.
+pub fn check_key_addresses_scope(
+    scope: FactScope,
+    scope_ref: &str,
+    key: &ClaimKey,
+) -> OpenFangResult<()> {
+    if scope != FactScope::Project {
+        return Ok(());
+    }
+    let Some(named) = project_qualifier_of(key) else {
+        return Ok(());
+    };
+    if openfang_types::agent::slug_covers(named, scope_ref) {
+        return Ok(());
+    }
+    // The slot half, whatever its depth: `project.tttb.a.b` keeps `a.b`.
+    let slot = key.as_str().splitn(3, '.').nth(2).unwrap_or_default();
+    Err(OpenFangError::InvalidInput(format!(
+        "rejected claim key {key:?}: its second segment names the project {named:?}, but the \
+         claim is being written to scope_ref {scope_ref:?}. Those are two different addresses \
+         for one slot, and that pair is how one claim ends up living under three spellings of \
+         its own project. Write either {:?} — repeating the scope_ref, or an ancestor of it — \
+         or {:?}, which leaves scope_ref to carry the project on its own. Both are legal; pick \
+         one and keep using it. This refusal fires only when the key is NEW: a slot that has \
+         already drifted can still be rewritten at its existing address, which is how it gets \
+         corrected rather than forked.",
+        format!("project.{scope_ref}.{slot}"),
+        format!("project.{slot}"),
+        key = key.as_str(),
+    )))
+}
+
+/// ANAI-281 advisory: a `project.*` key stored outside `project` scope.
+///
+/// Not a refusal. An agent may legitimately hold a private claim about a
+/// project in its own scope, and refusing that would be this module inventing
+/// a policy nobody reviewed. But it is currently *silent*, and both live
+/// instances (`project.fma_mod.step_status` and `project.membership_map`, both
+/// at `scope = agent`, 2026-09-16) look like mistakes: a project claim filed
+/// where no other member of the project can read it.
+pub fn project_key_outside_project_scope(scope: FactScope, key: &ClaimKey) -> bool {
+    scope != FactScope::Project && key.namespace() == "project"
+}
+
 /// The grammar, quoted back to whoever got it wrong.
 ///
 /// The last sentence is doing work the rest of the module cannot: it names the
@@ -797,6 +891,132 @@ mod tests {
         assert_eq!(near[0], "repo.trunk_mode");
         assert_eq!(near[1], "repo.trunk_model");
         assert_eq!(near, nearest_keys(&keys, "repo.trunk_modl", 3));
+    }
+
+    // ANAI-281: the key and the ref are halves of one address.
+
+    fn key(raw: &str) -> ClaimKey {
+        ClaimKey::parse(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}"))
+    }
+
+    #[test]
+    fn only_a_third_segment_makes_the_second_one_a_project_name() {
+        assert_eq!(
+            project_qualifier_of(&key("project.kimiya.matrix_harness")),
+            Some("kimiya")
+        );
+        // `project.<slot>` names no project, so there is nothing to disagree
+        // with `scope_ref` about. This is a live shape (`tttb-ben`'s
+        // `project.linear_auto_done_on_merge`) and must stay legal.
+        assert_eq!(
+            project_qualifier_of(&key("project.linear_auto_done_on_merge")),
+            None
+        );
+        assert_eq!(project_qualifier_of(&key("repo.trunk_head")), None);
+    }
+
+    /// The measured drift: three spellings of `tabletop-toybox` under one ref.
+    /// Each of these was accepted by the store on 2026-09-16.
+    #[test]
+    fn the_measured_project_slug_drift_is_refused() {
+        for raw in [
+            "project.tabletop_toybox.pip_state_model",
+            "project.tttb.pip_scalar_dual_write",
+            "project.tttb.epic3_feature_to_countdown",
+        ] {
+            let err = check_key_addresses_scope(FactScope::Project, "tabletop-toybox", &key(raw))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("tabletop-toybox"), "{err}");
+            // A refusal the caller cannot act on is a retry loop: both legal
+            // spellings have to be in the message.
+            assert!(err.contains("project.tabletop-toybox."), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_key_that_repeats_its_own_ref_is_fine() {
+        assert!(check_key_addresses_scope(
+            FactScope::Project,
+            "tabletop-toybox",
+            &key("project.tabletop-toybox.active_branch")
+        )
+        .is_ok());
+        assert!(check_key_addresses_scope(
+            FactScope::Project,
+            "kimiya",
+            &key("project.kimiya.matrix_harness")
+        )
+        .is_ok());
+    }
+
+    /// Coverage, not equality. A qualifier cannot hold a dot, so equality
+    /// would lock the blessed `project.<slug>.<slot>` shape out of every
+    /// sub-project the ANAI-264 hierarchy exists to address.
+    #[test]
+    fn an_ancestor_slug_may_name_a_sub_project() {
+        assert!(check_key_addresses_scope(
+            FactScope::Project,
+            "openfang.memory",
+            &key("project.openfang.memory_owner")
+        )
+        .is_ok());
+        // Only the FIRST qualifier is the project name. Deeper segments are
+        // subject, not address — that is kimiya-alpha's
+        // `project.<project>.<subject>.<slot>` shape, which the namespace
+        // review explicitly blessed — so this is a slot named `memory.owner`
+        // inside project `openfang` and is coherent, not a claim filed at the
+        // wrong level.
+        assert!(check_key_addresses_scope(
+            FactScope::Project,
+            "openfang",
+            &key("project.openfang.memory.owner")
+        )
+        .is_ok());
+        // And a character prefix is not a segment prefix — the whole point of
+        // borrowing `slug_covers` rather than writing a `starts_with`.
+        assert!(check_key_addresses_scope(
+            FactScope::Project,
+            "openfang-fork",
+            &key("project.openfang.owner")
+        )
+        .is_err());
+    }
+
+    /// Non-project scopes have no slug to agree with, so the check must be a
+    /// no-op on them rather than guessing.
+    #[test]
+    fn non_project_scopes_are_not_checked() {
+        for scope in [FactScope::Agent, FactScope::User] {
+            assert!(check_key_addresses_scope(
+                scope,
+                "whatever-ref",
+                &key("project.tttb.step_status")
+            )
+            .is_ok());
+        }
+    }
+
+    /// The advisory half: the same key is *reported* outside project scope,
+    /// because nobody in the project can read it there.
+    #[test]
+    fn a_project_key_outside_project_scope_is_reportable_but_legal() {
+        assert!(project_key_outside_project_scope(
+            FactScope::Agent,
+            &key("project.fma_mod.step_status")
+        ));
+        assert!(project_key_outside_project_scope(
+            FactScope::Agent,
+            &key("project.membership_map")
+        ));
+        assert!(!project_key_outside_project_scope(
+            FactScope::Project,
+            &key("project.kimiya.matrix_harness")
+        ));
+        assert!(!project_key_outside_project_scope(
+            FactScope::Agent,
+            &key("memory.fact_tool_status")
+        ));
     }
 
     #[test]

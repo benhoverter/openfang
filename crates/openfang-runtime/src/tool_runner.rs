@@ -4108,28 +4108,47 @@ fn render_slot_neighbourhood(payload: &serde_json::Value) -> String {
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    if addresses.is_empty() {
+    let shadowed = payload["shadows_ancestor_slot"].as_str();
+    if addresses.is_empty() && shadowed.is_none() {
         return String::new();
     }
 
-    let mut out = String::from(
-        "\nAddresses that already exist here. If one of them is this same claim under \
-         another name, write THAT key from now on — rewriting a slot supersedes it and \
-         keeps the history, while a second key splits one claim in two and surfaces both:\n",
-    );
-    for address in &addresses {
-        out.push_str(&format!("  - {address}\n"));
+    let mut out = String::new();
+
+    // ANAI-281 leads, because it is the only part of this hint that is not a
+    // guess. The ranked list below asks the agent to recognise something; this
+    // states a fact about the corpus it can act on without judging anything.
+    if let Some(ancestor) = shadowed {
+        out.push_str(&format!(
+            "\nSHADOWS AN EXISTING SLOT: `{ancestor}` already holds a live claim under this \
+             exact key, at a project ABOVE the one you just wrote to. Nothing was lost, but \
+             one claim now lives in two slots, and a lineage read returns yours and hides \
+             that one. If the claim belongs to the parent project, rewrite `{ancestor}` \
+             instead and let this slot go; if it is genuinely narrower than the parent's, \
+             this is correct and you can ignore the warning.\n"
+        ));
     }
 
-    let total = payload["existing_slots_total"].as_u64().unwrap_or(0) as usize;
-    if total > addresses.len() {
-        // Say what was dropped rather than letting a capped list read as the
-        // whole address space — the omitted tail is where an old settled slot
-        // is most likely to be hiding.
-        out.push_str(&format!(
-            "  ({} more not shown; memory_status lists your open slots)\n",
-            total - addresses.len()
-        ));
+    if !addresses.is_empty() {
+        out.push_str(
+            "\nAddresses that already exist here. If one of them is this same claim under \
+             another name, write THAT key from now on — rewriting a slot supersedes it and \
+             keeps the history, while a second key splits one claim in two and surfaces both:\n",
+        );
+        for address in &addresses {
+            out.push_str(&format!("  - {address}\n"));
+        }
+
+        let total = payload["existing_slots_total"].as_u64().unwrap_or(0) as usize;
+        if total > addresses.len() {
+            // Say what was dropped rather than letting a capped list read as
+            // the whole address space — the omitted tail is where an old
+            // settled slot is most likely to be hiding.
+            out.push_str(&format!(
+                "  ({} more not shown; memory_status lists your open slots)\n",
+                total - addresses.len()
+            ));
+        }
     }
 
     if let Some(near) = payload["likely_duplicate_of"].as_str() {
@@ -9013,6 +9032,67 @@ mod tests {
             out.contains("lexical guess, not a judgement about meaning"),
             "{out}"
         );
+    }
+
+    // --- ANAI-281: the shadowed ancestor slot ------------------------------
+
+    /// The measured case: `repo.trunk_head` minted at `openfang.memory` while
+    /// `openfang` already held it. Decidable, so it is stated rather than
+    /// ranked — and it leads, because everything else in the hint is a guess.
+    #[test]
+    fn a_shadowed_ancestor_slot_is_named_before_the_ranked_list() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "project",
+            "scope_ref": "openfang.memory",
+            "claim_key": "repo.trunk_head",
+            "existing_slots": ["openfang/repo.trunk_head", "openfang/deploy.live_binary"],
+            "existing_slots_total": 2,
+            "likely_duplicate_of": serde_json::Value::Null,
+            "shadows_ancestor_slot": "openfang/repo.trunk_head",
+        }));
+        assert!(out.contains("SHADOWS AN EXISTING SLOT"), "{out}");
+        let shadow = out.find("SHADOWS AN EXISTING SLOT").unwrap();
+        let list = out.find("Addresses that already exist").unwrap();
+        assert!(shadow < list, "the decidable warning must lead: {out}");
+        // Both readings are legitimate and the message says so — a warning
+        // that permitted only one would push a correctly narrower claim into
+        // the parent's slot.
+        assert!(out.contains("rewrite `openfang/repo.trunk_head`"), "{out}");
+        assert!(out.contains("this is correct and you can ignore"), "{out}");
+    }
+
+    /// A shadow with nothing else around it must still render: the
+    /// neighbourhood's emptiness is not evidence that the slot was free.
+    #[test]
+    fn a_shadow_survives_an_empty_neighbourhood() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "created",
+            "scope": "project",
+            "scope_ref": "openfang.memory",
+            "claim_key": "repo.trunk_head",
+            "existing_slots": [],
+            "existing_slots_total": 0,
+            "shadows_ancestor_slot": "openfang/repo.trunk_head",
+        }));
+        assert!(out.contains("SHADOWS AN EXISTING SLOT"), "{out}");
+        assert!(!out.contains("Addresses that already exist"), "{out}");
+    }
+
+    /// A supersession carries neither half, for the ANAI-277 reason: the
+    /// address was already chosen.
+    #[test]
+    fn a_supersession_carries_no_shadow_warning() {
+        let out = render_fact_write(&serde_json::json!({
+            "outcome": "superseded",
+            "scope": "project",
+            "scope_ref": "openfang.memory",
+            "claim_key": "repo.trunk_head",
+            "previous_claim": "main @ deadbee",
+            "shadows_ancestor_slot": "openfang/repo.trunk_head",
+        }));
+        assert!(out.contains("Superseded"), "{out}");
+        assert!(!out.contains("SHADOWS"), "{out}");
     }
 
     /// A capped list that read as the whole address space would be worse than

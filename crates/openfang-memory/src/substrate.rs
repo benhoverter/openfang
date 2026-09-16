@@ -821,11 +821,30 @@ impl MemorySubstrate {
     /// scopes, so a same-scope-only list would be blind to half the evidence.
     /// Not the reverse: an agent-scope write does not enumerate every project
     /// it belongs to, which would be a long list of slots it mostly cannot own.
+    ///
+    /// **The lineage is walked** (ANAI-281). This used to read the exact
+    /// `scope_ref` while every *read* path walked root-ward (ANAI-264), so a
+    /// write at `openfang.memory` was hinted against `openfang.memory` alone
+    /// and the ancestor slot it was about to shadow was invisible at the one
+    /// moment it was actionable. `vocabulary.rs` names that hazard one level
+    /// down — "a reader that resolves `scope_ref` differently from the writer
+    /// addresses a *different slot*" — and this reintroduced it one level up.
+    /// Measured cost: `repo.trunk_head` live at both `openfang` and
+    /// `openfang.memory`, one claim, two slots, same author, superseded
+    /// independently hours apart.
+    ///
+    /// Deduped on the **full display address**, not on `claim_key`, which is
+    /// the one thing this cannot borrow from
+    /// [`crate::fact::FactStore::list_for_scopes`]. That union is
+    /// most-specific-wins *per key*, which is right when you are reading a
+    /// claim's value and exactly wrong when you are showing an address space:
+    /// it would hide the shadowed ancestor, which is the duplicate.
     pub fn owned_slot_addresses(
         &self,
         agent_id: AgentId,
         scope: &str,
         scope_ref: &str,
+        may_read_project: &dyn Fn(&str) -> bool,
         limit: usize,
     ) -> OpenFangResult<Vec<String>> {
         let mut seen: HashSet<String> = HashSet::new();
@@ -837,8 +856,17 @@ impl MemorySubstrate {
             }
         };
 
-        for fact in self.facts().list_for_scope(scope, scope_ref, limit)? {
-            push(&fact, &mut out);
+        // Most specific first, so the agent's own level leads the list and a
+        // truncation drops background rather than the slot next door.
+        let lineage = if scope == "project" {
+            readable_lineage(scope_ref, may_read_project)
+        } else {
+            vec![scope_ref.to_string()]
+        };
+        for level in &lineage {
+            for fact in self.facts().list_for_scope(scope, level, limit)? {
+                push(&fact, &mut out);
+            }
         }
         let own = agent_id.to_string();
         if scope != "agent" || scope_ref != own {
@@ -847,6 +875,41 @@ impl MemorySubstrate {
             }
         }
         Ok(out)
+    }
+
+    /// ANAI-281: the ancestor slot a newly minted key shadows, if any.
+    ///
+    /// Distinct from the ranked neighbourhood on purpose. `likely_duplicate`
+    /// is a lexical guess and says so; *this* is decidable — the same
+    /// `claim_key` already holds a live claim at an ancestor of the ref just
+    /// written, so the lineage read that ANAI-264 made most-specific-wins will
+    /// now return the new row and hide the old one. Nothing is lost, but one
+    /// claim is being maintained in two places, and only the writer can say
+    /// which of the two addresses it meant.
+    ///
+    /// Gated by `may_read_project` for the reason
+    /// [`crate::fact::FactStore::list_for_scopes`] takes its refs from the
+    /// caller: membership grants downward, and naming an ancestor slot the
+    /// agent could not read by name would be the read gate leaking upward
+    /// through the hierarchy.
+    ///
+    /// Returns the address in [`crate::memory_md::display_key`] spelling —
+    /// carrying the ancestor's slug, which is the whole point: an inherited
+    /// claim without its source leaves the reader unable to tell which slot to
+    /// go correct.
+    pub fn shadowed_ancestor_slot(
+        &self,
+        scope: &str,
+        scope_ref: &str,
+        claim_key: &str,
+        may_read_project: &dyn Fn(&str) -> bool,
+    ) -> OpenFangResult<Option<String>> {
+        match self.facts().get_inherited(scope, scope_ref, claim_key)? {
+            Some((ancestor, fact)) if may_read_project(&ancestor) => {
+                Ok(Some(crate::memory_md::display_key(&fact)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Set or clear a session label.
@@ -1994,7 +2057,13 @@ mod tests {
         open_slot(&substrate, agent_id, "agent", None, "memory.loop", "open");
 
         let addresses = substrate
-            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .owned_slot_addresses(
+                agent_id,
+                "agent",
+                &agent_id.to_string(),
+                &|_: &str| true,
+                50,
+            )
             .unwrap();
         assert!(addresses.contains(&"repo.inference_vendor".to_string()));
         assert!(addresses.contains(&"memory.loop".to_string()));
@@ -2024,7 +2093,7 @@ mod tests {
         );
 
         let addresses = substrate
-            .owned_slot_addresses(agent_id, "project", "kimiya", 50)
+            .owned_slot_addresses(agent_id, "project", "kimiya", &|_: &str| true, 50)
             .unwrap();
         assert!(
             addresses.contains(&"kimiya/project.kimiya.other".to_string()),
@@ -2054,7 +2123,13 @@ mod tests {
         );
 
         let addresses = substrate
-            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .owned_slot_addresses(
+                agent_id,
+                "agent",
+                &agent_id.to_string(),
+                &|_: &str| true,
+                50,
+            )
             .unwrap();
         assert_eq!(addresses, vec!["memory.mine".to_string()]);
     }
@@ -2069,9 +2144,147 @@ mod tests {
         open_slot(&substrate, agent_id, "agent", None, "memory.mine", "mine");
 
         let addresses = substrate
-            .owned_slot_addresses(agent_id, "agent", &agent_id.to_string(), 50)
+            .owned_slot_addresses(
+                agent_id,
+                "agent",
+                &agent_id.to_string(),
+                &|_: &str| true,
+                50,
+            )
             .unwrap();
         assert_eq!(addresses.len(), 1, "{addresses:?}");
+    }
+
+    // --- ANAI-281: the write-time hint resolves refs the way reads do ------
+
+    /// The measured failure. `repo.trunk_head` was live at `openfang` when a
+    /// second copy was minted at `openfang.memory`, and the exact-ref hint
+    /// could not see the slot it was about to shadow.
+    #[tokio::test]
+    async fn the_neighbourhood_walks_the_scope_lineage() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "project", "openfang.memory", &|_: &str| true, 50)
+            .unwrap();
+        assert!(
+            addresses.contains(&"openfang/repo.trunk_head".to_string()),
+            "an ancestor's slot is an address this write can shadow: {addresses:?}"
+        );
+    }
+
+    /// Both levels holding one key is the duplicate, and it must survive the
+    /// dedup. `FactStore::list_for_scopes` is most-specific-wins per key —
+    /// right for reading a value, and it would hide exactly this.
+    #[tokio::test]
+    async fn a_shadowed_ancestor_address_is_not_deduped_away() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        for level in ["openfang", "openfang.memory"] {
+            open_slot(
+                &substrate,
+                agent_id,
+                "project",
+                Some(level),
+                "repo.trunk_head",
+                "main @ deadbee",
+            );
+        }
+
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "project", "openfang.memory", &|_: &str| true, 50)
+            .unwrap();
+        assert!(
+            addresses.contains(&"openfang.memory/repo.trunk_head".to_string()),
+            "{addresses:?}"
+        );
+        assert!(
+            addresses.contains(&"openfang/repo.trunk_head".to_string()),
+            "one claim in two slots must read as two addresses: {addresses:?}"
+        );
+        assert_eq!(
+            substrate
+                .shadowed_ancestor_slot("project", "openfang.memory", "repo.trunk_head", &|_| true)
+                .unwrap()
+                .as_deref(),
+            Some("openfang/repo.trunk_head"),
+            "the shadow is decidable, not a lexical guess"
+        );
+    }
+
+    /// Membership grants downward only. An ancestor the agent may not read is
+    /// withheld from both halves, or the read gate leaks upward through the
+    /// hierarchy.
+    #[tokio::test]
+    async fn an_unreadable_ancestor_is_withheld_from_the_hint() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let only_child = |slug: &str| slug == "openfang.memory";
+        let addresses = substrate
+            .owned_slot_addresses(agent_id, "project", "openfang.memory", &only_child, 50)
+            .unwrap();
+        assert!(
+            !addresses.contains(&"openfang/repo.trunk_head".to_string()),
+            "{addresses:?}"
+        );
+        assert_eq!(
+            substrate
+                .shadowed_ancestor_slot(
+                    "project",
+                    "openfang.memory",
+                    "repo.trunk_head",
+                    &only_child
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The whole live corpus is depth one, so the flat case must be a no-op:
+    /// no ancestors invented, and an agent scope never split on its dots.
+    #[tokio::test]
+    async fn a_flat_ref_shadows_nothing() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("kimiya"),
+            "repo.pinned_model",
+            "sonnet",
+        );
+        assert_eq!(
+            substrate
+                .shadowed_ancestor_slot("project", "kimiya", "repo.pinned_model", &|_| true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            substrate
+                .shadowed_ancestor_slot("agent", &agent_id.to_string(), "memory.mine", &|_| true)
+                .unwrap(),
+            None,
+            "an agent id is opaque; splitting it on '.' would invent ancestors"
+        );
     }
 
     #[tokio::test]
