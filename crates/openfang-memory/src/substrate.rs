@@ -44,6 +44,56 @@ fn readable_lineage(slug: &str, may_read_project: &dyn Fn(&str) -> bool) -> Vec<
         .collect()
 }
 
+/// ANAI-282. The scopes *below* `declared` that already hold claims,
+/// shallowest first.
+///
+/// [`readable_lineage`] walks root-ward, which is the right direction for
+/// *resolving* a claim — a reader at `openfang.memory` inherits `openfang` —
+/// and the wrong direction for enumerating an address space. Membership grants
+/// strictly downward ([`openfang_types::agent::AgentManifest::is_member_of`]
+/// is `slug_covers(declared, requested)`), so an agent declaring `openfang`
+/// may write `openfang.memory`; before this, the slot it wrote there was one
+/// it was authorized to own and structurally could not see in its own managed
+/// block. That is how `repo.trunk_head` came to be live at both `openfang` and
+/// `openfang.memory` — one claim, two slots, same author, superseded
+/// independently hours apart, under a block built to prevent exactly that.
+///
+/// Strictly below: `declared` itself arrives on the lineage walk, and pushing
+/// it twice would only make the dedupe work for nothing.
+///
+/// Gated by `may_read_project` even though membership already grants the whole
+/// subtree. Authorization and readability are two predicates today by design
+/// (`is_member_of` vs `works_on`), and a reader that assumed they agree would
+/// quietly become the place they diverge.
+///
+/// `known` is a *census* of scopes that hold facts, not a project registry: a
+/// sub-project with no claims yet is absent and is not thereby invalid.
+/// Absence costs nothing here — a scope with no claims contributes no
+/// addresses.
+fn covered_descendants<'a>(
+    known: &'a [String],
+    declared: &str,
+    may_read_project: &dyn Fn(&str) -> bool,
+) -> Vec<&'a str> {
+    let mut out: Vec<&str> = known
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| *s != declared)
+        .filter(|s| openfang_types::agent::slug_covers(declared, s))
+        .filter(|s| may_read_project(s))
+        .collect();
+    // Shallowest first, then lexicographic: deterministic, and a truncation at
+    // the caller's limit drops the deepest, most specialised corners rather
+    // than an arbitrary row.
+    out.sort_by(|a, b| {
+        a.matches('.')
+            .count()
+            .cmp(&b.matches('.').count())
+            .then_with(|| a.cmp(b))
+    });
+    out
+}
+
 /// One wake row failed closed by [`MemorySubstrate::reap_in_flight_wakes`].
 ///
 /// ## Why the payload rides along (ANAI-217)
@@ -742,6 +792,19 @@ impl MemorySubstrate {
     /// Ordering is stable by render rank — own open loops, own other slots,
     /// siblings' open loops — so a truncation at `limit` cuts the tail the
     /// renderer would have shown last rather than an arbitrary row.
+    ///
+    /// ANAI-282: the project walk covers **both directions** — the readable
+    /// ancestors of each declared slug and the member-covered descendants that
+    /// hold claims. See [`covered_descendants`] for why the root-ward half
+    /// alone made a writable slot invisible to the agent that owned it.
+    ///
+    /// Each level is read with [`crate::fact::FactStore::list_for_scope`]
+    /// rather than the lineage union, and the result deduped on the full
+    /// `(scope, scope_ref, claim_key)` address. The union is most-specific-wins
+    /// *per key*, which is right when resolving a claim's value and exactly
+    /// wrong when showing an address space: the row it hides is the shadowed
+    /// ancestor, which is the duplicate the block exists to surface. Same
+    /// reasoning as [`Self::owned_slot_addresses`], one surface over.
     pub fn visible_claim_slots(
         &self,
         agent_id: AgentId,
@@ -768,10 +831,36 @@ impl MemorySubstrate {
         {
             push(fact, &mut out);
         }
+        // ANAI-282: read once per call, and degrade to the pre-282
+        // ancestors-only answer on error. The block is assembled on the sweep
+        // path with no caller to tell, and a failed *enumeration* must not cost
+        // an agent the slots the lineage walk already found.
+        let known: Vec<String> = if declared_projects.is_empty() {
+            Vec::new()
+        } else {
+            self.facts().known_project_scopes().unwrap_or_else(|e| {
+                warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "Claim-slot enumeration could not read the project-scope census; \
+                     the block shows declared scopes and their ancestors only, so any \
+                     slot this agent owns BELOW its declared slug is omitted from it."
+                );
+                Vec::new()
+            })
+        };
         for declared in declared_projects {
-            let readable = readable_lineage(declared, may_read_project);
-            for fact in self.facts().list_for_scopes("project", &readable, limit)? {
-                push(fact, &mut out);
+            for level in readable_lineage(declared, may_read_project) {
+                for fact in self.facts().list_for_scope("project", &level, limit)? {
+                    push(fact, &mut out);
+                }
+            }
+            // Descendants after ancestors: the declared level is where an
+            // agent's own work lives, and it should lead.
+            for descendant in covered_descendants(&known, declared, may_read_project) {
+                for fact in self.facts().list_for_scope("project", descendant, limit)? {
+                    push(fact, &mut out);
+                }
             }
         }
         Ok(out)
@@ -2034,6 +2123,139 @@ mod tests {
             .open_claim_slots(agent_id, &[], &|_: &str| false, 50)
             .unwrap();
         assert_eq!(slots.len(), 1);
+    }
+
+    // --- ANAI-282: the address space runs downward too ---------------------
+
+    /// The measured failure. My manifest declares `openfang`; membership runs
+    /// downward, so writing `openfang.memory` was legal — and the block built
+    /// from the root-ward lineage alone could not show me the slot I owned.
+    #[tokio::test]
+    async fn the_block_lists_a_slot_written_below_the_declared_slug() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang.memory"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let slots = substrate
+            .block_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| true, 50)
+            .unwrap();
+        let refs: Vec<&str> = slots.iter().map(|f| f.scope_ref.as_str()).collect();
+        assert_eq!(refs, vec!["openfang.memory"]);
+    }
+
+    /// Both halves of a shadowed claim, not the winner of the lineage union.
+    /// The ancestor row IS the duplicate; a block that resolved it away would
+    /// look correct while hiding the thing it is for.
+    #[tokio::test]
+    async fn the_block_shows_both_halves_of_a_shadowed_claim() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        for scope_ref in ["openfang", "openfang.memory"] {
+            open_slot(
+                &substrate,
+                agent_id,
+                "project",
+                Some(scope_ref),
+                "repo.trunk_head",
+                "main @ deadbee",
+            );
+        }
+
+        let slots = substrate
+            .block_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| true, 50)
+            .unwrap();
+        let mut refs: Vec<&str> = slots.iter().map(|f| f.scope_ref.as_str()).collect();
+        refs.sort_unstable();
+        assert_eq!(refs, vec!["openfang", "openfang.memory"]);
+        assert!(slots.iter().all(|f| f.claim_key == "repo.trunk_head"));
+    }
+
+    /// The descendant walk answers to the same gate the ancestor walk does.
+    /// Membership already grants the subtree, so this is a guard against the
+    /// two predicates drifting apart, not a live path.
+    #[tokio::test]
+    async fn the_descendant_walk_respects_the_read_gate() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang.memory"),
+            "repo.trunk_head",
+            "main @ deadbee",
+        );
+
+        let slots = substrate
+            .block_claim_slots(
+                agent_id,
+                &["openfang".to_string()],
+                &|s: &str| s == "openfang",
+                50,
+            )
+            .unwrap();
+        assert!(slots.is_empty(), "a refused descendant contributes nothing");
+    }
+
+    /// The segment-boundary rule, one level down. `openfang-fork` is a
+    /// different project and `openfangevil` is a hostile prefix; neither is a
+    /// corner of `openfang`, and a character-prefix test would hand an agent
+    /// both.
+    #[tokio::test]
+    async fn a_prefix_that_is_not_a_child_is_not_enumerated() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        for scope_ref in ["openfang-fork", "openfangevil"] {
+            open_slot(
+                &substrate,
+                agent_id,
+                "project",
+                Some(scope_ref),
+                "repo.trunk_head",
+                "theirs",
+            );
+        }
+
+        let slots = substrate
+            .block_claim_slots(agent_id, &["openfang".to_string()], &|_: &str| true, 50)
+            .unwrap();
+        assert!(slots.is_empty(), "only dot-delimited children are covered");
+    }
+
+    /// An agent declaring a sub-project does not acquire its parent's claim
+    /// space, and must not acquire its *siblings'* either. The census is
+    /// fleet-wide, so this is the one direction the filter has to get right.
+    #[tokio::test]
+    async fn a_sub_project_agent_does_not_inherit_its_siblings() {
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let agent_id = AgentId::new();
+        open_slot(
+            &substrate,
+            agent_id,
+            "project",
+            Some("openfang.tools"),
+            "repo.trunk_head",
+            "not mine",
+        );
+
+        let slots = substrate
+            .block_claim_slots(
+                agent_id,
+                &["openfang.memory".to_string()],
+                // The parent is readable (ANAI-264); the sibling is not the
+                // question the gate is being asked here.
+                &|_: &str| true,
+                50,
+            )
+            .unwrap();
+        assert!(slots.is_empty(), "a sibling sub-project is not covered");
     }
 
     // --- ANAI-277: the address space a new key was minted into -------------
