@@ -1090,6 +1090,31 @@ pub async fn execute_tool(
     }
 }
 
+/// The `memory_episode_close` doctrine, in one place (ANAI-283).
+///
+/// Three surfaces teach an agent when to close: this description, the
+/// `## Memory` bullet in `prompt_builder`, and the bridge's copy in
+/// `openfang-mcp-bridge` — which is what a SUBPROCESS agent actually reads.
+/// They disagreed until now, and the model resolves a disagreement toward the
+/// one attached to the button. The bridge cannot depend on this crate (the
+/// seam is one-way on purpose), so it still carries its own literal; the
+/// equality is pinned instead by a cross-crate test in `openfang-api`, the one
+/// crate that sees both.
+///
+/// The trigger is deliberately a TOPIC SHIFT and not completion. ANAI-248 shipped
+/// the completion wording to 53 manifests and the fleet produced 1 voluntary
+/// close in three weeks against 210 timer closes: "is this finished?" asks the
+/// agent to notice an ABSENCE, mid-task, on a turn whose job is something else.
+/// "Does this message name work other than what I have been doing?" is readable
+/// off two things the agent is already holding — so the cue moved into the
+/// incoming turn, and the check moved to the top of it.
+///
+/// The bias against firing moved with it rather than being deleted. It now sits
+/// on `reset_context`, which is the half that can actually cost something: a
+/// close in a slightly odd place is a mislabelled boundary, while a reset on a
+/// live thread is a window. So: close liberally, reset conservatively.
+pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Check this BEFORE you start work on a turn, not after: if the incoming message moves you to different work - another project, another repo, another person's business, or an explicit \"let's switch to\" - the previous episode is over, and closing it first is what puts the new work in the new episode instead of the old one. Work reaching its end is also a close: a ticket landed, a question answered, a decision made. NOT a topic change: a question about what you just did, a digression that returns, a new ticket in the same project, or \"also, can you\". A long gap since the last message plus a different subject is two signals, not one - treat it as a change. Close on a plausible shift; a missed close is not free, because the boundary then lands hours late on the idle timeout, in the middle of the next topic. It is reset_context that deserves the caution, not the close: when you are unsure the old thread is finished, close WITHOUT reset_context - you keep your window and still get the boundary. Never reset mid-task, nor while something is unverified or a question to the operator is outstanding. Name the reason - \"topic-switch\" when the subject changed, \"explicit\" when the work finished or the operator asked. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.";
+
 /// Get definitions for all built-in tools.
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -1377,13 +1402,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // there skews indices silently.
         ToolDefinition {
             name: "memory_episode_close".to_string(),
-            description: "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Call this when a piece of work is FINISHED, before you move to something unrelated: a ticket landed, a question answered, a decision made. Never mid-task, never while something is unverified or a question to the operator is outstanding. When you are unsure whether the work is done, do not close - a missed close costs nothing and the idle timeout closes it for you, whereas a close mid-task throws away detail you still need. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.".to_string(),
+            description: EPISODE_CLOSE_DESCRIPTION.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
+                    "title": { "type": "string", "description": "Short label for the thread that just ended, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
-                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
+                    "reason": { "type": "string", "enum": ["topic-switch", "explicit"], "description": "Why the episode is closing. Use 'topic-switch' when the incoming message moved you to different work, and 'explicit' when the work itself finished or the operator asked for a wrap-up. Defaults to 'explicit'. Timer closes are the system's and are not available to you. Name it honestly: this is the only record of whether the boundary came from a cue or from completion." },
                     "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need. If you are weighing it up, the answer is no. Refused outright while you have an approval request outstanding to the operator." },
                     "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Use dots to name a sub-project, \"openfang.memory\": the briefing then carries the sub-project's claims AND everything the parent knows, so being more specific never costs you facts. This is the project's slug, not your own agent name. Omitting it clears any previous priming." }
                 },
@@ -4218,16 +4243,25 @@ fn render_fact_history(payload: &serde_json::Value) -> String {
     out
 }
 
-/// Close reasons an AGENT may name (ANAI-194, ADR 0002 §2.2).
+/// Close reasons an AGENT may name (ANAI-194 / ANAI-283, ADR 0002 §2.2, §2.6).
 ///
-/// Deliberately narrower than the schema. `timer` is the system's to write —
-/// an agent claiming a timer close would date the boundary wrong and make the
-/// idle gap unfalsifiable. `topic-switch` and `abandoned` are accepted by the
-/// DDL so the later agent-judgment work is a caller change rather than a
-/// migration, but nothing has approved an agent emitting them yet (§2.6), and
-/// advertising them now would get them used before the judgment they depend on
-/// exists.
-const AGENT_CLOSE_REASONS: &[&str] = &["explicit"];
+/// `topic-switch` was held back by §2.6 — "deferred until the judgment it
+/// depends on exists". ANAI-283 is that judgment: the close doctrine now fires
+/// on a shift named by the incoming message rather than on the agent's private
+/// sense of completion, which is a cue an agent can actually report. It is
+/// opened here in the same change that ships the wording, because otherwise
+/// every close still writes `explicit` and the census cannot tell a boundary
+/// that came from the new cue from one that came from the old one — we would
+/// ship the trigger and lose the only measurement of whether it fired right.
+///
+/// No migration: `CloseReason::TopicSwitch` already round-trips and
+/// `episodes.close_reason` carries no CHECK.
+///
+/// Still narrower than the enum. `timer` stays the system's to write — an agent
+/// claiming one would date the boundary wrong and make the idle gap
+/// unfalsifiable — and `abandoned` is by definition what nobody was around to
+/// say, so an agent emitting it is a contradiction rather than a report.
+const AGENT_CLOSE_REASONS: &[&str] = &["topic-switch", "explicit"];
 
 /// ANAI-252: an agent-authored wrap-up is *material*, never the summary.
 ///
@@ -8807,19 +8841,44 @@ mod tests {
             .find(|d| d.name == "memory_episode_close")
             .expect("the tool exists");
 
+        // ANAI-283 rewrites what ANAI-248 pinned here, deliberately and in the
+        // open. The old assertions were `"FINISHED"`, `"Never mid-task"` and
+        // `"do not close"` + `"idle timeout"` — the bias AGAINST firing, pinned
+        // so a later tidy-up could not quietly delete it. It was not deleted;
+        // it was moved onto `reset_context`, which is the half that can cost
+        // something, and the assertions moved with it.
         assert!(
-            def.description.contains("FINISHED"),
-            "fires on completion, not on drift: {}",
+            def.description.contains("BEFORE you start work on a turn"),
+            "the check is placed ahead of the work, not after it: {}",
             def.description
         );
         assert!(
-            def.description.contains("Never mid-task"),
-            "the prohibition has to be explicit: {}",
+            def.description.contains("moves you to different work"),
+            "the trigger is a shift named by the incoming message, not a private \
+             sense of completion: {}",
             def.description
         );
         assert!(
-            def.description.contains("do not close") && def.description.contains("idle timeout"),
-            "the tie-break is DON'T, and the timeout is why that is safe: {}",
+            def.description.contains("NOT a topic change"),
+            "a topic trigger is far more firing-prone than a completion trigger, \
+             so the negative space is part of the doctrine: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("WITHOUT reset_context"),
+            "the tie-break survives, reassigned: close anyway, hold the window: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("Never reset mid-task"),
+            "the prohibition has to stay explicit, and it is the RESET it now \
+             prohibits: {}",
+            def.description
+        );
+        assert!(
+            def.description.contains("topic-switch") && def.description.contains("explicit"),
+            "the agent is told which reason to name, or the census cannot tell \
+             a cue-driven boundary from a completion one: {}",
             def.description
         );
 
@@ -8834,6 +8893,47 @@ mod tests {
             reset.contains("Refused"),
             "the agent is told the guard exists rather than discovering it: {reset}"
         );
+    }
+
+    /// ANAI-283: the reason vocabulary the schema advertises and the one the
+    /// handler accepts are the same list, and neither offers the system's.
+    ///
+    /// These drifted apart trivially before — the schema is a JSON literal and
+    /// the gate is a Rust slice — and the failure mode is an agent picking a
+    /// value off the enum and being refused by the tool that offered it.
+    #[test]
+    fn the_advertised_close_reasons_are_exactly_the_accepted_ones() {
+        let def = builtin_tool_definitions()
+            .into_iter()
+            .find(|d| d.name == "memory_episode_close")
+            .expect("the tool exists");
+        let advertised: Vec<&str> = def.input_schema["properties"]["reason"]["enum"]
+            .as_array()
+            .expect("the reason is an enum")
+            .iter()
+            .map(|v| v.as_str().expect("string variants"))
+            .collect();
+
+        assert_eq!(
+            advertised, AGENT_CLOSE_REASONS,
+            "the schema offers what the handler accepts, in the same order"
+        );
+        assert!(
+            advertised.contains(&"topic-switch"),
+            "ADR 0002 §2.6 deferred this until the judgment existed; ANAI-283 is it"
+        );
+        for system_only in ["timer", "abandoned"] {
+            assert!(
+                !advertised.contains(&system_only),
+                "'{system_only}' stays the system's: an agent claiming it would \
+                 date the boundary wrong or report an absence it cannot witness"
+            );
+            assert!(
+                openfang_memory::episode::CloseReason::parse(system_only).is_some(),
+                "…but it is still a real reason the DB round-trips — the narrowing \
+                 is a caller rule, not a missing variant"
+            );
+        }
     }
 
     /// The agent cannot see the episodes table, so asking twice is reasonable.
@@ -8851,14 +8951,18 @@ mod tests {
         assert!(out.contains("No episode was open"), "{out}");
     }
 
-    /// `timer` is the system's to write and `topic-switch` is deferred until
-    /// the judgment it depends on exists (ADR 0002 §2.6). Neither may be
-    /// claimed by an agent, or the close reason stops being evidence.
+    /// `timer` is the system's to write and `abandoned` is by definition what
+    /// nobody was around to say. Neither may be claimed by an agent, or the
+    /// close reason stops being evidence.
+    ///
+    /// `topic-switch` used to be in this list, deferred by ADR 0002 §2.6 until
+    /// the judgment it depends on existed. ANAI-283 is that judgment, so it
+    /// moved to the test below.
     #[tokio::test]
     async fn episode_close_refuses_system_and_deferred_reasons() {
         let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
         let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
-        for reason in ["timer", "topic-switch", "abandoned", "nonsense"] {
+        for reason in ["timer", "abandoned", "nonsense"] {
             let err = tool_memory_episode_close(
                 &serde_json::json!({"title": "t", "reason": reason}),
                 Some(&kh),
@@ -8874,6 +8978,31 @@ mod tests {
         assert!(
             fake.episode_closes.lock().unwrap().is_empty(),
             "a refused reason must never reach the kernel"
+        );
+    }
+
+    /// ANAI-283: the new cue is only measurable if the agent's report of it
+    /// reaches the row. An accepted `topic-switch` that quietly persisted as
+    /// `explicit` would leave the census unable to tell the doctrine working
+    /// from the doctrine ignored — which is the whole reason the reason exists.
+    #[tokio::test]
+    async fn episode_close_forwards_a_topic_switch_verbatim() {
+        let fake = Arc::new(FakeKernelHandle::new().with_open_episode("ep-1"));
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_episode_close(
+            &serde_json::json!({"title": "ANAI-283 close doctrine", "reason": "topic-switch"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .expect("topic-switch is available to agents now");
+        assert!(out.contains("ep-1"), "{out}");
+
+        let calls = fake.episode_closes.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].1, "topic-switch",
+            "the reason reaches the kernel as the agent named it"
         );
     }
 

@@ -260,6 +260,22 @@ pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
     "browser_back",
 ];
 
+/// The `memory_episode_close` doctrine as a SUBPROCESS agent reads it (ANAI-283).
+///
+/// Byte-identical to `openfang_runtime::tool_runner::EPISODE_CLOSE_DESCRIPTION`
+/// and pinned equal by a cross-crate test in `openfang-api`, which is the one
+/// crate that depends on both. It is duplicated rather than shared because the
+/// runtime -> bridge seam is one-way on purpose (see this crate's Cargo.toml):
+/// the bridge stays out of the kernel/compactor blast radius, and the price of
+/// that is a literal that has to be kept honest by a test rather than by the
+/// compiler.
+///
+/// Held as a single-line const on both sides deliberately. The old copy here
+/// was a `\`-continued literal and the runtime's was one long line, so the two
+/// could not be compared by eye — which is how they drifted, and why the fleet
+/// read one doctrine while the prompt preached another.
+pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Check this BEFORE you start work on a turn, not after: if the incoming message moves you to different work - another project, another repo, another person's business, or an explicit \"let's switch to\" - the previous episode is over, and closing it first is what puts the new work in the new episode instead of the old one. Work reaching its end is also a close: a ticket landed, a question answered, a decision made. NOT a topic change: a question about what you just did, a digression that returns, a new ticket in the same project, or \"also, can you\". A long gap since the last message plus a different subject is two signals, not one - treat it as a change. Close on a plausible shift; a missed close is not free, because the boundary then lands hours late on the idle timeout, in the middle of the next topic. It is reset_context that deserves the caution, not the close: when you are unsure the old thread is finished, close WITHOUT reset_context - you keep your window and still get the boundary. Never reset mid-task, nor while something is unverified or a question to the operator is outstanding. Name the reason - \"topic-switch\" when the subject changed, \"explicit\" when the work finished or the operator asked. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.";
+
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
 
@@ -648,26 +664,14 @@ pub fn built_in_tools() -> Vec<Tool> {
         // what a subprocess agent actually sees.
         Tool::new(
             "memory_episode_close",
-            "Close the current episode - the stretch of turns your recent work \
-             is grouped into - and label it. Call this when a piece of work is \
-             FINISHED, before you move to something unrelated: a ticket landed, \
-             a question answered, a decision made. Never mid-task, never while \
-             something is unverified or a question to the operator is \
-             outstanding. When you are unsure whether the work is done, do not \
-             close - a missed close costs nothing and the idle timeout closes \
-             it for you, whereas a close mid-task throws away detail you still \
-             need. A new episode opens on your next turn. Harmless to call when \
-             nothing is open. Pass reset_context to also start the next episode \
-             with a clean conversation window, and prime_for to have that fresh \
-             window opened with what durable memory knows about the project you \
-             are moving to.",
+            EPISODE_CLOSE_DESCRIPTION,
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "title": { "type": "string", "description": "Short label for the work that just finished, e.g. \"git trunk cutover\"" },
+                    "title": { "type": "string", "description": "Short label for the thread that just ended, e.g. \"git trunk cutover\"" },
                     "summary": { "type": "string", "description": "Optional few-sentence wrap-up of what happened and what was decided. It is kept as a note on this episode and fed to the summariser as material; the episode's own summary is always synthesized afterwards, never taken from here." },
-                    "reason": { "type": "string", "enum": ["explicit"], "description": "Why the episode is closing. Only 'explicit' is available to agents; timer closes are the system's." },
-                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the work really is finished; doing it mid-task discards the detail you still need. If you are weighing it up, the answer is no. Refused outright while you have an approval request outstanding to the operator." },
+                    "reason": { "type": "string", "enum": ["topic-switch", "explicit"], "description": "Why the episode is closing. Use 'topic-switch' when the incoming message moved you to different work, and 'explicit' when the work itself finished or the operator asked for a wrap-up. Defaults to 'explicit'. Timer closes are the system's and are not available to you. Name it honestly: this is the only record of whether the boundary came from a cue or from completion." },
+                    "reset_context": { "type": "boolean", "description": "Default false. When true, your conversation window is cleared at the END of this turn so the next episode starts fresh. Your durable memory is untouched and the running summary of earlier work is kept - you will not forget what happened, you stop re-reading it verbatim. Only set this when the old thread really is finished; doing it mid-task discards the detail you still need. If you are weighing it up, the answer is no - close without it and keep your window. Refused outright while you have an approval request outstanding to the operator." },
                     "prime_for": { "type": "string", "description": "Optional project slug, e.g. \"openfang\". Only meaningful with reset_context. The next episode opens with a short briefing assembled from durable memory for that project - your recently closed episodes and what the fleet currently believes about it - instead of you having to ask for it. Use dots to name a sub-project, \"openfang.memory\": the briefing then carries the sub-project's claims AND everything the parent knows, so being more specific never costs you facts. This is the project's slug, not your own agent name. Omitting it clears any previous priming." }
                 },
                 "required": ["title"]

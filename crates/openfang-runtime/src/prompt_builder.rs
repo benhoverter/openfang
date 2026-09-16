@@ -639,11 +639,21 @@ fn build_write_doctrine(granted_tools: &[String]) -> String {
     }
     if has_close {
         out.push_str(
-            "- memory_episode_close — when a piece of work is genuinely FINISHED and you are \
-             moving to something unrelated, close the episode and title it. Never mid-task. Pass \
-             reset_context to start the next one on a clean window, and prime_for with the \
-             project slug you are moving to so that window opens with what durable memory \
-             already knows about it.\n",
+            "- memory_episode_close — check this BEFORE you start work on a turn, not after. If \
+             the incoming message moves you to different work — another project, another repo, \
+             another person's business, or an explicit \"let's switch to\" — the previous \
+             episode is over: memory_episode_close(title: \"<what that thread was>\", reason: \
+             \"topic-switch\", reset_context: true, prime_for: \"<new project slug>\"). Closing \
+             first is what puts the new work in the new episode instead of the old one; \
+             reset_context gives you a clean window, and prime_for opens it with what durable \
+             memory already knows about the new topic. Work reaching its end is a close too, \
+             with reason \"explicit\". Not a topic change: a question about what you just did, a \
+             digression that returns, a new ticket in the same project, or \"also, can you…\". A \
+             long gap since the last message plus a different subject is two signals, not one. \
+             Close on a plausible shift — a missed close lands the boundary hours late on the \
+             idle timer, in the middle of the next topic — but reset only when you are confident \
+             the old thread is finished; if you are unsure, close WITHOUT reset_context and keep \
+             your window.\n",
         );
     }
     if has_status || has_history {
@@ -1693,6 +1703,36 @@ mod tests {
         assert!(section.contains("memory_episode_close"));
         assert!(section.contains("reset_context"));
         assert!(section.contains("prime_for"));
+    }
+
+    /// ANAI-283. The bullet is the only close doctrine an agent reads *before*
+    /// it reads anything else, so it carries the cue, the recipe and the
+    /// negative space — and it has to agree with the tool description, because
+    /// a model reconciling the two favours the text attached to the button.
+    #[test]
+    fn the_close_doctrine_triggers_on_the_incoming_message() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(
+            section.contains("BEFORE you start work on a turn"),
+            "the check is placed ahead of the work: {section}"
+        );
+        assert!(
+            section.contains("moves you to different work"),
+            "the cue is the incoming message, not a private sense of completion: {section}"
+        );
+        assert!(
+            section.contains("topic-switch"),
+            "the recipe names the reason, or the census learns nothing: {section}"
+        );
+        assert!(
+            section.contains("Not a topic change"),
+            "a topic trigger is firing-prone; the stop-list is part of it: {section}"
+        );
+        assert!(
+            section.contains("WITHOUT reset_context"),
+            "close liberally, reset conservatively — the tie-break moved, it did \
+             not vanish: {section}"
+        );
     }
 
     /// The kernel builds the base prompt (doctrine included) and `agent_loop`

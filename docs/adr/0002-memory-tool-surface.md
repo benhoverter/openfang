@@ -207,3 +207,21 @@ Depends on how many stored keys are load-bearing after consolidation runs once.
   `shared:` escape (stage 2, `93a9b40`); that is an access-control decision and was living
   only in a code comment. Recorded here so it is not later read as an oversight and
   "fixed".
+- 2026-09-16 — **`topic-switch` is no longer deferred** (ANAI-283). §2.4 said "ship the
+  panel before asking for the judgment", and `AGENT_CLOSE_REASONS` held the reason back
+  until the judgment existed. The panel shipped and the judgment did not arrive: **4
+  explicit closes against 320 timer closes**, 1 voluntary close across 51 agents in the
+  three weeks after ANAI-248 put the capability in 53 manifests. The deferral was not the
+  bottleneck and neither was the grant — the *trigger* was. "Is this work finished?" asks
+  an agent to notice an absence, mid-task, on a turn whose job is something else.
+  ANAI-283 replaces it with a cue the agent is already holding: **does the incoming
+  message name work other than what I have been doing?** That is a judgment an agent can
+  both make and report, so the reason opens in the same change that ships the wording —
+  otherwise every close still writes `explicit` and the census cannot distinguish a
+  boundary drawn by the new cue from one drawn by the old doctrine.
+
+  Two things did **not** change. `timer` and `abandoned` stay the system's: an agent
+  claiming a timer close would date the boundary wrong, and `abandoned` is by definition
+  what nobody was around to say. And the bias against firing was moved, not deleted — it
+  now sits on `reset_context`, the half that can actually cost something. Close liberally,
+  reset conservatively.
