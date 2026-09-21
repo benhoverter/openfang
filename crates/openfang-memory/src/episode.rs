@@ -472,14 +472,15 @@ impl EpisodeStore {
         let recent = if recent_limit == 0 {
             Vec::new()
         } else {
-            // Ask for one extra and drop the open row: `list_for_agent` returns
-            // newest-first including the episode in flight, and the caller
-            // wants history, not the row it already has in `current`.
-            self.list_for_agent(agent_id, recent_limit + 1)?
-                .into_iter()
-                .filter(|ep| !ep.is_open())
-                .take(recent_limit)
-                .collect()
+            // Briefable, not merely closed. The open row is excluded by the
+            // query itself — the caller already has it in `current`, and the
+            // old `+1`-then-filter dance was an over-fetch guessing at how many
+            // rows the filter would eat. Untitled one-turn closes are dropped
+            // for the same reason the pack drops them (ANAI-285): a status tail
+            // padded with rows that render as "(untitled)" spends the agent's
+            // window telling it nothing, and pushes the episodes it could act
+            // on off the end of the limit.
+            self.list_briefable_for_agent(agent_id, recent_limit)?
         };
 
         Ok(EpisodeStatus {
@@ -791,6 +792,58 @@ impl EpisodeStore {
         let mut stmt = conn
             .prepare(&format!(
                 "{SELECT_COLS} WHERE agent_id = ?1 ORDER BY opened_at DESC LIMIT ?2"
+            ))
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![agent_id.0.to_string(), limit as i64],
+                row_to_episode,
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Most recent **briefable** episodes for an agent, newest first: closed,
+    /// and carrying a title or a summary.
+    ///
+    /// The predicate is byte-for-byte the one
+    /// [`crate::rehydration::render_pack`] applies, moved from Rust into SQL.
+    /// That is the whole point of the method. Every caller that wanted
+    /// briefable episodes previously asked [`Self::list_for_agent`] for
+    /// `limit + k` and filtered afterwards, where `k` was a guess at how many
+    /// unbriefable rows sit at the head of the list — `+2` in the rehydration
+    /// pack, `+1` in [`Self::status`]. When more than `k` do, the caller
+    /// silently receives fewer episodes than it asked for, with nothing in the
+    /// result to say so.
+    ///
+    /// That is not hypothetical. Measured 2026-09-21: 131 of 342 closed
+    /// episodes were one-turn, 129 of them untitled, and three live agents had
+    /// three or more unbriefable rows among their five most recent — so a pack
+    /// promising [`crate::rehydration::MAX_EPISODES`] lines was rendering one.
+    /// Filtering in SQL makes the guess unnecessary at any junk density.
+    ///
+    /// [`Self::list_for_agent`] deliberately keeps its unfiltered meaning: the
+    /// TUI and the lifecycle tests want every row, including the open one.
+    ///
+    /// Ordering matches `list_for_agent` (`opened_at DESC`) rather than
+    /// `closed_at DESC`, so the two agree about what "most recent" means. They
+    /// can differ — a long episode opened before a short one can close after it
+    /// — and a reader assembling recent *history* wants the order the
+    /// conversation happened in.
+    pub fn list_briefable_for_agent(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> OpenFangResult<Vec<Episode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "{SELECT_COLS} WHERE agent_id = ?1 AND closed_at IS NOT NULL \
+                   AND (title IS NOT NULL OR summary IS NOT NULL) \
+                 ORDER BY opened_at DESC LIMIT ?2"
             ))
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         let rows = stmt
@@ -1182,6 +1235,104 @@ mod tests {
             st.recent.iter().all(|ep| !ep.is_open()),
             "the open episode must not appear in its own history"
         );
+    }
+
+    /// **The starvation regression (ANAI-285).** Four unbriefable rows at the
+    /// head of the list is two more than the old `+2` over-fetch could absorb,
+    /// so the reader silently received one episode where it asked for three.
+    /// A filtered fetch returns its limit at any junk density.
+    #[test]
+    fn the_briefable_list_is_not_starved_by_a_run_of_thin_closes() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+
+        // Oldest first: three real, titled episodes...
+        for i in 0..3i64 {
+            s.ensure_open(a).unwrap();
+            let id = s
+                .close_current(a, CloseReason::Explicit, Some(&format!("real{i}")), None)
+                .unwrap()
+                .unwrap();
+            backdate(&c, id, 100 - i);
+        }
+        // ...then four untitled one-turn closes, all more recent than any of
+        // them. This is the live shape: 129 of 131 one-turn closes carry no
+        // title, and three agents had three or more of them in their five most
+        // recent episodes.
+        for i in 0..4i64 {
+            s.ensure_open(a).unwrap();
+            let id = s
+                .close_current(a, CloseReason::Timer, None, None)
+                .unwrap()
+                .unwrap();
+            backdate(&c, id, 50 - i);
+        }
+        // ...and an episode still in flight, which is history to nobody.
+        s.ensure_open(a).unwrap();
+
+        let got = s.list_briefable_for_agent(a, 3).unwrap();
+        let titles: Vec<_> = got.iter().map(|e| e.title.clone().unwrap()).collect();
+        assert_eq!(
+            titles,
+            vec!["real2", "real1", "real0"],
+            "the limit is a limit on briefable rows, not on rows scanned"
+        );
+
+        // The unfiltered list keeps its old meaning — the TUI wants every row.
+        assert_eq!(s.list_for_agent(a, 99).unwrap().len(), 8);
+    }
+
+    /// A timer close writes no title, so an episode becomes briefable only
+    /// when the consolidator catches up. Either half of the predicate is
+    /// enough: this is what stops the SQL filter from hiding a summarised
+    /// episode that nobody named.
+    #[test]
+    fn a_summarised_but_untitled_episode_is_briefable() {
+        let (s, _c) = store(120);
+        let a = AgentId::new();
+        s.ensure_open(a).unwrap();
+        let id = s
+            .close_current(a, CloseReason::Timer, None, None)
+            .unwrap()
+            .unwrap();
+
+        assert!(s.list_briefable_for_agent(a, 3).unwrap().is_empty());
+
+        assert!(s.set_summary(id, None, "the consolidator caught up").unwrap());
+        let got = s.list_briefable_for_agent(a, 3).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, id);
+        assert!(got[0].title.is_none());
+    }
+
+    /// `memory_status`'s recent tail rides the same filter. It used to apply
+    /// none at all, so an agent asking what it had been doing was answered
+    /// with a column of untitled one-turn rows.
+    #[test]
+    fn status_history_skips_untitled_thin_closes() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+
+        s.ensure_open(a).unwrap();
+        let real = s
+            .close_current(a, CloseReason::Explicit, Some("the work"), None)
+            .unwrap()
+            .unwrap();
+        backdate(&c, real, 100);
+
+        for i in 0..3i64 {
+            s.ensure_open(a).unwrap();
+            let id = s
+                .close_current(a, CloseReason::Timer, None, None)
+                .unwrap()
+                .unwrap();
+            backdate(&c, id, 50 - i);
+        }
+        s.ensure_open(a).unwrap();
+
+        let st = s.status(a, 2).unwrap();
+        assert_eq!(st.recent.len(), 1);
+        assert_eq!(st.recent[0].id, real);
     }
 
     /// A timer close leaves `summary` NULL. Nothing is present to write one,

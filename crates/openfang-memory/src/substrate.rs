@@ -658,12 +658,18 @@ impl MemorySubstrate {
         if canonical.messages.len() > rehydration::PACK_TTL_MESSAGES {
             return Ok(None);
         }
-        // Over-fetch episodes: `render_pack` drops any that are still open or
-        // carry neither a title nor a summary, and asking for exactly
-        // MAX_EPISODES would let one open episode cost us a closed one.
+        // ANAI-285: ask for exactly what the pack renders. This used to
+        // over-fetch `MAX_EPISODES + 2` and let `render_pack` drop the open and
+        // untitled rows — a `+2` that was a guess at how many unbriefable rows
+        // sit at the head of the list, and that lost an episode line every time
+        // more than two did. `list_briefable_for_agent` applies the same
+        // predicate in SQL, so the pack gets `MAX_EPISODES` briefable episodes
+        // at any junk density or none at all. `render_pack` keeps its own
+        // filter: it is pure, reads no store, and takes whatever slice a caller
+        // hands it.
         let episodes = self
             .episodes()
-            .list_for_agent(agent_id, rehydration::MAX_EPISODES + 2)?;
+            .list_briefable_for_agent(agent_id, rehydration::MAX_EPISODES)?;
         // ANAI-264: hierarchical. A pack primed for `openfang.memory` carries
         // `openfang`'s facts too, most-specific slot winning per claim key, so
         // naming the sub-project can never resolve *fewer* facts than naming
@@ -714,20 +720,15 @@ impl MemorySubstrate {
         slug: &str,
         may_read_project: &dyn Fn(&str) -> bool,
     ) -> OpenFangResult<(usize, usize)> {
-        let episodes = self
+        // The same fetch `rehydration_pack` makes, so the number the agent is
+        // told is the number it will get. ANAI-285 moved the predicate into
+        // SQL, which also retires the hand-copied filter that used to live here
+        // — two spellings of one rule, in two files, was how a preview could
+        // have drifted from the render it previews.
+        let closed = self
             .episodes()
-            .list_for_agent(agent_id, rehydration::MAX_EPISODES + 2)?;
-        let closed = episodes
-            .iter()
-            // The same predicate `rehydration::render_pack` applies, so the
-            // number the agent is told is the number it will get. Duplicated
-            // deliberately rather than exported: the render is pure and reads
-            // no store, and a shared helper would drag `Episode` filtering
-            // into two crates to save one line.
-            .filter(|e| !e.is_open())
-            .filter(|e| e.title.is_some() || e.summary.is_some())
-            .take(rehydration::MAX_EPISODES)
-            .count();
+            .list_briefable_for_agent(agent_id, rehydration::MAX_EPISODES)?
+            .len();
         // Same resolution the pack itself will use — a preview that counted
         // differently from the render would be a second source of truth about
         // what the agent is about to get.
