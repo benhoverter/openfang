@@ -31,8 +31,13 @@
 #                [--font-size 11pt] [--highlight-style tango]
 #                [--embed-resources true|false]
 #                [--table-align left|center|right] [--table-justify true|false]
+#                [--table-grid true|false]
 #
 # Defaults: landscape, 1in margin, us-letter, OUTPUT = INPUT with .pdf suffix.
+# --table-grid defaults to TRUE (ANAI, 2026-09-21): pandoc's typst template sets
+# `stroke: none`, so without this every OpenFang PDF renders with zero vertical
+# rules and pdfplumber's `lines` table strategy finds ZERO tables in our own
+# documents. Pass `--table-grid false` for the old rule-under-the-header look.
 # (The file_convert md->pdf recipe overrides orientation to portrait via
 #  --orientation, per ANAI-131 decision O1.)
 #
@@ -55,9 +60,12 @@ HIGHLIGHT_STYLE=""
 EMBED_RESOURCES=""
 TABLE_ALIGN=""
 TABLE_JUSTIFY=""
+TABLE_GRID="true"
 INPUT=""
 OUTPUT=""
 
+# Print the leading comment block (lines 2..49, ending just before `set -euo`).
+# Keep this range in sync if the header comment grows.
 usage() { sed -n '2,49p' "$0"; exit "${1:-0}"; }
 
 # Normalise a boolean-ish flag value to "true"/"false"/"" (empty = no override).
@@ -88,6 +96,7 @@ while [[ $# -gt 0 ]]; do
     --embed-resources) EMBED_RESOURCES="$(norm_bool "${2-}")"; shift 2;;
     --table-align)    TABLE_ALIGN="${2-}"; shift 2;;
     --table-justify)  TABLE_JUSTIFY="$(norm_bool "${2-}")"; shift 2;;
+    --table-grid)     TABLE_GRID="$(norm_bool "${2-}")"; shift 2;;
     -h|--help)        usage 0;;
     -*)               echo "build-pdf: unknown option: $1" >&2; usage 1;;
     *)                INPUT="$1"; shift;;
@@ -98,6 +107,9 @@ done
 # the built-in defaults rather than emitting an empty typst value.
 [[ -n "$MARGIN" ]] || MARGIN="1in"
 [[ -n "$PAPER" ]]  || PAPER="us-letter"
+# An explicitly-empty --table-grid value means "no opinion", which falls back to
+# the ON default rather than silently disabling the grid.
+[[ -n "$TABLE_GRID" ]] || TABLE_GRID="true"
 
 case "$ORIENTATION" in
   portrait|landscape) ;;
@@ -155,6 +167,18 @@ if [[ "$TABLE_JUSTIFY" == "true" ]]; then
   printf '#show table.cell: set par(justify: true)\n' >> "$HEADER"
 fi
 
+# Table grid. Default ON. This MUST be a show-rule and not a bare
+# `#set table(stroke: ...)`: pandoc's typst template issues its own
+# `#set table(stroke: none)` AFTER the header include, so a plain set rule here
+# loses. A show-rule-scoped set is applied at element realization and wins
+# regardless of include order -- same mechanism as the breakable-figure fix
+# above. Measured 2026-09-21: without it a two-table page reports v_edges=0 and
+# pdfplumber extracts 0 tables; with it, v_edges=9 and both tables extract with
+# their header rows intact.
+if [[ "$TABLE_GRID" == "true" ]]; then
+  printf '#show table: set table(stroke: 0.5pt)\n' >> "$HEADER"
+fi
+
 # Assemble pandoc argv. Conditionally-added args live in a bash array so an
 # omitted option contributes nothing (no empty argument reaches pandoc).
 PANDOC_ARGS=( "$INPUT" --pdf-engine=typst -V papersize="$PAPER" -H "$HEADER" -o "$OUTPUT" )
@@ -172,4 +196,4 @@ fi
 
 pandoc "${PANDOC_ARGS[@]}"
 
-echo "build-pdf: wrote $OUTPUT (${ORIENTATION}, ${PAPER}, margin ${MARGIN})"
+echo "build-pdf: wrote $OUTPUT (${ORIENTATION}, ${PAPER}, margin ${MARGIN}, table-grid ${TABLE_GRID})"

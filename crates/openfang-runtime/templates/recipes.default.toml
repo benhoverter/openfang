@@ -44,6 +44,7 @@ argv    = [
   "--embed-resources", "{embed_images}",
   "--table-align", "{table_align}",
   "--table-justify", "{table_justify}",
+  "--table-grid", "{table_grid}",
 ]
 needs   = ["pandoc", "typst"]
 out_ext = "pdf"
@@ -106,3 +107,9 @@ type    = "enum"
 values  = ["true", "false"]
 default = "false"      # ANAI-131 O3: cell-content justification (best-effort), not column width
 desc    = "Justify text within table cells (best-effort)"
+
+[recipe.options.table_grid]
+type    = "enum"
+values  = ["true", "false"]
+default = "true"       # 2026-09-21: ON by default so generated PDFs stay machine-readable.
+desc    = "Draw a full stroke grid on tables. ON by default: pandoc's typst template strokes only a single rule under the header, which leaves the PDF with zero vertical rules and makes table structure unrecoverable by pdf->md extraction. Set false for the older borderless look."
