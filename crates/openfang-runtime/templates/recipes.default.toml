@@ -27,6 +27,33 @@
 # type/enum-validated before substitution and always land as single argv
 # literals (never re-parsed by a shell). These declarations are projected into
 # the file_convert tool schema so callers discover them automatically.
+#
+# TIMEOUTS (ANAI-286): `timeout_secs` on a [[recipe]] bounds that recipe's
+# subprocess. Omit it to inherit the operator's `[convert] default_timeout_secs`
+# (120s). A value above `[convert] max_timeout_secs` (600s) is clamped down and
+# the clamp is disclosed -- requested AND enforced -- never silently honored.
+# Blowing the deadline kills the child and returns the CONVERT_TIMEOUT code,
+# which is deliberately distinct from CONVERT_FAILED: "still running" and
+# "exited nonzero" want different retries. The value belongs to the recipe
+# because it is a property of the conversion; the policy belongs to the operator
+# because it is a property of the host. Neither is per-agent.
+#
+# DEPENDENCIES (ANAI-287). Two complementary pre-spawn checks:
+#   needs       -- PATH search for an EXECUTABLE. Cannot see a missing library:
+#                  a recipe backed by a Python extractor passes
+#                  needs = ["python3"] perfectly while the module it imports is
+#                  gone. An entry containing a `/` is checked as a literal path
+#                  instead of being searched, which is how you pin a venv
+#                  interpreter rather than whatever `python3` resolves to today.
+#   needs_files -- plain existence check on an ABSOLUTE path. No PATH search, no
+#                  executable bit. Point it at the import target itself (e.g.
+#                  .../site-packages/<pkg>/__init__.py) to catch the case `needs`
+#                  structurally cannot: user-site packages orphaned by an
+#                  interpreter upgrade.
+# Neither can prove a module is *importable* -- only the interpreter that runs
+# the conversion can answer that. So a script-backed launcher should import its
+# dependencies at the top and EXIT 3 on ImportError: exit code 3 is reserved,
+# and the dispatcher maps it to MISSING_DEP rather than CONVERT_FAILED.
 
 [[recipe]]
 from    = "md"

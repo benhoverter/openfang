@@ -2625,6 +2625,40 @@ async fn tool_file_convert_in(
             ));
         }
     }
+    // ANAI-287 `needs_files`: a plain existence check, because `needs` cannot
+    // see a missing library. `find_on_path` searches PATH for an EXECUTABLE, so
+    // a script-backed recipe whose interpreter is present but whose module is
+    // gone passes `needs` and then dies at import. This closes that gap before
+    // the spawn instead of after it.
+    for need_file in &recipe.needs_files {
+        if !Path::new(need_file).exists() {
+            return Ok(convert_err(
+                to,
+                "MISSING_DEP",
+                &format!(
+                    "file_convert {from}->{to} needs the file '{need_file}', which does not exist. \
+                     Recipe present, dependency missing. (This is a `needs_files` entry: an \
+                     existence check for something PATH cannot find, such as an installed module.)"
+                ),
+            ));
+        }
+    }
+
+    // ANAI-286: resolve the spawn deadline. Value from the recipe (a property of
+    // the conversion), policy from `[convert]` in config.toml (a property of the
+    // operator). Neither is per-agent. Before this existed the spawn was awaited
+    // unconditionally, so a hung launcher hung the calling turn with it.
+    let convert_cfg = crate::convert::load_convert_config(home);
+    let (timeout_secs, clamped_from) = convert_cfg.resolve_timeout(recipe.timeout_secs);
+    if let Some(requested) = clamped_from {
+        tracing::warn!(
+            from = %from,
+            to = %to,
+            requested_secs = requested,
+            enforced_secs = timeout_secs,
+            "ANAI-286: recipe timeout_secs exceeds [convert] max_timeout_secs; CLAMPED"
+        );
+    }
 
     // Spawn via argv array -- no shell, so substituted paths cannot inject shell
     // syntax. Env is cleared then repopulated with the daemon's safe vars, then
@@ -2635,13 +2669,61 @@ async fn tool_file_convert_in(
     crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
     cmd.env("PATH", &child_path);
     cmd.stdin(std::process::Stdio::null());
+    // Load-bearing for the timeout below: dropping the `output()` future on
+    // elapse must actually KILL the child. Without this the deadline would
+    // return an error to the caller while leaving the runaway process alive and
+    // still holding its output file open -- a worse state than the hang.
+    cmd.kill_on_drop(true);
 
-    let proc = cmd
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn conversion launcher '{program}': {e}"))?;
+    let proc = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(result) => {
+            result.map_err(|e| format!("failed to spawn conversion launcher '{program}': {e}"))?
+        }
+        Err(_) => {
+            let asked = match clamped_from {
+                Some(requested) => format!(
+                    " (the recipe requested {requested}s; CLAMPED into the operator's \
+                     [convert] max_timeout_secs)"
+                ),
+                None => String::new(),
+            };
+            return Ok(convert_err(
+                to,
+                "CONVERT_TIMEOUT",
+                &format!(
+                    "file_convert {from}->{to} exceeded its {timeout_secs}s deadline and was \
+                     killed{asked}. No output is trustworthy: a partially-written file may exist \
+                     at the output path. Raise `timeout_secs` on the recipe, or convert less \
+                     input."
+                ),
+            ));
+        }
+    };
 
     if !proc.status.success() {
+        // ANAI-287 reserved exit code 3 = "a dependency I need is not
+        // importable". Only the interpreter that runs the conversion can
+        // truthfully answer "is this module present", so the launcher answers it
+        // and we classify from the code. MISSING_DEP and CONVERT_FAILED want
+        // different retries: one is "install something", the other is "the input
+        // or the options were wrong".
+        if proc.status.code() == Some(3) {
+            let stderr = String::from_utf8_lossy(&proc.stderr);
+            return Ok(convert_err(
+                to,
+                "MISSING_DEP",
+                &format!(
+                    "file_convert {from}->{to} launcher reported a missing dependency \
+                     (reserved exit code 3): {}",
+                    openfang_types::truncate_str(stderr.trim(), 600)
+                ),
+            ));
+        }
         let stderr = String::from_utf8_lossy(&proc.stderr);
         let detail = stderr.trim();
         let detail = if detail.is_empty() {
@@ -2687,7 +2769,9 @@ fn convert_ok(format: &str, output_path: &str) -> String {
 /// Build the structured `file_convert` error envelope (§4.3):
 /// `{ "ok": false, "format": "<fmt>", "error": { "code": "<CODE>", "message": "<msg>" } }`.
 /// `code` is one of UNKNOWN_FORMAT, BAD_PATH, MISSING_DEP, CONVERT_FAILED,
-/// UNKNOWN_PRESET, UNKNOWN_OPTION, INVALID_OPTION (ANAI-131).
+/// UNKNOWN_PRESET, UNKNOWN_OPTION, INVALID_OPTION (ANAI-131), CONVERT_TIMEOUT
+/// (ANAI-286). CONVERT_TIMEOUT is deliberately distinct from CONVERT_FAILED:
+/// "it was still running" and "it exited nonzero" call for different retries.
 fn convert_err(format: &str, code: &str, message: &str) -> String {
     serde_json::json!({
         "ok": false,
@@ -11741,6 +11825,233 @@ mod convert_dispatch_tests {
             !log.lines().any(|l| l == "portrait"),
             "default leaked: {log}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // ANAI-286 (spawn timeout) / ANAI-287 (dependency checking)
+    // ------------------------------------------------------------------
+
+    /// Hermetic home with a caller-supplied stub body and recipe extras, so a
+    /// test can pin the launcher's exit code / runtime and the recipe's
+    /// `timeout_secs` / `needs_files` independently.
+    #[cfg(unix)]
+    fn hermetic_home_custom(stub_body: &str, recipe_extra: &str, config_body: &str) -> TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempDir::new().unwrap();
+        let scripts = home.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        let stub = scripts.join("stub.sh");
+        fs::write(&stub, stub_body).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let convert_dir = home.path().join("convert");
+        fs::create_dir_all(&convert_dir).unwrap();
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            format!(
+                "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{{script}}/stub.sh\", \"{{input}}\", \"{{output}}\"]\nout_ext = \"txt\"\n{recipe_extra}"
+            ),
+        )
+        .unwrap();
+        if !config_body.is_empty() {
+            fs::write(home.path().join("config.toml"), config_body).unwrap();
+        }
+        home
+    }
+
+    #[cfg(unix)]
+    const SLEEPY_STUB: &str = "#!/usr/bin/env bash\nsleep 30\ncp \"$1\" \"$2\"\n";
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_timeout_kills_a_hanging_launcher() {
+        // Before ANAI-286 this awaited `cmd.output()` unconditionally, so this
+        // test would hang for 30s and then PASS as a successful conversion.
+        let home = hermetic_home_custom(SLEEPY_STUB, "timeout_secs = 1\n", "");
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["ok"], serde_json::json!(false), "envelope: {out}");
+        assert_eq!(v["error"]["code"], "CONVERT_TIMEOUT", "envelope: {out}");
+        // Distinct from CONVERT_FAILED on purpose: the retries differ.
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("1s deadline"), "message: {msg}");
+        // The launcher never reached its `cp`, so no output was produced.
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_timeout_clamped_by_operator_policy_discloses_both_numbers() {
+        // Recipe asks 9s; the operator ceiling is 1s. The refusal must state
+        // what was requested AND what was enforced -- a silently shortened
+        // conversion is indistinguishable from one that simply ran long.
+        let home = hermetic_home_custom(
+            SLEEPY_STUB,
+            "timeout_secs = 9\n",
+            "[convert]\nmax_timeout_secs = 1\n",
+        );
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["error"]["code"], "CONVERT_TIMEOUT", "envelope: {out}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("1s deadline"), "enforced missing: {msg}");
+        assert!(msg.contains("requested 9s"), "requested missing: {msg}");
+        assert!(msg.contains("CLAMPED"), "clamp undisclosed: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_within_its_deadline_is_untouched() {
+        // The satisfied case must be invisible: a recipe that finishes inside
+        // its bound behaves exactly as it did before the deadline existed.
+        let home = hermetic_home_custom(
+            "#!/usr/bin/env bash\ncp \"$1\" \"$2\"\n",
+            "timeout_secs = 30\n",
+            "",
+        );
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
+        assert!(ws.path().join("note.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_exit_code_3_is_missing_dep_not_convert_failed() {
+        // ANAI-287 option 1: only the interpreter that runs the conversion can
+        // truthfully answer "is this module importable", so it answers with a
+        // reserved code and we classify from that.
+        let home = hermetic_home_custom(
+            "#!/usr/bin/env bash\necho \"No module named 'pdfplumber'\" >&2\nexit 3\n",
+            "",
+            "",
+        );
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["error"]["code"], "MISSING_DEP", "envelope: {out}");
+        // The launcher's own diagnosis is carried through, not swallowed.
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("pdfplumber"), "message: {msg}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_other_nonzero_exit_is_still_convert_failed() {
+        // Negative control for the test above: 3 is reserved, everything else
+        // keeps its old classification.
+        let home = hermetic_home_custom(
+            "#!/usr/bin/env bash\necho 'bad input' >&2\nexit 1\n",
+            "",
+            "",
+        );
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parse(&out)["error"]["code"],
+            "CONVERT_FAILED",
+            "envelope: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_missing_needs_file_refuses_before_any_spawn() {
+        // The stub WOULD produce output. The absent output file is the
+        // observable proof that the preflight ran ahead of the spawn, rather
+        // than the refusal being asserted by a comment.
+        let home = hermetic_home_custom(
+            "#!/usr/bin/env bash\ncp \"$1\" \"$2\"\n",
+            "needs_files = [\"/definitely/not/here/pdfplumber/__init__.py\"]\n",
+            "",
+        );
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let v = parse(&out);
+        assert_eq!(v["error"]["code"], "MISSING_DEP", "envelope: {out}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("pdfplumber"), "message names nothing: {msg}");
+        assert!(!ws.path().join("note.txt").exists(), "launcher was spawned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_satisfied_needs_file_is_invisible() {
+        let home = hermetic_home_custom("#!/usr/bin/env bash\ncp \"$1\" \"$2\"\n", "", "");
+        // Point needs_files at the stub itself: guaranteed to exist, and proves
+        // a satisfied check changes nothing about the happy path.
+        let marker = home.path().join("scripts").join("stub.sh");
+        let convert_dir = home.path().join("convert");
+        fs::write(
+            convert_dir.join("recipes.toml"),
+            format!(
+                "[[recipe]]\nfrom = \"md\"\nto = \"txt\"\nargv = [\"{{script}}/stub.sh\", \"{{input}}\", \"{{output}}\"]\nout_ext = \"txt\"\nneeds_files = [\"{}\"]\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let ws = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let out = tool_file_convert_in(
+            &serde_json::json!({ "format": "txt", "input": "note.md" }),
+            Some(ws.path()),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parse(&out)["ok"],
+            serde_json::json!(true),
+            "envelope: {out}"
+        );
+        assert!(ws.path().join("note.txt").is_file());
     }
 
     #[test]
