@@ -168,6 +168,27 @@ impl OpenFangKernel {
         // Runs before the select, so the candidate set is already clean, and
         // before the `candidates.is_empty()` return, so an idle fleet still
         // gets its aged-out episodes classified.
+        // ANAI-285: classify by material first. A one-turn episode that ages
+        // out inside the orphan band is reachable by both stamps, and
+        // `no_material` is the accurate verdict where `orphaned` is merely the
+        // timing one — first stamp wins, so this call order *is* the precedence
+        // rule. It is also the only unbounded one: a count is decidable where a
+        // band is a guess, which is what lets it reach the 119 historical
+        // closes the v17 note deliberately left NULL, and the ones a daemon
+        // outage longer than two lookbacks would otherwise strand forever.
+        //
+        // Expected to report a backlog on its first tick after deploy and zero
+        // thereafter. A line that keeps reporting the same count means the
+        // stamp is not sticking, not that the fleet is producing that many
+        // empty episodes a minute.
+        match self.memory.mark_episodes_without_material_async().await {
+            Ok(0) => {}
+            Ok(n) => info!(target: "openfang::consolidation", no_material = n,
+                           "consolidation: {n} closed episodes had no material to summarise"),
+            Err(e) => warn!(target: "openfang::consolidation", error = %e,
+                            "Could not stamp episodes without material"),
+        }
+
         let horizon = cutoff - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
         match self
             .memory

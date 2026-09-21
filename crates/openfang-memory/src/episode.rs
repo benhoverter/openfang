@@ -785,13 +785,74 @@ impl EpisodeStore {
 
     /// Most recent episodes for an agent, newest first.
     pub fn list_for_agent(&self, agent_id: AgentId, limit: usize) -> OpenFangResult<Vec<Episode>> {
+        self.list_where(agent_id, limit, "")
+    }
+
+    /// Stamp [`SkipReason::NoMaterial`] on every closed, unsummarised,
+    /// unstamped episode with fewer than [`MIN_MATERIAL_ROWS`] linked rows.
+    /// Returns how many (ANAI-285).
+    ///
+    /// **Unbounded in time, unlike [`Self::mark_orphaned`], and that is the
+    /// decision worth reading.** The v17 migration note refuses a retroactive
+    /// stamp because guessing `orphaned` for a one-turn non-episode destroys
+    /// the only evidence that could later have called it `thin`. That argument
+    /// does not reach here: `no_material` is not a guess, it is a count, and it
+    /// is the identical verdict the consolidation tick already reaches for
+    /// these rows and declines on every time it sees them. The stamp records a
+    /// decision that is already being made — it changes no summarisation
+    /// outcome, only whether the outcome is legible — and it is reversible with
+    /// one `UPDATE`.
+    ///
+    /// **Material, not `turn_count`.** The scoping conversation proposed
+    /// stamping at close on the turn count; [`MIN_MATERIAL_ROWS`] argues
+    /// against exactly that, because `ensure_open` bumps the turn *before* the
+    /// write. Close is also the one moment an episode's material count is least
+    /// settled, and a wrong terminal stamp costs a real episode its summary
+    /// forever. Run from the consolidation tick, this has strictly more slack
+    /// than the close path and needs no change to `ensure_open`, `sweep_idle`
+    /// or the explicit close.
+    ///
+    /// **Run it before [`Self::mark_orphaned`].** A one-turn episode that ages
+    /// out inside the orphan band is reachable by both, and `no_material` is
+    /// the accurate answer where `orphaned` is merely the timing one. First
+    /// stamp wins — `skip_reason IS NULL` guards both — so the call order is
+    /// the precedence rule.
+    ///
+    /// The count is `deleted = 0`, matching [`Self::material`]: an episode
+    /// whose rows were all soft-deleted has nothing left to compress, whatever
+    /// it once held.
+    pub fn mark_no_material(&self) -> OpenFangResult<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let n = conn
+            .execute(
+                "UPDATE episodes SET skip_reason = ?1 \
+                 WHERE closed_at IS NOT NULL AND summary IS NULL AND skip_reason IS NULL \
+                   AND (SELECT COUNT(*) FROM memories m \
+                        WHERE m.episode_id = episodes.id AND m.deleted = 0) < ?2",
+                rusqlite::params![SkipReason::NoMaterial.as_str(), MIN_MATERIAL_ROWS as i64],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(n)
+    }
+
+    /// Shared body of the two list accessors: `extra` is an additional SQL
+    /// predicate, ANDed in, or empty for none.
+    fn list_where(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+        extra: &str,
+    ) -> OpenFangResult<Vec<Episode>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
         let mut stmt = conn
             .prepare(&format!(
-                "{SELECT_COLS} WHERE agent_id = ?1 ORDER BY opened_at DESC LIMIT ?2"
+                "{SELECT_COLS} WHERE agent_id = ?1 {extra} ORDER BY opened_at DESC LIMIT ?2"
             ))
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         let rows = stmt
@@ -835,24 +896,11 @@ impl EpisodeStore {
         agent_id: AgentId,
         limit: usize,
     ) -> OpenFangResult<Vec<Episode>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(&format!(
-                "{SELECT_COLS} WHERE agent_id = ?1 AND closed_at IS NOT NULL \
-                   AND (title IS NOT NULL OR summary IS NOT NULL) \
-                 ORDER BY opened_at DESC LIMIT ?2"
-            ))
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![agent_id.0.to_string(), limit as i64],
-                row_to_episode,
-            )
-            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        self.list_where(
+            agent_id,
+            limit,
+            "AND closed_at IS NOT NULL AND (title IS NOT NULL OR summary IS NOT NULL)",
+        )
     }
 
     fn is_timed_out(&self, ep: &Episode, now: DateTime<Utc>) -> bool {
@@ -1298,7 +1346,9 @@ mod tests {
 
         assert!(s.list_briefable_for_agent(a, 3).unwrap().is_empty());
 
-        assert!(s.set_summary(id, None, "the consolidator caught up").unwrap());
+        assert!(s
+            .set_summary(id, None, "the consolidator caught up")
+            .unwrap());
         let got = s.list_briefable_for_agent(a, 3).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, id);
@@ -1769,5 +1819,117 @@ mod tests {
         let now = Utc::now();
         assert_eq!(s.mark_orphaned(now - Duration::hours(2), now).unwrap(), 0);
         assert_eq!(s.get(aged_out).unwrap().unwrap().skip_reason, None);
+    }
+
+    /// The classifier stamps exactly the rows the summariser would decline for
+    /// having nothing to compress, and nothing else. The guard list is the same
+    /// one `mark_skipped` carries — closed, unsummarised, unstamped — so this
+    /// sweep can never overwrite a verdict somebody else already reached.
+    #[test]
+    fn mark_no_material_stamps_only_the_empty_closed_episodes() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+
+        // Enough material to be worth a call: untouched.
+        let fat = close_now(&s, a);
+        insert_memory(&c, a, fat, None, "turn one", Utc::now());
+        insert_memory(&c, a, fat, None, "turn two", Utc::now());
+
+        // One row is below MIN_MATERIAL_ROWS: the one-turn close.
+        let thin = close_now(&s, a);
+        insert_memory(&c, a, thin, None, "the only turn", Utc::now());
+
+        // Nothing linked at all.
+        let empty = close_now(&s, a);
+
+        // Already summarised: not a decline, and a stamp would read as both.
+        let summarised = close_now(&s, a);
+        assert!(s
+            .set_summary(summarised, Some("done"), "a summary")
+            .unwrap());
+
+        // Already stamped with a different reason: first verdict wins.
+        let stamped = close_now(&s, a);
+        assert!(s.mark_skipped(stamped, SkipReason::Thin).unwrap());
+
+        // Still in flight: no verdict is available yet at any material count.
+        let open = s.ensure_open(AgentId::new()).unwrap();
+
+        assert_eq!(s.mark_no_material().unwrap(), 2);
+        assert_eq!(
+            s.get(thin).unwrap().unwrap().skip_reason,
+            Some(SkipReason::NoMaterial)
+        );
+        assert_eq!(
+            s.get(empty).unwrap().unwrap().skip_reason,
+            Some(SkipReason::NoMaterial)
+        );
+        assert_eq!(s.get(fat).unwrap().unwrap().skip_reason, None);
+        assert_eq!(s.get(summarised).unwrap().unwrap().skip_reason, None);
+        assert_eq!(
+            s.get(stamped).unwrap().unwrap().skip_reason,
+            Some(SkipReason::Thin),
+            "a stamp is never rewritten with a second reason"
+        );
+        assert_eq!(s.get(open).unwrap().unwrap().skip_reason, None);
+
+        // Idempotent: the second sweep finds nothing left to say.
+        assert_eq!(s.mark_no_material().unwrap(), 0);
+    }
+
+    /// **The deliberate asymmetry with `mark_orphaned`.** That sweep is banded
+    /// because `orphaned` is a guess about timing; this one is unbounded
+    /// because `no_material` is a count. It is the only path that can reach the
+    /// historical closes v17 left NULL, and the ones an outage longer than two
+    /// lookbacks would otherwise strand.
+    #[test]
+    fn mark_no_material_reaches_history_the_orphan_band_cannot() {
+        let (s, c) = store(120);
+        let ancient = close_now(&s, AgentId::new());
+        backdate_close(&c, ancient, SUMMARY_LOOKBACK_MINUTES * 200);
+
+        let now = Utc::now();
+        let cutoff = now - Duration::minutes(SUMMARY_LOOKBACK_MINUTES);
+        assert_eq!(
+            s.mark_orphaned(cutoff, cutoff - Duration::minutes(SUMMARY_LOOKBACK_MINUTES))
+                .unwrap(),
+            0,
+            "the band cannot see it"
+        );
+
+        assert_eq!(s.mark_no_material().unwrap(), 1);
+        assert_eq!(
+            s.get(ancient).unwrap().unwrap().skip_reason,
+            Some(SkipReason::NoMaterial)
+        );
+    }
+
+    /// Material is `deleted = 0`, matching `EpisodeStore::material`. An episode
+    /// whose rows were all soft-deleted has nothing left to compress, whatever
+    /// it once held — and if the counts disagreed, the summariser would keep
+    /// selecting a row this sweep had already declined to stamp.
+    #[test]
+    fn soft_deleted_rows_are_not_material() {
+        let (s, c) = store(120);
+        let a = AgentId::new();
+        let ep = close_now(&s, a);
+        insert_memory(&c, a, ep, None, "purged one", Utc::now());
+        insert_memory(&c, a, ep, None, "purged two", Utc::now());
+
+        assert_eq!(s.mark_no_material().unwrap(), 0);
+
+        c.lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET deleted = 1 WHERE episode_id = ?1",
+                rusqlite::params![ep.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(s.mark_no_material().unwrap(), 1);
+        assert_eq!(
+            s.get(ep).unwrap().unwrap().skip_reason,
+            Some(SkipReason::NoMaterial)
+        );
     }
 }

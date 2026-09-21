@@ -420,6 +420,18 @@ impl MemorySubstrate {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Stamp `no_material` on every closed episode with nothing to compress
+    /// (ANAI-285). Takes no band on purpose — see
+    /// [`EpisodeStore::mark_no_material`] for why a count may be retroactive
+    /// where a guess may not, and why this must run before
+    /// [`Self::mark_orphaned_episodes_async`].
+    pub async fn mark_episodes_without_material_async(&self) -> OpenFangResult<usize> {
+        let store = self.episodes.clone();
+        tokio::task::spawn_blocking(move || store.mark_no_material())
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     // -----------------------------------------------------------------
     // Tier-3 facts (ADR 0001 §2.3)
     // -----------------------------------------------------------------
