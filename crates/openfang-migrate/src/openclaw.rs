@@ -4241,7 +4241,9 @@ mod tests {
         assert_eq!(map_tool_name("Write"), Some("file_write"));
         assert_eq!(map_tool_name("Bash"), Some("shell_exec"));
         assert_eq!(map_tool_name("Glob"), Some("file_list"));
-        assert_eq!(map_tool_name("Grep"), Some("file_list"));
+        // ANAI-292: Grep used to land on file_list because there was no grep
+        // tool to land on, which answered a search with a directory listing.
+        assert_eq!(map_tool_name("Grep"), Some("file_grep"));
         assert_eq!(map_tool_name("WebSearch"), Some("web_search"));
         assert_eq!(map_tool_name("WebFetch"), Some("web_fetch"));
         assert_eq!(map_tool_name("sessions_send"), Some("agent_send"));
@@ -4296,8 +4298,11 @@ mod tests {
     #[test]
     fn test_tools_for_profile() {
         let minimal = tools_for_profile("minimal");
-        assert_eq!(minimal.len(), 2);
+        // ANAI-292: file_grep joined the minimal profile alongside file_read
+        // and file_list — it exposes strictly less than a read already does.
+        assert_eq!(minimal.len(), 3);
         assert!(minimal.contains(&"file_read".to_string()));
+        assert!(minimal.contains(&"file_grep".to_string()));
 
         let coding = tools_for_profile("coding");
         assert!(coding.contains(&"shell_exec".to_string()));

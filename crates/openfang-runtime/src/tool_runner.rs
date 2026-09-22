@@ -36,6 +36,7 @@ const MAX_AGENT_CALL_DEPTH: u32 = 5;
 /// `channel_send`) are intentionally absent.
 pub const FS_SANDBOXED_TOOLS: &[&str] = &[
     "file_read",
+    "file_grep",
     "file_list",
     "file_write",
     "create_directory",
@@ -698,6 +699,15 @@ pub async fn execute_tool(
             )
             .await
         }
+        "file_grep" => {
+            tool_file_grep(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
         "create_directory" => {
             tool_create_directory(
                 input,
@@ -1125,6 +1135,30 @@ pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the str
 /// are one design.
 pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are relative to the agent workspace. Use offset and limit to read a bounded window instead of the whole file: both are LINE numbers, 1-based, and they take the line numbers file_grep returns verbatim. A file too large to return whole comes back as its first 200 lines plus a manifest stating the total line count, the file's sha256, and the exact call that returns the next slice - so a large read is never a silent truncation, but it is also not the file. For anything big, searching with file_grep and then reading the range it points at costs far less context than paging through.";
 
+/// Advertised description for `file_grep` (ANAI-292). Shared with the bridge's
+/// copy and pinned equal by a cross-crate test, for the same reason
+/// `FILE_READ_DESCRIPTION` is.
+pub const FILE_GREP_DESCRIPTION: &str = "Search a file, or recursively a directory, for a regular expression and get back the matching LINE NUMBERS with their text. Paths are relative to the agent workspace. The line numbers are 1-based and can be passed straight to file_read's offset, which is the point: for anything large, grep for the anchor and then read that range, instead of pulling a whole file into context. Exposes strictly less than file_read already does, and resolves every path through the same policy, so it reaches nothing file_read would refuse. Every bound that bites is disclosed in the result - the match cap, the file cap, skipped binaries, and the build/VCS directories not descended into - because a silent cap reads as an absence of matches.";
+
+/// `file_grep`'s advertised argument schema. Duplicated in the bridge (the
+/// crate seam is one-way) and pinned equal by a cross-crate test in
+/// `openfang-api`.
+pub fn file_grep_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "File to search, or directory to search recursively" },
+            "pattern": { "type": "string", "description": "Regular expression to search for" },
+            "ignore_case": { "type": "boolean", "description": "Match case-insensitively. Default false." },
+            "context": { "type": "integer", "description": "Lines of surrounding context to include per match, 0-20. Default 0. Context lines are marked with '-' and matches with ':'." },
+            "max_matches": { "type": "integer", "description": "Stop after this many matches. Default 100, ceiling 2000. Hitting it is disclosed in the result and is NOT a total." },
+            "max_files": { "type": "integer", "description": "Stop enumerating after this many files in a directory search. Default 400, ceiling 5000." },
+            "include": { "type": "string", "description": "Filename glob limiting which files are searched, e.g. \"*.rs\". Only '*' is a wildcard; everything else matches literally." }
+        },
+        "required": ["path", "pattern"]
+    })
+}
+
 /// Get definitions for all built-in tools.
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -1164,6 +1198,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 },
                 "required": ["path"]
             }),
+        },
+        ToolDefinition {
+            name: "file_grep".to_string(),
+            description: FILE_GREP_DESCRIPTION.to_string(),
+            input_schema: file_grep_input_schema(),
         },
         ToolDefinition {
             name: "create_directory".to_string(),
@@ -2099,7 +2138,7 @@ fn fs_tool_single_path<'a>(
     input: &'a serde_json::Value,
 ) -> Option<(bool, &'a str)> {
     let needs_write = match tool_name {
-        "file_read" | "file_list" => false,
+        "file_read" | "file_list" | "file_grep" => false,
         "file_write" | "create_directory" => true,
         _ => return None,
     };
@@ -2447,6 +2486,462 @@ async fn tool_file_read(
     }
     out.push_str(&body);
     Ok(out)
+}
+
+/// Default cap on reported matches. A pattern that matches every line would
+/// otherwise reinvent exactly the context problem `file_grep` exists to solve.
+const FILE_GREP_DEFAULT_MAX_MATCHES: usize = 100;
+
+/// Hard ceiling on `max_matches`, so a caller cannot opt out of the bound.
+const FILE_GREP_MAX_MATCHES_CEILING: usize = 2000;
+
+/// Default cap on files visited in a directory search.
+const FILE_GREP_DEFAULT_MAX_FILES: usize = 400;
+
+/// Hard ceiling on `max_files`.
+const FILE_GREP_MAX_FILES_CEILING: usize = 5000;
+
+/// Longest reported match line before it is cut. One minified bundle line can
+/// be megabytes; the line NUMBER is the useful part of a hit, and the caller
+/// can `file_read` the range to see it whole.
+const FILE_GREP_MAX_LINE_CHARS: usize = 512;
+
+/// Files bigger than this are skipped during a directory walk and disclosed in
+/// the trailer. Searching a multi-gigabyte artifact to find nothing is not
+/// what the caller meant, and doing it silently is worse.
+const FILE_GREP_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Directory names skipped by default during a recursive search: build output
+/// and VCS internals, which are large, generated, and essentially never the
+/// thing being looked for. Disclosed in the result trailer rather than applied
+/// silently, because a skip nobody is told about is indistinguishable from an
+/// absence of matches.
+const FILE_GREP_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    "dist",
+    "build",
+    ".next",
+];
+
+/// Translate a filename glob into a regex anchored to the whole file name.
+///
+/// Only `*` is meaningful, because `*.rs` is what a caller actually writes and
+/// a half-implemented glob dialect is worse than a stated one. Everything else
+/// is matched literally.
+fn filename_glob_to_regex(glob: &str) -> Result<regex_lite::Regex, String> {
+    let mut pattern = String::from("^");
+    for ch in glob.chars() {
+        if ch == '*' {
+            pattern.push_str(".*");
+        } else {
+            pattern.push_str(&regex_lite::escape(&ch.to_string()));
+        }
+    }
+    pattern.push('$');
+    regex_lite::Regex::new(&pattern)
+        .map_err(|e| format!("'include' is not a usable filename glob ({glob:?}): {e}"))
+}
+
+/// Parse an optional positive-integer argument, clamping to a stated ceiling
+/// and disclosing the clamp rather than silently honouring the caller's number.
+fn parse_capped_arg(
+    input: &serde_json::Value,
+    key: &str,
+    default: usize,
+    ceiling: usize,
+) -> Result<(usize, Option<usize>), String> {
+    let Some(requested) = parse_line_arg(input, key)? else {
+        return Ok((default, None));
+    };
+    if requested > ceiling {
+        Ok((ceiling, Some(requested)))
+    } else {
+        Ok((requested, None))
+    }
+}
+
+/// One reported hit.
+struct GrepHit {
+    line_no: usize,
+    /// `true` for the matching line, `false` for a context line.
+    is_match: bool,
+    text: String,
+}
+
+/// Search one file's lines, appending hits. Returns `Err` for a file that
+/// should be counted as skipped rather than failed.
+enum FileOutcome {
+    Searched,
+    SkippedNonText,
+    SkippedTooLarge,
+}
+
+/// `file_grep`: pattern search returning LINE NUMBERS.
+///
+/// ## Why this is a tool and not a shell-out
+///
+/// Most of the fleet has no `shell_exec` at all, and the agents that do run
+/// under an allowlist whose deny floor refuses `grep -i` outright (any `-i`
+/// flag trips it) and blocks pipes and redirects. So "just use grep" is not
+/// available to the callers who most need to avoid pulling a whole file into
+/// context. An argv-literal tool hands every agent the retrieval half without
+/// handing anyone a shell.
+///
+/// ## Why it shares `file_read`'s grant
+///
+/// A grep over a file exposes a strict SUBSET of what a read already returns,
+/// so denying it while granting `file_read` protects nothing. That equivalence
+/// has to be enforced and not merely asserted: every candidate path — not just
+/// the top-level argument — goes through the same `resolve_file_path` that
+/// `file_read` uses, so a subdirectory in a deny tier is refused here exactly
+/// as it would be there. Routing recursion around the resolver would make this
+/// a read-tier bypass regardless of which allowlist it sits in.
+async fn tool_file_grep(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let pattern = input["pattern"]
+        .as_str()
+        .ok_or("Missing 'pattern' parameter")?;
+    if pattern.is_empty() {
+        return Err("'pattern' is empty, which matches every line. State what \
+                    you are looking for."
+            .to_string());
+    }
+    let ignore_case = input["ignore_case"].as_bool().unwrap_or(false);
+    let context = parse_line_arg(input, "context")?.unwrap_or(0).min(20);
+    let (max_matches, matches_clamped) = parse_capped_arg(
+        input,
+        "max_matches",
+        FILE_GREP_DEFAULT_MAX_MATCHES,
+        FILE_GREP_MAX_MATCHES_CEILING,
+    )?;
+    let (max_files, files_clamped) = parse_capped_arg(
+        input,
+        "max_files",
+        FILE_GREP_DEFAULT_MAX_FILES,
+        FILE_GREP_MAX_FILES_CEILING,
+    )?;
+    let include = match input["include"].as_str() {
+        Some(g) if !g.trim().is_empty() => Some(filename_glob_to_regex(g.trim())?),
+        _ => None,
+    };
+
+    let effective = if ignore_case {
+        format!("(?i){pattern}")
+    } else {
+        pattern.to_string()
+    };
+    let re = regex_lite::Regex::new(&effective)
+        .map_err(|e| format!("'pattern' is not a valid regular expression ({pattern:?}): {e}"))?;
+
+    let root = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&root, prevalidated)?;
+    let root_meta = tokio::fs::metadata(&root)
+        .await
+        .map_err(|e| format!("Failed to search '{raw_path}': {e}"))?;
+
+    // Candidate files. A single-file search skips the walk entirely.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut dirs_skipped: Vec<String> = Vec::new();
+    let mut walk_capped = false;
+    if root_meta.is_dir() {
+        let mut queue = vec![root.clone()];
+        while let Some(dir) = queue.pop() {
+            let mut entries = match tokio::fs::read_dir(&dir).await {
+                Ok(e) => e,
+                // An unreadable subdirectory is not a reason to fail the whole
+                // search; it is a reason to say so, which the trailer does.
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if candidates.len() >= max_files {
+                    walk_capped = true;
+                    break;
+                }
+                let path = entry.path();
+                // symlink_metadata, NOT metadata: following a directory
+                // symlink can walk straight out of the resolved tier, and can
+                // also loop.
+                let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if meta.is_dir() {
+                    if FILE_GREP_SKIP_DIRS.contains(&name.as_str()) {
+                        if !dirs_skipped.contains(&name) {
+                            dirs_skipped.push(name);
+                        }
+                        continue;
+                    }
+                    queue.push(path);
+                    continue;
+                }
+                if let Some(inc) = &include {
+                    if !inc.is_match(&name) {
+                        continue;
+                    }
+                }
+                candidates.push(path);
+            }
+            if walk_capped {
+                break;
+            }
+        }
+        candidates.sort();
+    } else {
+        candidates.push(root.clone());
+    }
+
+    let mut out_files: Vec<(String, Vec<GrepHit>)> = Vec::new();
+    let mut total_matches = 0usize;
+    let mut files_searched = 0usize;
+    let mut skipped_non_text = 0usize;
+    let mut skipped_too_large = 0usize;
+    let mut match_cap_hit = false;
+
+    for path in &candidates {
+        if total_matches >= max_matches {
+            match_cap_hit = true;
+            break;
+        }
+        // Every candidate re-enters the resolver, so grep can never reach a
+        // path file_read would refuse.
+        let display = path.to_string_lossy().to_string();
+        if resolve_file_path(&display, workspace_root, file_policy, false).is_err() {
+            continue;
+        }
+        let outcome = search_one_file(
+            path,
+            &re,
+            context,
+            max_matches - total_matches,
+            &mut out_files,
+            &mut total_matches,
+            &mut match_cap_hit,
+            &display,
+        )
+        .await;
+        match outcome {
+            FileOutcome::Searched => files_searched += 1,
+            FileOutcome::SkippedNonText => skipped_non_text += 1,
+            FileOutcome::SkippedTooLarge => skipped_too_large += 1,
+        }
+    }
+
+    // --- Render -------------------------------------------------------------
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[openfang file_grep: {} match(es) in {} file(s), {} file(s) searched under '{}' for /{}/{}]\n",
+        total_matches,
+        out_files.len(),
+        files_searched,
+        raw_path,
+        pattern,
+        if ignore_case { " (case-insensitive)" } else { "" }
+    ));
+    out.push_str(
+        "[line numbers are 1-based and can be passed straight to \
+         file_read(offset=...)]\n",
+    );
+
+    for (display, hits) in &out_files {
+        out.push_str(&format!("\n{display}\n"));
+        let mut previous: Option<usize> = None;
+        for hit in hits {
+            if let Some(prev) = previous {
+                if hit.line_no > prev + 1 {
+                    out.push_str("  --\n");
+                }
+            }
+            // ':' for a match, '-' for context — the grep convention, so the
+            // two are never confused for each other.
+            let sep = if hit.is_match { ':' } else { '-' };
+            out.push_str(&format!("{:>7}{} {}\n", hit.line_no, sep, hit.text));
+            previous = Some(hit.line_no);
+        }
+    }
+
+    if total_matches == 0 {
+        out.push_str("\nNo matches.\n");
+    }
+
+    // --- Disclose every bound that bit ---------------------------------------
+    // A cap applied silently reads as "there was nothing more", which is the
+    // failure this whole line of work has been removing.
+    if match_cap_hit {
+        out.push_str(&format!(
+            "\n[openfang file_grep: stopped at the {max_matches}-match cap. The count above \
+             is what was found before stopping and is NOT a total -- there may be more \
+             matches that were never looked for. Narrow the pattern, or raise max_matches \
+             (ceiling {FILE_GREP_MAX_MATCHES_CEILING}).]\n"
+        ));
+    }
+    if walk_capped {
+        out.push_str(&format!(
+            "[openfang file_grep: stopped enumerating at the {max_files}-file cap, so \
+             some files under '{raw_path}' were never searched. Narrow with include, or \
+             raise max_files (ceiling {FILE_GREP_MAX_FILES_CEILING}).]\n"
+        ));
+    }
+    if skipped_non_text > 0 {
+        out.push_str(&format!(
+            "[openfang file_grep: skipped {skipped_non_text} non-text file(s).]\n"
+        ));
+    }
+    if skipped_too_large > 0 {
+        out.push_str(&format!(
+            "[openfang file_grep: skipped {skipped_too_large} file(s) over \
+             {FILE_GREP_MAX_FILE_BYTES} bytes.]\n"
+        ));
+    }
+    if !dirs_skipped.is_empty() {
+        dirs_skipped.sort();
+        out.push_str(&format!(
+            "[openfang file_grep: did not descend into {} (build output / VCS \
+             internals are skipped by default).]\n",
+            dirs_skipped.join(", ")
+        ));
+    }
+    if let Some(req) = matches_clamped {
+        out.push_str(&format!(
+            "[openfang file_grep: you requested max_matches={req}; CLAMPED to \
+             {max_matches}.]\n"
+        ));
+    }
+    if let Some(req) = files_clamped {
+        out.push_str(&format!(
+            "[openfang file_grep: you requested max_files={req}; CLAMPED to \
+             {max_files}.]\n"
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Stream one file, collecting matches (and their context) into `out_files`.
+#[allow(clippy::too_many_arguments)]
+async fn search_one_file(
+    path: &Path,
+    re: &regex_lite::Regex,
+    context: usize,
+    budget: usize,
+    out_files: &mut Vec<(String, Vec<GrepHit>)>,
+    total_matches: &mut usize,
+    cap_hit: &mut bool,
+    display: &str,
+) -> FileOutcome {
+    use tokio::io::AsyncBufReadExt;
+
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return FileOutcome::SkippedNonText;
+    };
+    if meta.len() > FILE_GREP_MAX_FILE_BYTES {
+        return FileOutcome::SkippedTooLarge;
+    }
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return FileOutcome::SkippedNonText;
+    };
+
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut raw: Vec<u8> = Vec::new();
+    let mut line_no = 0usize;
+    let mut hits: Vec<GrepHit> = Vec::new();
+    let mut before: std::collections::VecDeque<(usize, String)> = std::collections::VecDeque::new();
+    let mut after_remaining = 0usize;
+    let mut found = 0usize;
+
+    loop {
+        raw.clear();
+        match reader.read_until(b'\n', &mut raw).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return FileOutcome::SkippedNonText,
+        }
+        // A non-UTF8 file is skipped whole rather than emitting garbage for
+        // the lines that happen to decode.
+        let Ok(text) = std::str::from_utf8(&raw) else {
+            return FileOutcome::SkippedNonText;
+        };
+        line_no += 1;
+        let trimmed = text.trim_end_matches(['\n', '\r']);
+        let shown = clip_line(trimmed);
+
+        if re.is_match(trimmed) {
+            for (n, t) in before.drain(..) {
+                hits.push(GrepHit {
+                    line_no: n,
+                    is_match: false,
+                    text: t,
+                });
+            }
+            hits.push(GrepHit {
+                line_no,
+                is_match: true,
+                text: shown,
+            });
+            found += 1;
+            after_remaining = context;
+            if found >= budget {
+                // The budget stopped the scan mid-file, so there may be more
+                // matches below that were never looked for. Setting this HERE
+                // is the fix for a real defect: the outer loop only tested the
+                // running total at the TOP of its next iteration, so a
+                // single-file search that hit the cap disclosed nothing at all
+                // and its truncated hit list read as the complete answer.
+                //
+                // When the last match happens to be the last line, this
+                // over-discloses. That is the safe direction: the scan did
+                // stop at the cap, and a warning that was not needed costs a
+                // line, where a cap that stayed quiet costs the answer.
+                *cap_hit = true;
+                break;
+            }
+        } else if after_remaining > 0 {
+            hits.push(GrepHit {
+                line_no,
+                is_match: false,
+                text: shown,
+            });
+            after_remaining -= 1;
+        } else if context > 0 {
+            before.push_back((line_no, shown));
+            if before.len() > context {
+                before.pop_front();
+            }
+        }
+    }
+
+    if !hits.is_empty() {
+        *total_matches += found;
+        out_files.push((display.to_string(), hits));
+    }
+    FileOutcome::Searched
+}
+
+/// Clip an over-long line, saying so. The line number is the useful part of a
+/// hit; a caller who wants the whole line can `file_read` the range.
+fn clip_line(line: &str) -> String {
+    if line.chars().count() <= FILE_GREP_MAX_LINE_CHARS {
+        return line.to_string();
+    }
+    let kept: String = line.chars().take(FILE_GREP_MAX_LINE_CHARS).collect();
+    format!("{kept} […line clipped]")
 }
 
 async fn tool_file_write(
@@ -7103,6 +7598,239 @@ mod tests {
         let err = read(dir.path(), serde_json::json!({})).await.unwrap_err();
         assert!(err.contains("is a directory"), "{err}");
         assert!(err.contains("file_list"), "must name the right tool: {err}");
+    }
+
+    // ---- ANAI-292: file_grep ------------------------------------------------
+
+    async fn grep(path: &Path, args: serde_json::Value) -> Result<String, String> {
+        let mut input = args;
+        input["path"] = serde_json::json!(path.to_str().unwrap());
+        tool_file_grep(&input, None, None, None).await
+    }
+
+    #[tokio::test]
+    async fn a_hit_reports_a_line_number_that_file_read_can_consume() {
+        // The whole design: grep's output unit and file_read's input unit are
+        // the same, so a hit pastes straight into a range with no conversion.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src.rs");
+        std::fs::write(&path, "alpha\nbravo\nNEEDLE here\ndelta\n").unwrap();
+
+        let got = grep(&path, serde_json::json!({ "pattern": "NEEDLE" }))
+            .await
+            .unwrap();
+        assert!(got.contains("1 match(es)"), "{got}");
+        assert!(got.contains("3: NEEDLE here"), "{got}");
+
+        // And the number is right: reading that offset returns that line.
+        let read_back = read(&path, serde_json::json!({ "offset": 3, "limit": 1 }))
+            .await
+            .unwrap();
+        assert!(read_back.ends_with("NEEDLE here\n"), "{read_back:?}");
+    }
+
+    #[tokio::test]
+    async fn context_lines_are_marked_differently_from_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "a\nb\nHIT\nd\ne\n").unwrap();
+
+        let got = grep(&path, serde_json::json!({ "pattern": "HIT", "context": 1 }))
+            .await
+            .unwrap();
+        // ':' for the match, '-' for context: grep's convention, so a context
+        // line is never mistaken for a hit.
+        assert!(got.contains("2- b"), "{got}");
+        assert!(got.contains("3: HIT"), "{got}");
+        assert!(got.contains("4- d"), "{got}");
+        // context = 1, so line 1 is out of the window. Matched on the full
+        // rendered form, because the header legitimately contains "1-based".
+        assert!(
+            !got.contains("1- a"),
+            "context is 1, so line 1 is out: {got}"
+        );
+        assert!(!got.contains("5- e"), "and so is line 5: {got}");
+    }
+
+    #[tokio::test]
+    async fn the_match_cap_is_disclosed_and_not_reported_as_a_total() {
+        // The dangerous version of this says "20 matches" when it stopped
+        // looking at 20. That is a fabricated total, and it reads as complete.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        let body: String = (1..=500).map(|i| format!("hit {i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let got = grep(
+            &path,
+            serde_json::json!({ "pattern": "hit", "max_matches": 5 }),
+        )
+        .await
+        .unwrap();
+        assert!(got.contains("stopped at the 5-match cap"), "{got}");
+        assert!(
+            got.contains("NOT a total"),
+            "the cap must refuse to be read as a total: {got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_ceiling_cap_is_clamped_and_the_clamp_is_disclosed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "hit\n").unwrap();
+
+        let got = grep(
+            &path,
+            serde_json::json!({ "pattern": "hit", "max_matches": 999_999 }),
+        )
+        .await
+        .unwrap();
+        assert!(got.contains("you requested max_matches=999999"), "{got}");
+        assert!(got.contains("CLAMPED"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn no_matches_says_so_rather_than_returning_a_bare_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "nothing to see\n").unwrap();
+
+        let got = grep(&path, serde_json::json!({ "pattern": "zzz" }))
+            .await
+            .unwrap();
+        assert!(got.contains("No matches."), "{got}");
+        assert!(got.contains("0 match(es)"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn a_directory_search_recurses_and_include_narrows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.path().join("sub/b.rs"), "// needle\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "needle in txt\n").unwrap();
+
+        let all = grep(dir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(all.contains("3 match(es)"), "{all}");
+
+        let only_rs = grep(
+            dir.path(),
+            serde_json::json!({ "pattern": "needle", "include": "*.rs" }),
+        )
+        .await
+        .unwrap();
+        assert!(only_rs.contains("2 match(es)"), "{only_rs}");
+        assert!(!only_rs.contains("c.txt"), "{only_rs}");
+    }
+
+    #[tokio::test]
+    async fn skipped_build_directories_are_disclosed_not_silently_dropped() {
+        // A skip nobody is told about is indistinguishable from an absence of
+        // matches, which is the whole failure class.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/gen.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("real.rs"), "needle\n").unwrap();
+
+        let got = grep(dir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(got.contains("1 match(es)"), "{got}");
+        assert!(
+            got.contains("did not descend into target"),
+            "the skip must be stated: {got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_file_is_skipped_whole_and_counted() {
+        // Not "skip the lines that fail to decode" — a half-decoded binary
+        // yields plausible garbage.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.txt"), "needle\n").unwrap();
+        std::fs::write(
+            dir.path().join("b.bin"),
+            [0xff, 0xfe, b'n', b'e', b'e', b'd', b'l', b'e', 0x00],
+        )
+        .unwrap();
+
+        let got = grep(dir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(got.contains("1 match(es)"), "{got}");
+        assert!(got.contains("skipped 1 non-text file"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn ignore_case_is_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "Needle\n").unwrap();
+
+        let sensitive = grep(&path, serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(sensitive.contains("0 match(es)"), "{sensitive}");
+
+        let insensitive = grep(
+            &path,
+            serde_json::json!({ "pattern": "needle", "ignore_case": true }),
+        )
+        .await
+        .unwrap();
+        assert!(insensitive.contains("1 match(es)"), "{insensitive}");
+        assert!(insensitive.contains("case-insensitive"), "{insensitive}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_pattern_is_refused_by_name_not_treated_as_a_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "x\n").unwrap();
+
+        let err = grep(&path, serde_json::json!({ "pattern": "a(" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a valid regular expression"), "{err}");
+
+        // An empty pattern matches every line, which is never what was meant.
+        let err = grep(&path, serde_json::json!({ "pattern": "" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("matches every line"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_enormous_match_line_is_clipped_with_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("min.js");
+        let long = format!("var needle={};\n", "a".repeat(5000));
+        std::fs::write(&path, long).unwrap();
+
+        let got = grep(&path, serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(got.contains("line clipped"), "{got}");
+        assert!(got.len() < 3000, "one minified line must not be the result");
+    }
+
+    #[tokio::test]
+    async fn a_directory_symlink_is_not_followed_out_of_the_tree() {
+        // Following one walks straight out of the resolved tier, and can loop.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "needle\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("inside.txt"), "nothing\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let got = grep(dir.path(), serde_json::json!({ "pattern": "needle" }))
+            .await
+            .unwrap();
+        assert!(got.contains("0 match(es)"), "symlink was followed: {got}");
     }
 
     #[tokio::test]

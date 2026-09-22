@@ -14,7 +14,11 @@ pub fn map_tool_name(openclaw_name: &str) -> Option<&'static str> {
         "Write" | "write" | "write_file" => Some("file_write"),
         "Edit" | "edit" => Some("file_write"),
         "Glob" | "glob" | "list_files" => Some("file_list"),
-        "Grep" | "grep" => Some("file_list"),
+        // ANAI-292: `Grep` mapped to `file_list` because there was no grep
+        // tool to map it to. That was never right -- an agent asking to
+        // search a file got a directory listing, which is a plausible-looking
+        // answer to a different question. Now there is a real target.
+        "Grep" | "grep" | "search_files" | "ripgrep" | "rg" => Some("file_grep"),
         "Mkdir" | "mkdir" | "make_directory" | "makeDirectory" | "make_dir" | "makedir"
         | "create_dir" | "createDir" | "createDirectory" | "new_directory" | "new_folder"
         | "create_folder" | "createFolder" => Some("create_directory"),
@@ -59,6 +63,7 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
         "file_read"
             | "file_write"
             | "file_list"
+            | "file_grep"
             | "create_directory"
             | "shell_exec"
             | "web_search"
@@ -100,7 +105,10 @@ mod tests {
         assert_eq!(map_tool_name("Write"), Some("file_write"));
         assert_eq!(map_tool_name("Edit"), Some("file_write"));
         assert_eq!(map_tool_name("Glob"), Some("file_list"));
-        assert_eq!(map_tool_name("Grep"), Some("file_list"));
+        // ANAI-292: Grep now has a real target. It used to resolve to
+        // file_list, which answered a content search with a directory
+        // listing — a plausible-looking answer to a different question.
+        assert_eq!(map_tool_name("Grep"), Some("file_grep"));
         assert_eq!(map_tool_name("Bash"), Some("shell_exec"));
         assert_eq!(map_tool_name("WebSearch"), Some("web_search"));
         assert_eq!(map_tool_name("WebFetch"), Some("web_fetch"));
@@ -110,7 +118,7 @@ mod tests {
         assert_eq!(map_tool_name("write"), Some("file_write"));
         assert_eq!(map_tool_name("edit"), Some("file_write"));
         assert_eq!(map_tool_name("glob"), Some("file_list"));
-        assert_eq!(map_tool_name("grep"), Some("file_list"));
+        assert_eq!(map_tool_name("grep"), Some("file_grep"));
         assert_eq!(map_tool_name("bash"), Some("shell_exec"));
         assert_eq!(map_tool_name("exec"), Some("shell_exec"));
         assert_eq!(map_tool_name("execute_command"), Some("shell_exec"));

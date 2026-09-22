@@ -168,6 +168,11 @@ pub enum ToolDispatchError {
 /// [`OPENFANG_BRIDGE_ALLOWED`]: ../../openfang_mcp_bridge/index.html
 pub const DEFAULT_ALLOWED: &[&str] = &[
     "file_read",
+    // ANAI-292: default-granted alongside file_read deliberately. The whole
+    // argument for building it is that most of the fleet has no shell_exec, so
+    // it only pays off if it is granted by default -- opt-in would serve only
+    // the agents that already have a shell and help nobody.
+    "file_grep",
     "file_list",
     "file_write",
     "create_directory",
@@ -286,6 +291,13 @@ pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the str
 /// two prompts nobody can compare by eye are two prompts that will diverge.
 pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are relative to the agent workspace. Use offset and limit to read a bounded window instead of the whole file: both are LINE numbers, 1-based, and they take the line numbers file_grep returns verbatim. A file too large to return whole comes back as its first 200 lines plus a manifest stating the total line count, the file's sha256, and the exact call that returns the next slice - so a large read is never a silent truncation, but it is also not the file. For anything big, searching with file_grep and then reading the range it points at costs far less context than paging through.";
 
+/// Advertised description for `file_grep` (ANAI-292).
+///
+/// Byte-identical to `openfang_runtime::tool_runner::FILE_GREP_DESCRIPTION`
+/// and pinned equal by the cross-crate test in `openfang-api`. Duplicated for
+/// the same reason as the two consts above: the crate seam is one-way.
+pub const FILE_GREP_DESCRIPTION: &str = "Search a file, or recursively a directory, for a regular expression and get back the matching LINE NUMBERS with their text. Paths are relative to the agent workspace. The line numbers are 1-based and can be passed straight to file_read's offset, which is the point: for anything large, grep for the anchor and then read that range, instead of pulling a whole file into context. Exposes strictly less than file_read already does, and resolves every path through the same policy, so it reaches nothing file_read would refuse. Every bound that bites is disclosed in the result - the match cap, the file cap, skipped binaries, and the build/VCS directories not descended into - because a silent cap reads as an absence of matches.";
+
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
 
@@ -319,6 +331,26 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "path": { "type": "string", "description": "The directory path to list" }
                 },
                 "required": ["path"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` → `file_grep` (ANAI-292).
+        // Schema duplicated from `file_grep_input_schema()` and pinned equal
+        // by the cross-crate test in `openfang-api`.
+        Tool::new(
+            "file_grep",
+            FILE_GREP_DESCRIPTION,
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File to search, or directory to search recursively" },
+                    "pattern": { "type": "string", "description": "Regular expression to search for" },
+                    "ignore_case": { "type": "boolean", "description": "Match case-insensitively. Default false." },
+                    "context": { "type": "integer", "description": "Lines of surrounding context to include per match, 0-20. Default 0. Context lines are marked with '-' and matches with ':'." },
+                    "max_matches": { "type": "integer", "description": "Stop after this many matches. Default 100, ceiling 2000. Hitting it is disclosed in the result and is NOT a total." },
+                    "max_files": { "type": "integer", "description": "Stop enumerating after this many files in a directory search. Default 400, ceiling 5000." },
+                    "include": { "type": "string", "description": "Filename glob limiting which files are searched, e.g. \"*.rs\". Only '*' is a wildcard; everything else matches literally." }
+                },
+                "required": ["path", "pattern"]
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `file_write`. Workspace-
@@ -1105,6 +1137,7 @@ mod tests {
             vec![
                 "file_read",
                 "file_list",
+                "file_grep",
                 "file_write",
                 "create_directory",
                 "web_fetch",

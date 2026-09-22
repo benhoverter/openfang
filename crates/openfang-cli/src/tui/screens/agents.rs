@@ -15,6 +15,7 @@ const TOOL_OPTIONS: &[(&str, &str)] = &[
     ("file_read", "Read files"),
     ("file_write", "Write files"),
     ("file_list", "List directory contents"),
+    ("file_grep", "Search file contents by regex"),
     ("memory_store", "Store data in agent memory"),
     ("memory_recall", "Recall data from memory"),
     (
@@ -43,8 +44,13 @@ const DEFAULT_TOOLS: &[bool] = &[
     true,  // file_read
     false, // file_write
     true,  // file_list
-    true,  // memory_store
-    true,  // memory_recall
+    // ANAI-292: on by default, alongside file_read. It exposes strictly less
+    // than a read already does, and the point of building it was to give
+    // shell-less agents a way to search without pulling whole files into
+    // context — which only pays off if they have it.
+    true, // file_grep
+    true, // memory_store
+    true, // memory_recall
     // Off by default. Landing the tools grants nothing; which agents get the
     // episode surface is a rollout decision, not a side effect of the builder.
     false, // memory_episode_close

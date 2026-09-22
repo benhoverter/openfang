@@ -69,6 +69,11 @@ use tracing::{debug, error, info, warn};
 /// - `agent_send` — inter-agent messaging via the kernel
 pub const ALLOWED_TOOLS: &[&str] = &[
     "file_read",
+    // ANAI-292: same tier as file_read by construction. A grep over a file
+    // exposes a strict subset of what a read already returns, and every
+    // candidate path re-enters the same resolver, so granting one and denying
+    // the other protects nothing.
+    "file_grep",
     "file_list",
     "file_write",
     "create_directory",
@@ -2112,10 +2117,13 @@ mod tests {
         // Browser, page-driving: 30 -> 35 (click / type / screenshot /
         // run_js / back). All five are privileged-deny, so `DEFAULT_ALLOWED`
         // is unchanged at 26 and `PRIVILEGED_DEFAULT_DENY` goes 4 -> 9.
-        assert_eq!(ALLOWED_TOOLS.len(), 35, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-292: 35 -> 36 (`file_grep`). NOT privileged-deny — it is
+        // granted alongside `file_read`, so `DEFAULT_ALLOWED` moves with it,
+        // 26 -> 27, and `PRIVILEGED_DEFAULT_DENY` stays at 9.
+        assert_eq!(ALLOWED_TOOLS.len(), 36, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            35,
+            36,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -2125,8 +2133,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            26,
-            "DEFAULT_ALLOWED bridge-default cardinality (35 − 9 privileged)"
+            27,
+            "DEFAULT_ALLOWED bridge-default cardinality (36 − 9 privileged)"
         );
     }
 

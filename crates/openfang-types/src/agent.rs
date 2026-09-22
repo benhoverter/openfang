@@ -308,20 +308,28 @@ impl ToolProfile {
     /// Expand profile to tool name list.
     pub fn tools(&self) -> Vec<String> {
         match self {
-            Self::Minimal => vec!["file_read", "file_list"],
+            Self::Minimal => vec!["file_read", "file_list", "file_grep"],
             Self::Coding => vec![
                 "file_read",
                 "file_write",
                 "file_list",
+                "file_grep",
                 "shell_exec",
                 "web_fetch",
             ],
-            Self::Research => vec!["web_fetch", "web_search", "file_read", "file_write"],
+            Self::Research => vec![
+                "web_fetch",
+                "web_search",
+                "file_read",
+                "file_grep",
+                "file_write",
+            ],
             Self::Messaging => vec!["agent_send", "agent_list", "memory_store", "memory_recall"],
             Self::Automation => vec![
                 "file_read",
                 "file_write",
                 "file_list",
+                "file_grep",
                 "shell_exec",
                 "web_fetch",
                 "web_search",
@@ -1411,16 +1419,21 @@ mod tests {
     #[test]
     fn test_tool_profile_minimal() {
         let tools = ToolProfile::Minimal.tools();
-        assert_eq!(tools, vec!["file_read", "file_list"]);
+        // ANAI-292: file_grep joins every profile that already had file_read.
+        // It exposes a strict subset of what a read returns, so a profile that
+        // grants the read and withholds the search protects nothing and only
+        // costs the agent context.
+        assert_eq!(tools, vec!["file_read", "file_list", "file_grep"]);
     }
 
     #[test]
     fn test_tool_profile_coding() {
         let tools = ToolProfile::Coding.tools();
         assert!(tools.contains(&"file_read".to_string()));
+        assert!(tools.contains(&"file_grep".to_string()));
         assert!(tools.contains(&"shell_exec".to_string()));
         assert!(tools.contains(&"web_fetch".to_string()));
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
@@ -1428,7 +1441,8 @@ mod tests {
         let tools = ToolProfile::Research.tools();
         assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
-        assert_eq!(tools.len(), 4);
+        assert!(tools.contains(&"file_grep".to_string()));
+        assert_eq!(tools.len(), 5);
     }
 
     #[test]
@@ -1442,7 +1456,8 @@ mod tests {
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
-        assert_eq!(tools.len(), 10);
+        assert!(tools.contains(&"file_grep".to_string()));
+        assert_eq!(tools.len(), 11);
     }
 
     #[test]

@@ -103,3 +103,89 @@ fn both_tool_surfaces_advertise_the_range_arguments() {
         "offset/limit must stay optional — they are additive, not a new contract"
     );
 }
+
+// ---- ANAI-292: file_grep, the consumer's other half -------------------------
+
+#[test]
+fn the_bridge_and_the_runtime_describe_file_grep_identically() {
+    assert_eq!(
+        openfang_mcp_bridge::FILE_GREP_DESCRIPTION,
+        openfang_runtime::tool_runner::FILE_GREP_DESCRIPTION,
+        "the bridge's file_grep description has drifted from the runtime's"
+    );
+}
+
+/// The schema is duplicated by hand in the bridge, because the crate seam is
+/// one-way. Seven arguments is more than enough to drift silently, and an
+/// argument missing from the bridge is an argument no subprocess agent — which
+/// is most of the fleet — can ever use.
+#[test]
+fn both_tool_surfaces_advertise_the_same_file_grep_arguments() {
+    let runtime = openfang_runtime::tool_runner::builtin_tool_definitions()
+        .into_iter()
+        .find(|d| d.name == "file_grep")
+        .expect("the runtime defines file_grep");
+    let bridge = openfang_mcp_bridge::built_in_tools()
+        .into_iter()
+        .find(|t| t.name == "file_grep")
+        .expect("the bridge advertises file_grep");
+
+    assert_eq!(
+        runtime.input_schema,
+        openfang_runtime::tool_runner::file_grep_input_schema(),
+        "the runtime's definition must serve the shared schema helper"
+    );
+    assert_eq!(
+        serde_json::to_value(&*bridge.input_schema).unwrap(),
+        runtime.input_schema,
+        "the bridge's hand-copied file_grep schema has drifted from the runtime's"
+    );
+    assert_eq!(
+        runtime.input_schema["required"],
+        serde_json::json!(["path", "pattern"]),
+        "a grep with no pattern would match everything"
+    );
+}
+
+/// `file_grep` must be granted wherever `file_read` is. The argument for
+/// building it at all is that most of the fleet has no `shell_exec`, and that
+/// only pays off if it is granted by default: opt-in would serve the agents
+/// that already have a shell and help nobody. A grep also exposes a strict
+/// subset of what a read returns, so granting one and denying the other
+/// protects nothing.
+#[test]
+fn file_grep_is_granted_wherever_file_read_is() {
+    assert!(
+        openfang_mcp_bridge::DEFAULT_ALLOWED.contains(&"file_grep"),
+        "file_grep must be in the bridge's default-allowed set, like file_read"
+    );
+    assert!(
+        openfang_api::bridge_ipc::ALLOWED_TOOLS.contains(&"file_grep"),
+        "file_grep must be dispatchable by the daemon-side IPC ceiling"
+    );
+    assert!(
+        openfang_runtime::tool_runner::FS_SANDBOXED_TOOLS.contains(&"file_grep"),
+        "file_grep takes a path argument, so it must be workspace-scoped for \
+         the bridge surfaces — omitting it would be a sandbox bypass, which is \
+         exactly how create_directory and shell_exec were missed before"
+    );
+    assert!(
+        openfang_types::turn::READ_ONLY_TOOLS.contains(&"file_grep"),
+        "file_grep writes nothing; omitting it makes a retrieval-only call \
+         read as side-effecting and locks Assist-mode agents out of it"
+    );
+}
+
+/// The alias that used to lie: `Grep` mapped to `file_list`, so an agent
+/// asking to search a file got a directory listing — a plausible-looking
+/// answer to a different question. There is a real target now.
+#[test]
+fn the_grep_alias_points_at_the_grep_tool() {
+    use openfang_types::tool_compat::{map_tool_name, normalize_tool_name};
+    assert_eq!(map_tool_name("Grep"), Some("file_grep"));
+    assert_eq!(map_tool_name("grep"), Some("file_grep"));
+    assert_eq!(map_tool_name("rg"), Some("file_grep"));
+    assert_eq!(normalize_tool_name("Grep"), "file_grep");
+    // Glob is a name search, not a content search, and stays where it was.
+    assert_eq!(map_tool_name("Glob"), Some("file_list"));
+}
