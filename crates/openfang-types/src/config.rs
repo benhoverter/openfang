@@ -1875,6 +1875,11 @@ pub struct KernelConfig {
     /// `agent_send_async`, ANAI-201).
     #[serde(default)]
     pub async_reply: AsyncReplyConfig,
+    /// `file_convert` spawn-timeout policy (`[convert]`, ANAI-286). Operator
+    /// policy; the per-recipe value lives next to the recipe in
+    /// `convert/recipes.toml`.
+    #[serde(default)]
+    pub convert: ConvertConfig,
     /// Per-skill runtime config (from `[skills.<skill-name>]` sections).
     ///
     /// When a skill declares a `config:` section in its SKILL.md frontmatter,
@@ -2017,6 +2022,64 @@ impl Default for AgentWakeConfig {
             max_inflight: crate::agent_wake::MAX_INFLIGHT_WAKES,
             per_caller_max: crate::agent_wake::WAKE_PER_CALLER_MAX,
             stale_wake_secs: crate::agent_wake::WAKE_STALE_SECS,
+        }
+    }
+}
+
+/// `file_convert` spawn-timeout policy, exposed in the `[convert]` config
+/// section (ANAI-286).
+///
+/// A conversion is a subprocess spawn. Before this section existed the spawn
+/// was awaited unconditionally (`cmd.output().await`, unwrapped), so a launcher
+/// that hung hung the calling turn with it — `shell_exec` has had a policy
+/// timeout since forever; `file_convert` had none. Cheap to survive while every
+/// recipe was pandoc or headless Chrome; not cheap once a recipe is a Python
+/// extractor whose runtime scales with page count.
+///
+/// Split of responsibility, deliberate: the *value* belongs to the recipe (it
+/// is a property of the conversion — `pdf -> md` on a 300-page document is
+/// legitimately slower than `md -> pdf`), and the *policy* belongs to the
+/// operator (this section). Neither is per-agent: a conversion does not get
+/// slower because of who asked for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConvertConfig {
+    /// Timeout applied to a recipe that declares no `timeout_secs` of its own.
+    /// Default: 120.
+    pub default_timeout_secs: u64,
+    /// Ceiling on any recipe-declared `timeout_secs`. A recipe asking for more
+    /// is clamped down to this and the clamp is disclosed in the log line
+    /// (requested AND enforced), never silently honored. Default: 600.
+    pub max_timeout_secs: u64,
+}
+
+impl Default for ConvertConfig {
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 120,
+            max_timeout_secs: 600,
+        }
+    }
+}
+
+impl ConvertConfig {
+    /// Resolve the effective timeout for a recipe, given its declared value.
+    ///
+    /// Returns `(effective_secs, requested_secs_if_clamped)`. The second slot is
+    /// `Some(requested)` only when the recipe asked for more than the operator's
+    /// ceiling, so a caller can disclose both numbers — same clamp-and-disclose
+    /// contract as the ANAI-201 async-reply deadline band.
+    ///
+    /// A declared `0` is treated as "not declared": zero would mean an instantly
+    /// expiring conversion, which is never what an operator means, and the
+    /// manifest loader rejects it anyway. Both bounds are floored at 1 so a
+    /// misconfigured `0` in `[convert]` cannot make every conversion fail.
+    pub fn resolve_timeout(&self, recipe_secs: Option<u64>) -> (u64, Option<u64>) {
+        let ceiling = self.max_timeout_secs.max(1);
+        match recipe_secs.filter(|s| *s > 0) {
+            None => (self.default_timeout_secs.max(1).min(ceiling), None),
+            Some(requested) if requested > ceiling => (ceiling, Some(requested)),
+            Some(requested) => (requested, None),
         }
     }
 }
@@ -2307,6 +2370,7 @@ impl Default for KernelConfig {
             watchdog: WatchdogConfig::default(),
             agent_wake: AgentWakeConfig::default(),
             async_reply: AsyncReplyConfig::default(),
+            convert: ConvertConfig::default(),
             skills: HashMap::new(),
             turn_context: TurnContextConfig::default(),
             context: ContextConfig::default(),
@@ -5856,6 +5920,74 @@ mod tests {
         assert_eq!(c.agent_wake.max_inflight, 8);
         assert_eq!(c.agent_wake.per_caller_max, 4);
         assert_eq!(c.agent_wake.stale_wake_secs, 3600);
+    }
+
+    #[test]
+    fn test_convert_config_defaults() {
+        let c = KernelConfig::default();
+        assert_eq!(c.convert.default_timeout_secs, 120);
+        assert_eq!(c.convert.max_timeout_secs, 600);
+    }
+
+    #[test]
+    fn test_convert_config_from_toml() {
+        let toml_str = r#"
+            [convert]
+            default_timeout_secs = 45
+            max_timeout_secs = 300
+        "#;
+        let c: KernelConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.convert.default_timeout_secs, 45);
+        assert_eq!(c.convert.max_timeout_secs, 300);
+    }
+
+    #[test]
+    fn convert_timeout_undeclared_uses_operator_default() {
+        let c = ConvertConfig::default();
+        assert_eq!(c.resolve_timeout(None), (120, None));
+    }
+
+    #[test]
+    fn convert_timeout_declared_within_band_is_honored_verbatim() {
+        let c = ConvertConfig::default();
+        assert_eq!(c.resolve_timeout(Some(300)), (300, None));
+    }
+
+    #[test]
+    fn convert_timeout_above_ceiling_is_clamped_and_discloses_the_request() {
+        // Clamp-and-disclose, same contract as the ANAI-201 deadline band: the
+        // caller gets BOTH numbers so a silently-shortened conversion is
+        // impossible to mistake for one that simply ran long.
+        let c = ConvertConfig::default();
+        assert_eq!(c.resolve_timeout(Some(9000)), (600, Some(9000)));
+    }
+
+    #[test]
+    fn convert_timeout_zero_means_undeclared_not_instant_expiry() {
+        let c = ConvertConfig::default();
+        assert_eq!(c.resolve_timeout(Some(0)), (120, None));
+    }
+
+    #[test]
+    fn convert_timeout_floors_a_zeroed_operator_policy() {
+        // A `0` in [convert] must not make every conversion fail instantly.
+        let c = ConvertConfig {
+            default_timeout_secs: 0,
+            max_timeout_secs: 0,
+        };
+        assert_eq!(c.resolve_timeout(None), (1, None));
+        assert_eq!(c.resolve_timeout(Some(30)), (1, Some(30)));
+    }
+
+    #[test]
+    fn convert_default_is_clamped_by_the_ceiling() {
+        // An operator default above their own ceiling resolves to the ceiling
+        // rather than quietly exceeding it.
+        let c = ConvertConfig {
+            default_timeout_secs: 900,
+            max_timeout_secs: 300,
+        };
+        assert_eq!(c.resolve_timeout(None), (300, None));
     }
 
     #[test]

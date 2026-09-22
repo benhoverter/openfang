@@ -142,6 +142,12 @@ impl TurnPolicy {
 pub const READ_ONLY_TOOLS: &[&str] = &[
     "file_read",
     "file_list",
+    // ANAI-292: a search exposes strictly less than the read it replaces, and
+    // writes nothing. Omitting it here would make a retrieval-only call read
+    // as side-effecting and lock Assist-mode agents out of the one tool that
+    // lets them avoid pulling whole files into context -- the same omission
+    // ANAI-194 made with memory_status, noted below.
+    "file_grep",
     "memory_recall",
     // ANAI-194 shipped this tool but missed this list, which is the single
     // source of truth for BOTH the ANAI-76/77 drop predicate and

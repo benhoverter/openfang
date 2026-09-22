@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 /// Location of the recipe manifest, relative to the OpenFang home directory.
 pub const RECIPES_REL_PATH: &str = "convert/recipes.toml";
 
+/// Location of the operator config file, relative to the OpenFang home
+/// directory. Read here only for its `[convert]` section.
+pub const CONFIG_REL_PATH: &str = "config.toml";
+
 /// The canonical default manifest, embedded at compile time. This is the single
 /// source of truth for the built-in recipe table: it is parsed at load time
 /// when no external manifest exists, and a unit test asserts it stays in sync
@@ -49,6 +53,22 @@ pub struct Recipe {
     /// External binaries the recipe needs available, surfaced at preflight.
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Files the recipe needs to exist, checked by plain existence at preflight
+    /// (ANAI-287). Complements `needs`, which searches PATH for an *executable*
+    /// and therefore cannot see a missing library/module: a recipe backed by a
+    /// Python extractor passes `needs = ["python3"]` perfectly while the module
+    /// it imports is gone. Point this at the import target itself (e.g. a
+    /// `site-packages/<pkg>/__init__.py`) to turn that into a pre-spawn
+    /// MISSING_DEP instead of a runtime crash. Entries must be absolute paths;
+    /// no PATH search is performed and no executable bit is required.
+    #[serde(default)]
+    pub needs_files: Vec<String>,
+    /// Wall-clock ceiling on this recipe's subprocess, in seconds. `None` (the
+    /// default) means "use the operator's `[convert] default_timeout_secs`".
+    /// A declared value above `[convert] max_timeout_secs` is clamped down and
+    /// the clamp is disclosed, never silently honored. Must be > 0 when present.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     /// Extension of the produced output file (no leading dot).
     pub out_ext: String,
     /// Named render presets: preset-name -> { token-name -> value }. Values
@@ -340,6 +360,45 @@ pub fn recipes_path(home_dir: &Path) -> PathBuf {
     home_dir.join(RECIPES_REL_PATH)
 }
 
+/// Just the `[convert]` section of `config.toml`, pulled out with everything
+/// else ignored. Deserializing the whole `KernelConfig` here would couple the
+/// convert dispatcher to the entire config surface for two integers.
+#[derive(Debug, Default, Deserialize)]
+struct ConvertSectionOnly {
+    #[serde(default)]
+    convert: openfang_types::config::ConvertConfig,
+}
+
+/// Load the operator's `[convert]` timeout policy from
+/// `<openfang_home>/config.toml` (ANAI-286).
+///
+/// **Deliberately lenient, unlike [`load_recipes`].** A missing, unreadable, or
+/// malformed config yields the compiled-in defaults rather than an error. The
+/// fail-closed rule exists to stop a broken manifest silently converting
+/// *differently*; this section changes no output, only how long we are willing
+/// to wait for it. Failing the conversion because a timeout policy would not
+/// parse trades a working tool for a knob, and the kernel already rejects a
+/// malformed `config.toml` loudly at boot — so an operator is never left
+/// guessing why.
+pub fn load_convert_config(home_dir: &Path) -> openfang_types::config::ConvertConfig {
+    let path = home_dir.join(CONFIG_REL_PATH);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Default::default();
+    };
+    match toml::from_str::<ConvertSectionOnly>(&raw) {
+        Ok(parsed) => parsed.convert,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "ANAI-286: could not parse the [convert] section of config.toml; \
+                 using built-in timeout defaults"
+            );
+            Default::default()
+        }
+    }
+}
+
 /// Resolve the OpenFang home directory used to locate the recipe manifest.
 ///
 /// Priority: `OPENFANG_HOME` env var > `$HOME/.openfang` (or `%USERPROFILE%`).
@@ -419,6 +478,25 @@ fn validate(recipes: &[Recipe], path: &Path) -> Result<(), RecipeError> {
                 "recipe {}->{} has an empty `argv`",
                 r.from, r.to
             )));
+        }
+        if r.timeout_secs == Some(0) {
+            return Err(invalid(format!(
+                "recipe {}->{} declares `timeout_secs = 0`; a zero ceiling would \
+                 expire every conversion instantly. Omit the key to inherit \
+                 `[convert] default_timeout_secs`.",
+                r.from, r.to
+            )));
+        }
+        for nf in &r.needs_files {
+            if !Path::new(nf).is_absolute() {
+                return Err(invalid(format!(
+                    "recipe {}->{} `needs_files` entry {nf:?} is not an absolute \
+                     path; needs_files is a plain existence check with no PATH \
+                     search, so a relative entry would resolve against whatever \
+                     the daemon's cwd happens to be",
+                    r.from, r.to
+                )));
+            }
         }
         validate_presets(r).map_err(invalid)?;
         validate_options(r).map_err(invalid)?;
@@ -599,6 +677,8 @@ mod tests {
             to: "pdf".into(),
             argv: argv.into_iter().map(String::from).collect(),
             needs: vec![],
+            needs_files: vec![],
+            timeout_secs: None,
             out_ext: "pdf".into(),
             presets,
             default_preset: default_preset.map(String::from),
@@ -626,7 +706,11 @@ mod tests {
 
     #[test]
     fn resolve_argv_substitutes_known_tokens() {
-        let recipe = &default_recipes()[0];
+        let all = default_recipes();
+        let recipe = all
+            .iter()
+            .find(|r| r.from == "md" && r.to == "pdf")
+            .expect("default table must carry md->pdf");
         // The default recipe now declares options (ANAI-131); the dispatcher
         // fills every option with its declared default before resolving. Mirror
         // that here so the fixed-length argv fully resolves.
@@ -687,8 +771,11 @@ mod tests {
         // Guards the expect() in default_recipes() and keeps the embedded
         // template in sync with the typed expectation.
         let recipes = default_recipes();
-        assert_eq!(recipes.len(), 1);
-        let md = &recipes[0];
+        assert_eq!(recipes.len(), 4);
+        let md = recipes
+            .iter()
+            .find(|r| r.from == "md" && r.to == "pdf")
+            .expect("default table must carry md->pdf");
         assert_eq!(md.from, "md");
         assert_eq!(md.to, "pdf");
         assert_eq!(md.out_ext, "pdf");
@@ -702,6 +789,70 @@ mod tests {
         assert_eq!(md.options["orientation"].default, "portrait");
         assert!(md.options.contains_key("embed_images"));
         assert_eq!(md.options["embed_images"].default, "true");
+        // ANAI-288: html->png shipped in the deployed manifest but was missing
+        // from the embedded default, so a fresh install silently lacked the arm.
+        // Pin its shape here so the two cannot drift apart again.
+        let png = recipes
+            .iter()
+            .find(|r| r.from == "html" && r.to == "png")
+            .expect("default table must carry html->png");
+        assert_eq!(png.out_ext, "png");
+        assert_eq!(png.argv[0], "{script}/html2png.sh");
+        assert_eq!(png.default_preset.as_deref(), Some("mobile"));
+        assert!(png.presets.contains_key("mobile"));
+        assert!(png.presets.contains_key("desktop"));
+        assert!(png.presets.contains_key("og"));
+        // Presets, not options: viewport/scale always travel together.
+        assert!(png.options.is_empty());
+        assert_eq!(png.presets["mobile"]["viewport"], "390,844");
+        assert_eq!(png.presets["mobile"]["scale"], "3");
+        // The pinned Chrome path is a literal absolute path (a `/` entry is
+        // checked as-is, never PATH-searched), because Chrome installs as a
+        // .app and is not on PATH.
+        assert_eq!(png.needs.len(), 1);
+        assert!(Path::new(&png.needs[0]).is_absolute());
+        // ANAI-290: the pdf->txt text-layer arm. Distinct from pdf->md, which
+        // is pdfplumber-backed -- space-aligned ASCII is not markdown.
+        let txt = recipes
+            .iter()
+            .find(|r| r.from == "pdf" && r.to == "txt")
+            .expect("default table must carry pdf->txt");
+        assert_eq!(txt.out_ext, "txt");
+        assert_eq!(txt.argv[0], "{script}/pdf2txt.sh");
+        assert_eq!(txt.needs, vec!["pdftotext"]);
+        assert_eq!(txt.timeout_secs, Some(180));
+        assert!(txt.presets.is_empty());
+        // min_chars is the guard against a successful-looking extraction of
+        // nothing (a scanned PDF): the launcher refuses below this count, so a
+        // default of "0" would silently re-open that hole.
+        assert_eq!(txt.options["min_chars"].default, "1");
+        assert_eq!(txt.options["layout"].default, "true");
+        assert_eq!(txt.options["first_page"].default, "");
+        assert_eq!(txt.options["last_page"].default, "");
+        // ANAI-294: the pdf->md tier-1 arm. It reads the structure a tagged PDF
+        // states rather than inferring it from ruling lines, and REFUSES
+        // untagged input -- so it is not a richer pdf->txt, it is a different
+        // guarantee. Pin the shape that makes that guarantee legible.
+        let mdo = recipes
+            .iter()
+            .find(|r| r.from == "pdf" && r.to == "md")
+            .expect("default table must carry pdf->md");
+        assert_eq!(mdo.out_ext, "md");
+        assert_eq!(mdo.argv[0], "{script}/pdf2md.py");
+        assert_eq!(mdo.needs, vec!["python3"]);
+        assert_eq!(mdo.timeout_secs, Some(300));
+        assert!(mdo.presets.is_empty());
+        // needs_files is deliberately EMPTY here: pdfplumber's install path is
+        // host-specific, and a wrong absolute path would fail the preflight on
+        // every host but one. The launcher's exit 3 -> MISSING_DEP is the
+        // truthful check for an importable module.
+        assert!(mdo.needs_files.is_empty());
+        assert_eq!(mdo.options["min_chars"].default, "1");
+        // Defaulting require_tables to "true" would refuse every prose-only
+        // document; defaulting provenance to "false" would make a suspect cell
+        // untraceable to the method that produced it.
+        assert_eq!(mdo.options["require_tables"].default, "false");
+        assert_eq!(mdo.options["provenance"].default, "true");
         // The embedded default must survive full semantic validation.
         let tmp = std::path::Path::new("/embedded/default/recipes.toml");
         validate(&recipes, tmp).expect("embedded default recipes must validate");
@@ -843,6 +994,8 @@ mod tests {
                 "{scale}".into(),
             ],
             needs: vec![],
+            needs_files: vec![],
+            timeout_secs: None,
             out_ext: "png".into(),
             presets: BTreeMap::new(),
             default_preset: None,
@@ -870,6 +1023,8 @@ mod tests {
             to: "png".into(),
             argv: vec!["{script}/r.sh".into(), "{vp}".into()],
             needs: vec![],
+            needs_files: vec![],
+            timeout_secs: None,
             out_ext: "png".into(),
             presets: BTreeMap::new(),
             default_preset: None,
@@ -1022,6 +1177,121 @@ mod tests {
         assert!(r.presets.is_empty());
         assert!(r.default_preset.is_none());
         assert!(r.options.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // ANAI-286: per-recipe timeout + [convert] operator policy
+    // ANAI-287: needs_files existence preflight
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn recipe_timeout_and_needs_files_round_trip_from_manifest() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "pdf"
+                to = "md"
+                argv = ["{script}/pdf2md.py", "{input}", "-o", "{output}"]
+                needs = ["/opt/venv/bin/python3"]
+                needs_files = ["/opt/venv/lib/site-packages/pdfplumber/__init__.py"]
+                timeout_secs = 300
+                out_ext = "md"
+            "#,
+        );
+        let set = load_recipes(home.path()).unwrap();
+        let r = set.lookup("pdf", "md").unwrap();
+        assert_eq!(r.timeout_secs, Some(300));
+        assert_eq!(r.needs_files.len(), 1);
+    }
+
+    #[test]
+    fn recipe_omitting_timeout_and_needs_files_is_still_valid() {
+        // Backward compatibility: every pre-existing manifest lacks both keys.
+        let set = RecipeSet::new(default_recipes());
+        let r = set.lookup("md", "pdf").unwrap();
+        assert_eq!(r.timeout_secs, None);
+        assert!(r.needs_files.is_empty());
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected_rather_than_meaning_instant_expiry() {
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/b.sh", "{input}", "{output}"]
+                timeout_secs = 0
+                out_ext = "pdf"
+            "#,
+        );
+        assert!(matches!(
+            load_recipes(home.path()).unwrap_err(),
+            RecipeError::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn relative_needs_files_entry_is_rejected() {
+        // A relative entry would resolve against the daemon's cwd, so it could
+        // pass or fail depending on where the daemon was launched from.
+        let home = TempDir::new().unwrap();
+        write_manifest(
+            home.path(),
+            r#"
+                [[recipe]]
+                from = "md"
+                to = "pdf"
+                argv = ["{script}/b.sh", "{input}", "{output}"]
+                needs_files = ["site-packages/pdfplumber/__init__.py"]
+                out_ext = "pdf"
+            "#,
+        );
+        assert!(matches!(
+            load_recipes(home.path()).unwrap_err(),
+            RecipeError::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn convert_config_absent_yields_defaults() {
+        let home = TempDir::new().unwrap();
+        let cfg = load_convert_config(home.path());
+        assert_eq!(cfg.default_timeout_secs, 120);
+        assert_eq!(cfg.max_timeout_secs, 600);
+    }
+
+    #[test]
+    fn convert_config_reads_the_convert_section_and_ignores_the_rest() {
+        let home = TempDir::new().unwrap();
+        fs::write(
+            home.path().join(CONFIG_REL_PATH),
+            "log_level = \"debug\"\n\n[convert]\ndefault_timeout_secs = 45\nmax_timeout_secs = 300\n",
+        )
+        .unwrap();
+        let cfg = load_convert_config(home.path());
+        assert_eq!(cfg.default_timeout_secs, 45);
+        assert_eq!(cfg.max_timeout_secs, 300);
+    }
+
+    #[test]
+    fn malformed_config_falls_back_to_defaults_rather_than_breaking_conversion() {
+        // Unlike the recipe manifest, a broken [convert] section must NOT be a
+        // hard error: it changes no output, only how long we wait for it, and
+        // the kernel rejects a malformed config.toml loudly at boot anyway.
+        let home = TempDir::new().unwrap();
+        fs::write(
+            home.path().join(CONFIG_REL_PATH),
+            "this is = = not toml [[[",
+        )
+        .unwrap();
+        let cfg = load_convert_config(home.path());
+        assert_eq!(cfg.default_timeout_secs, 120);
+        assert_eq!(cfg.max_timeout_secs, 600);
     }
 
     // ------------------------------------------------------------------

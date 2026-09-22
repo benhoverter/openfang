@@ -69,6 +69,11 @@ use tracing::{debug, error, info, warn};
 /// - `agent_send` — inter-agent messaging via the kernel
 pub const ALLOWED_TOOLS: &[&str] = &[
     "file_read",
+    // ANAI-292: same tier as file_read by construction. A grep over a file
+    // exposes a strict subset of what a read already returns, and every
+    // candidate path re-enters the same resolver, so granting one and denying
+    // the other protects nothing.
+    "file_grep",
     "file_list",
     "file_write",
     "create_directory",
@@ -408,6 +413,22 @@ async fn handle_connection(
                 );
 
                 let result = dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await;
+                // Frame floor: every result, native or upstream, passes
+                // through here. Oversized frames are refused by the codec and
+                // the refusal closes the connection, so clamping must happen
+                // before the frame is built — not inside any one tool.
+                let (result, clamped_from) = clamp_result_to_frame(result);
+                if let Some(original_bytes) = clamped_from {
+                    warn!(
+                        request_id = call.request_id,
+                        tool = %call.tool_name,
+                        agent = %call.agent_id,
+                        agent_name = %call_agent_name,
+                        original_bytes,
+                        budget = FRAME_PAYLOAD_BUDGET,
+                        "bridge IPC: truncated oversized tool result to fit the frame"
+                    );
+                }
                 let result_kind = match &result {
                     CallResult::Ok {
                         is_error: false, ..
@@ -457,6 +478,115 @@ async fn handle_connection(
                 warn!(?other, "bridge IPC: unexpected frame in request loop");
                 continue;
             }
+        }
+    }
+}
+
+/// Headroom reserved inside [`MAX_FRAME_BYTES`] for everything in a response
+/// frame that is *not* the result payload: the JSON envelope (`request_id`,
+/// result tag, `is_error`), plus room for the truncation marker itself.
+/// Deliberately generous — the cost of over-reserving is a slightly shorter
+/// result, and the cost of under-reserving is a closed connection.
+const FRAME_ENVELOPE_RESERVE: usize = 16 * 1024;
+
+/// Payload budget for a single response frame, measured in JSON-*escaped*
+/// bytes (see [`json_escaped_cost`]).
+const FRAME_PAYLOAD_BUDGET: usize = MAX_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_RESERVE);
+
+/// Bytes a single `char` occupies inside a serialized JSON string literal.
+///
+/// Mirrors `serde_json`'s escaping exactly: the seven short escapes cost two
+/// bytes, any other C0 control byte becomes a six-byte `\u00XX`, and
+/// everything else — including all non-ASCII — is emitted verbatim at its
+/// UTF-8 length. Measuring the *escaped* cost is the point: a megabyte of
+/// quotes doubles on the wire, so a budget applied to the raw string would
+/// still overflow the frame.
+fn json_escaped_cost(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Longest prefix of `s` whose JSON-escaped form fits in `budget` bytes.
+///
+/// Cuts on a `char` boundary by construction (it walks `char_indices`), so the
+/// result is always valid UTF-8 and never splits a multi-byte codepoint.
+fn truncate_to_json_budget(s: &str, budget: usize) -> &str {
+    let mut cost = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let next = cost + json_escaped_cost(ch);
+        if next > budget {
+            return &s[..idx];
+        }
+        cost = next;
+    }
+    s
+}
+
+/// Clamp a dispatch result so its response frame cannot exceed
+/// [`MAX_FRAME_BYTES`].
+///
+/// ## Why this exists
+///
+/// `codec::write_frame` *refuses* an oversized frame, and the request loop
+/// propagates that error — which closes the connection. So before this, a
+/// single tool returning more than a mebibyte did not merely fail that call:
+/// it tore down the bridge for the rest of the turn, with no marker and no
+/// diagnosis the model could act on. `file_read` has no cap of its own (it is
+/// `read_to_string`), so one large file was enough.
+///
+/// The upstream-MCP path already truncated its own results at this boundary,
+/// which is precisely why the hole was easy to miss: half the traffic was
+/// protected and the protocol docs claimed *all* of it was. This moves the
+/// clamp to the one place every result passes through, and the upstream path
+/// now inherits it instead of hand-rolling it.
+///
+/// ## Semantics
+///
+/// Truncation sets `is_error = true` and appends a marker naming the original
+/// size, the budget, and the remedy. Flagging it is deliberate: a truncated
+/// result is not a complete answer, and the failure mode we are buying our way
+/// out of all month is the one where incomplete output reads as finished. A
+/// marker at the tail can be skimmed past; an error flag cannot.
+///
+/// Returns the (possibly clamped) result and the original payload size when it
+/// was clamped, so the caller can log it with full request context.
+fn clamp_result_to_frame(result: CallResult) -> (CallResult, Option<usize>) {
+    match result {
+        CallResult::Ok { content, is_error } => {
+            let kept = truncate_to_json_budget(&content, FRAME_PAYLOAD_BUDGET);
+            if kept.len() == content.len() {
+                return (CallResult::Ok { content, is_error }, None);
+            }
+            let original = content.len();
+            let mut clamped = kept.to_string();
+            clamped.push_str(&format!(
+                "\n\n[openfang: tool result truncated — {original} bytes exceeds the \
+                 {MAX_FRAME_BYTES}-byte bridge frame limit. {kept_len} bytes are shown \
+                 above; the rest was NOT returned. Re-request a bounded slice of this \
+                 data rather than retrying the same call, which will truncate \
+                 identically.]",
+                kept_len = kept.len()
+            ));
+            (
+                CallResult::Ok {
+                    content: clamped,
+                    is_error: true,
+                },
+                Some(original),
+            )
+        }
+        CallResult::Error { message } => {
+            let kept = truncate_to_json_budget(&message, FRAME_PAYLOAD_BUDGET);
+            if kept.len() == message.len() {
+                return (CallResult::Error { message }, None);
+            }
+            let original = message.len();
+            let mut clamped = kept.to_string();
+            clamped.push_str("\n\n[openfang: error message truncated to fit the bridge frame]");
+            (CallResult::Error { message: clamped }, Some(original))
         }
     }
 }
@@ -895,40 +1025,15 @@ async fn dispatch_upstream_mcp_call(
 
     match result_text {
         Ok(content) => {
-            // Truncation: keep the framed response well under
-            // MAX_FRAME_BYTES so the JSON envelope (request_id,
-            // result tag, is_error, escapes) fits comfortably.
-            // Margin is conservative on purpose.
-            const CONTENT_BUDGET: usize = MAX_FRAME_BYTES.saturating_sub(16 * 1024);
-            if content.len() > CONTENT_BUDGET {
-                warn!(
-                    request_id = call.request_id,
-                    tool = %call.tool_name,
-                    agent = %resolved_agent_id_string,
-                    agent_name = %agent_name_log,
-                    bytes = content.len(),
-                    budget = CONTENT_BUDGET,
-                    "bridge IPC (upstream MCP): truncating oversized result"
-                );
-                // UTF-8 invariant: each `char` encodes to ≤ 4 bytes, so
-                // `chars().take(N)` produces a `String` of ≤ 4N bytes.
-                // Taking `CONTENT_BUDGET / 4` chars therefore yields a
-                // string of ≤ CONTENT_BUDGET bytes, fitting the frame.
-                let mut truncated: String = content.chars().take(CONTENT_BUDGET / 4).collect();
-                truncated.push_str(
-                    "
-
-[openfang: upstream MCP result truncated —                      exceeded bridge frame budget]",
-                );
-                CallResult::Ok {
-                    content: truncated,
-                    is_error: true,
-                }
-            } else {
-                CallResult::Ok {
-                    content,
-                    is_error: false,
-                }
+            // No truncation here: `clamp_result_to_frame` in the request loop
+            // is the single frame floor for every result, native or upstream.
+            // The bespoke copy that used to live at this spot measured the RAW
+            // byte length and then took `budget / 4` chars to stay safe — which
+            // both over-trimmed ASCII by ~4x and, more importantly, left the
+            // native tool path with no clamp at all.
+            CallResult::Ok {
+                content,
+                is_error: false,
             }
         }
         Err(e) => {
@@ -1115,6 +1220,149 @@ mod tests {
     use openfang_runtime::bridge_auth::TokenIssuer;
     use tokio::io::BufReader;
     use tokio::net::UnixStream as ClientStream;
+
+    // ---- frame floor (clamp_result_to_frame) --------------------------------
+
+    /// Serialized size of the response frame this result would produce. The
+    /// assertions below measure THIS, not the payload length, because the
+    /// codec's refusal is against the encoded frame.
+    fn encoded_frame_len(result: CallResult) -> usize {
+        let frame = Frame::Response(CallResponse {
+            request_id: 7,
+            result,
+        });
+        serde_json::to_vec(&frame).unwrap().len()
+    }
+
+    #[test]
+    fn a_result_within_budget_is_returned_untouched() {
+        let content = "x".repeat(4096);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Ok {
+            content: content.clone(),
+            is_error: false,
+        });
+        assert!(clamped.is_none(), "small result must not be clamped");
+        match out {
+            CallResult::Ok {
+                content: got,
+                is_error,
+            } => {
+                assert_eq!(got, content, "payload must be byte-identical");
+                assert!(!is_error, "clamping must not invent an error flag");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_oversized_result_is_clamped_to_a_writable_frame() {
+        // 4 MiB — four times the frame limit. Before the floor existed this
+        // reached `write_frame`, which refused it, and the refusal propagated
+        // out of the request loop and CLOSED THE CONNECTION.
+        let content = "y".repeat(4 * 1024 * 1024);
+        let original = content.len();
+        let (out, clamped) = clamp_result_to_frame(CallResult::Ok {
+            content,
+            is_error: false,
+        });
+        assert_eq!(
+            clamped,
+            Some(original),
+            "caller must learn the original size"
+        );
+        let CallResult::Ok {
+            content: got,
+            is_error,
+        } = out.clone()
+        else {
+            panic!("expected Ok");
+        };
+        assert!(is_error, "an incomplete result must carry the error flag");
+        assert!(
+            got.contains("truncated"),
+            "the marker must say so in words: {}",
+            &got[got.len().saturating_sub(300)..]
+        );
+        assert!(
+            got.contains(&original.to_string()),
+            "the marker must name the original size"
+        );
+        // The load-bearing assertion: the frame the codec would write FITS.
+        let len = encoded_frame_len(out);
+        assert!(
+            len <= MAX_FRAME_BYTES,
+            "clamped frame is {len} bytes, over the {MAX_FRAME_BYTES} limit"
+        );
+    }
+
+    #[test]
+    fn a_payload_of_pure_escapes_still_fits() {
+        // Regression guard on measuring ESCAPED cost. A budget applied to raw
+        // byte length would pass ~1 MiB of quotes through, and each one
+        // doubles on the wire, so the encoded frame would be ~2 MiB and the
+        // codec would refuse it — the exact failure the clamp exists to stop.
+        let content = "\"".repeat(2 * 1024 * 1024);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Ok {
+            content,
+            is_error: false,
+        });
+        assert!(clamped.is_some());
+        let len = encoded_frame_len(out);
+        assert!(
+            len <= MAX_FRAME_BYTES,
+            "escape-heavy clamped frame is {len} bytes, over the limit"
+        );
+    }
+
+    #[test]
+    fn clamping_never_splits_a_codepoint() {
+        // A multi-byte char straddling the budget boundary must not be cut in
+        // half: the payload has to stay valid UTF-8 or serialization itself
+        // becomes the failure.
+        let content = "\u{1f600}".repeat(1024 * 1024);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Ok {
+            content,
+            is_error: false,
+        });
+        assert!(clamped.is_some());
+        let CallResult::Ok { content: got, .. } = out.clone() else {
+            panic!("expected Ok");
+        };
+        // `String` cannot hold invalid UTF-8, so the real check is that every
+        // emoji survived whole rather than as a partial sequence.
+        let body = got.split("\n\n[openfang:").next().unwrap();
+        assert_eq!(
+            body.len() % 4,
+            0,
+            "body must be a whole number of 4-byte codepoints"
+        );
+        assert!(body.chars().all(|c| c == '\u{1f600}'));
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn an_oversized_dispatch_error_is_clamped_too() {
+        let message = "z".repeat(3 * 1024 * 1024);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Error { message });
+        assert!(clamped.is_some());
+        match &out {
+            CallResult::Error { message } => assert!(message.contains("truncated")),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn an_existing_tool_error_flag_survives_clamping() {
+        let (out, _) = clamp_result_to_frame(CallResult::Ok {
+            content: "boom".to_string(),
+            is_error: true,
+        });
+        match out {
+            CallResult::Ok { is_error, .. } => assert!(is_error),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
 
     /// End-to-end wire-shape test: bind a listener at a tempfile path,
     /// connect, do the handshake, send two CallRequests:
@@ -1869,10 +2117,13 @@ mod tests {
         // Browser, page-driving: 30 -> 35 (click / type / screenshot /
         // run_js / back). All five are privileged-deny, so `DEFAULT_ALLOWED`
         // is unchanged at 26 and `PRIVILEGED_DEFAULT_DENY` goes 4 -> 9.
-        assert_eq!(ALLOWED_TOOLS.len(), 35, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-292: 35 -> 36 (`file_grep`). NOT privileged-deny — it is
+        // granted alongside `file_read`, so `DEFAULT_ALLOWED` moves with it,
+        // 26 -> 27, and `PRIVILEGED_DEFAULT_DENY` stays at 9.
+        assert_eq!(ALLOWED_TOOLS.len(), 36, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            35,
+            36,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -1882,8 +2133,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            26,
-            "DEFAULT_ALLOWED bridge-default cardinality (35 − 9 privileged)"
+            27,
+            "DEFAULT_ALLOWED bridge-default cardinality (36 − 9 privileged)"
         );
     }
 
