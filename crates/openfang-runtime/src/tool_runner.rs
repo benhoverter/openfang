@@ -1115,17 +1115,29 @@ pub async fn execute_tool(
 /// live thread is a window. So: close liberally, reset conservatively.
 pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Check this BEFORE you start work on a turn, not after: if the incoming message moves you to different work - another project, another repo, another person's business, or an explicit \"let's switch to\" - the previous episode is over, and closing it first is what puts the new work in the new episode instead of the old one. Work reaching its end is also a close: a ticket landed, a question answered, a decision made. NOT a topic change: a question about what you just did, a digression that returns, a new ticket in the same project, or \"also, can you\". A long gap since the last message plus a different subject is two signals, not one - treat it as a change. Close on a plausible shift; a missed close is not free, because the boundary then lands hours late on the idle timeout, in the middle of the next topic. It is reset_context that deserves the caution, not the close: when you are unsure the old thread is finished, close WITHOUT reset_context - you keep your window and still get the boundary. Never reset mid-task, nor while something is unverified or a question to the operator is outstanding. Name the reason - \"topic-switch\" when the subject changed, \"explicit\" when the work finished or the operator asked. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.";
 
+/// Advertised description for `file_read`, shared with the bridge's
+/// `built_in_tools()` so the two surfaces cannot drift (ANAI-291).
+///
+/// Says the two things a caller cannot discover by trying: that a large file
+/// comes back as a head plus a manifest rather than whole, and that the
+/// line-denominated `offset`/`limit` take exactly the numbers `file_grep`
+/// hands back. The units agreeing across both tools is the whole reason they
+/// are one design.
+pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are relative to the agent workspace. Use offset and limit to read a bounded window instead of the whole file: both are LINE numbers, 1-based, and they take the line numbers file_grep returns verbatim. A file too large to return whole comes back as its first 200 lines plus a manifest stating the total line count, the file's sha256, and the exact call that returns the next slice - so a large read is never a silent truncation, but it is also not the file. For anything big, searching with file_grep and then reading the range it points at costs far less context than paging through.";
+
 /// Get definitions for all built-in tools.
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         // --- Filesystem tools ---
         ToolDefinition {
             name: "file_read".to_string(),
-            description: "Read the contents of a file. Paths are relative to the agent workspace.".to_string(),
+            description: FILE_READ_DESCRIPTION.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "The file path to read" }
+                    "path": { "type": "string", "description": "The file path to read" },
+                    "offset": { "type": "integer", "description": "1-based line number to start at. Omit to start at line 1." },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return. Omit to read to the end of the file." }
                 },
                 "required": ["path"]
             }),
@@ -2120,6 +2132,214 @@ fn resolve_file_path(
     }
 }
 
+/// Byte size at which an unranged `file_read` stops returning the whole file
+/// and returns a head plus a manifest instead (ANAI-291).
+///
+/// Chosen against the two real ceilings this sits under: the native driver's
+/// per-tool-result cap (30% of the context window at two chars per token —
+/// 120,000 chars on a 200k window) and the bridge's 1 MiB frame. 128 KiB is
+/// roughly 32k tokens, which is already a large share of a turn's context to
+/// spend on one call, and it leaves both ceilings a wide margin.
+///
+/// Deliberately a constant and not yet an operator knob: `tool_file_read` does
+/// not receive the config, and threading it through `execute_tool` would touch
+/// every call site. If these numbers bite in ops, that plumbing is the fix.
+const FILE_READ_WHOLE_LIMIT_BYTES: u64 = 128 * 1024;
+
+/// Lines of head returned with the manifest when a file is too large to return
+/// whole. Enough to identify a file and find its structure; not enough to
+/// pretend it is the file.
+const FILE_READ_HEAD_LINES: usize = 200;
+
+/// Byte ceiling on an **explicit** range. Higher than
+/// [`FILE_READ_WHOLE_LIMIT_BYTES`] because the caller stated a bound and is
+/// entitled to more trust than a caller who stated none — but still bounded,
+/// so `limit: 1000000` degrades to a marked truncation here rather than
+/// travelling on to be clamped anonymously at the bridge frame.
+const FILE_READ_SLICE_LIMIT_BYTES: usize = 256 * 1024;
+
+/// A line-denominated window read out of a file, plus what it took to get it.
+struct FileWindow {
+    /// The window's bytes, newlines preserved exactly as on disk.
+    bytes: Vec<u8>,
+    /// 1-based line number of the first line included (0 when none were).
+    first_line: usize,
+    /// 1-based line number of the last line included (0 when none were).
+    last_line: usize,
+    /// Total lines in the whole file — the denominator, so a slice is never
+    /// mistaken for the file.
+    total_lines: usize,
+    /// True when the window hit [`FILE_READ_SLICE_LIMIT_BYTES`] and stopped
+    /// short of the requested line count.
+    byte_capped: bool,
+    /// sha256 of the entire file, not of the window. Identifies *which* file a
+    /// slice came from across calls.
+    sha256: String,
+}
+
+/// Read a 1-based line window out of `path` without holding the whole file.
+///
+/// Scans to EOF regardless of the window, because `total_lines` and the file
+/// hash are the two things that make a partial read honest, and both require
+/// seeing every byte. Only the window itself is retained.
+///
+/// Splits on `\n` with [`tokio::io::AsyncBufReadExt::read_until`] rather than
+/// `lines()`: `lines()` strips the terminator and a trailing `\r`, which would
+/// silently rewrite a CRLF file's contents on the way out.
+async fn read_line_window(
+    path: &Path,
+    start: usize,
+    max_lines: Option<usize>,
+) -> Result<FileWindow, String> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncBufReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("Failed to read file: {e}"))?;
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut hasher = Sha256::new();
+
+    let end_exclusive = max_lines.map(|n| start.saturating_add(n));
+    let mut buf: Vec<u8> = Vec::new();
+    let mut window: Vec<u8> = Vec::new();
+    let mut line_no: usize = 0;
+    let mut first_line: usize = 0;
+    let mut last_line: usize = 0;
+    let mut byte_capped = false;
+
+    loop {
+        buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(|e| format!("Failed to read file: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf);
+        line_no += 1;
+
+        let in_window = line_no >= start && end_exclusive.is_none_or(|e| line_no < e);
+        if in_window && !byte_capped {
+            if window.len() + buf.len() > FILE_READ_SLICE_LIMIT_BYTES {
+                // Stop collecting, keep scanning: the denominator still has to
+                // be true.
+                byte_capped = true;
+            } else {
+                if first_line == 0 {
+                    first_line = line_no;
+                }
+                last_line = line_no;
+                window.extend_from_slice(&buf);
+            }
+        }
+    }
+
+    Ok(FileWindow {
+        bytes: window,
+        first_line,
+        last_line,
+        total_lines: line_no,
+        byte_capped,
+        sha256: format!("{:x}", hasher.finalize()),
+    })
+}
+
+/// Leading bytes handed to [`sniff_binary_format`]. Taken with a `min`, not a
+/// range index: `slice.get(..64)` yields `None` for anything SHORTER than 64
+/// bytes, which silently costs the signpost on exactly the small files where
+/// a signature is most of the file.
+fn leading_bytes(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes.len().min(64)]
+}
+
+/// Identify a few common binary formats from their leading bytes, so a
+/// `file_read` that fails on UTF-8 can name what the file actually is and the
+/// call that would work.
+///
+/// This is the signpost half of the "polymorphic file_read" question, and
+/// deliberately not the router half: `file_read` never silently substitutes
+/// converted text for the bytes on disk. A read that returns something other
+/// than what is on disk makes every downstream assumption — diffing, hashing,
+/// "I read it so I can patch it" — quietly wrong, with no way for the caller
+/// to tell. So it points at `file_convert` and stops.
+fn sniff_binary_format(head: &[u8]) -> Option<&'static str> {
+    const SIGNATURES: &[(&[u8], &str)] = &[
+        (b"%PDF-", "PDF"),
+        (b"\x89PNG\r\n\x1a\n", "PNG"),
+        (b"\xff\xd8\xff", "JPEG"),
+        (b"GIF8", "GIF"),
+        (b"PK\x03\x04", "ZIP or OOXML (docx/xlsx/pptx)"),
+        (b"\x7fELF", "ELF executable"),
+        (b"\xca\xfe\xba\xbe", "Mach-O universal binary"),
+        (b"SQLite format 3\0", "SQLite database"),
+        (b"\x1f\x8b", "gzip"),
+    ];
+    SIGNATURES
+        .iter()
+        .find(|(sig, _)| head.starts_with(sig))
+        .map(|(_, name)| *name)
+}
+
+/// Turn a UTF-8 failure into a signpost naming the format and the call that
+/// would work, instead of a bare decode error.
+fn utf8_read_error(raw_path: &str, head: &[u8]) -> String {
+    match sniff_binary_format(head) {
+        Some("PDF") => format!(
+            "'{raw_path}' is not valid UTF-8 text: it is a PDF. file_read returns bytes \
+             as-is and will not extract for you. Convert it first, then read the result: \
+             file_convert(to=\"txt\", path=\"{raw_path}\") returns a path you can file_read. \
+             Note that file_convert is workspace-scoped, so a PDF outside your workspace \
+             has to be copied in before it can be converted."
+        ),
+        Some(fmt) => format!(
+            "'{raw_path}' is not valid UTF-8 text: it looks like {fmt}. file_read returns \
+             the bytes on disk and does not transcode. Check file_convert for a recipe \
+             that turns this format into text."
+        ),
+        None => format!(
+            "'{raw_path}' is not valid UTF-8 text and its leading bytes match no format \
+             openfang recognises. file_read only returns text; there is nothing here it \
+             can hand back."
+        ),
+    }
+}
+
+/// Parse an optional 1-based line argument, liberally but not silently.
+///
+/// Accepts a JSON integer or a numeric string (models send both). Rejects
+/// zero with an explicit note that lines are 1-based: silently treating 0 as 1
+/// would hide a real off-by-one in the caller, and silently treating it as
+/// "line zero" would shift every subsequent slice.
+fn parse_line_arg(input: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+    let raw = &input[key];
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let value = if let Some(n) = raw.as_u64() {
+        n
+    } else if let Some(s) = raw.as_str() {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        s.parse::<u64>()
+            .map_err(|_| format!("'{key}' must be a positive whole number of lines, got {s:?}"))?
+    } else {
+        return Err(format!(
+            "'{key}' must be a positive whole number of lines, got {raw}"
+        ));
+    };
+    if value == 0 {
+        return Err(format!(
+            "'{key}' is 0, but line numbers are 1-based: the first line of a file is \
+             line 1. Pass 1 to start at the beginning."
+        ));
+    }
+    Ok(Some(value as usize))
+}
+
 async fn tool_file_read(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
@@ -2129,9 +2349,104 @@ async fn tool_file_read(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
     crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
-    tokio::fs::read_to_string(&resolved)
+
+    let offset = parse_line_arg(input, "offset")?;
+    let limit = parse_line_arg(input, "limit")?;
+
+    let meta = tokio::fs::metadata(&resolved)
         .await
-        .map_err(|e| format!("Failed to read file: {e}"))
+        .map_err(|e| format!("Failed to read file: {e}"))?;
+    if meta.is_dir() {
+        return Err(format!(
+            "'{raw_path}' is a directory, not a file. Use file_list to enumerate it."
+        ));
+    }
+    let total_bytes = meta.len();
+
+    // Unranged read of a file that comfortably fits: byte-identical to the
+    // behaviour before ranges existed, header and all (there isn't one). This
+    // path is load-bearing for backward compatibility — annotating every read
+    // would break every caller that hashes, diffs, or round-trips content.
+    if offset.is_none() && limit.is_none() && total_bytes <= FILE_READ_WHOLE_LIMIT_BYTES {
+        let bytes = tokio::fs::read(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read file: {e}"))?;
+        return String::from_utf8(bytes)
+            .map_err(|e| utf8_read_error(raw_path, leading_bytes(e.as_bytes())));
+    }
+
+    let ranged = offset.is_some() || limit.is_some();
+    let start = offset.unwrap_or(1);
+    let max_lines = if ranged {
+        limit
+    } else {
+        Some(FILE_READ_HEAD_LINES)
+    };
+
+    let window = read_line_window(&resolved, start, max_lines).await?;
+    let body = String::from_utf8(window.bytes)
+        .map_err(|e| utf8_read_error(raw_path, leading_bytes(e.as_bytes())))?;
+
+    // An empty window is a refusal, not an empty success. Returning "" for an
+    // offset past EOF is indistinguishable from an empty file, and the caller
+    // would carry on believing it had read something.
+    if window.first_line == 0 {
+        if window.total_lines == 0 {
+            return Err(format!(
+                "'{raw_path}' is empty (0 lines, {total_bytes} bytes), so there is no \
+                 line {start} to return."
+            ));
+        }
+        return Err(format!(
+            "offset {start} is past the end of '{raw_path}', which has {} lines. \
+             Nothing was returned. Pass an offset between 1 and {}.",
+            window.total_lines, window.total_lines
+        ));
+    }
+
+    let mut out = String::new();
+    if ranged {
+        out.push_str(&format!(
+            "[openfang file_read: '{}' lines {}-{} of {} | {} bytes total]\n",
+            raw_path, window.first_line, window.last_line, window.total_lines, total_bytes
+        ));
+        if window.byte_capped {
+            out.push_str(&format!(
+                "[openfang file_read: this slice hit the {} byte ceiling and stopped at \
+                 line {} — fewer lines than you asked for. Continue with offset {}.]\n",
+                FILE_READ_SLICE_LIMIT_BYTES,
+                window.last_line,
+                window.last_line + 1
+            ));
+        }
+    } else {
+        // Head + manifest. The point of the manifest is that the dead end
+        // becomes a signpost: it says what the file is, proves which file it
+        // is, and names the exact call that gets the rest.
+        out.push_str(&format!(
+            "[openfang file_read: '{}' is {} bytes / {} lines — over the {} byte limit \
+             for returning a file whole, so this is the HEAD ONLY.\n\
+             Showing lines {}-{} of {}. sha256={}\n\
+             Next slice:    file_read(path=\"{}\", offset={}, limit={})\n\
+             Search first:  file_grep(path=\"{}\", pattern=\"...\") returns line numbers \
+             you can pass straight to offset — usually the right move, since a large \
+             read is nearly always a search wearing a read's clothes.]\n",
+            raw_path,
+            total_bytes,
+            window.total_lines,
+            FILE_READ_WHOLE_LIMIT_BYTES,
+            window.first_line,
+            window.last_line,
+            window.total_lines,
+            window.sha256,
+            raw_path,
+            window.last_line + 1,
+            FILE_READ_HEAD_LINES,
+            raw_path,
+        ));
+    }
+    out.push_str(&body);
+    Ok(out)
 }
 
 async fn tool_file_write(
@@ -6545,6 +6860,276 @@ async fn tool_skill_execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ANAI-291: file_read ranges, head+manifest, binary signpost --------
+
+    /// Call `tool_file_read` against a real file with no workspace and no
+    /// policy, which is the configuration `resolve_file_path` treats as
+    /// "absolute paths permitted" — the read path itself is what is under
+    /// test here, not the resolver.
+    async fn read(path: &Path, args: serde_json::Value) -> Result<String, String> {
+        let mut input = args;
+        input["path"] = serde_json::json!(path.to_str().unwrap());
+        tool_file_read(&input, None, None, None).await
+    }
+
+    fn write_lines(dir: &Path, name: &str, count: usize) -> PathBuf {
+        let path = dir.join(name);
+        let body: String = (1..=count).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_small_unranged_read_is_byte_identical_to_the_file() {
+        // Backward compatibility is the load-bearing property here. Every
+        // existing caller that hashes, diffs, or round-trips content through
+        // file_read breaks the moment an unranged read of a normal file grows
+        // a header.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        let content = "alpha\nbravo\ncharlie\n";
+        std::fs::write(&path, content).unwrap();
+
+        let got = read(&path, serde_json::json!({})).await.unwrap();
+        assert_eq!(got, content, "no header, no annotation, no rewriting");
+    }
+
+    #[tokio::test]
+    async fn a_range_returns_exactly_those_lines_with_a_denominator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "many.txt", 500);
+
+        let got = read(&path, serde_json::json!({ "offset": 10, "limit": 3 }))
+            .await
+            .unwrap();
+
+        let (header, body) = got.split_once('\n').unwrap();
+        assert!(
+            header.contains("lines 10-12 of 500"),
+            "the header must state the window AND the total, so a slice is \
+             never mistaken for the file: {header}"
+        );
+        assert_eq!(body, "line 10\nline 11\nline 12\n");
+    }
+
+    #[tokio::test]
+    async fn a_limit_without_an_offset_starts_at_line_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "many.txt", 50);
+        let got = read(&path, serde_json::json!({ "limit": 2 }))
+            .await
+            .unwrap();
+        assert!(got.contains("lines 1-2 of 50"));
+        assert!(got.ends_with("line 1\nline 2\n"));
+    }
+
+    #[tokio::test]
+    async fn an_offset_without_a_limit_runs_to_the_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "many.txt", 5);
+        let got = read(&path, serde_json::json!({ "offset": 4 }))
+            .await
+            .unwrap();
+        assert!(got.contains("lines 4-5 of 5"));
+        assert!(got.ends_with("line 4\nline 5\n"));
+    }
+
+    #[tokio::test]
+    async fn a_large_unranged_read_returns_a_head_and_a_manifest() {
+        // Each line is ~1 KiB, so 400 lines clears the 128 KiB whole-file
+        // limit without depending on the exact constant.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let filler = "x".repeat(1000);
+        let body: String = (1..=400).map(|i| format!("{i} {filler}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let got = read(&path, serde_json::json!({})).await.unwrap();
+
+        assert!(got.len() < body.len(), "the whole file must not come back");
+        // The manifest's job: say what this is, prove which file it is, and
+        // name the call that gets the rest.
+        assert!(got.contains("HEAD ONLY"), "must not read as the whole file");
+        assert!(got.contains("400 lines"), "must state the true denominator");
+        assert!(got.contains("sha256="), "must identify the file");
+        assert!(
+            got.contains("offset=201"),
+            "must name the NEXT call concretely, not describe it: {}",
+            &got[..600.min(got.len())]
+        );
+        assert!(
+            got.contains("file_grep"),
+            "must point at search, which is what a large read usually wants"
+        );
+        // And the head is really the head.
+        assert!(got.contains("\n1 xxx"), "line 1 present");
+        assert!(got.contains("\n200 xxx"), "line 200 present");
+        assert!(!got.contains("\n201 xxx"), "line 201 must NOT be present");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_range_is_honoured_past_the_whole_file_limit() {
+        // The head+manifest substitution must apply ONLY to a caller who
+        // stated no bound. A caller who asked for lines 300-302 of a large
+        // file gets lines 300-302, not a head.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let filler = "y".repeat(1000);
+        let body: String = (1..=400).map(|i| format!("{i} {filler}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let got = read(&path, serde_json::json!({ "offset": 300, "limit": 3 }))
+            .await
+            .unwrap();
+        assert!(got.contains("lines 300-302 of 400"));
+        assert!(!got.contains("HEAD ONLY"));
+        assert!(got.contains("\n300 yyy"));
+    }
+
+    #[tokio::test]
+    async fn an_offset_past_the_end_is_a_refusal_not_an_empty_success() {
+        // Returning "" here is indistinguishable from an empty file, and the
+        // caller would carry on believing it had read something. This is the
+        // silent-success class, so it is an error with the real line count.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "short.txt", 12);
+
+        let err = read(&path, serde_json::json!({ "offset": 5000 }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("past the end"), "{err}");
+        assert!(err.contains("12 lines"), "must name the real length: {err}");
+        assert!(err.contains("Nothing was returned"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_offset_is_refused_as_a_one_based_mistake() {
+        // Coercing 0 to 1 would hide a real off-by-one in the caller; treating
+        // it as "line zero" would shift every subsequent slice by one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "f.txt", 3);
+        let err = read(&path, serde_json::json!({ "offset": 0 }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("1-based"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_numeric_string_range_is_accepted_and_junk_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_lines(dir.path(), "f.txt", 9);
+
+        // Models send "2" as readily as 2. Accepting it is liberal; accepting
+        // "two" silently as 0 or 1 would not be.
+        let got = read(&path, serde_json::json!({ "offset": "2", "limit": "2" }))
+            .await
+            .unwrap();
+        assert!(got.contains("lines 2-3 of 9"));
+
+        let err = read(&path, serde_json::json!({ "limit": "lots" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("whole number of lines"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn crlf_line_endings_survive_a_ranged_read() {
+        // `BufReader::lines()` strips the terminator and a trailing '\r',
+        // which would silently rewrite the file's bytes on the way out. The
+        // window is assembled with read_until precisely to avoid that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        std::fs::write(&path, "one\r\ntwo\r\nthree\r\n").unwrap();
+
+        let got = read(&path, serde_json::json!({ "offset": 2, "limit": 1 }))
+            .await
+            .unwrap();
+        assert!(
+            got.ends_with("two\r\n"),
+            "the carriage return must still be there: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_with_no_trailing_newline_is_not_given_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonl.txt");
+        std::fs::write(&path, "a\nb").unwrap();
+
+        let got = read(&path, serde_json::json!({ "offset": 2, "limit": 1 }))
+            .await
+            .unwrap();
+        assert!(got.ends_with("b"), "{got:?}");
+        assert!(got.contains("lines 2-2 of 2"));
+    }
+
+    #[tokio::test]
+    async fn a_pdf_names_itself_and_the_call_that_would_work() {
+        // The signpost, not a router: file_read never substitutes converted
+        // text for the bytes on disk. It says what the file is and stops.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.pdf");
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xfe, 0x00, 0x01]);
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read(&path, serde_json::json!({})).await.unwrap_err();
+        assert!(err.contains("PDF"), "must name the format: {err}");
+        assert!(
+            err.contains("file_convert"),
+            "must name the tool that can: {err}"
+        );
+        assert!(
+            err.contains("to=\"txt\""),
+            "must name the concrete call, not gesture at one: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_binary_says_so_without_guessing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.bin");
+        std::fs::write(&path, [0xff, 0xfe, 0xfd, 0xfc, 0x00]).unwrap();
+
+        let err = read(&path, serde_json::json!({})).await.unwrap_err();
+        assert!(err.contains("no format"), "{err}");
+        assert!(!err.contains("PDF"));
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read(dir.path(), serde_json::json!({})).await.unwrap_err();
+        assert!(err.contains("is a directory"), "{err}");
+        assert!(err.contains("file_list"), "must name the right tool: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_slice_is_capped_and_says_where_to_resume() {
+        // A caller who asks for more than the slice ceiling gets a marked
+        // truncation here, with a resume point — rather than travelling on to
+        // be clamped anonymously at the bridge frame.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        let filler = "z".repeat(1000);
+        let body: String = (1..=600).map(|i| format!("{i} {filler}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+
+        let got = read(&path, serde_json::json!({ "offset": 1, "limit": 600 }))
+            .await
+            .unwrap();
+        assert!(
+            got.contains("byte ceiling"),
+            "the cap must announce itself: {}",
+            &got[..400.min(got.len())]
+        );
+        assert!(got.contains("Continue with offset"));
+        assert!(
+            got.contains("of 600"),
+            "the denominator stays true even when the window is short"
+        );
+    }
 
     // ANAI-110: lineage threading via the WAKE_LINEAGE task-local. These prove
     // `resolve_wake_base_lineage` reads the scoped inbound chain (the real read

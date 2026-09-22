@@ -276,6 +276,16 @@ pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
 /// read one doctrine while the prompt preached another.
 pub const EPISODE_CLOSE_DESCRIPTION: &str = "Close the current episode - the stretch of turns your recent work is grouped into - and label it. Check this BEFORE you start work on a turn, not after: if the incoming message moves you to different work - another project, another repo, another person's business, or an explicit \"let's switch to\" - the previous episode is over, and closing it first is what puts the new work in the new episode instead of the old one. Work reaching its end is also a close: a ticket landed, a question answered, a decision made. NOT a topic change: a question about what you just did, a digression that returns, a new ticket in the same project, or \"also, can you\". A long gap since the last message plus a different subject is two signals, not one - treat it as a change. Close on a plausible shift; a missed close is not free, because the boundary then lands hours late on the idle timeout, in the middle of the next topic. It is reset_context that deserves the caution, not the close: when you are unsure the old thread is finished, close WITHOUT reset_context - you keep your window and still get the boundary. Never reset mid-task, nor while something is unverified or a question to the operator is outstanding. Name the reason - \"topic-switch\" when the subject changed, \"explicit\" when the work finished or the operator asked. A new episode opens on your next turn. Harmless to call when nothing is open. Pass reset_context to also start the next episode with a clean conversation window, and prime_for to have that fresh window opened with what durable memory knows about the project you are moving to.";
 
+/// Advertised description for `file_read` (ANAI-291).
+///
+/// Byte-identical to `openfang_runtime::tool_runner::FILE_READ_DESCRIPTION`,
+/// and duplicated rather than shared for the same reason
+/// `EPISODE_CLOSE_DESCRIPTION` is: neither this crate nor `openfang-runtime`
+/// depends on the other, so there is nowhere to put one copy. A drift test in
+/// `openfang-api` — which depends on both — asserts they stay equal, because
+/// two prompts nobody can compare by eye are two prompts that will diverge.
+pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are relative to the agent workspace. Use offset and limit to read a bounded window instead of the whole file: both are LINE numbers, 1-based, and they take the line numbers file_grep returns verbatim. A file too large to return whole comes back as its first 200 lines plus a manifest stating the total line count, the file's sha256, and the exact call that returns the next slice - so a large read is never a silent truncation, but it is also not the file. For anything big, searching with file_grep and then reading the range it points at costs far less context than paging through.";
+
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
 
@@ -289,11 +299,13 @@ pub fn built_in_tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "file_read",
-            "Read the contents of a file. Paths are relative to the agent workspace.",
+            FILE_READ_DESCRIPTION,
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "The file path to read" }
+                    "path": { "type": "string", "description": "The file path to read" },
+                    "offset": { "type": "integer", "description": "1-based line number to start at. Omit to start at line 1." },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return. Omit to read to the end of the file." }
                 },
                 "required": ["path"]
             })),
