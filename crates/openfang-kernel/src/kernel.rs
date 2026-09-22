@@ -63,6 +63,38 @@ use tracing::{debug, error, info, warn};
 /// ANAI-122: `agent_reply_async` is inert without the reply-right token.
 const ALWAYS_ON_BUILTIN_TOOLS: &[&str] = &["agent_reply_async"];
 
+/// Companion tool grants: declaring the parent tool in `capabilities.tools`
+/// also admits its companions.
+///
+/// This exists because `capabilities.tools` is an *enumeration*, so a tool
+/// added to the fleet after an agent's manifest was written is reachable by
+/// nobody until every `agent.toml` is edited — and never by agents spawned
+/// from an older template. The bridge's `DEFAULT_ALLOWED` does not rescue
+/// this: it is only the no-env-var fallback, and production always threads
+/// the manifest-derived list through `OPENFANG_BRIDGE_ALLOWED`.
+///
+/// **Admission rule — both halves are required:**
+/// 1. the companion's output is a strict *subset* of what the parent already
+///    returns, so advertising it opens no new data class; and
+/// 2. it reaches that data through the *same resolver* as the parent, so the
+///    parent's path/permission tiering still applies.
+///
+/// This is deliberately not a convenience list. A tool that can reach data,
+/// a subprocess, or a side effect the parent cannot is a new capability and
+/// belongs in `capabilities.tools`, not here.
+///
+/// ANAI-296: `file_grep` returns lines from a file that `file_read` already
+/// returns whole, via the same `resolve_with_policy` tiering.
+const COMPANION_TOOL_GRANTS: &[(&str, &[&str])] = &[("file_read", &["file_grep"])];
+
+/// True when `tool` is admitted as a companion of some tool the agent
+/// declared. See [`COMPANION_TOOL_GRANTS`].
+fn is_companion_granted(tool: &str, declared: &[String]) -> bool {
+    COMPANION_TOOL_GRANTS.iter().any(|(parent, companions)| {
+        companions.contains(&tool) && declared.iter().any(|d| d == parent)
+    })
+}
+
 /// Tracing target for every "compaction did not happen" line in the kernel.
 ///
 /// ANAI-263 made the background-compaction ladder's declines log at `debug!`
@@ -9325,11 +9357,17 @@ impl OpenFangKernel {
             // without a runtime token; see ALWAYS_ON_BUILTIN_TOOLS). Advertising
             // grants nothing — the reply-right token still gates actual use, and
             // Step 4's tool_blocklist can still remove them. ANAI-122.
+            //
+            // ANAI-296: also include companion tools of anything declared —
+            // strict-subset tools that share the parent's resolver and so open
+            // no data class the agent did not already have. Step 4's
+            // tool_blocklist still removes them if an operator says so.
             all_builtins
                 .into_iter()
                 .filter(|t| {
                     declared_tools.iter().any(|d| d == &t.name)
                         || ALWAYS_ON_BUILTIN_TOOLS.contains(&t.name.as_str())
+                        || is_companion_granted(&t.name, &declared_tools)
                 })
                 .collect()
         } else {

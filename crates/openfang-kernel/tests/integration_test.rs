@@ -6,8 +6,13 @@ use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentManifest;
 use openfang_types::config::{DefaultModelConfig, KernelConfig};
 
-fn test_config() -> KernelConfig {
-    let tmp = std::env::temp_dir().join("openfang-integration-test");
+/// Per-test kernel config.
+///
+/// The directory is keyed on `name` because `cargo test` runs these in
+/// parallel: a shared path meant one test wiping another's SQLite file
+/// mid-boot, surfacing as `database is locked`. Each test gets its own home.
+fn test_config(name: &str) -> KernelConfig {
+    let tmp = std::env::temp_dir().join(format!("openfang-integration-test-{name}"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
 
@@ -33,7 +38,7 @@ async fn test_full_pipeline_with_groq() {
     }
 
     // Boot kernel
-    let config = test_config();
+    let config = test_config("full-pipeline");
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
 
     // Spawn agent
@@ -91,7 +96,7 @@ async fn test_multiple_agents_different_models() {
         return;
     }
 
-    let config = test_config();
+    let config = test_config("multi-agent");
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
 
     // Spawn agent 1: llama 70b
@@ -214,7 +219,7 @@ max_llm_tokens_per_hour = 100000
 ///      force-surfaced, so the carve-out has not become a blanket bypass.
 #[tokio::test]
 async fn test_reply_async_always_on_for_declared_tools_agent() {
-    let config = test_config();
+    let config = test_config("reply-async");
     let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
 
     // Agent declares ONLY file_read — neither reply tool is named.
@@ -259,5 +264,97 @@ memory_write = ["self.*"]
     );
 
     kernel.kill_agent(agent_id).ok();
+    kernel.shutdown();
+}
+
+/// ANAI-296 regression: `file_grep` must be surfaced to an agent that declares
+/// `file_read` without naming `file_grep` — and must NOT be surfaced to an
+/// agent that declares neither.
+///
+/// `file_grep` shipped in the bridge's `DEFAULT_ALLOWED`, but that list is only
+/// the no-env-var fallback; production threads the manifest-derived allowlist
+/// through `OPENFANG_BRIDGE_ALLOWED`, built from this same resolver. Every live
+/// `agent.toml` enumerates `file_read` and none enumerate `file_grep`, so
+/// without the companion grant the tool is reachable by nobody.
+///
+/// The negative half is the load-bearing one: it proves the grant is keyed on
+/// the *parent* being declared rather than having become a second always-on
+/// list. A regression that force-surfaces `file_grep` unconditionally passes
+/// the positive assertion and fails here.
+#[tokio::test]
+async fn test_file_grep_companion_grant_follows_declared_file_read() {
+    let config = test_config("companion-grant");
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+    let with_read: AgentManifest = toml::from_str(
+        r#"
+name = "companion-grant-agent"
+version = "0.1.0"
+description = "Agent declaring file_read but not file_grep"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[capabilities]
+tools = ["file_read"]
+"#,
+    )
+    .unwrap();
+
+    let without_read: AgentManifest = toml::from_str(
+        r#"
+name = "no-companion-grant-agent"
+version = "0.1.0"
+description = "Agent declaring neither file_read nor file_grep"
+author = "test"
+module = "builtin:chat"
+
+[model]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+
+[capabilities]
+tools = ["file_write"]
+"#,
+    )
+    .unwrap();
+
+    let granted_id = kernel.spawn_agent(with_read).expect("Agent should spawn");
+    let ungranted_id = kernel
+        .spawn_agent(without_read)
+        .expect("Agent should spawn");
+
+    let granted = kernel.available_tools_with_registry(granted_id, None);
+    let granted_names: Vec<&str> = granted.iter().map(|t| t.name.as_str()).collect();
+
+    let ungranted = kernel.available_tools_with_registry(ungranted_id, None);
+    let ungranted_names: Vec<&str> = ungranted.iter().map(|t| t.name.as_str()).collect();
+
+    assert!(
+        granted_names.contains(&"file_read"),
+        "declared tool file_read must be present, got: {granted_names:?}"
+    );
+    assert!(
+        granted_names.contains(&"file_grep"),
+        "file_grep must be surfaced as a companion of the declared file_read \
+         (ANAI-296), got: {granted_names:?}"
+    );
+    assert!(
+        !granted_names.contains(&"shell_exec"),
+        "the companion grant must not widen beyond the declared parent's data \
+         class, got: {granted_names:?}"
+    );
+    assert!(
+        !ungranted_names.contains(&"file_grep"),
+        "file_grep must NOT be surfaced to an agent that declares no parent tool \
+         — the companion grant is keyed on file_read, not always-on, got: \
+         {ungranted_names:?}"
+    );
+
+    kernel.kill_agent(granted_id).ok();
+    kernel.kill_agent(ungranted_id).ok();
     kernel.shutdown();
 }
