@@ -252,3 +252,57 @@ desc    = "Last page to extract, 1-based. Empty extracts to the end. Pair with f
 type    = "string"
 default = "1"
 desc    = "Refuse the conversion if fewer than this many characters were extracted. The default of 1 catches the image-only/scanned PDF, which pdftotext reports as a successful extraction of nothing. Raise it to assert a document has real body text."
+
+# ---------------------------------------------------------------------------
+# pdf -> md (tier 1: the document's OWN logical structure tree)
+#
+# This arm reads the structure a tagged PDF STATES -- StructTreeRoot -> Table ->
+# TR -> TH/TD, with mcids naming the text each node owns -- instead of inferring
+# it from ruling lines and word positions. Measured, the geometric approach
+# drops the first row of every table into the surrounding prose (no rule above
+# the header means no band) and fabricates tables on pages of running prose.
+# Both failures exit 0 and look correct.
+#
+# UNTAGGED input is REFUSED (exit 4), not best-efforted. Word/Office exports and
+# pandoc+typst output (including OpenFang's own PDFs, with or without
+# --table-grid) are tagged; design-tool PDFs and headless-Chrome HTML->PDF are
+# not. For those, use the pdf->txt arm and accept a best-effort text layer.
+#
+# DEPENDENCY NOTE: pdfplumber is a Python LIBRARY, so `needs` -- which resolves
+# names on PATH -- cannot see it. pdf2md.py re-execs once into the pinned venv
+# at <openfang_home>/venv/pdf and exits 3 (MISSING_DEP) if the module is still
+# unavailable, which is the only check that can be truthful about an import.
+# An operator wanting a pre-spawn signpost can add an absolute
+#   needs_files = [".../venv/pdf/lib/python3.X/site-packages/pdfplumber/__init__.py"]
+# here; it is left out of this default because that path is host-specific.
+[[recipe]]
+from    = "pdf"
+to      = "md"
+argv    = [
+  "{script}/pdf2md.py", "{input}", "-o", "{output}",
+  "--min-chars", "{min_chars}",
+  "--require-tables", "{require_tables}",
+  "--provenance", "{provenance}",
+]
+needs   = ["python3"]
+out_ext = "md"
+# pdfminer-class parsing runs roughly 0.3-1s per page, and this walks the word
+# index as well. Generous for a few hundred pages, still bounded.
+timeout_secs = 300
+
+[recipe.options.min_chars]
+type    = "string"
+default = "1"
+desc    = "Refuse the conversion if the rendered markdown is shorter than this many characters. Catches a PDF that is tagged but whose tree yields almost nothing."
+
+[recipe.options.require_tables]
+type    = "enum"
+values  = ["true", "false"]
+default = "false"
+desc    = "Refuse unless the structure tree states at least one Table. Use when you are converting specifically to recover tables and an answer without them is worthless."
+
+[recipe.options.provenance]
+type    = "enum"
+values  = ["true", "false"]
+default = "true"
+desc    = "Emit an HTML comment header naming the extractor, tier, source, page count and table count. ON by default so a suspect cell is traceable to the method that produced it."

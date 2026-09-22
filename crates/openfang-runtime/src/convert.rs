@@ -771,7 +771,7 @@ mod tests {
         // Guards the expect() in default_recipes() and keeps the embedded
         // template in sync with the typed expectation.
         let recipes = default_recipes();
-        assert_eq!(recipes.len(), 3);
+        assert_eq!(recipes.len(), 4);
         let md = recipes
             .iter()
             .find(|r| r.from == "md" && r.to == "pdf")
@@ -829,6 +829,30 @@ mod tests {
         assert_eq!(txt.options["layout"].default, "true");
         assert_eq!(txt.options["first_page"].default, "");
         assert_eq!(txt.options["last_page"].default, "");
+        // ANAI-294: the pdf->md tier-1 arm. It reads the structure a tagged PDF
+        // states rather than inferring it from ruling lines, and REFUSES
+        // untagged input -- so it is not a richer pdf->txt, it is a different
+        // guarantee. Pin the shape that makes that guarantee legible.
+        let mdo = recipes
+            .iter()
+            .find(|r| r.from == "pdf" && r.to == "md")
+            .expect("default table must carry pdf->md");
+        assert_eq!(mdo.out_ext, "md");
+        assert_eq!(mdo.argv[0], "{script}/pdf2md.py");
+        assert_eq!(mdo.needs, vec!["python3"]);
+        assert_eq!(mdo.timeout_secs, Some(300));
+        assert!(mdo.presets.is_empty());
+        // needs_files is deliberately EMPTY here: pdfplumber's install path is
+        // host-specific, and a wrong absolute path would fail the preflight on
+        // every host but one. The launcher's exit 3 -> MISSING_DEP is the
+        // truthful check for an importable module.
+        assert!(mdo.needs_files.is_empty());
+        assert_eq!(mdo.options["min_chars"].default, "1");
+        // Defaulting require_tables to "true" would refuse every prose-only
+        // document; defaulting provenance to "false" would make a suspect cell
+        // untraceable to the method that produced it.
+        assert_eq!(mdo.options["require_tables"].default, "false");
+        assert_eq!(mdo.options["provenance"].default, "true");
         // The embedded default must survive full semantic validation.
         let tmp = std::path::Path::new("/embedded/default/recipes.toml");
         validate(&recipes, tmp).expect("embedded default recipes must validate");
