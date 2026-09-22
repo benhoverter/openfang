@@ -897,22 +897,59 @@ mod tests {
 
     #[test]
     fn test_compute_next_run_after_skips_current_second() {
-        // A "every 4 hours" cron: next_run should be >= 4 hours from now,
-        // not in the same minute (the bug from #55).
+        // A "every 4 hours" cron must advance past the current second (the
+        // bug from #55). Pinned instants, not `Utc::now()`: the previous
+        // version asserted the next fire was >= 1 minute away, which is false
+        // for the 60 seconds before every 4-hourly boundary — it flaked at
+        // 07:59:50Z with "got 10 seconds", which was correct behavior.
+        use chrono::TimeZone;
         let schedule = CronSchedule::Cron {
             expr: "0 */4 * * *".into(),
             tz: None,
         };
-        let now = Utc::now();
-        let next = compute_next_run_after(&schedule, now);
-        // Must be strictly after `now` and at least ~1 hour away
-        // (the closest 4-hourly boundary is at least minutes away).
-        assert!(next > now, "next_run should be strictly after now");
-        let diff = next - now;
-        assert!(
-            diff.num_minutes() >= 1,
-            "Expected next_run at least 1 min away, got {} seconds",
-            diff.num_seconds()
+
+        // Exactly on a boundary: must skip to the NEXT one, never return
+        // `after` itself. This is the property the test is named for.
+        let on_boundary = Utc.with_ymd_and_hms(2026, 1, 1, 4, 0, 0).unwrap();
+        let next = compute_next_run_after(&schedule, on_boundary);
+        assert!(next > on_boundary, "next_run should be strictly after now");
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap());
+
+        // One second before a boundary. DOCUMENTS A DEFECT, not a desire:
+        // `compute_next_run_after` adds 1s to `after` before calling
+        // `cron::Schedule::after`, which is ALREADY strictly-exclusive — so
+        // the 04:00 fire is skipped and the job sleeps an extra 4 hours.
+        // One-second-wide blind window on every boundary. See the sibling
+        // probe `cron_crate_after_is_strictly_exclusive` below.
+        let just_before = Utc.with_ymd_and_hms(2026, 1, 1, 3, 59, 59).unwrap();
+        let next = compute_next_run_after(&schedule, just_before);
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap());
+
+        // Mid-interval: the next boundary, strictly ahead.
+        let mid = Utc.with_ymd_and_hms(2026, 1, 1, 5, 17, 33).unwrap();
+        let next = compute_next_run_after(&schedule, mid);
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap());
+    }
+
+    /// Pins the upstream semantic the `+ 1 second` in
+    /// `compute_next_run_after` was added to compensate for: it is already
+    /// strictly exclusive, so the addition is redundant and costs a
+    /// one-second blind window at every boundary.
+    #[test]
+    fn cron_crate_after_is_strictly_exclusive() {
+        use chrono::TimeZone;
+        let sched: cron::Schedule = "0 0 */4 * * * *".parse().unwrap();
+        let on_boundary = Utc.with_ymd_and_hms(2026, 1, 1, 4, 0, 0).unwrap();
+        assert_eq!(
+            sched.after(&on_boundary).next().unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap(),
+            "cron::Schedule::after must not return the instant it was given"
+        );
+        let just_before = Utc.with_ymd_and_hms(2026, 1, 1, 3, 59, 59).unwrap();
+        assert_eq!(
+            sched.after(&just_before).next().unwrap(),
+            Utc.with_ymd_and_hms(2026, 1, 1, 4, 0, 0).unwrap(),
+            "without the redundant +1s, the boundary fire is preserved"
         );
     }
 
