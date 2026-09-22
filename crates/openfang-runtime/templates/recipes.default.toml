@@ -140,3 +140,61 @@ type    = "enum"
 values  = ["true", "false"]
 default = "true"       # 2026-09-21: ON by default so generated PDFs stay machine-readable.
 desc    = "Draw a full stroke grid on tables. ON by default: pandoc's typst template strokes only a single rule under the header, which leaves the PDF with zero vertical rules and makes table structure unrecoverable by pdf->md extraction. Set false for the older borderless look."
+
+# ------------------------------------------------------------------------------
+# html -> png (ANAI-288)
+#
+# This arm shipped in the deployed manifest but was never added to the embedded
+# default, so a FRESH install had no html->png recipe at all -- the capability
+# existed only on hosts whose operator had hand-copied a manifest. Restoring it
+# here makes the compiled-in table match the capability we actually document.
+#
+# PRESETS instead of options: viewport and scale always travel together, and a
+# caller asking for "mobile" is choosing a device, not two independent numbers.
+#
+# HOST PIN, and its one wart: `needs` is a literal absolute path because Chrome
+# on macOS installs as a .app and is never on PATH. The launcher honours
+# $OPENFANG_CHROME for other hosts, but `needs` cannot read the environment --
+# so on a host with Chrome elsewhere the preflight fails MISSING_DEP with the
+# macOS path named, and the operator's fix is to override this recipe in
+# <openfang_home>/convert/recipes.toml. That is a loud, accurate refusal rather
+# than a silent misfire, which is why it is acceptable as a default.
+[[recipe]]
+from    = "html"
+to      = "png"
+argv    = [
+  "{script}/html2png.sh", "{input}", "-o", "{output}",
+  "--viewport", "{viewport}",
+  "--scale", "{scale}",
+]
+needs   = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+out_ext = "png"
+default_preset = "mobile"
+
+[recipe.presets.mobile]
+viewport = "390,844"
+scale    = "3"
+
+[recipe.presets."mobile-sm"]
+viewport = "360,800"
+scale    = "3"
+
+[recipe.presets.tablet]
+viewport = "820,1180"
+scale    = "2"
+
+[recipe.presets.desktop]
+viewport = "1280,800"
+scale    = "2"
+
+[recipe.presets.wide]
+viewport = "1920,1080"
+scale    = "2"
+
+[recipe.presets.square]
+viewport = "1080,1080"
+scale    = "2"
+
+[recipe.presets.og]
+viewport = "1200,630"
+scale    = "2"

@@ -706,7 +706,11 @@ mod tests {
 
     #[test]
     fn resolve_argv_substitutes_known_tokens() {
-        let recipe = &default_recipes()[0];
+        let all = default_recipes();
+        let recipe = all
+            .iter()
+            .find(|r| r.from == "md" && r.to == "pdf")
+            .expect("default table must carry md->pdf");
         // The default recipe now declares options (ANAI-131); the dispatcher
         // fills every option with its declared default before resolving. Mirror
         // that here so the fixed-length argv fully resolves.
@@ -767,8 +771,11 @@ mod tests {
         // Guards the expect() in default_recipes() and keeps the embedded
         // template in sync with the typed expectation.
         let recipes = default_recipes();
-        assert_eq!(recipes.len(), 1);
-        let md = &recipes[0];
+        assert_eq!(recipes.len(), 2);
+        let md = recipes
+            .iter()
+            .find(|r| r.from == "md" && r.to == "pdf")
+            .expect("default table must carry md->pdf");
         assert_eq!(md.from, "md");
         assert_eq!(md.to, "pdf");
         assert_eq!(md.out_ext, "pdf");
@@ -782,6 +789,28 @@ mod tests {
         assert_eq!(md.options["orientation"].default, "portrait");
         assert!(md.options.contains_key("embed_images"));
         assert_eq!(md.options["embed_images"].default, "true");
+        // ANAI-288: html->png shipped in the deployed manifest but was missing
+        // from the embedded default, so a fresh install silently lacked the arm.
+        // Pin its shape here so the two cannot drift apart again.
+        let png = recipes
+            .iter()
+            .find(|r| r.from == "html" && r.to == "png")
+            .expect("default table must carry html->png");
+        assert_eq!(png.out_ext, "png");
+        assert_eq!(png.argv[0], "{script}/html2png.sh");
+        assert_eq!(png.default_preset.as_deref(), Some("mobile"));
+        assert!(png.presets.contains_key("mobile"));
+        assert!(png.presets.contains_key("desktop"));
+        assert!(png.presets.contains_key("og"));
+        // Presets, not options: viewport/scale always travel together.
+        assert!(png.options.is_empty());
+        assert_eq!(png.presets["mobile"]["viewport"], "390,844");
+        assert_eq!(png.presets["mobile"]["scale"], "3");
+        // The pinned Chrome path is a literal absolute path (a `/` entry is
+        // checked as-is, never PATH-searched), because Chrome installs as a
+        // .app and is not on PATH.
+        assert_eq!(png.needs.len(), 1);
+        assert!(Path::new(&png.needs[0]).is_absolute());
         // The embedded default must survive full semantic validation.
         let tmp = std::path::Path::new("/embedded/default/recipes.toml");
         validate(&recipes, tmp).expect("embedded default recipes must validate");
