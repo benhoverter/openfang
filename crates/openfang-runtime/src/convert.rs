@@ -771,7 +771,7 @@ mod tests {
         // Guards the expect() in default_recipes() and keeps the embedded
         // template in sync with the typed expectation.
         let recipes = default_recipes();
-        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes.len(), 3);
         let md = recipes
             .iter()
             .find(|r| r.from == "md" && r.to == "pdf")
@@ -811,6 +811,24 @@ mod tests {
         // .app and is not on PATH.
         assert_eq!(png.needs.len(), 1);
         assert!(Path::new(&png.needs[0]).is_absolute());
+        // ANAI-290: the pdf->txt text-layer arm. Distinct from pdf->md, which
+        // is pdfplumber-backed -- space-aligned ASCII is not markdown.
+        let txt = recipes
+            .iter()
+            .find(|r| r.from == "pdf" && r.to == "txt")
+            .expect("default table must carry pdf->txt");
+        assert_eq!(txt.out_ext, "txt");
+        assert_eq!(txt.argv[0], "{script}/pdf2txt.sh");
+        assert_eq!(txt.needs, vec!["pdftotext"]);
+        assert_eq!(txt.timeout_secs, Some(180));
+        assert!(txt.presets.is_empty());
+        // min_chars is the guard against a successful-looking extraction of
+        // nothing (a scanned PDF): the launcher refuses below this count, so a
+        // default of "0" would silently re-open that hole.
+        assert_eq!(txt.options["min_chars"].default, "1");
+        assert_eq!(txt.options["layout"].default, "true");
+        assert_eq!(txt.options["first_page"].default, "");
+        assert_eq!(txt.options["last_page"].default, "");
         // The embedded default must survive full semantic validation.
         let tmp = std::path::Path::new("/embedded/default/recipes.toml");
         validate(&recipes, tmp).expect("embedded default recipes must validate");

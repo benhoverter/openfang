@@ -198,3 +198,57 @@ scale    = "2"
 [recipe.presets.og]
 viewport = "1200,630"
 scale    = "2"
+
+# ------------------------------------------------------------------------------
+# pdf -> txt (ANAI-290)
+#
+# The text-layer arm. `pdftotext -layout` preserves columns and table-ish
+# alignment well enough to read, which covers the common "point me at a PDF and
+# let me read it" case with no new engine and no Rust.
+#
+# It is NOT the pdf->md arm. Markdown is a separate recipe backed by pdfplumber,
+# because only table EXTRACTION produces real pipe tables -- and calling
+# space-aligned ASCII "markdown" because the file ends in .md is the same
+# quiet lie we have spent the month removing.
+#
+# WHY A LAUNCHER RATHER THAN A BARE pdftotext argv: pdftotext exits 0 on a PDF
+# with no text layer and writes an EMPTY file. That is a successful-looking
+# conversion of nothing. pdf2txt.sh counts the extracted characters and fails
+# with a diagnosis instead, and exits 3 on a missing binary so the dispatcher
+# reports MISSING_DEP rather than CONVERT_FAILED.
+[[recipe]]
+from    = "pdf"
+to      = "txt"
+argv    = [
+  "{script}/pdf2txt.sh", "{input}", "-o", "{output}",
+  "--layout", "{layout}",
+  "--first-page", "{first_page}",
+  "--last-page", "{last_page}",
+  "--min-chars", "{min_chars}",
+]
+needs   = ["pdftotext"]
+out_ext = "txt"
+# Extraction is cheap next to a render, but a few hundred pages of pdfminer-
+# class work is not instant. Generous, still bounded.
+timeout_secs = 180
+
+[recipe.options.layout]
+type    = "enum"
+values  = ["true", "false"]
+default = "true"
+desc    = "Preserve the original physical layout (pdftotext -layout). ON by default: it keeps columns and table alignment readable. Set false for a single reflowed text stream."
+
+[recipe.options.first_page]
+type    = "string"
+default = ""           # empty = from page 1
+desc    = "First page to extract, 1-based. Empty extracts from the beginning."
+
+[recipe.options.last_page]
+type    = "string"
+default = ""           # empty = to the last page
+desc    = "Last page to extract, 1-based. Empty extracts to the end. Pair with first_page to bound a large document."
+
+[recipe.options.min_chars]
+type    = "string"
+default = "1"
+desc    = "Refuse the conversion if fewer than this many characters were extracted. The default of 1 catches the image-only/scanned PDF, which pdftotext reports as a successful extraction of nothing. Raise it to assert a document has real body text."
