@@ -307,6 +307,29 @@ impl MemorySubstrate {
         .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Async wrapper for [`SemanticStore::resolve_note_refs`] (ANAI-270).
+    pub async fn resolve_note_refs_async(
+        &self,
+        agent_id: AgentId,
+        references: &[String],
+        max: usize,
+    ) -> OpenFangResult<Result<Vec<crate::semantic::ResolvedNote>, String>> {
+        let store = self.semantic.clone();
+        let references = references.to_vec();
+        tokio::task::spawn_blocking(move || store.resolve_note_refs(agent_id, &references, max))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
+    /// Async wrapper for [`SemanticStore::supersede_note`] (ANAI-270).
+    pub async fn supersede_note_async(&self, old_id: &str, new_id: &str) -> OpenFangResult<bool> {
+        let store = self.semantic.clone();
+        let (old_id, new_id) = (old_id.to_string(), new_id.to_string());
+        tokio::task::spawn_blocking(move || store.supersede_note(&old_id, &new_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// The agent's memory status. See [`EpisodeStore::status`].
     pub fn episode_status(
         &self,

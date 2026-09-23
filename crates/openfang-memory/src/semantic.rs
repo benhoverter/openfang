@@ -46,6 +46,36 @@ pub const KIND_KEY: &str = "kind";
 /// stops discriminating.
 pub const KIND_TURN: &str = "turn";
 
+/// `kind` value for a deliberate, agent-authored note (ANAI-166) — the only
+/// kind an agent can supersede by naming it (ANAI-270).
+pub const KIND_NOTE: &str = "note";
+
+/// How many leading characters of a note's id are shown to an agent, and the
+/// shortest reference [`SemanticStore::resolve_note_ref`] accepts (ANAI-270).
+///
+/// Eight hex digits is 32 bits. The largest single-author note corpus is a few
+/// hundred rows, so a collision is a birthday-bound curiosity, not a live
+/// path — and when one happens the resolver refuses as ambiguous rather than
+/// guessing, so the cost is one longer reference, never a wrong retirement.
+pub const NOTE_REF_LEN: usize = 8;
+
+/// The short, agent-facing form of a note id: its first [`NOTE_REF_LEN`]
+/// characters. A string shorter than that comes back whole.
+pub fn short_note_id(id: &str) -> &str {
+    id.get(..NOTE_REF_LEN).unwrap_or(id)
+}
+
+/// A note an agent named in `supersedes`, resolved to its row (ANAI-270).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedNote {
+    /// The full row id.
+    pub id: String,
+    /// Length of the note's text in characters, so the write can report the
+    /// old and new sizes side by side — the cheap tell for a replacement that
+    /// dropped content it should have carried forward.
+    pub chars: usize,
+}
+
 /// Semantic store backed by SQLite with optional vector search.
 ///
 /// Supports two backends:
@@ -299,6 +329,21 @@ impl SemanticStore {
                              AND s.kind = '{SUMMARY_KIND}' AND s.deleted = 0))",
             SUMMARY_KIND = crate::episode::SUMMARY_KIND,
         ));
+
+        // Note supersession (ANAI-270, schema v18).
+        //
+        // A note its own author has replaced is not deleted — it stays in the
+        // table, embedding and all, reachable by id — but it no longer
+        // competes with its successor for a recall slot. Only an agent-named
+        // `supersedes` sets this column; nothing in the system retires a note
+        // on its own judgement. Undo is one `UPDATE … SET superseded_by =
+        // NULL`, and the note is recallable again on the next query.
+        //
+        // Unscoped by kind on purpose: only notes are ever linked, so the
+        // predicate is a no-op for every other row, and scoping it would
+        // invite the next writer to link something without anyone noticing
+        // that recall still surfaces it.
+        sql.push_str(" AND memories.superseded_by IS NULL");
 
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut param_idx = 1;
@@ -735,6 +780,164 @@ impl SemanticStore {
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
+    }
+
+    /// Resolve a note reference an agent passed in `supersedes` (ANAI-270).
+    ///
+    /// The outer `Result` is the store; the inner one is the agent's answer.
+    /// An inner `Err` is a sentence written for the model — it is returned to
+    /// the caller as a refusal, and it says what would have worked.
+    ///
+    /// `reference` is a full id or a prefix of at least [`NOTE_REF_LEN`]
+    /// characters, which is what recall shows. It resolves only against
+    /// `agent_id`'s own rows: superseding another agent's note is a
+    /// permissions decision (ANAI-202), not something this write may do. The
+    /// refusal for a sibling's note is therefore indistinguishable from "no
+    /// such note", which is also the right answer to a guess.
+    ///
+    /// A row that is not a live, current note is refused with the reason:
+    /// a fact is superseded by rewriting its slot; a deleted note has nothing
+    /// to retire; a note that is already superseded points the caller at its
+    /// successor, because the successor is what it actually wants to replace.
+    pub fn resolve_note_ref(
+        &self,
+        agent_id: AgentId,
+        reference: &str,
+    ) -> OpenFangResult<Result<ResolvedNote, String>> {
+        let reference = reference.trim().to_ascii_lowercase();
+        if reference.chars().count() < NOTE_REF_LEN
+            || !reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        {
+            return Ok(Err(format!(
+                "'{reference}' is not a note id. Pass the id shown in the note's tag, \
+                 e.g. [note · 2d · id:1a2b3c4d] → \"1a2b3c4d\" (at least {NOTE_REF_LEN} characters)."
+            )));
+        }
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        // The charset check above is what makes this LIKE safe: hex digits and
+        // '-' carry no wildcard meaning, so the pattern is a pure prefix.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, kind, deleted, superseded_by FROM memories
+                 WHERE agent_id = ?1 AND id LIKE ?2 LIMIT 2",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        type Row = (String, String, Option<String>, i64, Option<String>);
+        let rows: Vec<Row> = stmt
+            .query_map(
+                rusqlite::params![agent_id.0.to_string(), format!("{reference}%")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let (id, content, kind, deleted, superseded_by) = match rows.len() {
+            0 => {
+                return Ok(Err(format!(
+                    "No note of yours has id '{reference}'. You can only supersede your own \
+                     notes, by the id shown in their tag."
+                )))
+            }
+            1 => rows.into_iter().next().expect("one row"),
+            _ => {
+                return Ok(Err(format!(
+                    "'{reference}' matches more than one of your memories. Pass more of the id."
+                )))
+            }
+        };
+        let short = short_note_id(&id);
+        if kind.as_deref() != Some(KIND_NOTE) {
+            let kind = kind.as_deref().unwrap_or("untyped row");
+            return Ok(Err(format!(
+                "'{short}' is a {kind}, not a note — only notes are superseded by memory_note. \
+                 A fact is superseded by writing its slot again with memory_fact."
+            )));
+        }
+        if deleted != 0 {
+            return Ok(Err(format!(
+                "Note '{short}' was deleted; there is nothing live to supersede."
+            )));
+        }
+        if let Some(next) = superseded_by {
+            return Ok(Err(format!(
+                "Note '{short}' was already superseded by '{}'. Supersede that one instead \
+                 — it is the current version.",
+                short_note_id(&next)
+            )));
+        }
+        Ok(Ok(ResolvedNote {
+            chars: content.chars().count(),
+            id,
+        }))
+    }
+
+    /// Resolve every reference in a `supersedes` list, all-or-nothing
+    /// (ANAI-270).
+    ///
+    /// The inner `Err` collects EVERY refusal, not the first, so an agent
+    /// that named three notes and got two wrong fixes both in one retry.
+    /// Duplicates — the same note named twice, or by a short and a full id —
+    /// collapse to one. More than `max` references is refused outright: a
+    /// bound keeps one call from retiring a corpus on a hallucinated list.
+    ///
+    /// The caller must write nothing when this refuses. Writing first and
+    /// failing the link would leave the successor live beside the note it was
+    /// meant to replace — the precise duplicate this feature exists to stop.
+    pub fn resolve_note_refs(
+        &self,
+        agent_id: AgentId,
+        references: &[String],
+        max: usize,
+    ) -> OpenFangResult<Result<Vec<ResolvedNote>, String>> {
+        if references.len() > max {
+            return Ok(Err(format!(
+                "A note can supersede at most {max} notes at once. If this many say the \
+                 same thing, supersede them over a few writes."
+            )));
+        }
+        let mut resolved: Vec<ResolvedNote> = Vec::with_capacity(references.len());
+        let mut refusals: Vec<String> = Vec::new();
+        for reference in references {
+            match self.resolve_note_ref(agent_id, reference)? {
+                Ok(note) if resolved.iter().any(|r| r.id == note.id) => {}
+                Ok(note) => resolved.push(note),
+                Err(why) => refusals.push(why),
+            }
+        }
+        if refusals.is_empty() {
+            Ok(Ok(resolved))
+        } else {
+            Ok(Err(refusals.join(" ")))
+        }
+    }
+
+    /// Link `old_id` to its successor `new_id` (ANAI-270): set the old row's
+    /// `superseded_by`, which is what takes it out of recall.
+    ///
+    /// Guarded so it can only ever retire a live, not-yet-superseded note, and
+    /// never a note into itself. Returns whether a row changed: `false` means
+    /// the guard refused — in practice a concurrent write superseded the same
+    /// note first — and the caller reports that rather than claiming a link
+    /// it did not make.
+    pub fn supersede_note(&self, old_id: &str, new_id: &str) -> OpenFangResult<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let changed = conn
+            .execute(
+                "UPDATE memories SET superseded_by = ?2
+                 WHERE id = ?1 AND id != ?2 AND kind = ?3 AND deleted = 0
+                   AND superseded_by IS NULL",
+                rusqlite::params![old_id, new_id, KIND_NOTE],
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        Ok(changed == 1)
     }
 
     /// HTTP implementation of recall — routes to memory-api POST /memory/search.
@@ -1911,5 +2114,161 @@ mod tests {
             material.contains(&"raw turn".to_string()),
             "got: {material:?}"
         );
+    }
+
+    // --- ANAI-270: agent-named note supersession ---------------------------
+
+    fn note(store: &SemanticStore, agent: AgentId, text: &str) -> String {
+        write(store, agent, text, kind_meta(KIND_NOTE.into()))
+            .0
+            .to_string()
+    }
+
+    /// The point of the ticket: once its author names a successor, the old
+    /// note stops competing with it in recall — and nothing else does.
+    #[test]
+    fn a_superseded_note_leaves_recall_and_its_successor_stays() {
+        let store = setup();
+        let agent = AgentId::new();
+        let old = note(&store, agent, "lactose-free fluid milk only");
+        let new = note(&store, agent, "all dairy is fine now");
+
+        assert!(store.supersede_note(&old, &new).unwrap());
+
+        let seen = contents(&store, agent);
+        assert_eq!(seen, vec!["all dairy is fine now".to_string()]);
+    }
+
+    /// Retirement is a link, not a delete: one UPDATE restores the note.
+    #[test]
+    fn clearing_the_link_restores_the_note_to_recall() {
+        let store = setup();
+        let agent = AgentId::new();
+        let old = note(&store, agent, "old version");
+        let new = note(&store, agent, "new version");
+        store.supersede_note(&old, &new).unwrap();
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET superseded_by = NULL WHERE id = ?1",
+                [&old],
+            )
+            .unwrap();
+        assert_eq!(contents(&store, agent).len(), 2);
+    }
+
+    /// The guard refuses a second retirement, a self-link, and a non-note —
+    /// the store never retires something the resolver would have refused.
+    #[test]
+    fn supersede_note_only_retires_a_live_current_note() {
+        let store = setup();
+        let agent = AgentId::new();
+        let a = note(&store, agent, "a");
+        let b = note(&store, agent, "b");
+        let c = note(&store, agent, "c");
+        let turn = write(&store, agent, "a turn", kind_meta(KIND_TURN.into()))
+            .0
+            .to_string();
+
+        assert!(!store.supersede_note(&a, &a).unwrap(), "self-link");
+        assert!(store.supersede_note(&a, &b).unwrap());
+        assert!(!store.supersede_note(&a, &c).unwrap(), "already retired");
+        assert!(!store.supersede_note(&turn, &c).unwrap(), "not a note");
+    }
+
+    /// The short id recall shows is enough to name a note, and the full id
+    /// works too; case and surrounding space are forgiven.
+    #[test]
+    fn resolve_note_ref_accepts_the_short_id_and_the_full_id() {
+        let store = setup();
+        let agent = AgentId::new();
+        let id = note(&store, agent, "héllo");
+
+        let short = short_note_id(&id).to_ascii_uppercase();
+        let got = store
+            .resolve_note_ref(agent, &format!("  {short} "))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.chars, 5, "characters, not bytes");
+
+        assert_eq!(store.resolve_note_ref(agent, &id).unwrap().unwrap().id, id);
+    }
+
+    /// Every refusal is an answer the agent can act on, and none of them
+    /// reaches another agent's rows.
+    #[test]
+    fn resolve_note_ref_refuses_what_it_must_not_retire() {
+        let store = setup();
+        let agent = AgentId::new();
+        let sibling = AgentId::new();
+
+        let theirs = note(&store, sibling, "a sibling's note");
+        let fact = write(&store, agent, "a fact", kind_meta(KIND_FACT.into()))
+            .0
+            .to_string();
+        let old = note(&store, agent, "old");
+        let new = note(&store, agent, "new");
+        store.supersede_note(&old, &new).unwrap();
+
+        let refuse = |r: &str| store.resolve_note_ref(agent, r).unwrap().unwrap_err();
+
+        assert!(refuse("1a2b").contains("not a note id"), "too short");
+        assert!(refuse("zzzzzzzz").contains("not a note id"), "not hex");
+        assert!(refuse("1a2b%%%%").contains("not a note id"), "wildcards");
+        assert!(refuse(&theirs).contains("No note of yours"), "sibling's");
+        assert!(refuse(&fact).contains("is a fact"), "fact");
+        let already = refuse(&old);
+        assert!(already.contains("already superseded"), "{already}");
+        assert!(already.contains(short_note_id(&new)), "names successor");
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE memories SET deleted = 1 WHERE id = ?1", [&new])
+            .unwrap();
+        assert!(refuse(&new).contains("deleted"));
+    }
+
+    /// All-or-nothing, every refusal reported at once, duplicates collapsed,
+    /// and a bound on how many one call may name.
+    #[test]
+    fn resolve_note_refs_is_all_or_nothing_and_reports_every_refusal() {
+        let store = setup();
+        let agent = AgentId::new();
+        let a = note(&store, agent, "a");
+        let b = note(&store, agent, "b");
+
+        let ok = store
+            .resolve_note_refs(
+                agent,
+                &[a.clone(), short_note_id(&a).to_string(), b.clone()],
+                8,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ok.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec![a.as_str(), b.as_str()],
+            "short and full id of one note collapse"
+        );
+
+        let bad = store
+            .resolve_note_refs(agent, &[a.clone(), "12".into(), "ffffffff".into()], 8)
+            .unwrap()
+            .unwrap_err();
+        assert!(bad.contains("not a note id"), "{bad}");
+        assert!(bad.contains("No note of yours"), "both refusals: {bad}");
+
+        let many: Vec<String> = (0..9).map(|_| a.clone()).collect();
+        assert!(store
+            .resolve_note_refs(agent, &many, 8)
+            .unwrap()
+            .unwrap_err()
+            .contains("at most 8"));
     }
 }

@@ -56,6 +56,14 @@ pub struct RecalledMemory {
     /// prompt builder stays a pure function of its inputs: the byte-stability
     /// pin would be a coin flip if this module read the clock.
     pub age_seconds: Option<i64>,
+    /// The row's id, when the caller knows it (ANAI-270).
+    ///
+    /// Rendered only for `note` rows: a note is the one kind an agent can
+    /// name in `memory_note(supersedes: …)`, and the correcting note is
+    /// usually written on the turn the stale one was recalled — so the id has
+    /// to be on the row the agent is already reading. Any other kind's id
+    /// would be characters the agent can do nothing with.
+    pub id: Option<String>,
 }
 
 impl RecalledMemory {
@@ -66,6 +74,7 @@ impl RecalledMemory {
             kind: None,
             content: content.into(),
             age_seconds: None,
+            id: None,
         }
     }
 
@@ -77,6 +86,12 @@ impl RecalledMemory {
         self
     }
 
+    /// Attach the row's id (ANAI-270). Shown only on `note` rows.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     /// A vector-recalled row: no key, but a kind we can budget against.
     pub fn of_kind(kind: Option<String>, content: impl Into<String>) -> Self {
         Self {
@@ -84,6 +99,7 @@ impl RecalledMemory {
             kind,
             content: content.into(),
             age_seconds: None,
+            id: None,
         }
     }
 }
@@ -177,6 +193,12 @@ fn provenance_tag(mem: &RecalledMemory) -> String {
     }
     if let Some(age) = mem.age_seconds {
         parts.push(format_age(age));
+    }
+    if let (Some(KIND_NOTE), Some(id)) = (mem.kind.as_deref(), mem.id.as_deref()) {
+        parts.push(format!(
+            "id:{}",
+            openfang_memory::semantic::short_note_id(id)
+        ));
     }
     if parts.is_empty() {
         String::new()
@@ -1454,6 +1476,31 @@ mod tests {
             section.contains("- [note · 2d] the thing"),
             "got: {section}"
         );
+    }
+
+    /// ANAI-270: a recalled note carries the short id `supersedes` takes, on
+    /// the row the agent is already reading. Other kinds carry none — their
+    /// ids are not a handle the agent can use.
+    #[test]
+    fn a_recalled_note_shows_its_short_id_and_other_kinds_do_not() {
+        let memories = vec![
+            RecalledMemory::of_kind(Some("note".to_string()), "the thing")
+                .aged(2 * 86_400)
+                .with_id("1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809"),
+            RecalledMemory::of_kind(Some("summary".to_string()), "an episode")
+                .aged(3600)
+                .with_id("9f9f9f9f-0000-0000-0000-000000000000"),
+        ];
+        let section = build_memory_section(&memories, &[]);
+        assert!(
+            section.contains("- [note · 2d · id:1a2b3c4d] the thing"),
+            "got: {section}"
+        );
+        assert!(
+            section.contains("- [summary · 1h] an episode"),
+            "got: {section}"
+        );
+        assert!(!section.contains("9f9f9f9f"), "got: {section}");
     }
 
     /// The legend is what turns the tag from decoration into instruction, and

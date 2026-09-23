@@ -10558,6 +10558,14 @@ pub(crate) const MEMORY_KIND_KEY: &str = "kind";
 /// `kind` value for an agent-authored note (ADR 0002 §2.2, `memory_note`).
 const MEMORY_KIND_NOTE: &str = "note";
 
+/// Most notes one `memory_note` call may supersede (ANAI-270).
+///
+/// The step-0 measurement's worst case was one author writing the same note
+/// six times in 25 minutes — five predecessors. Eight clears that with room,
+/// and a bound at all keeps one call from retiring a whole corpus on a
+/// hallucinated list.
+const MEMORY_NOTE_MAX_SUPERSEDES: usize = 8;
+
 /// Scope notes are written under.
 ///
 /// The same scope episodic capture uses, deliberately: a note is raw material
@@ -12335,6 +12343,54 @@ impl KernelHandle for OpenFangKernel {
         Ok(id.0.to_string())
     }
 
+    async fn memory_note_superseding(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+        supersedes: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+
+        // Resolve every reference BEFORE writing, all-or-nothing: see
+        // `SemanticStore::resolve_note_refs` for why a refusal must leave the
+        // corpus exactly as it found it.
+        let resolved = self
+            .memory
+            .resolve_note_refs_async(agent_id, supersedes, MEMORY_NOTE_MAX_SUPERSEDES)
+            .await
+            .map_err(|e| format!("Note supersession failed: {e}"))?
+            .map_err(|why| format!("Nothing was written. {why}"))?;
+
+        let new_id = self.memory_note(caller_agent_id, text, tags).await?;
+
+        let mut superseded = Vec::with_capacity(resolved.len());
+        let mut raced = Vec::new();
+        for old in &resolved {
+            match self.memory.supersede_note_async(&old.id, &new_id).await {
+                Ok(true) => superseded.push(serde_json::json!({
+                    "id": old.id,
+                    "chars": old.chars,
+                })),
+                // The guard refused: something retired this note between
+                // resolution and now. The new note is written and correct;
+                // say so rather than claim a link that was not made.
+                Ok(false) => raced.push(old.id.clone()),
+                Err(e) => {
+                    warn!(error = %e, old = %old.id, new = %new_id, "Note supersession link failed");
+                    raced.push(old.id.clone());
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "id": new_id,
+            "chars": text.trim().chars().count(),
+            "superseded": superseded,
+            "raced": raced,
+        }))
+    }
+
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {
         let q = query.to_lowercase();
         self.registry
@@ -13355,6 +13411,15 @@ mod tests {
             assert_eq!(slot.get(k), Some(v), "slot payload dropped `{k}`");
         }
         assert_eq!(slot["claim_key"], serde_json::json!("repo.trunk_head"));
+    }
+
+    /// ANAI-270: the writer stamps notes with `MEMORY_KIND_NOTE`, and the
+    /// store's supersession guard only ever retires rows of
+    /// `semantic::KIND_NOTE`. Two literals in two crates; if they drift,
+    /// every `supersedes` is refused as "not a note".
+    #[test]
+    fn the_note_kind_the_writer_stamps_is_the_one_supersession_retires() {
+        assert_eq!(MEMORY_KIND_NOTE, openfang_memory::semantic::KIND_NOTE);
     }
 
     // -----------------------------------------------------------------------

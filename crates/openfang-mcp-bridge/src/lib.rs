@@ -746,7 +746,8 @@ pub fn built_in_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "What to remember, in plain words." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." }
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." },
+                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true." }
                 },
                 "required": ["text"]
             })),

@@ -373,6 +373,29 @@ pub trait KernelHandle: Send + Sync {
         Err("Memory notes are not available on this kernel handle".to_string())
     }
 
+    /// ANAI-270: write a note that REPLACES notes the caller names.
+    ///
+    /// Every reference is resolved before anything is written — a bad id
+    /// refuses the whole call, so a refusal never leaves a new note behind
+    /// with its predecessor still live beside it. References resolve only
+    /// against the caller's own notes.
+    ///
+    /// Returns `{ "id", "chars", "superseded": [{ "id", "chars" }],
+    /// "raced": [id] }`, where `raced` lists notes another write retired
+    /// between resolution and link. Replacement is whole-note: the new text is
+    /// expected to carry everything in the old one that is still true, and the
+    /// sizes are returned so the tool can say when it looks like it did not.
+    async fn memory_note_superseding(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+        supersedes: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let _ = (caller_agent_id, text, tags, supersedes);
+        Err("Note supersession is not available on this kernel handle".to_string())
+    }
+
     /// Find agents by query (matches on name substring, tag, or tool name; case-insensitive).
     fn find_agents(&self, query: &str) -> Vec<AgentInfo>;
 

@@ -621,6 +621,7 @@ fn recalled_rows(
                 .map(str::to_string);
             crate::prompt_builder::RecalledMemory::of_kind(kind, m.content.clone())
                 .aged((now - m.created_at).num_seconds())
+                .with_id(m.id.0.to_string())
         })
         .collect()
 }

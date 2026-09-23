@@ -1438,7 +1438,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "What to remember, in plain words." },
-                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." }
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." },
+                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true." }
                 },
                 "required": ["text"]
             }),
@@ -4777,7 +4778,14 @@ fn format_recall_hits(query: &str, found: &serde_json::Value) -> String {
             .and_then(|c| c.as_str())
             .unwrap_or("?");
         let kind = hit.get("kind").and_then(|k| k.as_str()).unwrap_or("turn");
-        out.push_str(&format!("\n[{created} · {kind}]\n{content}\n"));
+        // ANAI-270: a note carries its short id — the handle `memory_note`'s
+        // `supersedes` takes. Other kinds cannot be superseded that way, so
+        // their ids would be noise.
+        let id = match (kind, hit.get("id").and_then(|i| i.as_str())) {
+            ("note", Some(id)) => format!(" · id:{}", openfang_memory::semantic::short_note_id(id)),
+            _ => String::new(),
+        };
+        out.push_str(&format!("\n[{created} · {kind}{id}]\n{content}\n"));
     }
     out
 }
@@ -4806,11 +4814,113 @@ async fn tool_memory_note(
         })
         .unwrap_or_default();
 
-    kh.memory_note(caller_agent_id, text, &tags).await?;
-    Ok(
-        "Noted. It is attached to your current episode and will surface in memory_recall."
-            .to_string(),
-    )
+    let supersedes = note_supersedes(input);
+    if supersedes.is_empty() {
+        let id = kh.memory_note(caller_agent_id, text, &tags).await?;
+        return Ok(format!(
+            "Noted (id:{}). It is attached to your current episode and will surface in \
+             memory_recall.",
+            openfang_memory::semantic::short_note_id(&id)
+        ));
+    }
+
+    let outcome = kh
+        .memory_note_superseding(caller_agent_id, text, &tags, &supersedes)
+        .await?;
+    Ok(render_note_supersession(&outcome))
+}
+
+/// Pull `supersedes` out of a `memory_note` call (ANAI-270).
+///
+/// Takes a list, and forgives a bare string: a model naming one note will
+/// sometimes pass `"1a2b3c4d"` rather than `["1a2b3c4d"]`, and refusing that
+/// over punctuation would make the agent retry a call whose intent is plain.
+fn note_supersedes(input: &serde_json::Value) -> Vec<String> {
+    let raw: Vec<&str> = match &input["supersedes"] {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(arr) => arr.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    };
+    raw.into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Below this fraction of the largest note it replaces, a successor is
+/// called out as possibly incomplete (ANAI-270).
+///
+/// Supersession is whole-note: a note that fixes one wrong line must carry
+/// every line that is still true, because the old text leaves recall. A
+/// successor under half the size of what it replaced is the cheap tell that
+/// it did not. Advisory only — a shorter note is sometimes the right answer,
+/// so this warns and never blocks.
+const NOTE_SHRINK_WARN_RATIO: f64 = 0.5;
+
+/// Render the outcome of a superseding note write for the model to read.
+fn render_note_supersession(outcome: &serde_json::Value) -> String {
+    use openfang_memory::semantic::short_note_id;
+    let id = outcome["id"].as_str().unwrap_or("?");
+    let chars = outcome["chars"].as_u64().unwrap_or(0);
+    let superseded = outcome["superseded"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let raced = outcome["raced"].as_array().cloned().unwrap_or_default();
+
+    let mut out = format!("Noted (id:{}, {chars} chars).", short_note_id(id));
+    if !superseded.is_empty() {
+        let listed: Vec<String> = superseded
+            .iter()
+            .map(|s| {
+                format!(
+                    "id:{} ({} chars)",
+                    short_note_id(s["id"].as_str().unwrap_or("?")),
+                    s["chars"].as_u64().unwrap_or(0)
+                )
+            })
+            .collect();
+        out.push_str(&format!(
+            " It supersedes {}: {} no longer surface{} in recall.",
+            listed.join(", "),
+            if superseded.len() == 1 {
+                "that note"
+            } else {
+                "those notes"
+            },
+            if superseded.len() == 1 { "s" } else { "" },
+        ));
+        let largest = superseded
+            .iter()
+            .filter_map(|s| s["chars"].as_u64())
+            .max()
+            .unwrap_or(0);
+        if largest > 0 && (chars as f64) < (largest as f64) * NOTE_SHRINK_WARN_RATIO {
+            out.push_str(&format!(
+                "\nCHECK: this note is much shorter than what it replaces ({chars} vs {largest} \
+                 chars). If only part of the old note was wrong, the new one must carry the \
+                 corrected part AND everything from the old note that is still true — the old \
+                 text no longer surfaces in recall. If you dropped something, write a fuller \
+                 note with supersedes: [\"{}\"]. If the shorter note is complete, ignore this.",
+                short_note_id(id)
+            ));
+        }
+    }
+    if !raced.is_empty() {
+        let ids: Vec<&str> = raced
+            .iter()
+            .filter_map(|r| r.as_str())
+            .map(short_note_id)
+            .collect();
+        out.push_str(&format!(
+            "\nNot superseded: {} — another write retired {} first. Your note is saved; \
+             recall for the current version if it matters.",
+            ids.join(", "),
+            if ids.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    out
 }
 
 // --- Tier-3 fact tools (ANAI-204, ADR 0001 §2.3) --------------------------
@@ -11187,6 +11297,113 @@ mod tests {
         }
     }
 
+    // --- ANAI-270: note supersession on the tool surface ---------------------
+
+    /// A plain note answers with its short id, so the agent holds the handle
+    /// a later correction will need.
+    #[tokio::test]
+    async fn a_plain_note_reports_its_id() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_note(
+            &serde_json::json!({"text": "a thing"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.starts_with("Noted (id:note-1)"), "{out}");
+    }
+
+    #[test]
+    fn supersedes_takes_a_list_or_a_bare_string_and_drops_blanks() {
+        let got = |v: serde_json::Value| note_supersedes(&serde_json::json!({ "supersedes": v }));
+        assert_eq!(got(serde_json::json!(["a", " b ", "", 7])), vec!["a", "b"]);
+        assert_eq!(got(serde_json::json!("1a2b3c4d")), vec!["1a2b3c4d"]);
+        assert!(got(serde_json::json!(null)).is_empty());
+        assert!(note_supersedes(&serde_json::json!({})).is_empty());
+    }
+
+    /// The reply names what left recall, with both sizes — and a successor
+    /// far smaller than its predecessor gets the whole-note reminder.
+    #[tokio::test]
+    async fn a_superseding_note_reports_sizes_and_flags_a_shrink() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_note(
+            &serde_json::json!({"text": "short", "supersedes": ["1a2b3c4d-full-id"]}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(out.contains("Noted (id:0f0e0d0c, 5 chars)"), "{out}");
+        assert!(out.contains("supersedes id:1a2b3c4d (1000 chars)"), "{out}");
+        assert!(out.contains("no longer surfaces in recall"), "{out}");
+        assert!(out.contains("CHECK:"), "a 5-char successor to 1000: {out}");
+        assert!(out.contains("still true"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn a_full_size_successor_is_not_nagged() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let text = "x".repeat(600);
+        let out = tool_memory_note(
+            &serde_json::json!({"text": text, "supersedes": "1a2b3c4d"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !out.contains("CHECK:"),
+            "600 of 1000 is over the ratio: {out}"
+        );
+    }
+
+    /// A link lost to a concurrent write is reported, never claimed.
+    #[tokio::test]
+    async fn a_raced_link_is_reported_not_claimed() {
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = Arc::new(FakeKernelHandle::new());
+        let out = tool_memory_note(
+            &serde_json::json!({"text": "x".repeat(2000), "supersedes": ["raced"]}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(!out.contains("It supersedes"), "{out}");
+        assert!(out.contains("Not superseded: raced"), "{out}");
+    }
+
+    /// Runtime half of the schema pin; Invariant C holds the bridge to it.
+    #[test]
+    fn memory_note_declares_supersedes_as_an_optional_list() {
+        let defs = builtin_tool_definitions();
+        let note = defs.iter().find(|d| d.name == "memory_note").unwrap();
+        let prop = &note.input_schema["properties"]["supersedes"];
+        assert_eq!(prop["type"], "array");
+        let desc = prop["description"].as_str().unwrap();
+        assert!(desc.contains("whole-note"), "{desc}");
+        assert!(desc.contains("still true"), "{desc}");
+        assert_eq!(note.input_schema["required"], serde_json::json!(["text"]));
+    }
+
+    /// Only notes show an id in recall output — the one kind `supersedes`
+    /// accepts.
+    #[test]
+    fn recall_hits_show_an_id_on_notes_only() {
+        let found = serde_json::json!({
+            "mode": "semantic",
+            "results": [
+                {"id": "1a2b3c4d-0000", "kind": "note", "content": "n", "created_at": "t"},
+                {"id": "9f9f9f9f-0000", "kind": "turn", "content": "t", "created_at": "t"},
+            ]
+        });
+        let out = format_recall_hits("q", &found);
+        assert!(out.contains("[t · note · id:1a2b3c4d]"), "{out}");
+        assert!(out.contains("[t · turn]"), "{out}");
+        assert!(!out.contains("9f9f9f9f"), "{out}");
+    }
+
     #[test]
     fn memory_note_is_declared_and_recall_advertises_query() {
         let defs = builtin_tool_definitions();
@@ -11447,6 +11664,25 @@ mod tests {
                 tags.to_vec(),
             ));
             Ok("note-1".to_string())
+        }
+        // ANAI-270: echo the named notes back as superseded, each 1000 chars,
+        // except a ref of "raced" which comes back as lost to a race.
+        async fn memory_note_superseding(
+            &self,
+            caller: Option<&str>,
+            text: &str,
+            tags: &[String],
+            supersedes: &[String],
+        ) -> Result<serde_json::Value, String> {
+            self.memory_note(caller, text, tags).await?;
+            let (raced, done): (Vec<&String>, Vec<&String>) =
+                supersedes.iter().partition(|s| s.as_str() == "raced");
+            Ok(serde_json::json!({
+                "id": "0f0e0d0c-aaaa-bbbb-cccc-000000000001",
+                "chars": text.chars().count(),
+                "superseded": done.iter().map(|s| serde_json::json!({"id": s, "chars": 1000})).collect::<Vec<_>>(),
+                "raced": raced,
+            }))
         }
         fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
             vec![]
