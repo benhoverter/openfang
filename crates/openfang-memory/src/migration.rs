@@ -5,7 +5,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 18;
 
 /// Run all migrations to bring the database up to date.
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -77,6 +77,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     if current_version < 17 {
         migrate_v17(conn)?;
+    }
+
+    if current_version < 18 {
+        migrate_v18(conn)?;
     }
 
     set_schema_version(conn, SCHEMA_VERSION)?;
@@ -794,9 +798,111 @@ fn migrate_v17(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Version 18: `memories.superseded_by` — the note that replaced this one
+/// (ANAI-270).
+///
+/// Notes have no slot, so unlike a fact there is no address a successor can
+/// overwrite. The agent names the note it replaces instead, and this column
+/// records the link on the *old* row: `superseded_by = <successor id>`.
+/// Recall skips any row carrying a link; a history reader can still walk it.
+///
+/// One nullable column and one partial index, no backfill, no row rewritten.
+/// NULL means "nothing has replaced this", which is true of every row that
+/// exists today — step 0 measured replacements, but nobody has named one,
+/// and a retroactive link would be the system retiring a note on its own
+/// judgement, which the ANAI-270 design rejects outright.
+///
+/// Why this and not the fact model, where the superseded row *leaves* the
+/// table for `fact_history`: a note is whole-note replaced (Ben's ruling,
+/// 2026-09-23), and the old note routinely carries detail the agent chose not
+/// to restate. Keeping it in `memories` — with its embedding — keeps it
+/// readable and makes the whole operation reversible in one `UPDATE ... SET
+/// superseded_by = NULL`. The cost is that recall must filter on this column;
+/// that filter lives in exactly one place, `SemanticStore::recall`.
+///
+/// No foreign key, for the same reason v17 has no CHECK: rebuilding the
+/// table that holds the fleet's entire corpus is not a price worth paying
+/// for a constraint the writer already enforces inside its transaction.
+///
+/// The index is partial on `superseded_by IS NOT NULL`, so it is empty today
+/// and costs nothing on the ~all rows that are never superseded. It serves
+/// the backward walk — "which notes did this one retire?" — which is the
+/// only lookup keyed on this column; the forward walk is a primary-key read.
+fn migrate_v18(conn: &Connection) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, "memories", "superseded_by") {
+        conn.execute("ALTER TABLE memories ADD COLUMN superseded_by TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_superseded_by
+             ON memories(superseded_by) WHERE superseded_by IS NOT NULL",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, applied_at, description) VALUES (18, datetime('now'), 'Add memories.superseded_by: agent-named note supersession (ANAI-270)')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v18 must be additive on a live `memories` table and must link nothing.
+    /// Every existing note stays recallable: a retroactive `superseded_by` is
+    /// the system retiring a note on its own judgement, which ANAI-270 rejects.
+    #[test]
+    fn v18_adds_superseded_by_and_links_no_existing_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Stop at v17 and plant a note the way a live pre-v18 database has.
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_memories_superseded_by;
+             ALTER TABLE memories DROP COLUMN superseded_by;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 17).unwrap();
+        assert!(!column_exists(&conn, "memories", "superseded_by"));
+        conn.execute(
+            "INSERT INTO memories (id, agent_id, content, source, scope, confidence, metadata,
+                                   created_at, accessed_at, access_count, deleted, kind)
+             VALUES ('n1', 'a1', 'an old note', '\"conversation\"', 'episodic', 1.0, '{}',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 3, 0, 'note')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        // A second boot must not fail on the ALTER or the index.
+        migrate_v18(&conn).unwrap();
+
+        assert!(column_exists(&conn, "memories", "superseded_by"));
+        assert_eq!(get_schema_version(&conn), 18);
+        let (content, access, link): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT content, access_count, superseded_by FROM memories WHERE id = 'n1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(content, "an old note", "no existing row may be rewritten");
+        assert_eq!(access, 3, "no existing row may be rewritten");
+        assert_eq!(link, None, "no retroactive supersession");
+
+        let index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_memories_superseded_by'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.contains("WHERE superseded_by IS NOT NULL"),
+            "the index must stay partial so it costs nothing on unlinked rows: {index_sql}"
+        );
+    }
 
     /// v15 must be additive on a database that already carries canonical
     /// sessions. This table holds every agent's cross-channel memory, so the
