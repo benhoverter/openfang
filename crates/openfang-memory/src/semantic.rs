@@ -76,6 +76,54 @@ pub struct ResolvedNote {
     pub chars: usize,
 }
 
+/// Cosine floor for listing an existing note as a neighbour of one just
+/// written without `supersedes` (ANAI-270 step 3).
+///
+/// From the step-0 read of 40 hand-labelled same-author pairs: the median
+/// same-author pair scores 0.675, and at 0.85–0.87 about one close pair in
+/// three is a genuine replacement. Below 0.85 the list would be mostly
+/// unrelated notes, which teaches the agent to skim it. This is a hint
+/// threshold, never a retirement threshold — nothing below or above it
+/// retires anything.
+pub const NOTE_NEIGHBOUR_MIN_SCORE: f32 = 0.85;
+
+/// At or above this, a neighbour is called out as a likely duplicate. Every
+/// minutes-apart rewrite step 0 found scored above 0.90.
+pub const NOTE_DUPLICATE_SCORE: f32 = 0.90;
+
+/// Most neighbours listed after one note write.
+pub const NOTE_NEIGHBOUR_LIMIT: usize = 3;
+
+/// Characters of a neighbour's text shown inline, so the agent can judge
+/// "same claim?" without a recall round trip.
+pub const NOTE_NEIGHBOUR_PREVIEW_CHARS: usize = 140;
+
+/// An existing note of the author's that sits close to one just written
+/// (ANAI-270 step 3). Advisory: the agent decides whether it is replaced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighbourNote {
+    /// The full row id.
+    pub id: String,
+    /// Length of the note's text in characters.
+    pub chars: usize,
+    /// Cosine similarity to the new note.
+    pub score: f32,
+    /// The opening of the note, whitespace collapsed, at most
+    /// [`NOTE_NEIGHBOUR_PREVIEW_CHARS`] characters plus an ellipsis.
+    pub preview: String,
+}
+
+/// Collapse whitespace and cut to `max` characters, marking a cut with `…`.
+fn note_preview(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
 /// Semantic store backed by SQLite with optional vector search.
 ///
 /// Supports two backends:
@@ -938,6 +986,73 @@ impl SemanticStore {
             )
             .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(changed == 1)
+    }
+
+    /// The author's existing notes closest to `embedding` (ANAI-270 step 3):
+    /// the hint a `memory_note` written WITHOUT `supersedes` answers with.
+    ///
+    /// Only rows `resolve_note_ref` would accept are candidates — the
+    /// author's own, live, not-yet-superseded notes — so every id listed is
+    /// one the agent can pass straight to `supersedes`. `exclude_id` is the
+    /// note just written, which would otherwise be its own nearest neighbour.
+    /// Unembedded notes are skipped, not guessed at.
+    ///
+    /// Returns at most `limit` rows scoring at least `min_score`, closest
+    /// first. Nothing here retires anything: similar and replaces are
+    /// different claims, and only the author may make the second.
+    pub fn note_neighbours(
+        &self,
+        agent_id: AgentId,
+        exclude_id: &str,
+        embedding: &[f32],
+        min_score: f32,
+        limit: usize,
+    ) -> OpenFangResult<Vec<NeighbourNote>> {
+        if embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, embedding FROM memories
+                 WHERE agent_id = ?1 AND kind = ?2 AND deleted = 0
+                   AND superseded_by IS NULL AND embedding IS NOT NULL
+                   AND id != ?3",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![agent_id.0.to_string(), KIND_NOTE, exclude_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let mut hits: Vec<NeighbourNote> = Vec::new();
+        for row in rows {
+            let (id, content, bytes) = row.map_err(|e| OpenFangError::Memory(e.to_string()))?;
+            let score = cosine_similarity(embedding, &embedding_from_bytes(&bytes));
+            // `>=` on a NaN is false, so a degenerate vector never lists.
+            if score >= min_score {
+                hits.push(NeighbourNote {
+                    chars: content.chars().count(),
+                    preview: note_preview(&content, NOTE_NEIGHBOUR_PREVIEW_CHARS),
+                    score,
+                    id,
+                });
+            }
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.truncate(limit);
+        Ok(hits)
     }
 
     /// HTTP implementation of recall — routes to memory-api POST /memory/search.
@@ -2270,5 +2385,128 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("at most 8"));
+    }
+
+    // --- ANAI-270 step 3: neighbour hint on a plain note write ---------------
+
+    fn embedded_note(store: &SemanticStore, agent: AgentId, text: &str, v: &[f32]) -> String {
+        store
+            .remember_with_embedding(
+                agent,
+                text,
+                MemorySource::Observation,
+                "episodic",
+                kind_meta(KIND_NOTE.into()),
+                Some(v),
+            )
+            .unwrap()
+            .0
+            .to_string()
+    }
+
+    /// Closest first, the new note never lists itself, the floor and the
+    /// limit both bite.
+    #[test]
+    fn note_neighbours_ranks_closest_first_and_excludes_the_new_note() {
+        let store = setup();
+        let agent = AgentId::new();
+        let near = embedded_note(&store, agent, "near", &[1.0, 0.1, 0.0]); // ~0.995
+        let mid = embedded_note(&store, agent, "mid", &[1.0, 0.5, 0.0]); // ~0.894
+        let _far = embedded_note(&store, agent, "far", &[0.0, 1.0, 0.0]); // 0.0
+        let new = embedded_note(&store, agent, "new", &[1.0, 0.0, 0.0]);
+
+        let got = store
+            .note_neighbours(agent, &new, &[1.0, 0.0, 0.0], NOTE_NEIGHBOUR_MIN_SCORE, 3)
+            .unwrap();
+        let ids: Vec<&str> = got.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![near.as_str(), mid.as_str()],
+            "floor drops far, self excluded"
+        );
+        assert!(got[0].score > got[1].score);
+
+        let one = store
+            .note_neighbours(agent, &new, &[1.0, 0.0, 0.0], NOTE_NEIGHBOUR_MIN_SCORE, 1)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].id, near);
+    }
+
+    /// Every id listed must be one `supersedes` would accept: the author's
+    /// own, live, current notes only. Anything else would hand the agent a
+    /// reference that is refused on the next call.
+    #[test]
+    fn note_neighbours_lists_only_what_supersedes_would_accept() {
+        let store = setup();
+        let agent = AgentId::new();
+        let sibling = AgentId::new();
+        let v = [1.0f32, 0.0, 0.0];
+
+        let live = embedded_note(&store, agent, "live", &v);
+        let _theirs = embedded_note(&store, sibling, "theirs", &v);
+        let retired = embedded_note(&store, agent, "retired", &v);
+        store.supersede_note(&retired, &live).unwrap();
+        let deleted = embedded_note(&store, agent, "deleted", &v);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE memories SET deleted = 1 WHERE id = ?1", [&deleted])
+            .unwrap();
+        store
+            .remember_with_embedding(
+                agent,
+                "a fact",
+                MemorySource::Observation,
+                "episodic",
+                kind_meta(KIND_FACT.into()),
+                Some(&v),
+            )
+            .unwrap();
+        // Unembedded note: skipped, not guessed at.
+        note(&store, agent, "no vector");
+
+        let got = store
+            .note_neighbours(agent, "new-note-id", &v, NOTE_NEIGHBOUR_MIN_SCORE, 10)
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            vec![live.as_str()]
+        );
+        for n in &got {
+            assert!(store.resolve_note_ref(agent, &n.id).unwrap().is_ok());
+        }
+    }
+
+    /// An empty or degenerate query vector lists nothing rather than
+    /// everything.
+    #[test]
+    fn note_neighbours_degrades_to_empty_on_a_useless_vector() {
+        let store = setup();
+        let agent = AgentId::new();
+        embedded_note(&store, agent, "a", &[1.0, 0.0, 0.0]);
+        assert!(store
+            .note_neighbours(agent, "x", &[], 0.0, 3)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .note_neighbours(agent, "x", &[0.0, 0.0, 0.0], 0.5, 3)
+            .unwrap()
+            .is_empty());
+        assert!(
+            store
+                .note_neighbours(agent, "x", &[1.0, 0.0], 0.5, 3)
+                .unwrap()
+                .is_empty(),
+            "dimension mismatch scores 0"
+        );
+    }
+
+    #[test]
+    fn note_preview_flattens_and_marks_a_cut() {
+        assert_eq!(note_preview("a\n\n  b\tc", 10), "a b c");
+        assert_eq!(note_preview("ééééé", 3), "ééé…");
+        assert_eq!(note_preview("abc", 3), "abc");
     }
 }

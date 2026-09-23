@@ -330,6 +330,24 @@ impl MemorySubstrate {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Async wrapper for [`SemanticStore::note_neighbours`] (ANAI-270 step 3).
+    pub async fn note_neighbours_async(
+        &self,
+        agent_id: AgentId,
+        exclude_id: &str,
+        embedding: Vec<f32>,
+        min_score: f32,
+        limit: usize,
+    ) -> OpenFangResult<Vec<crate::semantic::NeighbourNote>> {
+        let store = self.semantic.clone();
+        let exclude_id = exclude_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            store.note_neighbours(agent_id, &exclude_id, &embedding, min_score, limit)
+        })
+        .await
+        .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// The agent's memory status. See [`EpisodeStore::status`].
     pub fn episode_status(
         &self,

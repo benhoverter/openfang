@@ -10617,6 +10617,81 @@ fn note_metadata(
     metadata
 }
 
+/// A note that has just been written, with what the write already computed
+/// (ANAI-270 step 3). The embedding is handed back so the neighbour hint can
+/// reuse it instead of paying for a second embed of the same text.
+struct WrittenNote {
+    id: String,
+    agent_id: AgentId,
+    embedding: Option<Vec<f32>>,
+}
+
+impl OpenFangKernel {
+    /// The one note write. `memory_note` and `memory_note_with_neighbours`
+    /// both go through here, so there is a single path that opens the
+    /// episode, embeds, and stores.
+    async fn write_note(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+    ) -> Result<WrittenNote, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("Note text is empty".to_string());
+        }
+
+        // A note is activity, so it opens an episode if none is open and
+        // extends one that is. This is why ADR 0002 §2.6 refuses an
+        // `episode_open` tool: the write already establishes the state.
+        let episode_id = self
+            .memory
+            .ensure_open_episode_async(agent_id)
+            .await
+            .map_err(|e| format!("Note failed to resolve an episode: {e}"))?;
+
+        let metadata = note_metadata(episode_id, tags);
+
+        let embedding = match self.embedding_driver {
+            Some(ref driver) => match driver.embed_one(text).await {
+                Ok(vec) => Some(vec),
+                Err(e) => {
+                    // Store unembedded rather than lose the note. It stays
+                    // findable by text search, and `update_embedding` can
+                    // backfill it later; refusing the write would throw away
+                    // the one thing the agent actually asked to keep.
+                    warn!(error = %e, "Note embedding failed; storing without a vector");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let id = self
+            .memory
+            .remember_with_embedding_async(
+                agent_id,
+                text,
+                // Observation, not Inference: the agent is recording something
+                // it saw or decided, and `kind` — not `source` — is the
+                // discriminator this surface reads (see MEMORY_KIND_KEY).
+                MemorySource::Observation,
+                MEMORY_NOTE_SCOPE,
+                metadata,
+                embedding.as_deref(),
+            )
+            .await
+            .map_err(|e| format!("Note failed: {e}"))?;
+
+        Ok(WrittenNote {
+            id: id.0.to_string(),
+            agent_id,
+            embedding,
+        })
+    }
+}
+
 /// Metadata filter for `memory_recall`'s optional `kind` (ANAI-166).
 ///
 /// A blank or whitespace-only `kind` yields an EMPTY filter, not a filter for
@@ -12292,55 +12367,53 @@ impl KernelHandle for OpenFangKernel {
         text: &str,
         tags: &[String],
     ) -> Result<String, String> {
-        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
-        let text = text.trim();
-        if text.is_empty() {
-            return Err("Note text is empty".to_string());
-        }
-
-        // A note is activity, so it opens an episode if none is open and
-        // extends one that is. This is why ADR 0002 §2.6 refuses an
-        // `episode_open` tool: the write already establishes the state.
-        let episode_id = self
-            .memory
-            .ensure_open_episode_async(agent_id)
+        self.write_note(caller_agent_id, text, tags)
             .await
-            .map_err(|e| format!("Note failed to resolve an episode: {e}"))?;
+            .map(|w| w.id)
+    }
 
-        let metadata = note_metadata(episode_id, tags);
+    async fn memory_note_with_neighbours(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let written = self.write_note(caller_agent_id, text, tags).await?;
 
-        let embedding = match self.embedding_driver {
-            Some(ref driver) => match driver.embed_one(text).await {
-                Ok(vec) => Some(vec),
-                Err(e) => {
-                    // Store unembedded rather than lose the note. It stays
-                    // findable by text search, and `update_embedding` can
-                    // backfill it later; refusing the write would throw away
-                    // the one thing the agent actually asked to keep.
-                    warn!(error = %e, "Note embedding failed; storing without a vector");
-                    None
-                }
-            },
-            None => None,
+        // Best-effort: the note is already durable. Failing a successful
+        // write over a failed advisory would trade the thing the agent asked
+        // to keep for a hint about it. No vector (embedding outage, no
+        // driver) means no hint, never a guess.
+        let neighbours = match written.embedding {
+            Some(vec) => self
+                .memory
+                .note_neighbours_async(
+                    written.agent_id,
+                    &written.id,
+                    vec,
+                    openfang_memory::semantic::NOTE_NEIGHBOUR_MIN_SCORE,
+                    openfang_memory::semantic::NOTE_NEIGHBOUR_LIMIT,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, note = %written.id, "Note neighbour lookup failed");
+                    Vec::new()
+                }),
+            None => Vec::new(),
         };
 
-        let id = self
-            .memory
-            .remember_with_embedding_async(
-                agent_id,
-                text,
-                // Observation, not Inference: the agent is recording something
-                // it saw or decided, and `kind` — not `source` — is the
-                // discriminator this surface reads (see MEMORY_KIND_KEY).
-                MemorySource::Observation,
-                MEMORY_NOTE_SCOPE,
-                metadata,
-                embedding.as_deref(),
-            )
-            .await
-            .map_err(|e| format!("Note failed: {e}"))?;
-
-        Ok(id.0.to_string())
+        Ok(serde_json::json!({
+            "id": written.id,
+            "neighbours": neighbours
+                .iter()
+                .map(|n| serde_json::json!({
+                    "id": n.id,
+                    "chars": n.chars,
+                    "score": n.score,
+                    "preview": n.preview,
+                }))
+                .collect::<Vec<_>>(),
+        }))
     }
 
     async fn memory_note_superseding(

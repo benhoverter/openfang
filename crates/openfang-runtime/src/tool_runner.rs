@@ -4816,12 +4816,10 @@ async fn tool_memory_note(
 
     let supersedes = note_supersedes(input);
     if supersedes.is_empty() {
-        let id = kh.memory_note(caller_agent_id, text, &tags).await?;
-        return Ok(format!(
-            "Noted (id:{}). It is attached to your current episode and will surface in \
-             memory_recall.",
-            openfang_memory::semantic::short_note_id(&id)
-        ));
+        let outcome = kh
+            .memory_note_with_neighbours(caller_agent_id, text, &tags)
+            .await?;
+        return Ok(render_note_with_neighbours(&outcome));
     }
 
     let outcome = kh
@@ -4846,6 +4844,55 @@ fn note_supersedes(input: &serde_json::Value) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Render a plain note write and, when there are any, the author's existing
+/// notes closest to it (ANAI-270 step 3).
+///
+/// The note is already written when this is read, so the repair it offers is
+/// one more write that retires BOTH the old note and this one — the single
+/// path that leaves exactly one current note without a separate link tool.
+/// Advisory throughout: similar is not replaces, and the message says so.
+fn render_note_with_neighbours(outcome: &serde_json::Value) -> String {
+    use openfang_memory::semantic::{short_note_id, NOTE_DUPLICATE_SCORE};
+    let id = short_note_id(outcome["id"].as_str().unwrap_or("?")).to_string();
+    let mut out = format!(
+        "Noted (id:{id}). It is attached to your current episode and will surface in \
+         memory_recall."
+    );
+    let neighbours = outcome["neighbours"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if neighbours.is_empty() {
+        return out;
+    }
+
+    out.push_str("\n\nYour existing notes closest to this one:");
+    for n in &neighbours {
+        let score = n["score"].as_f64().unwrap_or(0.0);
+        let flag = if score >= f64::from(NOTE_DUPLICATE_SCORE) {
+            " LIKELY DUPLICATE —"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\n  - id:{} ({score:.2}, {} chars) —{flag} \"{}\"",
+            short_note_id(n["id"].as_str().unwrap_or("?")),
+            n["chars"].as_u64().unwrap_or(0),
+            n["preview"].as_str().unwrap_or(""),
+        ));
+    }
+    let first = short_note_id(neighbours[0]["id"].as_str().unwrap_or("?")).to_string();
+    out.push_str(&format!(
+        "\n\nThis is a similarity guess, not a verdict — close notes can both be true. \
+         If this note restates or corrects one of them, merge them: call memory_note \
+         once more with the combined text and supersedes: [\"{first}\", \"{id}\"] (the \
+         old id and this one). Both retire and one current note remains. Carry forward \
+         everything from either that is still true. If they are different claims, do \
+         nothing."
+    ));
+    out
 }
 
 /// Below this fraction of the largest note it replaces, a successor is
@@ -11312,6 +11359,71 @@ mod tests {
         .await
         .unwrap();
         assert!(out.starts_with("Noted (id:note-1)"), "{out}");
+    }
+
+    /// No neighbours: the reply is exactly the plain acknowledgement — no
+    /// empty heading, nothing to skim.
+    #[test]
+    fn a_note_with_no_neighbours_renders_no_hint() {
+        let out = render_note_with_neighbours(&serde_json::json!({
+            "id": "0f0e0d0c-aaaa", "neighbours": []
+        }));
+        assert_eq!(
+            out,
+            "Noted (id:0f0e0d0c). It is attached to your current episode and will surface \
+             in memory_recall."
+        );
+    }
+
+    /// ANAI-270 step 3: neighbours list with id, score, size and preview; a
+    /// near-identical one is flagged; the merge recipe names BOTH ids so one
+    /// call leaves exactly one current note; and the reply says it is a
+    /// guess, not a verdict.
+    #[test]
+    fn a_note_with_neighbours_lists_them_and_offers_the_merge() {
+        let out = render_note_with_neighbours(&serde_json::json!({
+            "id": "0f0e0d0c-aaaa",
+            "neighbours": [
+                {"id": "1a2b3c4d-full", "chars": 812, "score": 0.93, "preview": "step 1 done"},
+                {"id": "5e6f7a8b-full", "chars": 400, "score": 0.86, "preview": "mod design"},
+            ],
+        }));
+        assert!(out.starts_with("Noted (id:0f0e0d0c)."), "{out}");
+        assert!(
+            out.contains("id:1a2b3c4d (0.93, 812 chars) — LIKELY DUPLICATE — \"step 1 done\""),
+            "{out}"
+        );
+        assert!(
+            out.contains("id:5e6f7a8b (0.86, 400 chars) — \"mod design\""),
+            "{out}"
+        );
+        assert!(
+            !out.contains("5e6f7a8b (0.86, 400 chars) — LIKELY"),
+            "{out}"
+        );
+        assert!(
+            out.contains("supersedes: [\"1a2b3c4d\", \"0f0e0d0c\"]"),
+            "the merge must retire the new note too: {out}"
+        );
+        assert!(out.contains("not a verdict"), "{out}");
+        assert!(out.contains("still true"), "{out}");
+    }
+
+    /// The fake handle lacks the lookup, so the trait default must still
+    /// write the note — the hint is optional, the write is not.
+    #[tokio::test]
+    async fn the_default_neighbour_path_still_writes_the_note() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let kh: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let out = tool_memory_note(
+            &serde_json::json!({"text": "a thing"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap();
+        assert!(!out.contains("closest"), "{out}");
+        assert_eq!(fake.notes.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -373,6 +373,25 @@ pub trait KernelHandle: Send + Sync {
         Err("Memory notes are not available on this kernel handle".to_string())
     }
 
+    /// ANAI-270 step 3: write a plain note (no `supersedes`) and answer with
+    /// the author's closest existing notes, so a rewrite the agent did not
+    /// mark as one is visible in the same reply.
+    ///
+    /// Returns `{ "id", "neighbours": [{ "id", "chars", "score", "preview" }] }`,
+    /// closest first. The neighbours are advisory and best-effort: an empty
+    /// list means none close enough, or none computable — never a failed
+    /// write. The default keeps a handle without the lookup honest: it
+    /// writes the note and lists nothing.
+    async fn memory_note_with_neighbours(
+        &self,
+        caller_agent_id: Option<&str>,
+        text: &str,
+        tags: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let id = self.memory_note(caller_agent_id, text, tags).await?;
+        Ok(serde_json::json!({ "id": id, "neighbours": [] }))
+    }
+
     /// ANAI-270: write a note that REPLACES notes the caller names.
     ///
     /// Every reference is resolved before anything is written — a bad id
