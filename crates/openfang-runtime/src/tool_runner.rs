@@ -1100,6 +1100,25 @@ pub async fn execute_tool(
     }
 }
 
+/// The `memory_note` doctrine, in one place (ANAI-270).
+///
+/// Duplicated byte-for-byte in `openfang-mcp-bridge` (the seam is one-way, see
+/// `EPISODE_CLOSE_DESCRIPTION`) and pinned equal by
+/// `openfang-api/tests/memory_note_doctrine_drift_test.rs`.
+///
+/// Step 0 of ANAI-270 read the 40 closest same-author note pairs: 20 were full
+/// replacements, and of those 8 were duplicates written minutes apart, 8 were
+/// status updates that should have been facts, and only 4 were genuine
+/// corrections. So the description carries three rules, in that order of
+/// yield: a moving value is a fact; a note you can see and are replacing is
+/// named in `supersedes`; and replacement is whole-note (Ben's ruling,
+/// 2026-09-23) — a partial correction restates everything still true.
+pub const MEMORY_NOTE_DESCRIPTION: &str = "Jot something down in your own memory, in your own words - an observation, a lesson, a decision and why, something that will still be true next week. Cheap and unstructured; no key needed. It is attached to your current episode. If what you are writing has a CURRENT VALUE that will move - a status, an owner, a commit, a count, a progress marker like 'step 1 done, next is step 2' - use memory_fact instead: rewriting a fact slot replaces the old value, while a second note leaves the stale one surfacing beside it. If this note corrects or replaces one of your own notes that you can see, name it in 'supersedes' so the old one stops surfacing. Replacement is whole-note: if only part of the old note is wrong, this note must carry the corrected part AND everything from the old note that is still true, because the old note stops surfacing in full. A note written without 'supersedes' answers with your closest existing notes - if one of them already says this, merge them as the reply describes.";
+
+/// The `supersedes` parameter's description (ANAI-270). Pinned equal to the
+/// bridge's copy by the same drift test as `MEMORY_NOTE_DESCRIPTION`.
+pub const MEMORY_NOTE_SUPERSEDES_DESCRIPTION: &str = "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true.";
+
 /// The `memory_episode_close` doctrine, in one place (ANAI-283).
 ///
 /// Three surfaces teach an agent when to close: this description, the
@@ -1433,13 +1452,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_note".to_string(),
-            description: "Jot something down in your own memory, in your own words - a decision, an observation, something worth keeping. Cheap and unstructured; no key needed. It is attached to your current episode.".to_string(),
+            description: MEMORY_NOTE_DESCRIPTION.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "What to remember, in plain words." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." },
-                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true." }
+                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": MEMORY_NOTE_SUPERSEDES_DESCRIPTION }
                 },
                 "required": ["text"]
             }),

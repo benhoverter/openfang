@@ -265,6 +265,17 @@ pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
     "browser_back",
 ];
 
+/// The `memory_note` doctrine as a SUBPROCESS agent reads it (ANAI-270).
+///
+/// Byte-identical to `openfang_runtime::tool_runner::MEMORY_NOTE_DESCRIPTION`,
+/// duplicated for the same reason as `EPISODE_CLOSE_DESCRIPTION`, and pinned
+/// equal by `openfang-api/tests/memory_note_doctrine_drift_test.rs`.
+pub const MEMORY_NOTE_DESCRIPTION: &str = "Jot something down in your own memory, in your own words - an observation, a lesson, a decision and why, something that will still be true next week. Cheap and unstructured; no key needed. It is attached to your current episode. If what you are writing has a CURRENT VALUE that will move - a status, an owner, a commit, a count, a progress marker like 'step 1 done, next is step 2' - use memory_fact instead: rewriting a fact slot replaces the old value, while a second note leaves the stale one surfacing beside it. If this note corrects or replaces one of your own notes that you can see, name it in 'supersedes' so the old one stops surfacing. Replacement is whole-note: if only part of the old note is wrong, this note must carry the corrected part AND everything from the old note that is still true, because the old note stops surfacing in full. A note written without 'supersedes' answers with your closest existing notes - if one of them already says this, merge them as the reply describes.";
+
+/// Byte-identical to
+/// `openfang_runtime::tool_runner::MEMORY_NOTE_SUPERSEDES_DESCRIPTION` (ANAI-270).
+pub const MEMORY_NOTE_SUPERSEDES_DESCRIPTION: &str = "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true.";
+
 /// The `memory_episode_close` doctrine as a SUBPROCESS agent reads it (ANAI-283).
 ///
 /// Byte-identical to `openfang_runtime::tool_runner::EPISODE_CLOSE_DESCRIPTION`
@@ -741,13 +752,13 @@ pub fn built_in_tools() -> Vec<Tool> {
         // later entry and make an unrelated diff look like the cause.
         Tool::new(
             "memory_note",
-            "Jot something down in your own memory, in your own words - a decision, an observation, something worth keeping. Cheap and unstructured; no key needed. It is attached to your current episode.",
+            MEMORY_NOTE_DESCRIPTION,
             obj(json!({
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "What to remember, in plain words." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional short labels to help find this later." },
-                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": "Optional: ids of your own notes that this note corrects or replaces, e.g. [\"1a2b3c4d\"] - the id is shown in a recalled note's tag, [note · 2d · id:1a2b3c4d]. Those notes stop surfacing in recall. Replacement is whole-note: if only part of an old note was wrong, this note must carry the corrected part AND everything from the old note that is still true." }
+                    "supersedes": { "type": "array", "items": { "type": "string" }, "description": MEMORY_NOTE_SUPERSEDES_DESCRIPTION }
                 },
                 "required": ["text"]
             })),

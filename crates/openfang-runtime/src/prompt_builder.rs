@@ -621,14 +621,19 @@ fn build_write_doctrine(granted_tools: &[String]) -> String {
         out.push_str(
             "- memory_note — the default. One observation, lesson, or piece of context in your \
              own words. Cheap and recallable: write it rather than wonder whether it is worth \
-             writing.\n",
+             writing. If it corrects or replaces a note of yours you can see — recalled notes \
+             carry an id, `[note · 2d · id:1a2b3c4d]` — pass `supersedes: [\"1a2b3c4d\"]` so \
+             the stale one stops surfacing. Replacement is whole-note: if only part of the old \
+             note is wrong, the new note must carry the corrected part and everything from the \
+             old note that is still true.\n",
         );
     }
     if has_fact {
         out.push_str(
             "- memory_fact — use this INSTEAD of a note whenever the thing you are writing has \
              a CURRENT VALUE that can change later: a status, an owner, a version or commit, a \
-             count you will re-measure, a decision that may be revised. Name the slot for the \
+             count you will re-measure, a decision that may be revised, a progress marker like \
+             \"step 1 done, next is step 2\". Name the slot for the \
              thing and not for the moment — `repo.trunk_head`, not `trunk head as of Friday` — \
              and write the same slot again when the value moves; that supersedes the old value \
              and keeps the history. Two tells that you want a fact and not a note: you are about \
@@ -1606,6 +1611,27 @@ mod tests {
     fn the_doctrine_carries_a_trigger() {
         let section = build_memory_section(&[], &full_suite());
         assert!(section.contains("SAME turn"));
+    }
+
+    /// ANAI-270. The note bullet is the one surface an agent reads BEFORE it
+    /// composes a note, so it must carry the handle (the id tag shape), the
+    /// verb (`supersedes`), and Ben's whole-note ruling — without the last, an
+    /// agent fixing one line retires every true line with it.
+    #[test]
+    fn the_note_doctrine_teaches_whole_note_supersession() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("supersedes: [\"1a2b3c4d\"]"));
+        assert!(section.contains("id:1a2b3c4d"));
+        assert!(section.contains("Replacement is whole-note"));
+        assert!(section.contains("everything from the old note that is still true"));
+    }
+
+    /// ANAI-270 step 0: 8 of 20 replaced notes were progress markers that
+    /// should have been facts. The fact bullet names that shape outright.
+    #[test]
+    fn the_fact_doctrine_claims_progress_markers() {
+        let section = build_memory_section(&[], &full_suite());
+        assert!(section.contains("step 1 done, next is step 2"));
     }
 
     /// `memory_store` is demoted, not deleted — ANAI-269 leaves the rows and
