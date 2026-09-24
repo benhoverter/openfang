@@ -190,6 +190,8 @@ pub const DEFAULT_ALLOWED: &[&str] = &[
     // it only pays off if it is granted by default -- opt-in would serve only
     // the agents that already have a shell and help nobody.
     "file_grep",
+    // ANAI-297: same files, same resolver as file_read; granted with it.
+    "image_read",
     "file_list",
     "file_write",
     "create_directory",
@@ -326,6 +328,12 @@ pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are 
 /// the same reason as the two consts above: the crate seam is one-way.
 pub const FILE_GREP_DESCRIPTION: &str = "Search a file, or recursively a directory, for a regular expression and get back the matching LINE NUMBERS with their text. Paths are relative to the agent workspace. The line numbers are 1-based and can be passed straight to file_read's offset, which is the point: for anything large, grep for the anchor and then read that range, instead of pulling a whole file into context. Exposes strictly less than file_read already does, and resolves every path through the same policy, so it reaches nothing file_read would refuse. Every bound that bites is disclosed in the result - the match cap, the file cap, skipped binaries, and the build/VCS directories not descended into - because a silent cap reads as an absence of matches.";
 
+/// Advertised description for `image_read` (ANAI-297).
+///
+/// Byte-identical to `openfang_runtime::tool_runner::IMAGE_READ_DESCRIPTION`
+/// and pinned equal by the cross-crate test in `openfang-api`.
+pub const IMAGE_READ_DESCRIPTION: &str = "Look at an image file. Returns the image itself (PNG, JPEG, GIF or WebP) as an image you can see, plus one line of text giving its type, size and sha256. Paths are relative to the agent workspace and resolve through the same file policy as file_read, so it reaches exactly the files file_read reaches. The type is decided by the file's bytes, not its name. A file over the operator's size limit ([media] image_read_max_bytes, default 3,750,000 bytes) is refused whole, never truncated. SVG is text: read it with file_read.";
+
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
 
@@ -379,6 +387,20 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "include": { "type": "string", "description": "Filename glob limiting which files are searched, e.g. \"*.rs\". Only '*' is a wildcard; everything else matches literally." }
                 },
                 "required": ["path", "pattern"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` -> `image_read` (ANAI-297).
+        // The only built-in whose result carries image content; see
+        // `CallResult::Rich`.
+        Tool::new(
+            "image_read",
+            IMAGE_READ_DESCRIPTION,
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The image file to read" }
+                },
+                "required": ["path"]
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `file_write`. Workspace-
@@ -1171,6 +1193,7 @@ mod tests {
                 "file_read",
                 "file_list",
                 "file_grep",
+                "image_read",
                 "file_write",
                 "create_directory",
                 "web_fetch",

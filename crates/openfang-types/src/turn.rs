@@ -148,6 +148,9 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     // lets them avoid pulling whole files into context -- the same omission
     // ANAI-194 made with memory_status, noted below.
     "file_grep",
+    // ANAI-297: returns a file's bytes as an image and writes nothing, like
+    // file_read.
+    "image_read",
     "memory_recall",
     // ANAI-194 shipped this tool but missed this list, which is the single
     // source of truth for BOTH the ANAI-76/77 drop predicate and

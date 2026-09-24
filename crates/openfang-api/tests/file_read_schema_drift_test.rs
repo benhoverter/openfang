@@ -189,3 +189,64 @@ fn the_grep_alias_points_at_the_grep_tool() {
     // Glob is a name search, not a content search, and stays where it was.
     assert_eq!(map_tool_name("Glob"), Some("file_list"));
 }
+
+// ---- ANAI-297: image_read -----------------------------------------------------
+
+#[test]
+fn the_bridge_and_the_runtime_describe_image_read_identically() {
+    assert_eq!(
+        openfang_mcp_bridge::IMAGE_READ_DESCRIPTION,
+        openfang_runtime::tool_runner::IMAGE_READ_DESCRIPTION,
+        "the bridge's image_read description has drifted from the runtime's"
+    );
+}
+
+#[test]
+fn both_tool_surfaces_serve_the_same_image_read_tool() {
+    let runtime = openfang_runtime::tool_runner::builtin_tool_definitions()
+        .into_iter()
+        .find(|d| d.name == "image_read")
+        .expect("the runtime defines image_read");
+    let bridge = openfang_mcp_bridge::built_in_tools()
+        .into_iter()
+        .find(|t| t.name == "image_read")
+        .expect("the bridge advertises image_read");
+
+    assert_eq!(
+        runtime.description,
+        openfang_runtime::tool_runner::IMAGE_READ_DESCRIPTION
+    );
+    assert_eq!(
+        bridge.description.as_deref(),
+        Some(openfang_mcp_bridge::IMAGE_READ_DESCRIPTION)
+    );
+    assert_eq!(
+        runtime.input_schema,
+        openfang_runtime::tool_runner::image_read_input_schema()
+    );
+    assert_eq!(
+        serde_json::to_value(&*bridge.input_schema).unwrap(),
+        runtime.input_schema,
+        "the bridge's hand-copied image_read schema has drifted from the runtime's"
+    );
+}
+
+/// Ben, 2026-09-23: "as ubiquitous as file_read". Every list that makes
+/// file_read reachable and correctly classified must carry image_read too.
+#[test]
+fn image_read_is_granted_and_classified_wherever_file_read_is() {
+    assert!(openfang_mcp_bridge::DEFAULT_ALLOWED.contains(&"image_read"));
+    assert!(openfang_api::bridge_ipc::ALLOWED_TOOLS.contains(&"image_read"));
+    assert!(
+        openfang_runtime::tool_runner::FS_SANDBOXED_TOOLS.contains(&"image_read"),
+        "image_read takes a path, so it must be workspace-scoped on the bridge"
+    );
+    assert!(
+        openfang_types::turn::READ_ONLY_TOOLS.contains(&"image_read"),
+        "image_read writes nothing"
+    );
+    assert!(openfang_runtime::mcp::RESERVED_BUILTIN_NAMES.contains(&"image_read"));
+    assert!(openfang_types::tool_compat::is_known_openfang_tool(
+        "image_read"
+    ));
+}

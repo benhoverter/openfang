@@ -74,6 +74,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     // candidate path re-enters the same resolver, so granting one and denying
     // the other protects nothing.
     "file_grep",
+    // ANAI-297: same files and resolver as file_read. The one built-in whose
+    // result can carry images; see `native_call_result`.
+    "image_read",
     "file_list",
     "file_write",
     "create_directory",
@@ -908,42 +911,90 @@ async fn dispatch_call(
         .get(&resolved_agent_id)
         .map(|r| r.clone());
 
-    let result = openfang_runtime::tool_runner::execute_tool(
-        &format!("bridge-{}", call.request_id),
-        &call.tool_name,
-        &call.args,
-        Some(&kernel_handle),
-        Some(&allowed_tools_owned),
-        Some(resolved_agent_id_string.as_str()),
-        Some(&skill_snapshot),
-        Some(&kernel.mcp_connections),
-        Some(&kernel.web_ctx),
-        Some(&kernel.browser_ctx),
-        allowed_env_arg,
-        workspace_root_arg, // scoped to the authenticated agent's workspace; gated above
-        Some(&kernel.media_engine),
-        effective_exec_policy,
-        entry.manifest.file_policy.as_ref(), // F6: agent's resolved policy (was None — silent tier downgrade on bridge)
-        if kernel.config.tts.enabled {
-            Some(&kernel.tts_engine)
-        } else {
-            None
-        },
-        if kernel.config.docker.enabled {
-            Some(&kernel.config.docker)
-        } else {
-            None
-        },
-        Some(&*kernel.process_manager),
-        // Piece 3 (ANAI-82): in-flight run's origin (targeting/audit only;
-        // authz already enforced off the authenticated agent id above).
-        bridge_origin.as_ref(),
+    // ANAI-297: this path can deliver images (`CallResult::Rich`), so it is
+    // the one caller that scopes the image sink. Every other execute_tool
+    // caller leaves it unset, and image_read refuses there by name.
+    let (result, images) = openfang_runtime::tool_runner::with_image_sink(
+        openfang_runtime::tool_runner::execute_tool(
+            &format!("bridge-{}", call.request_id),
+            &call.tool_name,
+            &call.args,
+            Some(&kernel_handle),
+            Some(&allowed_tools_owned),
+            Some(resolved_agent_id_string.as_str()),
+            Some(&skill_snapshot),
+            Some(&kernel.mcp_connections),
+            Some(&kernel.web_ctx),
+            Some(&kernel.browser_ctx),
+            allowed_env_arg,
+            workspace_root_arg, // scoped to the authenticated agent's workspace; gated above
+            Some(&kernel.media_engine),
+            effective_exec_policy,
+            entry.manifest.file_policy.as_ref(), // F6: agent's resolved policy (was None — silent tier downgrade on bridge)
+            if kernel.config.tts.enabled {
+                Some(&kernel.tts_engine)
+            } else {
+                None
+            },
+            if kernel.config.docker.enabled {
+                Some(&kernel.config.docker)
+            } else {
+                None
+            },
+            Some(&*kernel.process_manager),
+            // Piece 3 (ANAI-82): in-flight run's origin (targeting/audit only;
+            // authz already enforced off the authenticated agent id above).
+            bridge_origin.as_ref(),
+        ),
     )
     .await;
 
-    CallResult::Ok {
+    native_call_result(result, images, call.request_id, &call.tool_name)
+}
+
+/// Build the wire result for a native tool call plus any images it deposited
+/// (ANAI-297).
+///
+/// No images: `CallResult::Ok`, byte-identical to before this existed, which
+/// is every tool but `image_read`. Images ride only on a success. An errored
+/// call that somehow deposited one has it dropped and logged: an error with a
+/// picture attached is ambiguous about which the model should believe, and
+/// `image_read` deposits only after its last check, so this is a guard, not a
+/// path.
+fn native_call_result(
+    result: openfang_types::tool::ToolResult,
+    images: Vec<openfang_runtime::tool_runner::ToolImage>,
+    request_id: u64,
+    tool_name: &str,
+) -> CallResult {
+    if images.is_empty() {
+        return CallResult::Ok {
+            content: result.content,
+            is_error: result.is_error,
+        };
+    }
+    if result.is_error {
+        warn!(
+            request_id,
+            tool = %tool_name,
+            dropped = images.len(),
+            "bridge IPC: tool returned an error AND deposited images; images dropped"
+        );
+        return CallResult::Ok {
+            content: result.content,
+            is_error: true,
+        };
+    }
+    CallResult::Rich {
         content: result.content,
-        is_error: result.is_error,
+        is_error: false,
+        images: images
+            .into_iter()
+            .map(|i| WireImage {
+                mime_type: i.mime_type,
+                data_base64: i.data_base64,
+            })
+            .collect(),
     }
 }
 
@@ -1452,6 +1503,84 @@ mod tests {
         match out {
             CallResult::Ok { is_error, .. } => assert!(is_error),
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    // ---- ANAI-297: native results with images ------------------------------
+
+    fn tool_result(content: &str, is_error: bool) -> openfang_types::tool::ToolResult {
+        openfang_types::tool::ToolResult {
+            tool_use_id: "t".to_string(),
+            content: content.to_string(),
+            is_error,
+        }
+    }
+
+    fn tool_png() -> openfang_runtime::tool_runner::ToolImage {
+        openfang_runtime::tool_runner::ToolImage {
+            mime_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    /// Every tool but image_read: the wire result must be exactly what it was
+    /// before images existed.
+    #[test]
+    fn a_native_result_without_images_is_unchanged() {
+        for is_error in [false, true] {
+            match native_call_result(tool_result("hello", is_error), Vec::new(), 1, "file_read") {
+                CallResult::Ok {
+                    content,
+                    is_error: e,
+                } => {
+                    assert_eq!(content, "hello");
+                    assert_eq!(e, is_error);
+                }
+                other => panic!("text-only result must stay Ok, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_successful_native_result_with_an_image_goes_rich() {
+        match native_call_result(
+            tool_result("header", false),
+            vec![tool_png()],
+            1,
+            "image_read",
+        ) {
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            } => {
+                assert_eq!(content, "header");
+                assert!(!is_error);
+                assert_eq!(
+                    images,
+                    vec![WireImage {
+                        mime_type: "image/png".to_string(),
+                        data_base64: "iVBORw0KGgo=".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_errored_native_result_never_carries_an_image() {
+        match native_call_result(
+            tool_result("Error: nope", true),
+            vec![tool_png()],
+            1,
+            "image_read",
+        ) {
+            CallResult::Ok { content, is_error } => {
+                assert_eq!(content, "Error: nope");
+                assert!(is_error);
+            }
+            other => panic!("an error must not go Rich, got {other:?}"),
         }
     }
 
@@ -2335,10 +2464,12 @@ mod tests {
         // ANAI-292: 35 -> 36 (`file_grep`). NOT privileged-deny — it is
         // granted alongside `file_read`, so `DEFAULT_ALLOWED` moves with it,
         // 26 -> 27, and `PRIVILEGED_DEFAULT_DENY` stays at 9.
-        assert_eq!(ALLOWED_TOOLS.len(), 36, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-297: 36 -> 37 (`image_read`). Granted with file_read, so
+        // `DEFAULT_ALLOWED` moves too, 27 -> 28.
+        assert_eq!(ALLOWED_TOOLS.len(), 37, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            36,
+            37,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -2348,8 +2479,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            27,
-            "DEFAULT_ALLOWED bridge-default cardinality (36 − 9 privileged)"
+            28,
+            "DEFAULT_ALLOWED bridge-default cardinality (37 − 9 privileged)"
         );
     }
 

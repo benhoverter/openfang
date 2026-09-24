@@ -343,9 +343,18 @@ tools = ["file_write"]
          (ANAI-296), got: {granted_names:?}"
     );
     assert!(
+        granted_names.contains(&"image_read"),
+        "image_read must be surfaced as a companion of the declared file_read \
+         (ANAI-297), got: {granted_names:?}"
+    );
+    assert!(
         !granted_names.contains(&"shell_exec"),
         "the companion grant must not widen beyond the declared parent's data \
          class, got: {granted_names:?}"
+    );
+    assert!(
+        !ungranted_names.contains(&"image_read"),
+        "image_read must NOT be surfaced without file_read, got: {ungranted_names:?}"
     );
     assert!(
         !ungranted_names.contains(&"file_grep"),
