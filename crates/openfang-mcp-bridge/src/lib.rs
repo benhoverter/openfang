@@ -697,17 +697,20 @@ pub fn built_in_tools() -> Vec<Tool> {
         // entry is the cross-leaf advertise surface the bridge owes it.
         Tool::new(
             "file_convert",
-            "Convert a workspace file from one format to another using an \
+            "Convert a file from one format to another using an \
              allowlisted recipe table (e.g. Markdown to PDF). The source format \
              is inferred from the input file extension; the target format is the \
              'format' argument. Only conversions defined in the recipe manifest \
-             are permitted. Paths are relative to the agent workspace.",
+             are permitted. Paths are relative to the agent workspace; absolute \
+             paths follow the same file_policy as file_read (the input needs read \
+             access, the output needs write access). Returns the output path, not \
+             its content: file_read it afterwards.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
-                    "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
-                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
+                    "input": { "type": "string", "description": "Path to the source file, relative to the workspace or absolute. It must be readable under your file_policy, exactly as for file_read. Its extension determines the source format." },
+                    "output": { "type": "string", "description": "Optional output path, relative to the workspace or absolute. It must be writable under your file_policy. If omitted, the input path with the target extension is used, so for an input you can only read, pass an output you can write." },
                     "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." }
                 },
                 "required": ["format", "input"]

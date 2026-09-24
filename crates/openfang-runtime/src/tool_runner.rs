@@ -722,7 +722,7 @@ pub async fn execute_tool(
         }
 
         // File conversion tool (recipe-driven, allowlisted formats)
-        "file_convert" => tool_file_convert(input, workspace_root).await,
+        "file_convert" => tool_file_convert(input, workspace_root, file_policy).await,
 
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
@@ -1250,13 +1250,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "file_convert".to_string(),
-            description: "Convert a workspace file from one format to another using an allowlisted recipe table (e.g. Markdown to PDF). The source format is inferred from the input file extension; the target format is the 'format' argument. Only conversions defined in the recipe manifest are permitted. Paths are relative to the agent workspace.".to_string(),
+            description: "Convert a file from one format to another using an allowlisted recipe table (e.g. Markdown to PDF). The source format is inferred from the input file extension; the target format is the 'format' argument. Only conversions defined in the recipe manifest are permitted. Paths are relative to the agent workspace; absolute paths follow the same file_policy as file_read (the input needs read access, the output needs write access). Returns the output path, not its content: file_read it afterwards.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "format": { "type": "string", "description": "Target format / output extension, e.g. \"pdf\"" },
-                    "input": { "type": "string", "description": "Workspace-relative path to the source file. Its extension determines the source format." },
-                    "output": { "type": "string", "description": "Optional workspace-relative output path. If omitted, the input path with the target extension is used." },
+                    "input": { "type": "string", "description": "Path to the source file, relative to the workspace or absolute. It must be readable under your file_policy, exactly as for file_read. Its extension determines the source format." },
+                    "output": { "type": "string", "description": "Optional output path, relative to the workspace or absolute. It must be writable under your file_policy. If omitted, the input path with the target extension is used, so for an input you can only read, pass an output you can write." },
                     "preset": { "type": "string", "description": "Optional render preset selecting size/scale, e.g. \"mobile\", \"tablet\", \"desktop\", \"wide\". Must be one offered by the target recipe; omit to use the recipe's default preset. Ignored by recipes that define no presets." },
                     "options": file_convert_options_schema()
                 },
@@ -2349,8 +2349,8 @@ fn utf8_read_error(raw_path: &str, head: &[u8]) -> String {
             "'{raw_path}' is not valid UTF-8 text: it is a PDF. file_read returns bytes \
              as-is and will not extract for you. Convert it first, then read the result: \
              file_convert(to=\"txt\", path=\"{raw_path}\") returns a path you can file_read. \
-             Note that file_convert is workspace-scoped, so a PDF outside your workspace \
-             has to be copied in before it can be converted."
+             file_convert follows the same file_policy as file_read, so any PDF you can read \
+             you can convert; pass an 'output' you can write if this location is read-only."
         ),
         Some(fmt) => format!(
             "'{raw_path}' is not valid UTF-8 text: it looks like {fmt}. file_read returns \
@@ -3166,12 +3166,45 @@ async fn tool_file_list(
 // File conversion tool
 // ---------------------------------------------------------------------------
 
+/// The `BAD_PATH` message for a `file_convert` path the resolver refused
+/// (ANAI-300). The resolver's own reason goes first and verbatim; the tail says
+/// what the caller can do about it, because a bare "rejected" reads as a
+/// lockout and gives the agent nothing to try.
+fn convert_path_rejection(
+    role: &str,
+    raw: &str,
+    reason: &str,
+    policy_active: bool,
+    output_defaulted: bool,
+) -> String {
+    let reason = reason.trim_end().trim_end_matches('.');
+    let hint = if reason.contains("requires approval") {
+        " file_convert cannot raise an approval prompt, so a prompt-tier path is refused \
+         rather than asked about. Copy the file somewhere you can read (or write) without \
+         approval, or ask the operator for a file_policy rule covering it."
+    } else if output_defaulted && role == "output" {
+        " No 'output' was given, so file_convert defaulted to writing next to the input, \
+         and you cannot write there. Pass 'output' with a path you can write, such as a \
+         file in your workspace."
+    } else if !policy_active && reason.contains("outside workspace") {
+        " This agent has no active file_policy, so file_convert, like file_read, is \
+         limited to its workspace. Copy the file in first, or ask the operator for a \
+         file_policy rule covering it."
+    } else if reason.contains("read-only") {
+        " Choose an output path you can write."
+    } else {
+        ""
+    };
+    format!("{role} path '{raw}' rejected: {reason}.{hint}")
+}
+
 /// `file_convert` — render a workspace file to another format via an
 /// allowlisted recipe table (see [`crate::convert`]).
 ///
 /// `file_convert` dispatcher (ANAI-67..71): the load-bearing security seam.
 /// Resolves the request against the allowlisted recipe table (fail-closed),
-/// clamps both paths into the caller's workspace, substitutes the argv template
+/// resolves both paths under the caller's `file_policy` exactly as `file_read`
+/// (input) and `file_write` (output) do (ANAI-300), substitutes the argv template
 /// with resolved paths only, pins the launcher to an absolute file, preflights
 /// the recipe's external `needs`, then spawns via an argv array (never a shell
 /// string) with a guaranteed PATH. Every conversion outcome — success and the
@@ -3180,17 +3213,36 @@ async fn tool_file_list(
 async fn tool_file_convert(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
 ) -> Result<String, String> {
-    tool_file_convert_in(input, workspace_root, &crate::convert::openfang_home_dir()).await
+    tool_file_convert_with_policy_in(
+        input,
+        workspace_root,
+        file_policy,
+        &crate::convert::openfang_home_dir(),
+    )
+    .await
 }
 
 /// Inner `file_convert` dispatcher with an injectable OpenFang home directory,
 /// so hermetic tests can supply their own `scripts/` + `convert/recipes.toml`
 /// without mutating process-global env. Production calls this via the wrapper
 /// above with the real resolved home.
+#[cfg(test)]
 async fn tool_file_convert_in(
     input: &serde_json::Value,
     workspace_root: Option<&Path>,
+    home: &Path,
+) -> Result<String, String> {
+    tool_file_convert_with_policy_in(input, workspace_root, None, home).await
+}
+
+/// [`tool_file_convert_in`] with the caller's `file_policy` (ANAI-300). `None`
+/// or a disabled policy keeps the legacy workspace clamp, byte for byte.
+async fn tool_file_convert_with_policy_in(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
     home: &Path,
 ) -> Result<String, String> {
     // Request-shape validation (a malformed call, not a conversion outcome):
@@ -3201,7 +3253,7 @@ async fn tool_file_convert_in(
         .ok_or("Missing 'format' parameter (target format, e.g. \"pdf\")")?;
     let input_path = input["input"]
         .as_str()
-        .ok_or("Missing 'input' parameter (workspace-relative source file)")?;
+        .ok_or("Missing 'input' parameter (path to the source file)")?;
     if input_path.trim().is_empty() {
         return Err("'input' parameter is empty".to_string());
     }
@@ -3300,27 +3352,54 @@ async fn tool_file_convert_in(
         }
     };
 
-    // §5.1 path validation: both paths must resolve INSIDE the workspace.
-    // resolve_sandbox_path rejects `..`, absolute escape, and symlink escape;
-    // the input must exist and the output's parent directory must exist.
+    // §5.1 path validation (ANAI-300): the SAME resolver file_read and
+    // file_write use. The input is resolved as a read, so anything file_read
+    // may open, file_convert may convert; the output is resolved as a write, so
+    // it lands only where the agent may write. The floor (`..`-reject,
+    // canonicalize, symlink resolution, sensitive-path deny) runs first either
+    // way. With no active policy this is the legacy workspace clamp.
+    //
+    // `prompt_preapproved = false`: file_convert has two paths and is not in
+    // execute_tool's single-path approval pre-pass, so a prompt-tier path was
+    // never put to a human. Refuse it by name rather than treat it as approved.
     let root = workspace_root.ok_or("file_convert requires a workspace root")?;
-    let resolved_input = match crate::workspace_sandbox::resolve_sandbox_path(input_path, root) {
+    let policy_active = file_policy.is_some_and(|fp| fp.is_active());
+    let resolved_input = match crate::workspace_sandbox::resolve_with_policy(
+        input_path,
+        root,
+        file_policy,
+        false,
+        false,
+    ) {
         Ok(p) => p,
         Err(e) => {
             return Ok(convert_err(
                 to,
                 "BAD_PATH",
-                &format!("input path rejected: {e}"),
+                &convert_path_rejection("input", input_path, &e, policy_active, false),
             ))
         }
     };
-    let resolved_output = match crate::workspace_sandbox::resolve_sandbox_path(&output_path, root) {
+    let output_defaulted = input["output"].as_str().is_none();
+    let resolved_output = match crate::workspace_sandbox::resolve_with_policy(
+        &output_path,
+        root,
+        file_policy,
+        true,
+        false,
+    ) {
         Ok(p) => p,
         Err(e) => {
             return Ok(convert_err(
                 to,
                 "BAD_PATH",
-                &format!("output path rejected: {e}"),
+                &convert_path_rejection(
+                    "output",
+                    &output_path,
+                    &e,
+                    policy_active,
+                    output_defaulted,
+                ),
             ))
         }
     };
@@ -13101,6 +13180,278 @@ mod convert_dispatch_tests {
         assert_eq!(v["format"], "txt");
         assert_eq!(v["output_path"], "note.txt");
         assert!(ws.path().join("note.txt").is_file());
+    }
+
+    // --- ANAI-300: file_convert resolves paths under file_policy ---------
+
+    /// Enabled policy, default Deny, with the given absolute rules. Paths are
+    /// canonicalized so macOS's /var -> /private/var symlink cannot make a rule
+    /// miss the canonical path the resolver evaluates.
+    #[cfg(unix)]
+    fn convert_policy(
+        enabled: bool,
+        rules: Vec<(&Path, openfang_types::config::FileAccessTier)>,
+    ) -> openfang_types::config::FilePolicy {
+        openfang_types::config::FilePolicy::new(
+            enabled,
+            openfang_types::config::FileAccessTier::Deny,
+            rules
+                .into_iter()
+                .map(|(p, tier)| openfang_types::config::FileRule {
+                    path: p.canonicalize().unwrap().to_string_lossy().into_owned(),
+                    tier,
+                })
+                .collect(),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn convert_with(
+        input: serde_json::Value,
+        ws: &Path,
+        policy: Option<&openfang_types::config::FilePolicy>,
+        home: &Path,
+    ) -> serde_json::Value {
+        let out = tool_file_convert_with_policy_in(&input, Some(ws), policy, home)
+            .await
+            .unwrap();
+        parse(&out)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_read_tier_input_outside_workspace_converts() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "# from outside").unwrap();
+        let fp = convert_policy(true, vec![(ws.path(), T::Write), (outside.path(), T::Read)]);
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap(), "output": "note.txt" }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
+        assert_eq!(
+            fs::read_to_string(ws.path().join("note.txt")).unwrap(),
+            "# from outside"
+        );
+    }
+
+    /// A read-tier input with no `output` defaults next to the input, which is
+    /// not writable. It must refuse and name the `output` argument, and it must
+    /// NOT quietly relocate the output somewhere else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_read_tier_default_output_refused_with_signpost() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "x").unwrap();
+        let fp = convert_policy(true, vec![(ws.path(), T::Write), (outside.path(), T::Read)]);
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap() }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("read-only"), "{msg}");
+        assert!(msg.contains("Pass 'output'"), "{msg}");
+        assert!(!outside.path().join("note.txt").exists());
+        assert!(!ws.path().join("note.txt").exists(), "must not relocate");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_deny_tier_input_refused() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "x").unwrap();
+        // No rule for `outside`: the default tier (Deny) governs it.
+        let fp = convert_policy(true, vec![(ws.path(), T::Write)]);
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap(), "output": "note.txt" }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("deny tier"),
+            "{v}"
+        );
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    /// file_convert is outside execute_tool's approval pre-pass, so a prompt-tier
+    /// path was never put to a human. It must refuse, and say why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_prompt_tier_refused_by_name() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "x").unwrap();
+        let fp = convert_policy(
+            true,
+            vec![(ws.path(), T::Write), (outside.path(), T::Prompt)],
+        );
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap(), "output": "note.txt" }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot raise an approval prompt"),
+            "{v}"
+        );
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    /// The output is resolved as a WRITE: an explicit output into a read-tier
+    /// directory is refused and nothing is written there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_output_into_read_tier_refused() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let ro = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "x").unwrap();
+        let fp = convert_policy(true, vec![(ws.path(), T::Write), (ro.path(), T::Read)]);
+        let dest = ro.path().join("note.txt");
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": "note.md", "output": dest.to_str().unwrap() }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("output path"), "{msg}");
+        assert!(msg.contains("Choose an output path you can write"), "{msg}");
+        assert!(!dest.exists());
+    }
+
+    /// Output into a write-tier directory outside the workspace is allowed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_output_into_write_tier_outside_workspace() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let rw = TempDir::new().unwrap();
+        fs::write(ws.path().join("note.md"), "body").unwrap();
+        let fp = convert_policy(true, vec![(ws.path(), T::Write), (rw.path(), T::Write)]);
+        let dest = rw.path().join("note.txt");
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": "note.md", "output": dest.to_str().unwrap() }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["ok"], serde_json::json!(true), "envelope: {v}");
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "body");
+    }
+
+    /// No policy: legacy clamp, but the refusal now says what to do instead of
+    /// a bare "rejected" (the missing signpost from 2026-09-16).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_no_policy_outside_workspace_signposts() {
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "x").unwrap();
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap(), "output": "note.txt" }),
+            ws.path(),
+            None,
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.starts_with("input path"), "{msg}");
+        assert!(msg.contains("no active file_policy"), "{msg}");
+        assert!(msg.contains("Copy the file in"), "{msg}");
+    }
+
+    /// A present-but-disabled policy is inert: its rules must not widen access,
+    /// exactly as for file_read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_disabled_policy_keeps_workspace_clamp() {
+        use openfang_types::config::FileAccessTier as T;
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let src = outside.path().join("note.md");
+        fs::write(&src, "x").unwrap();
+        let fp = convert_policy(false, vec![(outside.path(), T::Write)]);
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": src.to_str().unwrap(), "output": "note.txt" }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        assert!(!ws.path().join("note.txt").exists());
+    }
+
+    /// The sensitive-path floor runs under an active policy too: a Write rule
+    /// over a directory cannot expose a protected file inside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn convert_policy_cannot_open_mcp_auth() {
+        use openfang_types::config::FileAccessTier as T;
+        let Some(h) = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .and_then(|h| h.canonicalize().ok())
+        else {
+            return;
+        };
+        let home = hermetic_home("");
+        let ws = TempDir::new().unwrap();
+        let fp = convert_policy(true, vec![(ws.path(), T::Write), (h.as_path(), T::Write)]);
+        let target = h.join(".mcp-auth").join("probe.md");
+        let v = convert_with(
+            serde_json::json!({ "format": "txt", "input": target.to_str().unwrap(), "output": "p.txt" }),
+            ws.path(),
+            Some(&fp),
+            home.path(),
+        )
+        .await;
+        assert_eq!(v["error"]["code"], "BAD_PATH", "envelope: {v}");
+        assert!(!ws.path().join("p.txt").exists());
     }
 
     #[cfg(unix)]
