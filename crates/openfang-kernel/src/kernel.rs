@@ -561,7 +561,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - Act first, narrate second. Use tools to accomplish tasks rather than describing what you'd do.\n\
          - Batch tool calls when possible \u{2014} don't output reasoning between each call.\n\
          - When a task is ambiguous, ask ONE clarifying question, not five.\n\
-         - Store important context in memory (memory_store) proactively.\n\
+         - What to write to memory, and with which tool, is set by the ## Memory section of your system prompt. Follow it.\n\
          - Search memory (memory_recall) before asking the user for context they may have given before.\n\n\
          ## Tool Usage Protocols\n\
          - file_read BEFORE file_write \u{2014} always understand what exists.\n\
@@ -579,7 +579,7 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          On your FIRST conversation with a new user, follow this protocol:\n\n\
          1. **Greet** \u{2014} Introduce yourself as {name} with a one-line summary of your specialty.\n\
          2. **Discover** \u{2014} Ask the user's name and one key preference relevant to your domain.\n\
-         3. **Store** \u{2014} Use memory_store to save: user_name, their preference, and today's date as first_interaction.\n\
+         3. **Store** \u{2014} Use memory_store with the exact key \"user_name\" and their name as the value; that key is read into your User Profile. Record their preference as your ## Memory section directs.\n\
          4. **Orient** \u{2014} Briefly explain what you can help with (2-3 bullet points, not a wall of text).\n\
          5. **Serve** \u{2014} If the user included a request in their first message, handle it immediately after steps 1-3.\n\n\
          After bootstrap, this protocol is complete. Focus entirely on the user's needs.\n",
@@ -15511,6 +15511,40 @@ system_prompt = "You are a test agent."
         assert!(kernel2.registry.find_by_name("my-custom-agent").is_some());
 
         kernel2.shutdown();
+    }
+
+    /// ANAI-299. The default AGENTS.md told every new agent to "store important
+    /// context in memory (memory_store)", while the compiled `## Memory`
+    /// section says `memory_store` is NOT memory: recall cannot find it. The
+    /// template must defer to that section rather than restate it, because the
+    /// section is grant-aware and a static file is not. The bootstrap keeps
+    /// exactly one `memory_store` call, for `user_name`, which
+    /// `resolve_user_name` reads by that exact key (ANAI-165).
+    #[test]
+    fn identity_templates_do_not_teach_memory_store_as_memory() {
+        let state_dir = tempfile::TempDir::new().expect("temp state dir");
+        let manifest = AgentManifest {
+            name: "tmpl-test".to_string(),
+            description: "x".to_string(),
+            ..AgentManifest::default()
+        };
+        generate_identity_files(state_dir.path(), &manifest);
+
+        let agents = std::fs::read_to_string(state_dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            !agents.contains("memory_store"),
+            "AGENTS.md must not name memory_store; the ## Memory section owns that doctrine"
+        );
+        assert!(agents.contains("## Memory section"));
+
+        let bootstrap = std::fs::read_to_string(state_dir.path().join("BOOTSTRAP.md")).unwrap();
+        assert_eq!(
+            bootstrap.matches("memory_store").count(),
+            1,
+            "the bootstrap's only memory_store use is the user_name handoff"
+        );
+        assert!(bootstrap.contains("memory_store with the exact key \"user_name\""));
+        assert!(!bootstrap.contains("first_interaction"));
     }
 
     /// Regression for #1097: when a user points an agent's workspace at an
