@@ -73,11 +73,14 @@ const ALWAYS_ON_BUILTIN_TOOLS: &[&str] = &["agent_reply_async"];
 /// this: it is only the no-env-var fallback, and production always threads
 /// the manifest-derived list through `OPENFANG_BRIDGE_ALLOWED`.
 ///
-/// **Admission rule — both halves are required:**
-/// 1. the companion's output is a strict *subset* of what the parent already
-///    returns, so advertising it opens no new data class; and
+/// **Admission rule: same files, same resolver. Both halves are required:**
+/// 1. the companion reaches *no data the parent cannot*: the same files,
+///    read-only, with no subprocess and no side effect. It may present that
+///    data differently (a grep's matching lines, an image block instead of
+///    text), but it opens no new data class; and
 /// 2. it reaches that data through the *same resolver* as the parent, so the
-///    parent's path/permission tiering still applies.
+///    parent's path/permission tiering, including its prompt-tier approval,
+///    still applies.
 ///
 /// This is deliberately not a convenience list. A tool that can reach data,
 /// a subprocess, or a side effect the parent cannot is a new capability and
@@ -85,7 +88,14 @@ const ALWAYS_ON_BUILTIN_TOOLS: &[&str] = &["agent_reply_async"];
 ///
 /// ANAI-296: `file_grep` returns lines from a file that `file_read` already
 /// returns whole, via the same `resolve_with_policy` tiering.
-const COMPANION_TOOL_GRANTS: &[(&str, &[&str])] = &[("file_read", &["file_grep"])];
+///
+/// ANAI-297: `image_read` returns an image file's bytes, which `file_read`
+/// resolves and opens identically (it then refuses them as non-UTF-8, which
+/// is presentation, not access). Same resolver, same pre-pass, read-only.
+/// The rule was reworded from "strict subset of the output" for this: the
+/// old wording made a binary file's *presentation* decide access, which it
+/// never did.
+const COMPANION_TOOL_GRANTS: &[(&str, &[&str])] = &[("file_read", &["file_grep", "image_read"])];
 
 /// True when `tool` is admitted as a companion of some tool the agent
 /// declared. See [`COMPANION_TOOL_GRANTS`].

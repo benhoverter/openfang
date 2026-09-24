@@ -338,7 +338,20 @@ impl ToolDispatcher for IpcDispatcher {
             .map_err(|_| ToolDispatchError::Execution(anyhow!("IPC response dropped")))?;
 
         match result {
-            CallResult::Ok { content, is_error } => Ok(DispatchOk { content, is_error }),
+            CallResult::Ok { content, is_error } => Ok(DispatchOk {
+                content,
+                is_error,
+                images: Vec::new(),
+            }),
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            } => Ok(DispatchOk {
+                content,
+                is_error,
+                images,
+            }),
             CallResult::Error { message } => Err(ToolDispatchError::Execution(anyhow!(message))),
         }
     }

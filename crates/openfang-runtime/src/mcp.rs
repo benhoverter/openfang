@@ -358,6 +358,7 @@ pub const RESERVED_BUILTIN_NAMES: &[&str] = &[
     "file_read",
     "file_list",
     "file_grep",
+    "image_read",
     "file_write",
     "create_directory",
     "web_fetch",

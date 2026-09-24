@@ -41,8 +41,8 @@ use crate::bridge_auth::BridgeAuthority;
 use openfang_kernel::OpenFangKernel;
 use openfang_mcp_bridge::protocol::{
     codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
-    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    SOCKET_RELATIVE_PATH,
+    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, WireImage, MAX_FRAME_BYTES,
+    MAX_WIRE_FRAME_BYTES, PROTOCOL_VERSION, SOCKET_RELATIVE_PATH,
 };
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
@@ -74,6 +74,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     // candidate path re-enters the same resolver, so granting one and denying
     // the other protects nothing.
     "file_grep",
+    // ANAI-297: same files and resolver as file_read. The one built-in whose
+    // result can carry images; see `native_call_result`.
+    "image_read",
     "file_list",
     "file_write",
     "create_directory",
@@ -434,6 +437,10 @@ async fn handle_connection(
                         is_error: false, ..
                     } => "ok",
                     CallResult::Ok { is_error: true, .. } => "tool_error",
+                    CallResult::Rich {
+                        is_error: false, ..
+                    } => "ok",
+                    CallResult::Rich { is_error: true, .. } => "tool_error",
                     CallResult::Error { .. } => "dispatch_error",
                 };
                 info!(
@@ -492,6 +499,31 @@ const FRAME_ENVELOPE_RESERVE: usize = 16 * 1024;
 /// Payload budget for a single response frame, measured in JSON-*escaped*
 /// bytes (see [`json_escaped_cost`]).
 const FRAME_PAYLOAD_BUDGET: usize = MAX_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_RESERVE);
+
+/// Payload budget for a response frame that carries images (ANAI-297).
+///
+/// Images get the headroom between the text cap and the wire ceiling; the
+/// text inside such a frame is still held to [`FRAME_PAYLOAD_BUDGET`]. The
+/// operator's per-image policy is `[media] image_read_max_bytes`, enforced
+/// by the tool before it ever builds a result — this is only the floor that
+/// keeps a frame writable.
+const RICH_PAYLOAD_BUDGET: usize = MAX_WIRE_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_RESERVE);
+
+/// Base64 length of `raw` bytes, with padding.
+const fn base64_len(raw: usize) -> usize {
+    raw.div_ceil(3) * 4
+}
+
+// The largest image an operator may permit, plus a full text result, must
+// fit one rich frame. If someone raises the config ceiling or shrinks the
+// wire ceiling past this, the build fails here instead of the bridge
+// dropping every max-size image at runtime.
+const _: () = assert!(
+    base64_len(openfang_types::media::IMAGE_READ_MAX_BYTES_CEILING as usize)
+        + WIRE_IMAGE_OVERHEAD
+        + FRAME_PAYLOAD_BUDGET
+        <= RICH_PAYLOAD_BUDGET
+);
 
 /// Bytes a single `char` occupies inside a serialized JSON string literal.
 ///
@@ -588,7 +620,69 @@ fn clamp_result_to_frame(result: CallResult) -> (CallResult, Option<usize>) {
             clamped.push_str("\n\n[openfang: error message truncated to fit the bridge frame]");
             (CallResult::Error { message: clamped }, Some(original))
         }
+        CallResult::Rich {
+            content,
+            is_error,
+            images,
+        } => clamp_rich_result(content, is_error, images),
     }
+}
+
+/// Per-image JSON overhead on top of the base64 itself: the object braces,
+/// both key names, quotes and separators. Base64 contains no characters JSON
+/// escapes, so the data costs exactly its length.
+const WIRE_IMAGE_OVERHEAD: usize = 64;
+
+/// Frame clamp for [`CallResult::Rich`] (ANAI-297). Images are all-or-nothing.
+///
+/// Text can be truncated with a marker and still mean something; a base64
+/// payload cut short decodes to a corrupt image that the model receives as a
+/// successful read. So when the whole result will not fit, every image is
+/// dropped and the result becomes an error that says so and why — never a
+/// partial image, and never a text-only success that silently lost its
+/// pixels.
+fn clamp_rich_result(
+    content: String,
+    is_error: bool,
+    images: Vec<WireImage>,
+) -> (CallResult, Option<usize>) {
+    let text_cost: usize = content.chars().map(json_escaped_cost).sum();
+    let image_cost: usize = images
+        .iter()
+        .map(|i| i.data_base64.len() + i.mime_type.len() + WIRE_IMAGE_OVERHEAD)
+        .sum();
+    let total = text_cost + image_cost;
+    // Two gates: the whole frame must fit the rich budget, AND the text
+    // must fit the ordinary text cap. The second is what stops the image
+    // headroom becoming a side door for megabytes of text.
+    if total <= RICH_PAYLOAD_BUDGET && text_cost <= FRAME_PAYLOAD_BUDGET {
+        return (
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            },
+            None,
+        );
+    }
+    let kept = truncate_to_json_budget(&content, FRAME_PAYLOAD_BUDGET / 2);
+    let message = format!(
+        "{kept}\n\n[openfang: {n} image(s) NOT returned — the result is {total} bytes \
+         encoded ({text_cost} of text), over the bridge budget of {budget} bytes \
+         total / {text_budget} bytes of text. Images are never sent partially, \
+         because a truncated image decodes as corrupt yet reads as success. \
+         Nothing above this line is a view of the image.]",
+        n = images.len(),
+        budget = RICH_PAYLOAD_BUDGET,
+        text_budget = FRAME_PAYLOAD_BUDGET,
+    );
+    (
+        CallResult::Ok {
+            content: message,
+            is_error: true,
+        },
+        Some(total),
+    )
 }
 
 /// Dispatch a single bridge tool call to the runtime.
@@ -817,42 +911,90 @@ async fn dispatch_call(
         .get(&resolved_agent_id)
         .map(|r| r.clone());
 
-    let result = openfang_runtime::tool_runner::execute_tool(
-        &format!("bridge-{}", call.request_id),
-        &call.tool_name,
-        &call.args,
-        Some(&kernel_handle),
-        Some(&allowed_tools_owned),
-        Some(resolved_agent_id_string.as_str()),
-        Some(&skill_snapshot),
-        Some(&kernel.mcp_connections),
-        Some(&kernel.web_ctx),
-        Some(&kernel.browser_ctx),
-        allowed_env_arg,
-        workspace_root_arg, // scoped to the authenticated agent's workspace; gated above
-        Some(&kernel.media_engine),
-        effective_exec_policy,
-        entry.manifest.file_policy.as_ref(), // F6: agent's resolved policy (was None — silent tier downgrade on bridge)
-        if kernel.config.tts.enabled {
-            Some(&kernel.tts_engine)
-        } else {
-            None
-        },
-        if kernel.config.docker.enabled {
-            Some(&kernel.config.docker)
-        } else {
-            None
-        },
-        Some(&*kernel.process_manager),
-        // Piece 3 (ANAI-82): in-flight run's origin (targeting/audit only;
-        // authz already enforced off the authenticated agent id above).
-        bridge_origin.as_ref(),
+    // ANAI-297: this path can deliver images (`CallResult::Rich`), so it is
+    // the one caller that scopes the image sink. Every other execute_tool
+    // caller leaves it unset, and image_read refuses there by name.
+    let (result, images) = openfang_runtime::tool_runner::with_image_sink(
+        openfang_runtime::tool_runner::execute_tool(
+            &format!("bridge-{}", call.request_id),
+            &call.tool_name,
+            &call.args,
+            Some(&kernel_handle),
+            Some(&allowed_tools_owned),
+            Some(resolved_agent_id_string.as_str()),
+            Some(&skill_snapshot),
+            Some(&kernel.mcp_connections),
+            Some(&kernel.web_ctx),
+            Some(&kernel.browser_ctx),
+            allowed_env_arg,
+            workspace_root_arg, // scoped to the authenticated agent's workspace; gated above
+            Some(&kernel.media_engine),
+            effective_exec_policy,
+            entry.manifest.file_policy.as_ref(), // F6: agent's resolved policy (was None — silent tier downgrade on bridge)
+            if kernel.config.tts.enabled {
+                Some(&kernel.tts_engine)
+            } else {
+                None
+            },
+            if kernel.config.docker.enabled {
+                Some(&kernel.config.docker)
+            } else {
+                None
+            },
+            Some(&*kernel.process_manager),
+            // Piece 3 (ANAI-82): in-flight run's origin (targeting/audit only;
+            // authz already enforced off the authenticated agent id above).
+            bridge_origin.as_ref(),
+        ),
     )
     .await;
 
-    CallResult::Ok {
+    native_call_result(result, images, call.request_id, &call.tool_name)
+}
+
+/// Build the wire result for a native tool call plus any images it deposited
+/// (ANAI-297).
+///
+/// No images: `CallResult::Ok`, byte-identical to before this existed, which
+/// is every tool but `image_read`. Images ride only on a success. An errored
+/// call that somehow deposited one has it dropped and logged: an error with a
+/// picture attached is ambiguous about which the model should believe, and
+/// `image_read` deposits only after its last check, so this is a guard, not a
+/// path.
+fn native_call_result(
+    result: openfang_types::tool::ToolResult,
+    images: Vec<openfang_runtime::tool_runner::ToolImage>,
+    request_id: u64,
+    tool_name: &str,
+) -> CallResult {
+    if images.is_empty() {
+        return CallResult::Ok {
+            content: result.content,
+            is_error: result.is_error,
+        };
+    }
+    if result.is_error {
+        warn!(
+            request_id,
+            tool = %tool_name,
+            dropped = images.len(),
+            "bridge IPC: tool returned an error AND deposited images; images dropped"
+        );
+        return CallResult::Ok {
+            content: result.content,
+            is_error: true,
+        };
+    }
+    CallResult::Rich {
         content: result.content,
-        is_error: result.is_error,
+        is_error: false,
+        images: images
+            .into_iter()
+            .map(|i| WireImage {
+                mime_type: i.mime_type,
+                data_base64: i.data_base64,
+            })
+            .collect(),
     }
 }
 
@@ -1362,6 +1504,208 @@ mod tests {
             CallResult::Ok { is_error, .. } => assert!(is_error),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    // ---- ANAI-297: native results with images ------------------------------
+
+    fn tool_result(content: &str, is_error: bool) -> openfang_types::tool::ToolResult {
+        openfang_types::tool::ToolResult {
+            tool_use_id: "t".to_string(),
+            content: content.to_string(),
+            is_error,
+        }
+    }
+
+    fn tool_png() -> openfang_runtime::tool_runner::ToolImage {
+        openfang_runtime::tool_runner::ToolImage {
+            mime_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+        }
+    }
+
+    /// Every tool but image_read: the wire result must be exactly what it was
+    /// before images existed.
+    #[test]
+    fn a_native_result_without_images_is_unchanged() {
+        for is_error in [false, true] {
+            match native_call_result(tool_result("hello", is_error), Vec::new(), 1, "file_read") {
+                CallResult::Ok {
+                    content,
+                    is_error: e,
+                } => {
+                    assert_eq!(content, "hello");
+                    assert_eq!(e, is_error);
+                }
+                other => panic!("text-only result must stay Ok, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_successful_native_result_with_an_image_goes_rich() {
+        match native_call_result(
+            tool_result("header", false),
+            vec![tool_png()],
+            1,
+            "image_read",
+        ) {
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            } => {
+                assert_eq!(content, "header");
+                assert!(!is_error);
+                assert_eq!(
+                    images,
+                    vec![WireImage {
+                        mime_type: "image/png".to_string(),
+                        data_base64: "iVBORw0KGgo=".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_errored_native_result_never_carries_an_image() {
+        match native_call_result(
+            tool_result("Error: nope", true),
+            vec![tool_png()],
+            1,
+            "image_read",
+        ) {
+            CallResult::Ok { content, is_error } => {
+                assert_eq!(content, "Error: nope");
+                assert!(is_error);
+            }
+            other => panic!("an error must not go Rich, got {other:?}"),
+        }
+    }
+
+    fn wire_png(len: usize) -> WireImage {
+        WireImage {
+            mime_type: "image/png".to_string(),
+            data_base64: "A".repeat(len),
+        }
+    }
+
+    // ANAI-297: an image result that fits passes through untouched, image and
+    // all, and the frame the codec would write is within the limit.
+    #[test]
+    fn a_rich_result_that_fits_passes_through_whole() {
+        let img = wire_png(900 * 1024);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![img.clone()],
+        });
+        assert_eq!(clamped, None);
+        match &out {
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            } => {
+                assert_eq!(content, "header");
+                assert!(!is_error);
+                assert_eq!(images, &vec![img]);
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    // The load-bearing ANAI-297 clamp test. An image that does not fit is
+    // dropped WHOLE: no partial base64 survives, the result is an error, and
+    // the message says the image was not returned. A text-style truncation
+    // here would hand the model a corrupt image flagged as a successful read.
+    #[test]
+    fn an_oversized_rich_result_drops_images_whole_and_errors() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![wire_png(RICH_PAYLOAD_BUDGET + 1)],
+        });
+        assert!(clamped.is_some(), "caller must learn the original size");
+        match &out {
+            CallResult::Ok { content, is_error } => {
+                assert!(*is_error, "a dropped image must never read as success");
+                assert!(content.contains("NOT returned"), "{content}");
+                assert!(
+                    !content.contains("AAAA"),
+                    "no fragment of the image data may leak into the text"
+                );
+            }
+            other => panic!("expected a text-only error result, got {other:?}"),
+        }
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    // ANAI-297 config split: an image at the operator ceiling — larger than
+    // the whole 1 MiB text cap — passes, and its frame is writable by the
+    // codec. Before the split this was dropped at any size over ~1 MiB.
+    #[test]
+    fn an_image_at_the_config_ceiling_passes_and_fits_the_wire() {
+        let at_ceiling = base64_len(openfang_types::media::IMAGE_READ_MAX_BYTES_CEILING as usize);
+        assert!(
+            at_ceiling > MAX_FRAME_BYTES,
+            "test must exceed the text cap"
+        );
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![wire_png(at_ceiling)],
+        });
+        assert_eq!(clamped, None);
+        assert!(matches!(
+            out,
+            CallResult::Rich {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(encoded_frame_len(out) <= MAX_WIRE_FRAME_BYTES);
+    }
+
+    // The side-door guard. The image headroom must not let TEXT past the
+    // 1 MiB cap: a rich result whose text alone is over it is refused, even
+    // though text + image would fit the larger rich budget.
+    #[test]
+    fn image_headroom_does_not_raise_the_text_cap() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "t".repeat(FRAME_PAYLOAD_BUDGET + 1),
+            is_error: false,
+            images: vec![wire_png(1024)],
+        });
+        assert!(clamped.is_some());
+        match &out {
+            CallResult::Ok { content, is_error } => {
+                assert!(*is_error);
+                assert!(
+                    content.len() <= FRAME_PAYLOAD_BUDGET,
+                    "text must come back capped"
+                );
+            }
+            other => panic!("expected a text-only error result, got {other:?}"),
+        }
+    }
+
+    // Two images that each fit but together do not are refused together:
+    // the budget is the whole frame, not per image.
+    #[test]
+    fn images_are_budgeted_as_a_set_not_individually() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: String::new(),
+            is_error: false,
+            images: vec![
+                wire_png(RICH_PAYLOAD_BUDGET / 2 + 1024),
+                wire_png(RICH_PAYLOAD_BUDGET / 2 + 1024),
+            ],
+        });
+        assert!(clamped.is_some());
+        assert!(matches!(out, CallResult::Ok { is_error: true, .. }));
     }
 
     /// End-to-end wire-shape test: bind a listener at a tempfile path,
@@ -2120,10 +2464,12 @@ mod tests {
         // ANAI-292: 35 -> 36 (`file_grep`). NOT privileged-deny — it is
         // granted alongside `file_read`, so `DEFAULT_ALLOWED` moves with it,
         // 26 -> 27, and `PRIVILEGED_DEFAULT_DENY` stays at 9.
-        assert_eq!(ALLOWED_TOOLS.len(), 36, "ALLOWED_TOOLS surface cardinality");
+        // ANAI-297: 36 -> 37 (`image_read`). Granted with file_read, so
+        // `DEFAULT_ALLOWED` moves too, 27 -> 28.
+        assert_eq!(ALLOWED_TOOLS.len(), 37, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            36,
+            37,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
@@ -2133,8 +2479,8 @@ mod tests {
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
-            27,
-            "DEFAULT_ALLOWED bridge-default cardinality (36 − 9 privileged)"
+            28,
+            "DEFAULT_ALLOWED bridge-default cardinality (37 − 9 privileged)"
         );
     }
 

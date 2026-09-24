@@ -37,6 +37,7 @@ const MAX_AGENT_CALL_DEPTH: u32 = 5;
 pub const FS_SANDBOXED_TOOLS: &[&str] = &[
     "file_read",
     "file_grep",
+    "image_read",
     "file_list",
     "file_write",
     "create_directory",
@@ -708,6 +709,31 @@ pub async fn execute_tool(
             )
             .await
         }
+        // ANAI-297. The limit is operator policy from `[media]`; with no
+        // media engine in scope (tests, bare call paths) the compiled default
+        // applies, which is also what an unconfigured host gets.
+        "image_read" => {
+            let limit = media_engine
+                .map(|e| e.config().effective_image_read_max_bytes())
+                .unwrap_or_else(|| {
+                    openfang_types::media::MediaConfig::default().effective_image_read_max_bytes()
+                });
+            if let Some(requested) = limit.clamped_from {
+                warn!(
+                    requested,
+                    enforced = limit.max_bytes,
+                    "image_read: [media] image_read_max_bytes is outside the valid band; clamped"
+                );
+            }
+            tool_image_read(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+                limit,
+            )
+            .await
+        }
         "create_directory" => {
             tool_create_directory(
                 input,
@@ -1159,6 +1185,26 @@ pub const FILE_READ_DESCRIPTION: &str = "Read the contents of a file. Paths are 
 /// `FILE_READ_DESCRIPTION` is.
 pub const FILE_GREP_DESCRIPTION: &str = "Search a file, or recursively a directory, for a regular expression and get back the matching LINE NUMBERS with their text. Paths are relative to the agent workspace. The line numbers are 1-based and can be passed straight to file_read's offset, which is the point: for anything large, grep for the anchor and then read that range, instead of pulling a whole file into context. Exposes strictly less than file_read already does, and resolves every path through the same policy, so it reaches nothing file_read would refuse. Every bound that bites is disclosed in the result - the match cap, the file cap, skipped binaries, and the build/VCS directories not descended into - because a silent cap reads as an absence of matches.";
 
+/// Advertised description for `image_read` (ANAI-297). Shared with the
+/// bridge's copy and pinned equal by a cross-crate test, like the two above.
+///
+/// States what a caller cannot discover by trying: that the format is decided
+/// by the bytes, that the size limit refuses rather than truncates, and that
+/// SVG belongs to `file_read`.
+pub const IMAGE_READ_DESCRIPTION: &str = "Look at an image file. Returns the image itself (PNG, JPEG, GIF or WebP) as an image you can see, plus one line of text giving its type, size and sha256. Paths are relative to the agent workspace and resolve through the same file policy as file_read, so it reaches exactly the files file_read reaches. The type is decided by the file's bytes, not its name. A file over the operator's size limit ([media] image_read_max_bytes, default 3,750,000 bytes) is refused whole, never truncated. SVG is text: read it with file_read.";
+
+/// `image_read`'s advertised argument schema (ANAI-297). Duplicated in the
+/// bridge and pinned equal by a cross-crate test in `openfang-api`.
+pub fn image_read_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": { "type": "string", "description": "The image file to read" }
+        },
+        "required": ["path"]
+    })
+}
+
 /// `file_grep`'s advertised argument schema. Duplicated in the bridge (the
 /// crate seam is one-way) and pinned equal by a cross-crate test in
 /// `openfang-api`.
@@ -1222,6 +1268,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             name: "file_grep".to_string(),
             description: FILE_GREP_DESCRIPTION.to_string(),
             input_schema: file_grep_input_schema(),
+        },
+        ToolDefinition {
+            name: "image_read".to_string(),
+            description: IMAGE_READ_DESCRIPTION.to_string(),
+            input_schema: image_read_input_schema(),
         },
         ToolDefinition {
             name: "create_directory".to_string(),
@@ -2158,7 +2209,7 @@ fn fs_tool_single_path<'a>(
     input: &'a serde_json::Value,
 ) -> Option<(bool, &'a str)> {
     let needs_write = match tool_name {
-        "file_read" | "file_list" | "file_grep" => false,
+        "file_read" | "file_list" | "file_grep" | "image_read" => false,
         "file_write" | "create_directory" => true,
         _ => return None,
     };
@@ -2335,6 +2386,11 @@ fn sniff_binary_format(head: &[u8]) -> Option<&'static str> {
         (b"SQLite format 3\0", "SQLite database"),
         (b"\x1f\x8b", "gzip"),
     ];
+    // WebP is `RIFF<size>WEBP`: the discriminating bytes sit after a length
+    // field, so it cannot be a plain prefix row above.
+    if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        return Some("WebP");
+    }
     SIGNATURES
         .iter()
         .find(|(sig, _)| head.starts_with(sig))
@@ -2351,6 +2407,11 @@ fn utf8_read_error(raw_path: &str, head: &[u8]) -> String {
              file_convert(to=\"txt\", path=\"{raw_path}\") returns a path you can file_read. \
              file_convert follows the same file_policy as file_read, so any PDF you can read \
              you can convert; pass an 'output' you can write if this location is read-only."
+        ),
+        Some(fmt @ ("PNG" | "JPEG" | "GIF" | "WebP")) => format!(
+            "'{raw_path}' is not valid UTF-8 text: it is a {fmt} image. file_read only \
+             returns text. To look at it, call image_read(path=\"{raw_path}\"), which \
+             returns the image itself."
         ),
         Some(fmt) => format!(
             "'{raw_path}' is not valid UTF-8 text: it looks like {fmt}. file_read returns \
@@ -2397,6 +2458,189 @@ fn parse_line_arg(input: &serde_json::Value, key: &str) -> Result<Option<usize>,
         ));
     }
     Ok(Some(value as usize))
+}
+
+// ---------------------------------------------------------------------------
+// image_read (ANAI-297)
+// ---------------------------------------------------------------------------
+
+/// One image a tool hands back to the model beside its text result
+/// (ANAI-297). `data_base64` is standard base64 of the file's bytes exactly as
+/// on disk; `mime_type` comes from the file's leading bytes, never its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolImage {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime_type: String,
+    /// Standard, padded base64 of the raw file.
+    pub data_base64: String,
+}
+
+tokio::task_local! {
+    /// Where an image-producing tool deposits its images (ANAI-297).
+    ///
+    /// `ToolResult` is text-only and is built in well over a hundred places,
+    /// so images travel beside it rather than inside it. Only a caller that
+    /// can actually deliver images to the model scopes this: today, the bridge
+    /// IPC dispatcher, via [`with_image_sink`]. Every other path (native
+    /// drivers, the HTTP `/mcp` route) leaves it unset, and `image_read`
+    /// refuses there rather than returning a text-only "success" that quietly
+    /// lost its pixels.
+    static IMAGE_SINK: std::cell::RefCell<Vec<ToolImage>>;
+}
+
+/// Run `fut` (normally an [`execute_tool`] call) with an image sink in scope,
+/// and return its output together with any images a tool deposited.
+///
+/// Scoping the sink is a promise that the caller delivers what lands in it.
+/// Do not wrap a call whose images you would drop.
+pub async fn with_image_sink<T, F>(fut: F) -> (T, Vec<ToolImage>)
+where
+    F: std::future::Future<Output = T>,
+{
+    IMAGE_SINK
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            let images = IMAGE_SINK.with(|sink| std::mem::take(&mut *sink.borrow_mut()));
+            (out, images)
+        })
+        .await
+}
+
+/// Identify an image format `image_read` returns, from the file's leading
+/// bytes. These four are the formats the model accepts; anything else is
+/// refused by name rather than forwarded to fail at the provider.
+fn sniff_image_mime(head: &[u8]) -> Option<&'static str> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if head.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Signpost for a file `image_read` will not return: what it looks like, and
+/// the tool that would work.
+fn image_read_format_error(raw_path: &str, head: &[u8]) -> String {
+    let start = head
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(head.len());
+    let text_head = &head[start..];
+    if text_head.starts_with(b"<svg") || text_head.starts_with(b"<?xml") {
+        return format!(
+            "'{raw_path}' looks like SVG or other XML, which is text, not a raster \
+             image. image_read returns PNG, JPEG, GIF or WebP only. Read it with \
+             file_read. Nothing was returned."
+        );
+    }
+    match sniff_binary_format(head) {
+        Some(fmt) => format!(
+            "'{raw_path}' looks like {fmt}, which is not a format image_read returns \
+             (PNG, JPEG, GIF, WebP). Nothing was returned."
+        ),
+        None => format!(
+            "'{raw_path}' does not start with the signature of PNG, JPEG, GIF or WebP, \
+             the only formats image_read returns. The type is decided by the file's \
+             bytes, not its name. Nothing was returned."
+        ),
+    }
+}
+
+/// Refuse an image over the operator's limit. Whole-file only: a cut-off
+/// image decodes as corrupt yet reads as a successful read.
+fn check_image_size(
+    raw_path: &str,
+    size: u64,
+    limit: openfang_types::media::ImageReadLimit,
+) -> Result<(), String> {
+    if size > limit.max_bytes {
+        return Err(format!(
+            "'{raw_path}' is {size} bytes, over image_read's limit of {} bytes \
+             ([media] image_read_max_bytes in config.toml). Nothing was returned: \
+             images are never truncated, because a cut-off image decodes as corrupt \
+             yet reads as a successful read. Downscale or recompress it and read \
+             the smaller copy.",
+            limit.max_bytes
+        ));
+    }
+    Ok(())
+}
+
+/// `image_read` (ANAI-297): return an image file to the model as an image.
+///
+/// Path resolution, tiering and prompt-tier approval are `file_read`'s,
+/// unchanged: the same `resolve_file_path(.., needs_write = false)`, the same
+/// pre-pass in [`execute_tool`], the same prevalidated-path check. So it
+/// reaches exactly the files `file_read` reaches, which is the admission
+/// condition for its companion grant in the kernel.
+///
+/// The image is deposited in [`IMAGE_SINK`] only on success, and only after
+/// every check has passed, so an error never carries a picture.
+async fn tool_image_read(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
+    limit: openfang_types::media::ImageReadLimit,
+) -> Result<String, String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
+
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|e| format!("Failed to read file: {e}"))?;
+    if meta.is_dir() {
+        return Err(format!(
+            "'{raw_path}' is a directory, not a file. Use file_list to enumerate it."
+        ));
+    }
+    if meta.len() == 0 {
+        return Err(format!(
+            "'{raw_path}' is empty (0 bytes), so there is no image to return."
+        ));
+    }
+    check_image_size(raw_path, meta.len(), limit)?;
+
+    // Refuse before reading when nothing downstream can carry the image.
+    if IMAGE_SINK.try_with(|_| ()).is_err() {
+        return Err(format!(
+            "image_read cannot return '{raw_path}' here: images are only carried by \
+             the Claude Code bridge, and this call arrived through a text-only path. \
+             Nothing was returned. This is a limit of the calling path, not of the file."
+        ));
+    }
+
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|e| format!("Failed to read file: {e}"))?;
+    // Again on the bytes actually read: the file can grow between stat and read.
+    check_image_size(raw_path, bytes.len() as u64, limit)?;
+    let mime = sniff_image_mime(leading_bytes(&bytes))
+        .ok_or_else(|| image_read_format_error(raw_path, leading_bytes(&bytes)))?;
+
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let image = ToolImage {
+        mime_type: mime.to_string(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    };
+    IMAGE_SINK
+        .try_with(|sink| sink.borrow_mut().push(image))
+        .map_err(|_| "image_read lost its image sink mid-call; nothing was returned".to_string())?;
+
+    Ok(format!(
+        "[openfang image_read: '{raw_path}' | {mime} | {} bytes | sha256 {sha256}]\n\
+         The image follows as a separate image block.",
+        bytes.len()
+    ))
 }
 
 async fn tool_file_read(
@@ -14157,5 +14401,272 @@ impl ReplyRight {
     /// emits exactly one `channel_send(surface_to, ...)`.
     pub fn surface_to(&self) -> Option<&str> {
         self.surface_to.as_deref()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// image_read (ANAI-297)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod image_read_tests {
+    use super::*;
+    use base64::Engine;
+    use openfang_types::media::ImageReadLimit;
+
+    const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    fn limit(max_bytes: u64) -> ImageReadLimit {
+        ImageReadLimit {
+            max_bytes,
+            clamped_from: None,
+        }
+    }
+
+    fn with_sig(sig: &[u8], len: usize) -> Vec<u8> {
+        let mut v = sig.to_vec();
+        v.resize(len.max(sig.len()), 0xAB);
+        v
+    }
+
+    fn webp(len: usize) -> Vec<u8> {
+        let mut v = b"RIFF\x00\x00\x00\x00WEBPVP8 ".to_vec();
+        v.resize(len.max(v.len()), 0x11);
+        v
+    }
+
+    async fn read_in_sink(
+        root: &Path,
+        path: &str,
+        max_bytes: u64,
+    ) -> (Result<String, String>, Vec<ToolImage>) {
+        with_image_sink(tool_image_read(
+            &serde_json::json!({ "path": path }),
+            Some(root),
+            None,
+            None,
+            limit(max_bytes),
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn returns_the_bytes_on_disk_as_exactly_one_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = with_sig(PNG_SIG, 300);
+        std::fs::write(dir.path().join("a.png"), &bytes).unwrap();
+
+        let (res, images) = read_in_sink(dir.path(), "a.png", 1_000_000).await;
+        let text = res.expect("a PNG inside the workspace must read");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&images[0].data_base64)
+            .unwrap();
+        assert_eq!(
+            decoded, bytes,
+            "the image must be the file's bytes, unaltered"
+        );
+        assert!(text.contains("image/png"), "{text}");
+        assert!(text.contains("300 bytes"), "{text}");
+        assert!(text.contains("sha256 "), "{text}");
+    }
+
+    /// The name is a claim; the bytes are the fact. A mislabelled file must be
+    /// sent with its real type, or the provider rejects it after the upload.
+    #[tokio::test]
+    async fn the_type_comes_from_the_bytes_not_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("really-jpeg.png"),
+            with_sig(b"\xff\xd8\xff\xe0", 64),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("really-webp.jpg"), webp(64)).unwrap();
+        std::fs::write(dir.path().join("really-gif.bin"), with_sig(b"GIF89a", 64)).unwrap();
+
+        for (path, mime) in [
+            ("really-jpeg.png", "image/jpeg"),
+            ("really-webp.jpg", "image/webp"),
+            ("really-gif.bin", "image/gif"),
+        ] {
+            let (res, images) = read_in_sink(dir.path(), path, 1_000_000).await;
+            res.unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(images[0].mime_type, mime, "{path}");
+        }
+    }
+
+    /// The load-bearing refusal. Outside the bridge nothing can carry the
+    /// image, and a text-only success would read as "I looked at it".
+    #[tokio::test]
+    async fn refuses_on_a_text_only_path_instead_of_succeeding_without_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), with_sig(PNG_SIG, 64)).unwrap();
+
+        let err = tool_image_read(
+            &serde_json::json!({ "path": "a.png" }),
+            Some(dir.path()),
+            None,
+            None,
+            limit(1_000_000),
+        )
+        .await
+        .expect_err("no sink in scope: must refuse, not succeed");
+        assert!(err.contains("text-only path"), "{err}");
+        assert!(err.contains("Nothing was returned"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn over_the_limit_is_refused_whole_and_at_the_limit_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("big.png"), with_sig(PNG_SIG, 301)).unwrap();
+        std::fs::write(dir.path().join("fits.png"), with_sig(PNG_SIG, 300)).unwrap();
+
+        let (res, images) = read_in_sink(dir.path(), "big.png", 300).await;
+        let err = res.expect_err("one byte over must refuse");
+        assert!(err.contains("301 bytes"), "{err}");
+        assert!(
+            err.contains("image_read_max_bytes"),
+            "names the setting: {err}"
+        );
+        assert!(images.is_empty(), "a refused read must deposit nothing");
+
+        let (res, images) = read_in_sink(dir.path(), "fits.png", 300).await;
+        res.expect("exactly at the limit must pass");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_images_are_refused_by_name_and_deposit_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("logo.svg"),
+            b"  <svg xmlns=\"http://www.w3.org/2000/svg\"></svg>",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("doc.png"), b"%PDF-1.7 not an image").unwrap();
+        std::fs::write(dir.path().join("notes.png"), b"just some text").unwrap();
+
+        let cases = [
+            ("logo.svg", "file_read"),
+            ("doc.png", "PDF"),
+            ("notes.png", "not its name"),
+        ];
+        for (path, needle) in cases {
+            let (res, images) = read_in_sink(dir.path(), path, 1_000_000).await;
+            let err = res.expect_err(path);
+            assert!(err.contains(needle), "{path}: {err}");
+            assert!(images.is_empty(), "{path}: deposited an image on refusal");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_files_and_directories_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("empty.png"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+        let (res, _) = read_in_sink(dir.path(), "empty.png", 1_000_000).await;
+        assert!(res.unwrap_err().contains("empty"));
+        let (res, _) = read_in_sink(dir.path(), "sub", 1_000_000).await;
+        assert!(res.unwrap_err().contains("directory"));
+    }
+
+    /// The companion-grant admission condition, as behaviour: image_read
+    /// reaches nothing file_read would refuse, because it asks the same
+    /// resolver the same question.
+    #[tokio::test]
+    async fn reaches_nothing_file_read_would_refuse() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let foreign = outside.path().join("secret.png");
+        std::fs::write(&foreign, with_sig(PNG_SIG, 64)).unwrap();
+        let foreign = foreign.to_str().unwrap().to_string();
+
+        for path in [foreign.as_str(), "../secret.png"] {
+            let read = tool_file_read(
+                &serde_json::json!({ "path": path }),
+                Some(workspace.path()),
+                None,
+                None,
+            )
+            .await;
+            assert!(read.is_err(), "precondition: file_read refuses {path}");
+
+            let (res, images) = read_in_sink(workspace.path(), path, 1_000_000).await;
+            assert!(res.is_err(), "image_read must refuse {path} too");
+            assert!(images.is_empty(), "{path}: deposited an image on refusal");
+        }
+    }
+
+    /// End to end through `execute_tool`: the dispatch arm exists, the
+    /// compiled-default limit applies with no media engine, and file_read on
+    /// the same file points at image_read instead of dead-ending.
+    #[tokio::test]
+    async fn execute_tool_dispatches_it_and_file_read_signposts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot.png"), with_sig(PNG_SIG, 128)).unwrap();
+
+        let (result, images) = with_image_sink(execute_tool(
+            "t",
+            "image_read",
+            &serde_json::json!({ "path": "shot.png" }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+            None, // media_engine
+            None, // exec_policy
+            None, // file_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+            None, // origin
+        ))
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(images.len(), 1);
+
+        let read = execute_tool(
+            "t",
+            "file_read",
+            &serde_json::json!({ "path": "shot.png" }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(dir.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(read.is_error);
+        assert!(
+            read.content.contains("image_read(path=\"shot.png\")"),
+            "file_read on an image must name the call that works: {}",
+            read.content
+        );
+    }
+
+    #[test]
+    fn webp_is_recognised_by_the_file_read_signpost_too() {
+        assert_eq!(sniff_binary_format(&webp(16)), Some("WebP"));
+        assert_eq!(sniff_image_mime(&webp(16)), Some("image/webp"));
+        // RIFF alone is WAV/AVI territory, not an image.
+        let wav = b"RIFF\x00\x00\x00\x00WAVEfmt ";
+        assert_eq!(sniff_image_mime(wav), None);
     }
 }

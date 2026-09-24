@@ -14,9 +14,11 @@
 //! ## Framing
 //!
 //! Each message is a 4-byte big-endian length prefix followed by that many
-//! bytes of UTF-8 JSON. No nested length fields, no streaming. Messages are
-//! capped at [`MAX_FRAME_BYTES`] to bound memory; oversized frames are an
-//! error and the connection is closed.
+//! bytes of UTF-8 JSON. No nested length fields, no streaming. Frames are
+//! capped at [`MAX_WIRE_FRAME_BYTES`] to bound memory; oversized frames are an
+//! error and the connection is closed. *Text* results are held to the much
+//! smaller [`MAX_FRAME_BYTES`] by the daemon before framing; only image
+//! results (ANAI-297) use the headroom between the two.
 //!
 //! ## Versioning
 //!
@@ -29,10 +31,24 @@ use serde::{Deserialize, Serialize};
 /// Wire protocol version. Bumped on incompatible changes.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Maximum size of a single framed message, in bytes (1 MiB).
+/// Text budget for a single tool result, in bytes (1 MiB).
 ///
-/// Tool results that exceed this are truncated by the daemon before framing.
+/// Tool results whose *text* exceeds this are truncated by the daemon
+/// before framing. This is the context-safety cap, and it is deliberately
+/// NOT raised for images: before ANAI-297 it was also the wire ceiling, and
+/// the text truncation budget is derived from it, so raising it to fit an
+/// image would have let a large `file_read` put megabytes of text in context.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Hard ceiling on a single frame on the wire, in bytes (8 MiB).
+///
+/// Bounds the codec's allocation. Sized to hold a full text result
+/// ([`MAX_FRAME_BYTES`]) *plus* one image at the operator's largest
+/// permitted `[media] image_read_max_bytes` after base64 expansion (the
+/// 3.75 MB ceiling encodes to 5,000,000 bytes). The daemon enforces the
+/// operator's limit; this constant only has to be at least that big, which
+/// the daemon asserts at compile time.
+pub const MAX_WIRE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default unix socket path, relative to the OpenFang home directory.
 ///
@@ -114,6 +130,32 @@ pub enum CallResult {
     /// permitted, malformed args, internal panic). Distinct from `Ok { is_error: true }`,
     /// which means the tool itself returned an error result.
     Error { message: String },
+    /// Tool executed and returned image content alongside its text (ANAI-297).
+    ///
+    /// A separate variant rather than a new field on [`CallResult::Ok`] so the
+    /// text-only path — every tool but `image_read` — is byte-identical on the
+    /// wire and every existing `Ok` pattern stays exhaustive. No protocol
+    /// version bump: only a bridge that advertises `image_read` can provoke
+    /// one, and bridge and daemon ship from the same build.
+    ///
+    /// Images are never partially sent. If the frame cannot hold them whole,
+    /// the daemon drops them and returns an error instead — a truncated base64
+    /// payload decodes to a corrupt image that still reads as success.
+    Rich {
+        content: String,
+        is_error: bool,
+        images: Vec<WireImage>,
+    },
+}
+
+/// One image carried by [`CallResult::Rich`]: base64 data plus its MIME type,
+/// which the bridge maps straight onto an MCP image content block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireImage {
+    /// MIME type, one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub mime_type: String,
+    /// Standard base64 (with padding) of the image bytes.
+    pub data_base64: String,
 }
 
 /// Bridge → daemon: request the list of upstream MCP tools the calling
@@ -205,17 +247,17 @@ pub mod codec {
     //! feature so the bare protocol types stay usable in `no-tokio` contexts
     //! (tests, type-only consumers).
 
-    use super::{Frame, MAX_FRAME_BYTES};
+    use super::{Frame, MAX_WIRE_FRAME_BYTES};
     use std::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Read one length-prefixed JSON frame from `r`.
     pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> io::Result<Frame> {
         let len = r.read_u32().await? as usize;
-        if len == 0 || len > MAX_FRAME_BYTES {
+        if len == 0 || len > MAX_WIRE_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("frame size {len} out of bounds (max {MAX_FRAME_BYTES})"),
+                format!("frame size {len} out of bounds (max {MAX_WIRE_FRAME_BYTES})"),
             ));
         }
         let mut buf = vec![0u8; len];
@@ -228,13 +270,13 @@ pub mod codec {
     pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
         let bytes = serde_json::to_vec(frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("encode: {e}")))?;
-        if bytes.len() > MAX_FRAME_BYTES {
+        if bytes.len() > MAX_WIRE_FRAME_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "frame size {} exceeds MAX_FRAME_BYTES {}",
+                    "frame size {} exceeds MAX_WIRE_FRAME_BYTES {}",
                     bytes.len(),
-                    MAX_FRAME_BYTES
+                    MAX_WIRE_FRAME_BYTES
                 ),
             ));
         }
@@ -285,6 +327,41 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    // ANAI-297: an image result survives the wire intact, and the text-only
+    // `Ok` shape is untouched by the new variant (no `images` key leaks in).
+    #[test]
+    fn frame_roundtrip_response_rich_carries_images() {
+        let img = WireImage {
+            mime_type: "image/webp".into(),
+            data_base64: "UklGRg==".into(),
+        };
+        let frame = Frame::Response(CallResponse {
+            request_id: 9,
+            result: CallResult::Rich {
+                content: "header".into(),
+                is_error: false,
+                images: vec![img.clone()],
+            },
+        });
+        let s = serde_json::to_string(&frame).unwrap();
+        assert!(s.contains("\"rich\""));
+        let back: Frame = serde_json::from_str(&s).unwrap();
+        match back {
+            Frame::Response(CallResponse {
+                result: CallResult::Rich { images, .. },
+                ..
+            }) => assert_eq!(images, vec![img]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let plain = serde_json::to_string(&CallResult::Ok {
+            content: "x".into(),
+            is_error: false,
+        })
+        .unwrap();
+        assert!(!plain.contains("images"), "{plain}");
     }
 
     #[test]

@@ -134,6 +134,73 @@ pub struct MediaConfig {
     /// Closes <https://github.com/RightNow-AI/openfang/issues/1051>.
     #[serde(default)]
     pub image_gen_base_url: Option<String>,
+
+    /// Largest image file, in raw bytes on disk, that `image_read` will
+    /// return to the model (ANAI-297). Larger files are refused with an
+    /// error naming the size and this setting — never truncated, since a
+    /// cut-off image decodes as corrupt yet reads as success.
+    ///
+    /// Token cost is set by pixel dimensions, not file size, so this knob
+    /// governs upload size and memory, not context spend. It is clamped to
+    /// [`IMAGE_READ_MAX_BYTES_CEILING`] (the provider's per-image limit after
+    /// base64's 4/3 expansion); a value above it is lowered and the clamp is
+    /// logged, never silently honored. See [`MediaConfig::effective_image_read_max_bytes`].
+    ///
+    /// ```toml
+    /// [media]
+    /// image_read_max_bytes = 3750000
+    /// ```
+    pub image_read_max_bytes: u64,
+}
+
+/// Hard ceiling on [`MediaConfig::image_read_max_bytes`], in raw bytes.
+///
+/// Anthropic rejects a single image whose base64 exceeds 5,000,000 bytes.
+/// Base64 is 4/3 of raw, so 3,750,000 raw is the largest file that can pass.
+/// An operator value above this would only produce images the API refuses
+/// after the upload, so it is clamped here instead.
+pub const IMAGE_READ_MAX_BYTES_CEILING: u64 = 3_750_000;
+
+/// Default for [`MediaConfig::image_read_max_bytes`]: the ceiling itself, so
+/// out of the box every image the API would accept is readable.
+pub const DEFAULT_IMAGE_READ_MAX_BYTES: u64 = IMAGE_READ_MAX_BYTES_CEILING;
+
+/// The image-size limit actually enforced, plus disclosure of any clamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageReadLimit {
+    /// Raw-byte limit `image_read` enforces.
+    pub max_bytes: u64,
+    /// The configured value, when it was outside the valid band and had to
+    /// be clamped. `None` when the configured value was used as-is.
+    pub clamped_from: Option<u64>,
+}
+
+impl MediaConfig {
+    /// Resolve `image_read_max_bytes` into the limit actually enforced.
+    ///
+    /// Above [`IMAGE_READ_MAX_BYTES_CEILING`] clamps down to it; `0` would
+    /// refuse every image, which is never what an operator means, so it
+    /// falls back to the default. Either adjustment is reported in
+    /// `clamped_from` so the caller can log requested *and* enforced values.
+    pub fn effective_image_read_max_bytes(&self) -> ImageReadLimit {
+        let requested = self.image_read_max_bytes;
+        if requested == 0 {
+            ImageReadLimit {
+                max_bytes: DEFAULT_IMAGE_READ_MAX_BYTES,
+                clamped_from: Some(0),
+            }
+        } else if requested > IMAGE_READ_MAX_BYTES_CEILING {
+            ImageReadLimit {
+                max_bytes: IMAGE_READ_MAX_BYTES_CEILING,
+                clamped_from: Some(requested),
+            }
+        } else {
+            ImageReadLimit {
+                max_bytes: requested,
+                clamped_from: None,
+            }
+        }
+    }
 }
 
 impl Default for MediaConfig {
@@ -149,6 +216,7 @@ impl Default for MediaConfig {
             tts_openai_base_url: None,
             tts_elevenlabs_base_url: None,
             image_gen_base_url: None,
+            image_read_max_bytes: DEFAULT_IMAGE_READ_MAX_BYTES,
         }
     }
 }
@@ -487,6 +555,54 @@ mod tests {
         assert!(parsed.tts_openai_base_url.is_none());
         assert!(parsed.tts_elevenlabs_base_url.is_none());
         assert!(parsed.image_gen_base_url.is_none());
+        assert_eq!(parsed.image_read_max_bytes, DEFAULT_IMAGE_READ_MAX_BYTES);
+    }
+
+    // ANAI-297: the image_read limit is operator-set in config.toml, and the
+    // three bands resolve distinctly — in-band as-is, over-ceiling clamped
+    // down, zero falls back — with every adjustment disclosed.
+    #[test]
+    fn image_read_max_bytes_parses_from_toml_and_clamps() {
+        let parsed: MediaConfig = toml::from_str("image_read_max_bytes = 2000000").unwrap();
+        assert_eq!(
+            parsed.effective_image_read_max_bytes(),
+            ImageReadLimit {
+                max_bytes: 2_000_000,
+                clamped_from: None
+            }
+        );
+
+        let over = MediaConfig {
+            image_read_max_bytes: 20_000_000,
+            ..MediaConfig::default()
+        };
+        assert_eq!(
+            over.effective_image_read_max_bytes(),
+            ImageReadLimit {
+                max_bytes: IMAGE_READ_MAX_BYTES_CEILING,
+                clamped_from: Some(20_000_000)
+            }
+        );
+
+        let zero = MediaConfig {
+            image_read_max_bytes: 0,
+            ..MediaConfig::default()
+        };
+        assert_eq!(
+            zero.effective_image_read_max_bytes(),
+            ImageReadLimit {
+                max_bytes: DEFAULT_IMAGE_READ_MAX_BYTES,
+                clamped_from: Some(0)
+            }
+        );
+
+        // The default sits in-band, so an untouched config never logs a clamp.
+        assert_eq!(
+            MediaConfig::default()
+                .effective_image_read_max_bytes()
+                .clamped_from,
+            None
+        );
     }
 
     #[test]
