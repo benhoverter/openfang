@@ -114,6 +114,32 @@ pub enum CallResult {
     /// permitted, malformed args, internal panic). Distinct from `Ok { is_error: true }`,
     /// which means the tool itself returned an error result.
     Error { message: String },
+    /// Tool executed and returned image content alongside its text (ANAI-297).
+    ///
+    /// A separate variant rather than a new field on [`CallResult::Ok`] so the
+    /// text-only path — every tool but `image_read` — is byte-identical on the
+    /// wire and every existing `Ok` pattern stays exhaustive. No protocol
+    /// version bump: only a bridge that advertises `image_read` can provoke
+    /// one, and bridge and daemon ship from the same build.
+    ///
+    /// Images are never partially sent. If the frame cannot hold them whole,
+    /// the daemon drops them and returns an error instead — a truncated base64
+    /// payload decodes to a corrupt image that still reads as success.
+    Rich {
+        content: String,
+        is_error: bool,
+        images: Vec<WireImage>,
+    },
+}
+
+/// One image carried by [`CallResult::Rich`]: base64 data plus its MIME type,
+/// which the bridge maps straight onto an MCP image content block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireImage {
+    /// MIME type, one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+    pub mime_type: String,
+    /// Standard base64 (with padding) of the image bytes.
+    pub data_base64: String,
 }
 
 /// Bridge → daemon: request the list of upstream MCP tools the calling
@@ -285,6 +311,41 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    // ANAI-297: an image result survives the wire intact, and the text-only
+    // `Ok` shape is untouched by the new variant (no `images` key leaks in).
+    #[test]
+    fn frame_roundtrip_response_rich_carries_images() {
+        let img = WireImage {
+            mime_type: "image/webp".into(),
+            data_base64: "UklGRg==".into(),
+        };
+        let frame = Frame::Response(CallResponse {
+            request_id: 9,
+            result: CallResult::Rich {
+                content: "header".into(),
+                is_error: false,
+                images: vec![img.clone()],
+            },
+        });
+        let s = serde_json::to_string(&frame).unwrap();
+        assert!(s.contains("\"rich\""));
+        let back: Frame = serde_json::from_str(&s).unwrap();
+        match back {
+            Frame::Response(CallResponse {
+                result: CallResult::Rich { images, .. },
+                ..
+            }) => assert_eq!(images, vec![img]),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let plain = serde_json::to_string(&CallResult::Ok {
+            content: "x".into(),
+            is_error: false,
+        })
+        .unwrap();
+        assert!(!plain.contains("images"), "{plain}");
     }
 
     #[test]

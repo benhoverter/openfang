@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use rmcp::{model::*, service::RequestContext, ErrorData as McpError, ServerHandler};
 
-use crate::protocol::UpstreamToolDef;
+use crate::protocol::{UpstreamToolDef, WireImage};
 
 /// Narrow seam between the bridge and the OpenFang runtime.
 ///
@@ -114,6 +114,23 @@ pub trait ToolDispatcher: Send + Sync {
 pub struct DispatchOk {
     pub content: String,
     pub is_error: bool,
+    /// Image blocks to emit after the text block (ANAI-297). Empty for every
+    /// tool except `image_read`.
+    pub images: Vec<WireImage>,
+}
+
+/// MCP content for a dispatch result: the text block first, then one image
+/// block per image, in order. The text leads so the model reads what it is
+/// looking at (path, format, size) before the pixels.
+fn dispatch_blocks(content: String, images: Vec<WireImage>) -> Vec<Content> {
+    let mut blocks = Vec::with_capacity(1 + images.len());
+    blocks.push(Content::text(content));
+    blocks.extend(
+        images
+            .into_iter()
+            .map(|img| Content::image(img.data_base64, img.mime_type)),
+    );
+    blocks
 }
 
 /// Errors a [`ToolDispatcher`] can return. Bridge maps these to MCP errors.
@@ -1065,8 +1082,12 @@ impl ServerHandler for Bridge {
         }
 
         match self.dispatcher.call(tool_name, args).await {
-            Ok(DispatchOk { content, is_error }) => {
-                let blocks = vec![Content::text(content)];
+            Ok(DispatchOk {
+                content,
+                is_error,
+                images,
+            }) => {
+                let blocks = dispatch_blocks(content, images);
                 Ok(if is_error {
                     CallToolResult::error(blocks)
                 } else {
@@ -1241,6 +1262,7 @@ mod tests {
             canned: DispatchOk {
                 content: String::new(),
                 is_error: false,
+                images: Vec::new(),
             },
         };
         let bridge = Bridge::new(Arc::new(stub));
@@ -1273,6 +1295,7 @@ mod tests {
             DispatchOk {
                 content: String::new(),
                 is_error: false,
+                images: Vec::new(),
             },
         );
         let bridge = Bridge::new(Arc::new(stub));
@@ -1302,6 +1325,7 @@ mod tests {
             DispatchOk {
                 content: String::new(),
                 is_error: false,
+                images: Vec::new(),
             },
         )));
         let names: Vec<String> = bridge
@@ -1320,6 +1344,7 @@ mod tests {
             DispatchOk {
                 content: String::new(),
                 is_error: false,
+                images: Vec::new(),
             },
         );
         stub.upstream = vec![
@@ -1361,6 +1386,7 @@ mod tests {
             DispatchOk {
                 content: String::new(),
                 is_error: false,
+                images: Vec::new(),
             },
         );
         stub.upstream = vec![UpstreamToolDef {
@@ -1373,5 +1399,48 @@ mod tests {
         assert!(bridge.is_advertised_upstream("mcp_linear_getteams"));
         assert!(!bridge.is_advertised_upstream("mcp_linear_unknown"));
         assert!(!bridge.is_advertised_upstream("file_read"));
+    }
+
+    // ANAI-297: a dispatch carrying images emits the text block first, then
+    // one MCP image block per image with data and MIME passed through intact.
+    #[test]
+    fn dispatch_blocks_emits_text_then_images_in_order() {
+        let blocks = dispatch_blocks(
+            "header".to_string(),
+            vec![
+                WireImage {
+                    mime_type: "image/png".into(),
+                    data_base64: "iVBORw0KGgo=".into(),
+                },
+                WireImage {
+                    mime_type: "image/jpeg".into(),
+                    data_base64: "/9j/".into(),
+                },
+            ],
+        );
+        assert_eq!(blocks.len(), 3);
+        match &blocks[0].raw {
+            RawContent::Text(t) => assert_eq!(t.text, "header"),
+            other => panic!("first block must be text, got {other:?}"),
+        }
+        match &blocks[1].raw {
+            RawContent::Image(i) => {
+                assert_eq!(i.mime_type, "image/png");
+                assert_eq!(i.data, "iVBORw0KGgo=");
+            }
+            other => panic!("second block must be an image, got {other:?}"),
+        }
+        match &blocks[2].raw {
+            RawContent::Image(i) => assert_eq!(i.mime_type, "image/jpeg"),
+            other => panic!("third block must be an image, got {other:?}"),
+        }
+    }
+
+    // The text-only path is unchanged: exactly one text block, no images.
+    #[test]
+    fn dispatch_blocks_without_images_is_a_single_text_block() {
+        let blocks = dispatch_blocks("plain".to_string(), Vec::new());
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0].raw, RawContent::Text(t) if t.text == "plain"));
     }
 }

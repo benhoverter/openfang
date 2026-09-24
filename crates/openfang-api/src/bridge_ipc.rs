@@ -41,8 +41,8 @@ use crate::bridge_auth::BridgeAuthority;
 use openfang_kernel::OpenFangKernel;
 use openfang_mcp_bridge::protocol::{
     codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
-    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    SOCKET_RELATIVE_PATH,
+    UpstreamListResponse, UpstreamListResult, UpstreamToolDef, WireImage, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, SOCKET_RELATIVE_PATH,
 };
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
@@ -434,6 +434,10 @@ async fn handle_connection(
                         is_error: false, ..
                     } => "ok",
                     CallResult::Ok { is_error: true, .. } => "tool_error",
+                    CallResult::Rich {
+                        is_error: false, ..
+                    } => "ok",
+                    CallResult::Rich { is_error: true, .. } => "tool_error",
                     CallResult::Error { .. } => "dispatch_error",
                 };
                 info!(
@@ -588,7 +592,64 @@ fn clamp_result_to_frame(result: CallResult) -> (CallResult, Option<usize>) {
             clamped.push_str("\n\n[openfang: error message truncated to fit the bridge frame]");
             (CallResult::Error { message: clamped }, Some(original))
         }
+        CallResult::Rich {
+            content,
+            is_error,
+            images,
+        } => clamp_rich_result(content, is_error, images),
     }
+}
+
+/// Per-image JSON overhead on top of the base64 itself: the object braces,
+/// both key names, quotes and separators. Base64 contains no characters JSON
+/// escapes, so the data costs exactly its length.
+const WIRE_IMAGE_OVERHEAD: usize = 64;
+
+/// Frame clamp for [`CallResult::Rich`] (ANAI-297). Images are all-or-nothing.
+///
+/// Text can be truncated with a marker and still mean something; a base64
+/// payload cut short decodes to a corrupt image that the model receives as a
+/// successful read. So when the whole result will not fit, every image is
+/// dropped and the result becomes an error that says so and why — never a
+/// partial image, and never a text-only success that silently lost its
+/// pixels.
+fn clamp_rich_result(
+    content: String,
+    is_error: bool,
+    images: Vec<WireImage>,
+) -> (CallResult, Option<usize>) {
+    let text_cost: usize = content.chars().map(json_escaped_cost).sum();
+    let image_cost: usize = images
+        .iter()
+        .map(|i| i.data_base64.len() + i.mime_type.len() + WIRE_IMAGE_OVERHEAD)
+        .sum();
+    let total = text_cost + image_cost;
+    if total <= FRAME_PAYLOAD_BUDGET {
+        return (
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            },
+            None,
+        );
+    }
+    let kept = truncate_to_json_budget(&content, FRAME_PAYLOAD_BUDGET / 2);
+    let message = format!(
+        "{kept}\n\n[openfang: {n} image(s) NOT returned — the result is {total} bytes \
+         encoded, over the {budget}-byte bridge frame budget. Images are never sent \
+         partially, because a truncated image decodes as corrupt yet reads as success. \
+         Nothing above this line is a view of the image.]",
+        n = images.len(),
+        budget = FRAME_PAYLOAD_BUDGET,
+    );
+    (
+        CallResult::Ok {
+            content: message,
+            is_error: true,
+        },
+        Some(total),
+    )
 }
 
 /// Dispatch a single bridge tool call to the runtime.
@@ -1362,6 +1423,78 @@ mod tests {
             CallResult::Ok { is_error, .. } => assert!(is_error),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    fn wire_png(len: usize) -> WireImage {
+        WireImage {
+            mime_type: "image/png".to_string(),
+            data_base64: "A".repeat(len),
+        }
+    }
+
+    // ANAI-297: an image result that fits passes through untouched, image and
+    // all, and the frame the codec would write is within the limit.
+    #[test]
+    fn a_rich_result_that_fits_passes_through_whole() {
+        let img = wire_png(900 * 1024);
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![img.clone()],
+        });
+        assert_eq!(clamped, None);
+        match &out {
+            CallResult::Rich {
+                content,
+                is_error,
+                images,
+            } => {
+                assert_eq!(content, "header");
+                assert!(!is_error);
+                assert_eq!(images, &vec![img]);
+            }
+            other => panic!("expected Rich, got {other:?}"),
+        }
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    // The load-bearing ANAI-297 clamp test. An image that does not fit is
+    // dropped WHOLE: no partial base64 survives, the result is an error, and
+    // the message says the image was not returned. A text-style truncation
+    // here would hand the model a corrupt image flagged as a successful read.
+    #[test]
+    fn an_oversized_rich_result_drops_images_whole_and_errors() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![wire_png(2 * 1024 * 1024)],
+        });
+        assert!(clamped.is_some(), "caller must learn the original size");
+        match &out {
+            CallResult::Ok { content, is_error } => {
+                assert!(*is_error, "a dropped image must never read as success");
+                assert!(content.contains("NOT returned"), "{content}");
+                assert!(
+                    !content.contains("AAAA"),
+                    "no fragment of the image data may leak into the text"
+                );
+            }
+            other => panic!("expected a text-only error result, got {other:?}"),
+        }
+        assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
+    }
+
+    // Two images that each fit but together do not are refused together:
+    // the budget is the whole frame, not per image.
+    #[test]
+    fn images_are_budgeted_as_a_set_not_individually() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: String::new(),
+            is_error: false,
+            images: vec![wire_png(600 * 1024), wire_png(600 * 1024)],
+        });
+        assert!(clamped.is_some());
+        assert!(matches!(out, CallResult::Ok { is_error: true, .. }));
     }
 
     /// End-to-end wire-shape test: bind a listener at a tempfile path,
