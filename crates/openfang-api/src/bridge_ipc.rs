@@ -42,7 +42,7 @@ use openfang_kernel::OpenFangKernel;
 use openfang_mcp_bridge::protocol::{
     codec, CallRequest, CallResponse, CallResult, Frame, Hello, HelloAck, ListUpstreamRequest,
     UpstreamListResponse, UpstreamListResult, UpstreamToolDef, WireImage, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, SOCKET_RELATIVE_PATH,
+    MAX_WIRE_FRAME_BYTES, PROTOCOL_VERSION, SOCKET_RELATIVE_PATH,
 };
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
@@ -497,6 +497,31 @@ const FRAME_ENVELOPE_RESERVE: usize = 16 * 1024;
 /// bytes (see [`json_escaped_cost`]).
 const FRAME_PAYLOAD_BUDGET: usize = MAX_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_RESERVE);
 
+/// Payload budget for a response frame that carries images (ANAI-297).
+///
+/// Images get the headroom between the text cap and the wire ceiling; the
+/// text inside such a frame is still held to [`FRAME_PAYLOAD_BUDGET`]. The
+/// operator's per-image policy is `[media] image_read_max_bytes`, enforced
+/// by the tool before it ever builds a result — this is only the floor that
+/// keeps a frame writable.
+const RICH_PAYLOAD_BUDGET: usize = MAX_WIRE_FRAME_BYTES.saturating_sub(FRAME_ENVELOPE_RESERVE);
+
+/// Base64 length of `raw` bytes, with padding.
+const fn base64_len(raw: usize) -> usize {
+    raw.div_ceil(3) * 4
+}
+
+// The largest image an operator may permit, plus a full text result, must
+// fit one rich frame. If someone raises the config ceiling or shrinks the
+// wire ceiling past this, the build fails here instead of the bridge
+// dropping every max-size image at runtime.
+const _: () = assert!(
+    base64_len(openfang_types::media::IMAGE_READ_MAX_BYTES_CEILING as usize)
+        + WIRE_IMAGE_OVERHEAD
+        + FRAME_PAYLOAD_BUDGET
+        <= RICH_PAYLOAD_BUDGET
+);
+
 /// Bytes a single `char` occupies inside a serialized JSON string literal.
 ///
 /// Mirrors `serde_json`'s escaping exactly: the seven short escapes cost two
@@ -624,7 +649,10 @@ fn clamp_rich_result(
         .map(|i| i.data_base64.len() + i.mime_type.len() + WIRE_IMAGE_OVERHEAD)
         .sum();
     let total = text_cost + image_cost;
-    if total <= FRAME_PAYLOAD_BUDGET {
+    // Two gates: the whole frame must fit the rich budget, AND the text
+    // must fit the ordinary text cap. The second is what stops the image
+    // headroom becoming a side door for megabytes of text.
+    if total <= RICH_PAYLOAD_BUDGET && text_cost <= FRAME_PAYLOAD_BUDGET {
         return (
             CallResult::Rich {
                 content,
@@ -637,11 +665,13 @@ fn clamp_rich_result(
     let kept = truncate_to_json_budget(&content, FRAME_PAYLOAD_BUDGET / 2);
     let message = format!(
         "{kept}\n\n[openfang: {n} image(s) NOT returned — the result is {total} bytes \
-         encoded, over the {budget}-byte bridge frame budget. Images are never sent \
-         partially, because a truncated image decodes as corrupt yet reads as success. \
+         encoded ({text_cost} of text), over the bridge budget of {budget} bytes \
+         total / {text_budget} bytes of text. Images are never sent partially, \
+         because a truncated image decodes as corrupt yet reads as success. \
          Nothing above this line is a view of the image.]",
         n = images.len(),
-        budget = FRAME_PAYLOAD_BUDGET,
+        budget = RICH_PAYLOAD_BUDGET,
+        text_budget = FRAME_PAYLOAD_BUDGET,
     );
     (
         CallResult::Ok {
@@ -1467,7 +1497,7 @@ mod tests {
         let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
             content: "header".to_string(),
             is_error: false,
-            images: vec![wire_png(2 * 1024 * 1024)],
+            images: vec![wire_png(RICH_PAYLOAD_BUDGET + 1)],
         });
         assert!(clamped.is_some(), "caller must learn the original size");
         match &out {
@@ -1484,6 +1514,55 @@ mod tests {
         assert!(encoded_frame_len(out) <= MAX_FRAME_BYTES);
     }
 
+    // ANAI-297 config split: an image at the operator ceiling — larger than
+    // the whole 1 MiB text cap — passes, and its frame is writable by the
+    // codec. Before the split this was dropped at any size over ~1 MiB.
+    #[test]
+    fn an_image_at_the_config_ceiling_passes_and_fits_the_wire() {
+        let at_ceiling = base64_len(openfang_types::media::IMAGE_READ_MAX_BYTES_CEILING as usize);
+        assert!(
+            at_ceiling > MAX_FRAME_BYTES,
+            "test must exceed the text cap"
+        );
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "header".to_string(),
+            is_error: false,
+            images: vec![wire_png(at_ceiling)],
+        });
+        assert_eq!(clamped, None);
+        assert!(matches!(
+            out,
+            CallResult::Rich {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(encoded_frame_len(out) <= MAX_WIRE_FRAME_BYTES);
+    }
+
+    // The side-door guard. The image headroom must not let TEXT past the
+    // 1 MiB cap: a rich result whose text alone is over it is refused, even
+    // though text + image would fit the larger rich budget.
+    #[test]
+    fn image_headroom_does_not_raise_the_text_cap() {
+        let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
+            content: "t".repeat(FRAME_PAYLOAD_BUDGET + 1),
+            is_error: false,
+            images: vec![wire_png(1024)],
+        });
+        assert!(clamped.is_some());
+        match &out {
+            CallResult::Ok { content, is_error } => {
+                assert!(*is_error);
+                assert!(
+                    content.len() <= FRAME_PAYLOAD_BUDGET,
+                    "text must come back capped"
+                );
+            }
+            other => panic!("expected a text-only error result, got {other:?}"),
+        }
+    }
+
     // Two images that each fit but together do not are refused together:
     // the budget is the whole frame, not per image.
     #[test]
@@ -1491,7 +1570,10 @@ mod tests {
         let (out, clamped) = clamp_result_to_frame(CallResult::Rich {
             content: String::new(),
             is_error: false,
-            images: vec![wire_png(600 * 1024), wire_png(600 * 1024)],
+            images: vec![
+                wire_png(RICH_PAYLOAD_BUDGET / 2 + 1024),
+                wire_png(RICH_PAYLOAD_BUDGET / 2 + 1024),
+            ],
         });
         assert!(clamped.is_some());
         assert!(matches!(out, CallResult::Ok { is_error: true, .. }));
