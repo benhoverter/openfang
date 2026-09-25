@@ -260,6 +260,16 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         Ok(result.response)
     }
 
+    async fn agent_workspace(&self, agent_id: AgentId) -> Option<std::path::PathBuf> {
+        // ANAI-301: the manifest's workspace, not a name-derived guess (#1097).
+        self.kernel
+            .registry
+            .get(agent_id)?
+            .manifest
+            .workspace
+            .clone()
+    }
+
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
         Ok(self.kernel.registry.find_by_name(name).map(|e| e.id))
     }

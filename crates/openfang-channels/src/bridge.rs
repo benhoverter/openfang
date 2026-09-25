@@ -156,6 +156,18 @@ pub trait ChannelBridgeHandle: Send + Sync {
         self.send_message_with_blocks(agent_id, blocks).await
     }
 
+    /// The agent's resolved workspace root (ANAI-301).
+    ///
+    /// The real kernel answers from the agent's manifest, which is the only
+    /// correct source: a workspace can be pointed anywhere (#1097), so
+    /// deriving `~/.openfang/workspaces/<name>` is wrong for those agents.
+    /// Default `None` ("unknown"): inbound files then render URL-only and
+    /// outbound attachments fall back to the name-derived path.
+    async fn agent_workspace(&self, agent_id: AgentId) -> Option<PathBuf> {
+        let _ = agent_id;
+        None
+    }
+
     /// Find an agent by name, returning its ID.
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String>;
 
@@ -656,9 +668,10 @@ async fn maybe_prefix_response(
 
 /// Compute the per-agent workspace root for outbound attachment scoping.
 ///
-/// Returns the canonical path to `~/.openfang/workspaces/<agent_name>/` if
-/// the agent name can be resolved and the directory exists; `None`
-/// otherwise. A `None` result causes the attachment parser to fall back to
+/// Asks the kernel for the agent's real workspace first (ANAI-301; a
+/// workspace can live anywhere, #1097), falling back to
+/// `~/.openfang/workspaces/<agent_name>/` only when the handle can't say.
+/// Returns the canonical path if the directory exists; `None` otherwise. A `None` result causes the attachment parser to fall back to
 /// its (empty) default allow-roots — i.e. attachments are dropped fail-
 /// closed rather than escalated. The text portion of the message is still
 /// delivered.
@@ -666,6 +679,11 @@ async fn agent_workspace_root(
     handle: &Arc<dyn ChannelBridgeHandle>,
     agent_id: AgentId,
 ) -> Option<PathBuf> {
+    if let Some(ws) = handle.agent_workspace(agent_id).await {
+        if let Ok(canon) = std::fs::canonicalize(&ws) {
+            return Some(canon);
+        }
+    }
     let name = resolve_agent_name(handle, agent_id).await?;
     let home = std::env::var_os("HOME")?;
     let mut p = PathBuf::from(home);
@@ -1469,8 +1487,11 @@ async fn dispatch_message(
                     for (name, maybe_id) in &targets {
                         if let Some(aid) = maybe_id {
                             let h = handle.clone();
-                            let t = text.clone();
                             let aid = *aid;
+                            // ANAI-301: each target gets its own workspace copy.
+                            let t =
+                                localize_attachments(handle, aid, &message.content, text.clone())
+                                    .await;
                             let name = name.clone();
                             handles_vec.push(tokio::spawn(async move {
                                 let result = h.send_message(aid, &t).await;
@@ -1490,7 +1511,11 @@ async fn dispatch_message(
                 openfang_types::config::BroadcastStrategy::Sequential => {
                     for (name, maybe_id) in &targets {
                         if let Some(aid) = maybe_id {
-                            match handle.send_message(*aid, &text).await {
+                            // ANAI-301: each target gets its own workspace copy.
+                            let t =
+                                localize_attachments(handle, *aid, &message.content, text.clone())
+                                    .await;
+                            match handle.send_message(*aid, &t).await {
                                 Ok(r) => responses.push(format!("[{name}]: {r}")),
                                 Err(e) => responses.push(format!("[{name}]: Error: {e}")),
                             }
@@ -1591,6 +1616,10 @@ async fn dispatch_message(
         .await;
         return;
     }
+
+    // ANAI-301: move downloaded files into this agent's workspace and point
+    // the descriptor there, now that routing has named the agent.
+    let text = localize_attachments(handle, agent_id, &message.content, text).await;
 
     // Build channel key for re-resolution lookups
     let channel_key = format!("{:?}", message.channel);
@@ -1947,6 +1976,104 @@ fn render_file_descriptor(url: &str, filename: &str, local_path: Option<&str>) -
     }
 }
 
+/// Every downloaded file attachment in `content`, as
+/// `(url, filename, staged_local_path)` (ANAI-301).
+fn staged_files(content: &ChannelContent) -> Vec<(&str, &str, &str)> {
+    match content {
+        ChannelContent::File {
+            url,
+            filename,
+            local_path: Some(path),
+            ..
+        } => vec![(url.as_str(), filename.as_str(), path.as_str())],
+        ChannelContent::Multipart(parts) => parts.iter().flat_map(staged_files).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Copy each staged attachment into `agent_id`'s workspace and return
+/// `(old descriptor, new descriptor)` pairs for rewriting the text the agent
+/// will see (ANAI-301).
+///
+/// The staged path is never shown to an agent: when the workspace is unknown
+/// or the copy fails, the new descriptor is the URL-only form, the same
+/// degradation a failed download already produces.
+async fn attachment_rewrites(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    agent_id: AgentId,
+    content: &ChannelContent,
+) -> Vec<(String, String)> {
+    let staged = staged_files(content);
+    if staged.is_empty() {
+        return Vec::new();
+    }
+    let workspace = handle.agent_workspace(agent_id).await;
+    if workspace.is_none() {
+        warn!(%agent_id, "ANAI-301: agent workspace unknown; inbound files render URL-only");
+    }
+    staged
+        .into_iter()
+        .map(|(url, filename, staged_path)| {
+            let copy = workspace.as_deref().and_then(|ws| {
+                crate::inbound_files::relocate_into_workspace(
+                    std::path::Path::new(staged_path),
+                    filename,
+                    ws,
+                )
+            });
+            let copy = copy.map(|p| p.to_string_lossy().into_owned());
+            (
+                render_file_descriptor(url, filename, Some(staged_path)),
+                render_file_descriptor(url, filename, copy.as_deref()),
+            )
+        })
+        .collect()
+}
+
+fn apply_rewrites(mut text: String, rewrites: &[(String, String)]) -> String {
+    for (old, new) in rewrites {
+        text = text.replace(old, new);
+    }
+    text
+}
+
+/// Text-path form: localize the attachments in `text` for `agent_id`.
+async fn localize_attachments(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    agent_id: AgentId,
+    content: &ChannelContent,
+    text: String,
+) -> String {
+    let rewrites = attachment_rewrites(handle, agent_id, content).await;
+    apply_rewrites(text, &rewrites)
+}
+
+/// Block-path form of [`localize_attachments`].
+async fn localize_attachment_blocks(
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    agent_id: AgentId,
+    content: &ChannelContent,
+    blocks: Vec<ContentBlock>,
+) -> Vec<ContentBlock> {
+    let rewrites = attachment_rewrites(handle, agent_id, content).await;
+    if rewrites.is_empty() {
+        return blocks;
+    }
+    blocks
+        .into_iter()
+        .map(|b| match b {
+            ContentBlock::Text {
+                text,
+                provider_metadata,
+            } => ContentBlock::Text {
+                text: apply_rewrites(text, &rewrites),
+                provider_metadata,
+            },
+            other => other,
+        })
+        .collect()
+}
+
 /// Download an image from a URL and build content blocks for multimodal LLM input.
 ///
 /// Accepts both `http(s)://` URLs (fetched via reqwest) and `file://` URLs
@@ -2165,6 +2292,9 @@ async fn dispatch_with_blocks(
         .await;
         return;
     }
+
+    // ANAI-301: same as the text path -- localize after routing and RBAC.
+    let blocks = localize_attachment_blocks(handle, agent_id, &message.content, blocks).await;
 
     let _ = adapter.send_typing(&message.sender).await;
 
@@ -2647,6 +2777,120 @@ mod tests {
         assert!(
             !msg.contains(openfang_types::watchdog::PROVIDER_STALL_MARKER),
             "raw watchdog marker must not leak to users: {msg}"
+        );
+    }
+
+    /// ANAI-301 mock: reports a fixed workspace (or none).
+    struct WorkspaceHandle {
+        ws: Option<PathBuf>,
+    }
+
+    #[async_trait]
+    impl ChannelBridgeHandle for WorkspaceHandle {
+        async fn send_message(&self, _agent_id: AgentId, message: &str) -> Result<String, String> {
+            Ok(message.to_string())
+        }
+        async fn agent_workspace(&self, _agent_id: AgentId) -> Option<PathBuf> {
+            self.ws.clone()
+        }
+        async fn find_agent_by_name(&self, _name: &str) -> Result<Option<AgentId>, String> {
+            Ok(None)
+        }
+        async fn list_agents(&self) -> Result<Vec<(AgentId, String)>, String> {
+            Ok(Vec::new())
+        }
+        async fn spawn_agent_by_name(&self, _manifest_name: &str) -> Result<AgentId, String> {
+            Err("not implemented".to_string())
+        }
+    }
+
+    fn staged_pdf(dir: &std::path::Path) -> (ChannelContent, String) {
+        let staged =
+            crate::inbound_files::materialize_bytes(b"%PDF bytes", "plan.pdf", dir).unwrap();
+        let staged = staged.to_string_lossy().into_owned();
+        let content = ChannelContent::File {
+            url: "https://cdn/plan.pdf?ex=1&hm=2".to_string(),
+            filename: "plan.pdf".to_string(),
+            mime: None,
+            size: None,
+            local_path: Some(staged.clone()),
+        };
+        (content, staged)
+    }
+
+    /// ANAI-301: the agent sees a path in its own workspace, never the
+    /// staging path, and the bytes are really there.
+    #[tokio::test]
+    async fn inbound_file_is_localized_into_the_agent_workspace() {
+        let staging = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (content, staged) = staged_pdf(staging.path());
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(WorkspaceHandle {
+            ws: Some(ws.path().to_path_buf()),
+        });
+        let text = format!(
+            "look at this\n{}",
+            render_file_descriptor("https://cdn/plan.pdf?ex=1&hm=2", "plan.pdf", Some(&staged))
+        );
+
+        let out = localize_attachments(&handle, AgentId::new(), &content, text).await;
+        assert!(!out.contains(&staged), "staging path leaked: {out}");
+        let dir = crate::inbound_files::workspace_file_dir(ws.path());
+        let dir_str = dir.to_string_lossy().into_owned();
+        assert!(
+            out.contains(&dir_str),
+            "descriptor must name the workspace copy: {out}"
+        );
+        assert!(
+            out.starts_with("look at this\n"),
+            "surrounding text intact: {out}"
+        );
+        let copies: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(copies[0].path()).unwrap(), b"%PDF bytes");
+    }
+
+    /// Unknown workspace: URL-only descriptor, staging path never shown.
+    #[tokio::test]
+    async fn inbound_file_without_workspace_degrades_to_url_only() {
+        let staging = tempfile::tempdir().unwrap();
+        let (content, staged) = staged_pdf(staging.path());
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(WorkspaceHandle { ws: None });
+        let text =
+            render_file_descriptor("https://cdn/plan.pdf?ex=1&hm=2", "plan.pdf", Some(&staged));
+
+        let out = localize_attachments(&handle, AgentId::new(), &content, text).await;
+        assert_eq!(
+            out,
+            render_file_descriptor("https://cdn/plan.pdf?ex=1&hm=2", "plan.pdf", None)
+        );
+    }
+
+    /// The block path rewrites text blocks the same way.
+    #[tokio::test]
+    async fn inbound_file_blocks_are_localized() {
+        let staging = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let (content, staged) = staged_pdf(staging.path());
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(WorkspaceHandle {
+            ws: Some(ws.path().to_path_buf()),
+        });
+        let blocks = vec![ContentBlock::Text {
+            text: render_file_descriptor(
+                "https://cdn/plan.pdf?ex=1&hm=2",
+                "plan.pdf",
+                Some(&staged),
+            ),
+            provider_metadata: None,
+        }];
+        let out = localize_attachment_blocks(&handle, AgentId::new(), &content, blocks).await;
+        let ContentBlock::Text { text, .. } = &out[0] else {
+            panic!("expected a text block");
+        };
+        assert!(!text.contains(&staged), "staging path leaked: {text}");
+        assert!(
+            text.contains(&*ws.path().to_string_lossy()),
+            "workspace copy named: {text}"
         );
     }
 

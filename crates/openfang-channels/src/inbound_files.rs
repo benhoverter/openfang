@@ -44,8 +44,9 @@
 //!   `.bin`.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use tracing::{debug, info, warn};
 
 /// TTL for materialized inbound attachment tmpfiles (24 hours), matching
@@ -84,6 +85,64 @@ static FILE_TMP_SWEEP_ONCE: Once = Once::new();
 /// across the tree pre-ANAI-137 returned zero hits). This module is what
 /// finally makes it live.
 pub use openfang_types::paths::file_tmp_dir;
+
+/// Per-agent inbound-file dir: `<workspace>/tmp/files` (ANAI-301).
+pub fn workspace_file_dir(workspace: &Path) -> PathBuf {
+    workspace.join("tmp").join("files")
+}
+
+/// Copy a staged attachment into the receiving agent's workspace and return
+/// the new path (ANAI-301).
+///
+/// Adapters download before routing, so they cannot know which agent a file
+/// is for; they stage it under [`file_tmp_dir`], which no agent is pointed
+/// at. Once the bridge has routed the message it calls this for each target
+/// agent, and the descriptor the agent sees names the workspace copy, which
+/// is inside that agent's `file_policy` by construction. A broadcast gets one
+/// copy per target, so no agent reads another's folder.
+///
+/// Goes through [`materialize_bytes`], so the copy is content-addressed,
+/// atomically published, and named from `original_name` (the user's
+/// filename, not the staged `<hash>__...` name). `None` on any failure; the
+/// caller must then render the URL-only descriptor, never the staged path.
+pub fn relocate_into_workspace(
+    staged: &Path,
+    original_name: &str,
+    workspace: &Path,
+) -> Option<PathBuf> {
+    let bytes = match std::fs::read(staged) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(path = ?staged, error = %e, "ANAI-301: staged attachment unreadable; descriptor falls back to URL only");
+            return None;
+        }
+    };
+    let dir = workspace_file_dir(workspace);
+    let out = materialize_bytes(&bytes, original_name, &dir)?;
+    sweep_dir_once(&dir);
+    Some(out)
+}
+
+/// Directories already swept by [`sweep_dir_once`] in this process.
+static SWEPT_DIRS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Run the TTL sweep over `dir` the first time this process sees it, on a
+/// background thread. Per-workspace counterpart of [`spawn_sweep_once`].
+/// Returns `true` when this call scheduled the sweep.
+pub fn sweep_dir_once(dir: &Path) -> bool {
+    let mut guard = match SWEPT_DIRS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(dir.to_path_buf()) {
+        return false;
+    }
+    drop(guard);
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || sweep_old_file_tmpfiles(&dir));
+    true
+}
 
 /// Write `bytes` to a content-addressed file under `dir` and return its path.
 ///
@@ -334,6 +393,44 @@ mod tests {
         assert!(
             hex.chars().all(|c| c.is_ascii_hexdigit()),
             "expected 16 hex chars of content hash, got {name}"
+        );
+    }
+
+    /// ANAI-301: the workspace copy carries the user's filename and the
+    /// same bytes, and lands under `<workspace>/tmp/files/`.
+    #[test]
+    fn relocate_copies_into_the_workspace_under_the_user_name() {
+        let staging = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let staged = materialize_bytes(b"%PDF-1.7 bytes", "Q3 Report.pdf", staging.path()).unwrap();
+
+        let copy = relocate_into_workspace(&staged, "Q3 Report.pdf", ws.path()).unwrap();
+        assert_eq!(copy.parent().unwrap(), workspace_file_dir(ws.path()));
+        assert_eq!(std::fs::read(&copy).unwrap(), b"%PDF-1.7 bytes");
+        let name = copy.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.ends_with("__q3_report.pdf"),
+            "user name, not the staged name: {name}"
+        );
+        assert!(
+            staged.exists(),
+            "staging copy is left for its own TTL sweep"
+        );
+
+        // Idempotent: a second relocation of the same bytes reuses the file.
+        let again = relocate_into_workspace(&staged, "Q3 Report.pdf", ws.path()).unwrap();
+        assert_eq!(copy, again);
+    }
+
+    #[test]
+    fn relocate_refuses_a_missing_staged_file() {
+        let ws = tempfile::tempdir().unwrap();
+        assert!(
+            relocate_into_workspace(Path::new("/nonexistent/x.pdf"), "x.pdf", ws.path()).is_none()
+        );
+        assert!(
+            !workspace_file_dir(ws.path()).exists(),
+            "nothing is created when there is nothing to copy"
         );
     }
 
