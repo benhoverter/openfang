@@ -8183,6 +8183,7 @@ pub async fn test_provider(
                 thinking: None,
                 caller_agent_id: None,
                 caller_agent_name: None,
+                caller_workspace: None,
                 allowed_tools: None,
             };
             match driver.complete(test_req).await {

@@ -21,8 +21,9 @@
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use tracing::{debug, info, warn};
 
 /// TTL for materialized image tmpfiles (24 hours). Files older than this
@@ -53,6 +54,39 @@ pub fn image_tmp_dir() -> PathBuf {
         p.push("openfang-images");
         p
     }
+}
+
+/// Per-agent image materialization dir: `<workspace>/tmp/images` (ANAI-301).
+///
+/// Inbound images used to land in the shared [`image_tmp_dir`], reachable
+/// only through Claude Code's native `Read` and its own allowlist. Writing
+/// them into the receiving agent's workspace puts them inside that agent's
+/// `file_policy` by construction, so `image_read` can open them, and keeps
+/// one agent's attachments out of every other agent's reach.
+pub fn workspace_image_dir(workspace: &Path) -> PathBuf {
+    workspace.join("tmp").join("images")
+}
+
+/// Directories already swept by [`sweep_dir_once`] in this process.
+static SWEPT_DIRS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Run the TTL sweep over `dir` the first time this process sees it, on a
+/// background thread. The per-workspace counterpart of [`spawn_sweep_once`],
+/// which can only ever cover one fixed directory. Returns `true` when this
+/// call scheduled the sweep (tests use it; callers can ignore it).
+pub fn sweep_dir_once(dir: &Path) -> bool {
+    let mut guard = match SWEPT_DIRS.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(dir.to_path_buf()) {
+        return false;
+    }
+    drop(guard);
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || sweep_old_image_tmpfiles(&dir));
+    true
 }
 
 /// Map a MIME type to a sensible filename extension.
@@ -342,6 +376,30 @@ mod tests {
 
         sweep_old_image_tmpfiles(dir);
         assert!(!path.exists(), "stale tmpfile should have been swept");
+    }
+
+    #[test]
+    fn workspace_image_dir_is_under_the_workspace() {
+        let ws = Path::new("/ws/agent-a");
+        assert_eq!(workspace_image_dir(ws), Path::new("/ws/agent-a/tmp/images"));
+    }
+
+    #[test]
+    fn sweep_dir_once_fires_once_per_directory() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        assert!(
+            sweep_dir_once(a.path()),
+            "first sight of a dir schedules a sweep"
+        );
+        assert!(
+            !sweep_dir_once(a.path()),
+            "second sight of the same dir does not"
+        );
+        assert!(
+            sweep_dir_once(b.path()),
+            "a different dir gets its own sweep"
+        );
     }
 
     #[test]

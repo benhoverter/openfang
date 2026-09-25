@@ -99,6 +99,15 @@ pub struct CompletionRequest {
     /// Populated by the agent loop from `manifest.name`. Background/internal
     /// callers leave it `None`, which the driver renders as `-`.
     pub caller_agent_name: Option<String>,
+    /// Workspace root of the OpenFang agent issuing this request, if any.
+    ///
+    /// ANAI-301: subprocess drivers materialize inbound images into
+    /// `<workspace>/tmp/images/` so the agent reaches them with `image_read`
+    /// under its own `file_policy` (an agent's workspace is always inside
+    /// it). `None` for background/internal callers; the Claude Code driver
+    /// then renders a "not viewable" placeholder rather than falling back
+    /// to a shared host folder.
+    pub caller_workspace: Option<std::path::PathBuf>,
     /// Per-agent tool allowlist for the bridge subprocess, if any.
     ///
     /// Sourced from the agent's resolved `available_tools` (which in turn
@@ -454,6 +463,7 @@ mod tests {
             thinking: None,
             caller_agent_id: None,
             caller_agent_name: None,
+            caller_workspace: None,
             allowed_tools: None,
         };
 

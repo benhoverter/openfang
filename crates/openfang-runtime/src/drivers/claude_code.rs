@@ -9,7 +9,9 @@
 //! hung CLI processes from blocking agents indefinitely.
 
 use crate::bridge_auth::{SpawnGuard, TokenIssuer};
-use crate::image_cache::{image_tmp_dir, materialize_image, spawn_sweep_once};
+use crate::image_cache::{
+    image_tmp_dir, materialize_image, spawn_sweep_once, sweep_dir_once, workspace_image_dir,
+};
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -541,7 +543,18 @@ impl ClaudeCodeDriver {
     /// attachment, but it knows the attachment exists and can acknowledge
     /// it coherently instead of confabulating.
     fn build_prompt(request: &CompletionRequest) -> String {
-        let tmp_dir = image_tmp_dir();
+        // ANAI-301: images materialize into the caller's own workspace, so
+        // `image_read` reaches them under the agent's file_policy. No
+        // workspace (background/internal callers) means no path at all --
+        // render_content falls back to the "not viewable" placeholder
+        // rather than a shared host folder nobody's policy covers.
+        let image_dir = request
+            .caller_workspace
+            .as_deref()
+            .map(workspace_image_dir);
+        if let Some(dir) = image_dir.as_deref() {
+            sweep_dir_once(dir);
+        }
         let mut parts = Vec::new();
 
         for msg in &request.messages {
@@ -550,7 +563,7 @@ impl ClaudeCodeDriver {
                 Role::Assistant => "Assistant",
                 Role::System => "System",
             };
-            let rendered = Self::render_content(&msg.content, Some(&tmp_dir));
+            let rendered = Self::render_content(&msg.content, image_dir.as_deref());
             if !rendered.is_empty() {
                 parts.push(format!("[{role_label}]\n{rendered}"));
             }
@@ -610,7 +623,7 @@ impl ClaudeCodeDriver {
                                 materialize_image(media_type, data, dir, name_hint.as_deref())
                             {
                                 return Some(format!(
-                                    "[attachment: {media_type} image, ~{approx_kb} KB — view with the Read tool at {path}{url_suffix}]",
+                                    "[attachment: {media_type} image, ~{approx_kb} KB — view it with image_read at {path}{url_suffix}]",
                                     path = path.display()
                                 ));
                             }
@@ -2583,6 +2596,7 @@ mod tests {
             thinking: None,
             caller_agent_id: None,
             caller_agent_name: None,
+            caller_workspace: None,
             allowed_tools: None,
         };
 
@@ -2623,6 +2637,7 @@ mod tests {
             thinking: None,
             caller_agent_id: None,
             caller_agent_name: None,
+            caller_workspace: None,
             allowed_tools: None,
         };
 
@@ -2636,10 +2651,86 @@ mod tests {
         // the legacy "not viewable" placeholder. Both are acceptable
         // outcomes for this test; we just need the marker to be emitted.
         assert!(
-            prompt.contains("view with the Read tool at")
+            prompt.contains("view it with image_read at")
                 || prompt.contains("not viewable on this provider"),
             "marker either points at a tmpfile or explains the limitation, got: {prompt}"
         );
+    }
+
+    /// ANAI-301: with a caller workspace, the image lands under
+    /// `<workspace>/tmp/images/` and the marker points at `image_read`.
+    #[test]
+    fn test_build_prompt_materializes_image_into_caller_workspace() {
+        use openfang_types::message::{ContentBlock, Message, MessageContent};
+
+        const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+        let ws = tempfile::tempdir().unwrap();
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: TINY_PNG_B64.to_string(),
+                    source_url: Some("https://cdn.example/shot.png".to_string()),
+                }]),
+                ..Default::default()
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.7,
+            system: None,
+            thinking: None,
+            caller_agent_id: None,
+            caller_agent_name: None,
+            caller_workspace: Some(ws.path().to_path_buf()),
+            allowed_tools: None,
+        };
+
+        let prompt = ClaudeCodeDriver::build_prompt(&request);
+        let dir = ws.path().join("tmp").join("images");
+        assert!(
+            prompt.contains(&format!("view it with image_read at {}", dir.display())),
+            "marker must name image_read and a path in the caller's workspace, got: {prompt}"
+        );
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(files.len(), 1, "exactly one materialized image in the workspace");
+        assert!(!prompt.contains("Read tool"), "no pointer at native Read: {prompt}");
+    }
+
+    /// ANAI-301: no caller workspace means no path, never a shared folder.
+    #[test]
+    fn test_build_prompt_without_workspace_is_not_viewable() {
+        use openfang_types::message::{ContentBlock, Message, MessageContent};
+
+        let request = CompletionRequest {
+            model: "claude-code/sonnet".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "Zm9v".to_string(),
+                    source_url: None,
+                }]),
+                ..Default::default()
+            }],
+            tools: vec![],
+            max_tokens: 1024,
+            temperature: 0.7,
+            system: None,
+            thinking: None,
+            caller_agent_id: None,
+            caller_agent_name: None,
+            caller_workspace: None,
+            allowed_tools: None,
+        };
+
+        let prompt = ClaudeCodeDriver::build_prompt(&request);
+        assert!(
+            prompt.contains("not viewable on this provider"),
+            "no workspace must degrade to the placeholder, got: {prompt}"
+        );
+        assert!(!prompt.contains("image_read at"), "no path offered: {prompt}");
     }
 
     #[test]
@@ -2664,6 +2755,7 @@ mod tests {
             thinking: None,
             caller_agent_id: None,
             caller_agent_name: None,
+            caller_workspace: None,
             allowed_tools: None,
         };
 

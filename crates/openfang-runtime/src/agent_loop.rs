@@ -948,6 +948,8 @@ pub async fn run_agent_loop(
             // ANAI-266: the name, so subprocess drivers can attribute their
             // accounting rows in the shared fleet log without a registry hop.
             caller_agent_name: Some(manifest.name.clone()),
+            // ANAI-301: where the driver materializes inbound images.
+            caller_workspace: workspace_root.map(std::path::Path::to_path_buf),
             // Per-agent allowlist for the bridge subprocess: the names of
             // every tool this agent is currently permitted to invoke,
             // derived from the kernel-resolved `available_tools` (sourced
@@ -2684,6 +2686,8 @@ pub async fn run_agent_loop_streaming(
             // ANAI-266: the name, so subprocess drivers can attribute their
             // accounting rows in the shared fleet log without a registry hop.
             caller_agent_name: Some(manifest.name.clone()),
+            // ANAI-301: where the driver materializes inbound images.
+            caller_workspace: workspace_root.map(std::path::Path::to_path_buf),
             // Per-agent allowlist for the bridge subprocess: the names of
             // every tool this agent is currently permitted to invoke,
             // derived from the kernel-resolved `available_tools` (sourced
@@ -4334,6 +4338,7 @@ mod tests {
             thinking: None,
             caller_agent_id: None,
             caller_agent_name: None,
+            caller_workspace: None,
             allowed_tools: None,
         }
     }
