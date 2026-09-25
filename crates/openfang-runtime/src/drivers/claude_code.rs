@@ -10,14 +10,13 @@
 
 use crate::bridge_auth::{SpawnGuard, TokenIssuer};
 use crate::image_cache::{
-    image_tmp_dir, materialize_image, spawn_sweep_once, sweep_dir_once, workspace_image_dir,
+    materialize_image, spawn_sweep_once, sweep_dir_once, workspace_image_dir,
 };
 use crate::llm_driver::{CompletionRequest, CompletionResponse, LlmDriver, LlmError, StreamEvent};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use openfang_types::agent::AgentId;
 use openfang_types::message::{ContentBlock, MessageContent, Role, StopReason, TokenUsage};
-use openfang_types::paths::file_tmp_dir;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -161,15 +160,11 @@ const CC_NATIVE_DENY: &[&str] = &[
     "KillShell",
     "KillBash",
     "Monitor",
-    // Filesystem read/write.
-    //
-    // `Read` is intentionally NOT in this list. It's gated by a per-spawn
-    // PreToolUse hook (`CC_READ_GUARD_SCRIPT`) that scopes it to the
-    // driver-managed materialization dirs only (`cc_read_allowed_prefixes`:
-    // image tmpfiles for vision, inbound-file tmpfiles for attachments).
-    // See `projects/openfang-fork/vision-cc-read-deny.md` for why
-    // a path-scoped allow rule can't substitute (CC deny precedence is
-    // absolute; an allow can never rescue a denied tool).
+    // Filesystem read/write. `Read` is denied too (ANAI-301): inbound
+    // attachments now land in the agent's own workspace and are read with
+    // `image_read` / `file_read`, which answer to file_policy. The old
+    // PreToolUse guard hook and its separate allowlist are gone.
+    "Read",
     "Write",
     "Edit",
     "MultiEdit",
@@ -199,108 +194,6 @@ const CC_NATIVE_DENY: &[&str] = &[
     // Comms routing
     "PushNotification",
 ];
-
-/// PreToolUse hook matcher string for the native `Read` tool. Emitted in
-/// the per-spawn `settings.json` under `hooks.PreToolUse[].matcher`. Bare
-/// tool-name matchers are the canonical CC hook-spec form (per the
-/// `code.claude.com/docs/en/hooks` reference); the hook fires on every
-/// invocation of the named tool, regardless of arguments.
-const CC_READ_GUARD_HOOK_MATCHER: &str = "Read";
-
-/// PreToolUse hook script for the native `Read` tool. Materialized
-/// alongside `settings.json` at spawn time (`0700`) and referenced from
-/// `hooks.PreToolUse[].hooks[].command` so CC invokes it before every
-/// `Read` call. The script extracts `tool_input.file_path` from the hook
-/// payload on stdin, canonicalizes it through `os.path.realpath` (which
-/// resolves symlinks and `..` segments without requiring the target to
-/// exist), and exits `0` iff the canonical target falls under the
-/// canonical form of **any** allowed prefix passed in `argv[1:]`.
-/// Otherwise it exits `2` with a reason on stderr — per CC's hook contract,
-/// exit `2` blocks the tool call and surfaces stderr to the model.
-///
-/// The prefix list (not a single prefix) is ANAI-137a: the runtime
-/// materializes inbound **images** under `image_tmp_dir()` and inbound
-/// **files** under `openfang_types::paths::file_tmp_dir()`. A one-prefix
-/// guard makes the second dir unreadable, which is exactly the bug ANAI-137
-/// surfaced — the bytes land on disk and nothing can open them. Prefixes are
-/// supplied by the materialization site, never by the model.
-///
-/// Why a hook and not a path-scoped allow rule: CC deny precedence is
-/// absolute (deny -> ask -> allow; first match wins; an allow can never
-/// rescue a denied tool). Once bare `"Read"` is no longer in the deny
-/// list, native Read is open in the default permission mode — so the
-/// hook is the only mechanism that can express "Read this one path and
-/// nothing else" without a brittle, ever-growing scoped-denylist of
-/// secret-bearing paths across `~/.aws`, `~/.ssh`, `~/.openfang/data`,
-/// `~/Library/...`, every project's `.env`, browser profiles, message
-/// stores, etc. See `projects/openfang-fork/vision-cc-read-deny.md` for
-/// the full failure-mode survey.
-///
-/// Python (not bash) because: stdin is a JSON document we have to parse,
-/// and `os.path.realpath` is consistent across macOS / Linux. The host
-/// `realpath(1)` differs in subtle ways (BSD `/bin/realpath` lacks `-m`,
-/// GNU has it) and shelling out for JSON parsing is fiddly. Python 3 is
-/// already a hard dependency of the bridge tooling.
-///
-/// Stays in-source as a `&str` const so it ships with the binary; the
-/// materialization site writes a fresh copy per spawn under the bridge
-/// socket dir and the [`CcSettingsFile`] RAII handle cleans it up on
-/// drop together with the settings file.
-const CC_READ_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
-"""OpenFang CC PreToolUse guard for the native Read tool.
-
-Invoked per `Read` call by Claude Code. Reads the hook JSON payload from
-stdin, pulls `tool_input.file_path`, canonicalizes both it and the
-allowed prefixes in `argv[1:]` via `os.path.realpath`, and exits 0 iff the
-target resolves under at least one of them. Exit 2 (with stderr) on anything
-else — CC's hook contract treats exit 2 as a hard block and surfaces stderr
-to the model so the denial has a reason attached.
-"""
-import json
-import os
-import sys
-
-
-def _die(msg):
-    print("cc-read-guard: " + msg, file=sys.stderr)
-    sys.exit(2)
-
-
-def main():
-    # argv[1:] is the allowed-prefix list. Empty strings are dropped so a
-    # stray quoted-empty arg can never widen the guard to "" (which every
-    # path would startswith-match). No usable prefix at all denies
-    # everything, the safe direction for a fail-closed guard.
-    allowed = [a for a in sys.argv[1:] if a]
-    if not allowed:
-        _die("missing ALLOWED_PREFIX arg")
-
-    try:
-        payload = json.load(sys.stdin)
-    except Exception as exc:
-        _die("stdin JSON parse failed: " + repr(exc))
-
-    tool_input = payload.get("tool_input") or {}
-    file_path = tool_input.get("file_path") or ""
-    if not file_path:
-        _die("tool_input.file_path missing or empty")
-
-    canon_allowed = [os.path.realpath(os.path.expanduser(a)) for a in allowed]
-    canon_target = os.path.realpath(os.path.expanduser(file_path))
-
-    # Trailing-sep test so /tmp/images doesn't accidentally accept
-    # /tmp/images-evil/foo. Equality also accepted so a Read of the dir
-    # itself (rare, but valid) doesn't false-negative.
-    for prefix in canon_allowed:
-        if canon_target == prefix or canon_target.startswith(prefix + os.sep):
-            sys.exit(0)
-
-    _die("Read denied: " + canon_target + " not under any of " + ", ".join(canon_allowed))
-
-
-if __name__ == "__main__":
-    main()
-"#;
 
 /// PreToolUse hook matcher for the tool-observation sideband (ANAI-77x).
 ///
@@ -548,10 +441,7 @@ impl ClaudeCodeDriver {
         // workspace (background/internal callers) means no path at all --
         // render_content falls back to the "not viewable" placeholder
         // rather than a shared host folder nobody's policy covers.
-        let image_dir = request
-            .caller_workspace
-            .as_deref()
-            .map(workspace_image_dir);
+        let image_dir = request.caller_workspace.as_deref().map(workspace_image_dir);
         if let Some(dir) = image_dir.as_deref() {
             sweep_dir_once(dir);
         }
@@ -576,7 +466,7 @@ impl ClaudeCodeDriver {
     ///
     /// Text blocks pass through verbatim. Image blocks are materialized to
     /// an on-disk tmpfile (when `image_dir` is provided) so the model can
-    /// view them via the CLI's `Read` tool — Claude Code is multimodal and
+    /// view them with the `image_read` bridge tool — Claude Code is multimodal and
     /// will load the file as native image content. We render a directive
     /// telling the model exactly which path to read, plus the original
     /// `source_url` (e.g. Discord CDN) when known. If materialization
@@ -863,24 +753,11 @@ impl Drop for CcSettingsFile {
 ///   cleanly over any user/managed settings without clobbering them.
 ///   Deny is monotone — adding entries can only further restrict the
 ///   surface — so it's safe to merge.
-/// - When `read_hook_cmd` is `Some(cmd)`, a top-level `hooks.PreToolUse`
-///   entry is emitted matching the native `Read` tool and running the
-///   given command. The command is responsible for path scoping; this
-///   builder does not interpret it. When `None`, no `hooks` key is
-///   emitted at all (the builder stays minimal so the settings file
-///   merges as a pure subtraction of capability rather than introducing
-///   sidecar process surface that wasn't there before).
-/// - When `observe_hook_cmd` is `Some(cmd)`, a second `hooks.PreToolUse`
-///   matcher group is appended with an empty (match-all) matcher running the
-///   given command — the tool-observation sideband appender (ANAI-77x). It
-///   stacks independently alongside the Read group. Either, both, or neither
-///   hook may be present; the `hooks` key is emitted iff at least one group
-///   exists.
-fn build_cc_settings_value(
-    deny: &[&str],
-    read_hook_cmd: Option<&str>,
-    observe_hook_cmd: Option<&str>,
-) -> serde_json::Value {
+/// - When `observe_hook_cmd` is `Some(cmd)`, a `hooks.PreToolUse`
+///   matcher group is emitted with an empty (match-all) matcher running the
+///   given command — the tool-observation sideband appender (ANAI-77x).
+///   When `None`, no `hooks` key is emitted at all.
+fn build_cc_settings_value(deny: &[&str], observe_hook_cmd: Option<&str>) -> serde_json::Value {
     let deny_arr = serde_json::Value::Array(
         deny.iter()
             .map(|s| serde_json::Value::String((*s).into()))
@@ -896,11 +773,8 @@ fn build_cc_settings_value(
     // with a `matcher` (tool-name regex; empty string = match-all) and a
     // `hooks` array of command entries. See code.claude.com/docs/en/hooks
     // for the spec. We build the PreToolUse array from whichever hooks are
-    // requested — the Read guard (matcher `Read`) and/or the observe
-    // sideband (empty match-all matcher) — and emit the `hooks` key only if
-    // at least one group is present. The groups stack: CC evaluates every
-    // matcher group independently, so the observe hook fires alongside the
-    // Read guard without clobbering it.
+    // requested — today only the observe sideband (empty match-all
+    // matcher) — and emit the `hooks` key only if a group is present.
     let build_group = |matcher: &str, cmd: &str| -> serde_json::Value {
         let mut hook_entry = serde_json::Map::new();
         hook_entry.insert("type".into(), serde_json::Value::String("command".into()));
@@ -916,9 +790,6 @@ fn build_cc_settings_value(
     };
 
     let mut pre_tool_use: Vec<serde_json::Value> = Vec::new();
-    if let Some(cmd) = read_hook_cmd {
-        pre_tool_use.push(build_group(CC_READ_GUARD_HOOK_MATCHER, cmd));
-    }
     if let Some(cmd) = observe_hook_cmd {
         pre_tool_use.push(build_group(CC_OBSERVE_HOOK_MATCHER, cmd));
     }
@@ -930,24 +801,6 @@ fn build_cc_settings_value(
     }
 
     serde_json::Value::Object(root)
-}
-
-/// Directories the native `Read` tool is permitted to reach, in the order
-/// they are passed to the guard script and to `--add-dir`.
-///
-/// Two entries, both driver-managed materialization sinks outside the agent
-/// workspace:
-/// - [`image_tmp_dir`] — inbound images, for the vision path.
-/// - [`file_tmp_dir`] — inbound non-image attachments (ANAI-137). Before
-///   ANAI-137a this dir was absent from the guard, so materialized PDFs and
-///   other files landed on disk and every `Read` of them was hard-denied.
-///
-/// Single source for both the guard args and the `--add-dir` grants so the
-/// two can't drift: a dir in one and not the other is a silent half-failure
-/// (CC refuses the path, or the guard blocks it, depending which half is
-/// missing).
-fn cc_read_allowed_prefixes() -> Vec<PathBuf> {
-    vec![image_tmp_dir(), file_tmp_dir()]
 }
 
 /// Materialize a per-spawn CC settings file containing the OpenFang deny
@@ -978,7 +831,6 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     let socket_dir = std::path::Path::new(&socket).parent()?.to_path_buf();
     let spawn_uuid = uuid::Uuid::new_v4();
     let path = socket_dir.join(format!("cc-settings-{spawn_uuid}.json"));
-    let guard_path = socket_dir.join(format!("cc-read-guard-{spawn_uuid}.py"));
     // Tool-observation sideband (ANAI-77x): the appender script and the
     // per-spawn sideband file it writes to. Both live under the same socket
     // dir as the settings + guard and are cleaned by the same RAII handle.
@@ -986,49 +838,10 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     let observe_path = socket_dir.join(format!("cc-observe-{spawn_uuid}.py"));
     let sideband_path = socket_dir.join(format!("cc-tools-{spawn_uuid}.jsonl"));
 
-    // Write the guard script first; if this fails we don't want a
-    // settings file pointing at a non-existent hook command. 0700 on
-    // unix: executable by us only. Hook script path + each allowed-prefix
-    // arg are quoted with the python interpreter explicit so the command
-    // works whether or not the script ends up `+x` on the host fs
-    // (belt + suspenders: chmod below sets the bit; the explicit
-    // `python3` here makes the deps obvious in audits and decouples the
-    // command from fs-mode races).
-    let allowed_prefixes = cc_read_allowed_prefixes();
-    if let Err(e) = std::fs::write(&guard_path, CC_READ_GUARD_SCRIPT) {
-        warn!(error = %e, path = %guard_path.display(), "failed to write CC read-guard script");
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&guard_path) {
-            let mut perms = meta.permissions();
-            // 0700: executable + readable by owner only. Owner is the
-            // daemon user; CC subprocess runs as same uid so it can
-            // both read (interpreter loads source) and execute.
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(&guard_path, perms);
-        }
-    }
-
-    // Build the hook command. Single-line shell-style invocation; CC
-    // executes hook commands through a shell, so quoting matters. We
-    // single-quote both args to neutralize any unlikely metacharacters
-    // in the socket-dir path (it lives under `~/.openfang/run` by
-    // convention; no spaces today, but we don't want to depend on that).
-    let read_hook_cmd = {
-        let mut c = format!("python3 '{}'", guard_path.display());
-        for prefix in &allowed_prefixes {
-            c.push_str(&format!(" '{}'", prefix.display()));
-        }
-        c
-    };
-
-    // Write the tool-observation appender script (ANAI-77x). Same 0700 +
-    // explicit-python3 treatment as the guard. On failure we skip the
+    // Write the tool-observation appender script (ANAI-77x): 0700, run
+    // through an explicit `python3`. On failure we skip the
     // observe hook entirely rather than abort the whole settings file: the
-    // deny set + Read guard are load-bearing for security; the observe
+    // deny set is load-bearing for security; the observe
     // sideband is a best-effort memory signal, so its absence must degrade
     // to "observer blind on this spawn" (the (c) safety valve keeps such
     // rows), never to a native-surface-open regression.
@@ -1052,7 +865,8 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     };
 
     // Observe hook command: passes the sideband path as argv[1]. Only wired
-    // if the script materialized. Same single-quote hygiene as the guard.
+    // if the script materialized. Args are single-quoted against stray
+    // metacharacters in the socket-dir path.
     let observe_hook_cmd = observe_wired.then(|| {
         format!(
             "python3 '{}' '{}'",
@@ -1061,15 +875,11 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
         )
     });
 
-    let cfg = build_cc_settings_value(
-        CC_NATIVE_DENY,
-        Some(&read_hook_cmd),
-        observe_hook_cmd.as_deref(),
-    );
+    let cfg = build_cc_settings_value(CC_NATIVE_DENY, observe_hook_cmd.as_deref());
     let serialized = serde_json::to_string(&cfg).ok()?;
     if let Err(e) = std::fs::write(&path, serialized) {
         warn!(error = %e, path = %path.display(), "failed to write CC --settings file");
-        let _ = std::fs::remove_file(&guard_path);
+        let _ = std::fs::remove_file(&observe_path);
         return None;
     }
 
@@ -1089,15 +899,9 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     debug!(
         agent_id = %caller_agent_id.unwrap_or("<none>"),
         settings = %path.display(),
-        guard = %guard_path.display(),
-        allowed_prefixes = %allowed_prefixes
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(","),
         deny_count = CC_NATIVE_DENY.len(),
         observe_wired,
-        "materialized CC --settings deny set + Read guard hook + observe hook"
+        "materialized CC --settings deny set + observe hook"
     );
 
     // The observe script joins `extras` for cleanup; the sideband file it
@@ -1106,7 +910,7 @@ fn try_materialize_cc_settings(caller_agent_id: Option<&str>) -> Option<CcSettin
     // recorded (the appender was never installed, so the file never
     // appears) — the driver then sees `observed_tools == []`, which the
     // (c) safety valve treats as observer-blind, not inert.
-    let mut extras = vec![guard_path];
+    let mut extras = Vec::new();
     let sideband = if observe_wired {
         extras.push(observe_path);
         Some(sideband_path)
@@ -1969,17 +1773,6 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
-        // Grant the CLI's Read tool access to our materialization dirs
-        // (images + inbound files), which live outside the agent's workspace
-        // cwd. Without --add-dir the CLI would refuse Read on
-        // `$HOME/.openfang/tmp/{images,files}/*` (unless
-        // --dangerously-skip-permissions is set) and the materialization would
-        // be a dead-end. Cheap and idempotent — the dirs are per-user and
-        // content-addressed. Same list the read-guard is given, by
-        // construction (`cc_read_allowed_prefixes`).
-        for dir in cc_read_allowed_prefixes() {
-            cmd.arg("--add-dir").arg(dir);
-        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -2248,10 +2041,6 @@ impl LlmDriver for ClaudeCodeDriver {
                 cmd.arg("--settings").arg(s.path());
             });
         let native_deny_wired = _cc_settings.is_some();
-        // Same tmp-dir grants as the non-streaming path; see complete().
-        for dir in cc_read_allowed_prefixes() {
-            cmd.arg("--add-dir").arg(dir);
-        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -2694,8 +2483,15 @@ mod tests {
             "marker must name image_read and a path in the caller's workspace, got: {prompt}"
         );
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(files.len(), 1, "exactly one materialized image in the workspace");
-        assert!(!prompt.contains("Read tool"), "no pointer at native Read: {prompt}");
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly one materialized image in the workspace"
+        );
+        assert!(
+            !prompt.contains("Read tool"),
+            "no pointer at native Read: {prompt}"
+        );
     }
 
     /// ANAI-301: no caller workspace means no path, never a shared folder.
@@ -2730,7 +2526,10 @@ mod tests {
             prompt.contains("not viewable on this provider"),
             "no workspace must degrade to the placeholder, got: {prompt}"
         );
-        assert!(!prompt.contains("image_read at"), "no path offered: {prompt}");
+        assert!(
+            !prompt.contains("image_read at"),
+            "no path offered: {prompt}"
+        );
     }
 
     #[test]
@@ -3088,11 +2887,11 @@ mod tests {
 
     #[test]
     fn test_build_cc_settings_shape_no_hook() {
-        // Without a read_hook_cmd, the settings doc carries only the
+        // Without an observe hook, the settings doc carries only the
         // `permissions.deny` block — no `hooks` key, no other top-level
         // surface. This is the minimum-merge shape that subtracts
         // capability cleanly from any user/managed settings.
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None, None);
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None);
         let root = cfg.as_object().expect("root must be a JSON object");
         assert_eq!(root.len(), 1, "root must contain only `permissions`");
 
@@ -3119,116 +2918,27 @@ mod tests {
 
         assert!(
             cfg.pointer("/hooks").is_none(),
-            "no hooks key must be emitted when read_hook_cmd is None"
-        );
-    }
-
-    #[test]
-    fn test_build_cc_settings_shape_with_read_hook() {
-        // With a read_hook_cmd, the settings doc gains a top-level `hooks`
-        // key carrying a single PreToolUse matcher group for `Read`, with
-        // one command entry. This is the wire shape consumed by CC; if it
-        // drifts, the hook silently no-ops at spawn and vision regresses
-        // without a loud failure mode.
-        let cmd = "python3 /tmp/guard.py /tmp/images";
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(cmd), None);
-
-        let root = cfg.as_object().expect("root must be a JSON object");
-        assert_eq!(
-            root.len(),
-            2,
-            "root must contain exactly `permissions` and `hooks` when read_hook_cmd is set"
-        );
-
-        // PreToolUse matcher group must target `Read` and only `Read`.
-        let groups = cfg
-            .pointer("/hooks/PreToolUse")
-            .and_then(|v| v.as_array())
-            .expect("PreToolUse array missing");
-        assert_eq!(groups.len(), 1, "exactly one matcher group");
-
-        let group = groups[0].as_object().expect("matcher group must be object");
-        assert_eq!(
-            group.get("matcher").and_then(|v| v.as_str()),
-            Some("Read"),
-            "matcher must be bare `Read`"
-        );
-
-        let hooks = group
-            .get("hooks")
-            .and_then(|v| v.as_array())
-            .expect("hooks array missing");
-        assert_eq!(hooks.len(), 1, "exactly one hook entry");
-
-        let entry = hooks[0].as_object().expect("hook entry must be object");
-        assert_eq!(
-            entry.get("type").and_then(|v| v.as_str()),
-            Some("command"),
-            "hook type must be `command`"
-        );
-        assert_eq!(
-            entry.get("command").and_then(|v| v.as_str()),
-            Some(cmd),
-            "command string must round-trip unchanged"
-        );
-    }
-
-    #[test]
-    fn test_build_cc_settings_observe_hook_stacks_with_read() {
-        // Both hooks present: PreToolUse carries two independent matcher
-        // groups — Read guard first, observe match-all second — so they
-        // stack without clobbering. This is the ANAI-77x wire shape.
-        let read = "python3 /tmp/guard.py /tmp/images";
-        let observe = "python3 /tmp/observe.py /tmp/run/cc-tools-x.jsonl";
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(read), Some(observe));
-
-        let groups = cfg
-            .pointer("/hooks/PreToolUse")
-            .and_then(|v| v.as_array())
-            .expect("PreToolUse array missing");
-        assert_eq!(
-            groups.len(),
-            2,
-            "both hooks must produce two matcher groups"
-        );
-
-        assert_eq!(
-            groups[0].pointer("/matcher").and_then(|v| v.as_str()),
-            Some("Read"),
-            "first group must be the Read guard"
-        );
-        assert_eq!(
-            groups[0]
-                .pointer("/hooks/0/command")
-                .and_then(|v| v.as_str()),
-            Some(read),
-        );
-
-        // Observe group uses the empty-string match-all matcher, NOT `*`.
-        assert_eq!(
-            groups[1].pointer("/matcher").and_then(|v| v.as_str()),
-            Some(""),
-            "observe matcher must be the empty-string match-all, not `*`"
-        );
-        assert_eq!(
-            groups[1]
-                .pointer("/hooks/0/command")
-                .and_then(|v| v.as_str()),
-            Some(observe),
+            "no hooks key must be emitted when no hook is requested"
         );
     }
 
     #[test]
     fn test_build_cc_settings_observe_hook_alone() {
-        // Observe hook without the Read guard: single match-all group. The
+        // Observe hook: single match-all group. The
         // `hooks` key must still appear (at least one group present).
         let observe = "python3 /tmp/observe.py /tmp/sb.jsonl";
-        let cfg = build_cc_settings_value(CC_NATIVE_DENY, None, Some(observe));
+        let cfg = build_cc_settings_value(CC_NATIVE_DENY, Some(observe));
         let groups = cfg
             .pointer("/hooks/PreToolUse")
             .and_then(|v| v.as_array())
             .expect("PreToolUse array missing");
         assert_eq!(groups.len(), 1);
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.pointer("/matcher").and_then(|v| v.as_str()) != Some("Read")),
+            "ANAI-301: no Read guard group is ever emitted"
+        );
         assert_eq!(
             groups[0].pointer("/matcher").and_then(|v| v.as_str()),
             Some(""),
@@ -3339,22 +3049,16 @@ mod tests {
         // future refactor that drops them needs a deliberate change.
         assert!(CC_NATIVE_DENY.contains(&"Glob"), "Glob must be denied");
         assert!(CC_NATIVE_DENY.contains(&"Grep"), "Grep must be denied");
-        // Read is the load-bearing exception: deliberately NOT denied,
-        // because the PreToolUse hook scopes it to the image tmpfile dir.
-        // If Read sneaks back into the deny list, vision breaks again
-        // (deny precedence is absolute; the hook can't un-deny).
-        assert!(
-            !CC_NATIVE_DENY.contains(&"Read"),
-            "Read must NOT be in CC_NATIVE_DENY — gated by PreToolUse hook instead"
-        );
+        // ANAI-301: native Read is denied. Attachments live in the agent's
+        // workspace and are opened with image_read / file_read under
+        // file_policy; a second allowlist for Read is exactly what this
+        // retires.
+        assert!(CC_NATIVE_DENY.contains(&"Read"), "Read must be denied");
 
         // Core dangerous tools — the load-bearing reason for this commit.
-        // Note: `Read` is intentionally absent. It's gated by a PreToolUse
-        // hook (`CC_READ_GUARD_SCRIPT`) scoped to the driver tmpfile dirs,
-        // not by deny — see vision-cc-read-deny.md for why deny-then-allow
-        // can't scope `Read`.
         for must_deny in [
             "Bash",
+            "Read",
             "Write",
             "Edit",
             "MultiEdit",
@@ -3486,85 +3190,6 @@ mod tests {
 
         assert!(!path.exists(), "settings must be removed when guard drops");
         assert!(!guard.exists(), "extras must be removed when guard drops");
-    }
-
-    #[test]
-    fn test_read_guard_script_is_valid_python_shebang() {
-        // Cheap content sanity. If someone edits the embedded script and
-        // breaks the shebang or drops the `ALLOWED_PREFIX` usage, the
-        // hook will materialize but no-op (or worse, accept everything).
-        // We don't run Python here — just assert the script carries the
-        // load-bearing surface markers.
-        assert!(
-            CC_READ_GUARD_SCRIPT.starts_with("#!/usr/bin/env python3\n"),
-            "guard script must lead with a python3 shebang"
-        );
-        assert!(
-            CC_READ_GUARD_SCRIPT.contains("sys.argv[1:]"),
-            "guard script must read the ALLOWED_PREFIX list from argv[1:]"
-        );
-        assert!(
-            CC_READ_GUARD_SCRIPT.contains("json.load(sys.stdin)"),
-            "guard script must parse hook payload from stdin"
-        );
-        assert!(
-            CC_READ_GUARD_SCRIPT.contains("os.path.realpath"),
-            "guard script must canonicalize via realpath (symlink-safe)"
-        );
-        assert!(
-            CC_READ_GUARD_SCRIPT.contains("sys.exit(2)") || CC_READ_GUARD_SCRIPT.contains("_die"),
-            "guard script must exit 2 on denial (CC contract for blocking PreToolUse)"
-        );
-    }
-
-    #[test]
-    fn test_cc_read_allowed_prefixes_covers_images_and_files() {
-        // ANAI-137a regression pin. The guard and `--add-dir` both consume
-        // this list; if the inbound-file dir falls out, materialized PDFs
-        // land on disk and every Read of them is hard-denied — the exact
-        // failure ANAI-137's smoke test surfaced.
-        let prefixes = cc_read_allowed_prefixes();
-        assert_eq!(prefixes.len(), 2, "expected image + file tmp dirs");
-        assert!(
-            prefixes.contains(&image_tmp_dir()),
-            "image tmp dir must stay allowed (vision path)"
-        );
-        assert!(
-            prefixes.contains(&file_tmp_dir()),
-            "inbound-file tmp dir must be allowed (ANAI-137 materialization)"
-        );
-        for p in &prefixes {
-            assert!(p.is_absolute(), "prefix must be absolute: {p:?}");
-            assert!(
-                !p.as_os_str().is_empty(),
-                "empty prefix would widen the guard to everything"
-            );
-        }
-    }
-
-    #[test]
-    fn test_read_guard_hook_cmd_quotes_every_prefix() {
-        // The hook command is built by string concatenation, so the
-        // quoting-per-arg property is worth pinning: one `'...'` group per
-        // prefix, plus the script path itself.
-        let guard_path = std::path::Path::new("/tmp/of-test/cc-read-guard-x.py");
-        let prefixes = cc_read_allowed_prefixes();
-        let mut cmd = format!("python3 '{}'", guard_path.display());
-        for prefix in &prefixes {
-            cmd.push_str(&format!(" '{}'", prefix.display()));
-        }
-        assert_eq!(
-            cmd.matches('\'').count(),
-            2 * (prefixes.len() + 1),
-            "every arg must be single-quoted: {cmd}"
-        );
-        for prefix in &prefixes {
-            assert!(
-                cmd.contains(&format!("'{}'", prefix.display())),
-                "prefix missing from hook cmd: {}",
-                prefix.display()
-            );
-        }
     }
 
     #[test]
