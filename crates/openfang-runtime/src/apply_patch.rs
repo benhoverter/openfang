@@ -34,13 +34,35 @@
 //!   failure rejects the whole patch.
 //! - Untouched lines keep their own line ending; inserted lines take the
 //!   file's dominant one.
+//!
+//! When a hunk matches more than one place (ANAI-298 B), nothing is written
+//! and the result is a `needs_input` question, not an error: every ambiguous
+//! hunk is listed with its candidate locations, plus a `state_token` that
+//! fingerprints the patch and every target file. A retry carrying that token
+//! and one `{file, hunk, at_line}` choice per listed hunk is applied at the
+//! chosen places. A token that no longer matches (a file or the patch
+//! changed) voids its choices, and the question is asked again.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{info, warn};
 
-/// Most match locations quoted in one error message.
+/// Most match locations quoted in one error message, and most candidates
+/// offered for one ambiguous hunk.
 const MAX_LISTED: usize = 10;
+/// Most ambiguous hunks described in one needs_input response.
+const MAX_DECISIONS: usize = 10;
+/// Lines shown on each side of a candidate, outside the hunk's own anchor.
+const SHOWN_CONTEXT: usize = 2;
+/// Longest line quoted in a candidate, in chars.
+const MAX_LINE_CHARS: usize = 160;
+/// How far above a candidate to look for its enclosing line.
+const WITHIN_SCAN: usize = 2000;
+/// Largest patch echoed back verbatim in the retry arguments. Keeps the whole
+/// response far below the bridge's 1 MiB frame clamp, which would otherwise
+/// truncate the JSON and flip the result to an error.
+const MAX_ECHO_PATCH: usize = 64 * 1024;
 
 /// A single operation in a patch.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,16 +110,28 @@ pub struct PatchResult {
     pub files_moved: u32,
     /// Errors encountered during application.
     pub errors: Vec<String>,
+    /// ANAI-298 B: set when hunks matched several places and need the
+    /// caller's choice. Nothing was written.
+    pub needs_input: Option<NeedsInput>,
+    /// The call carried a `state_token` that no longer matched, so its
+    /// choices were ignored.
+    pub stale_selection: bool,
 }
 
 impl PatchResult {
-    /// Returns true if no errors occurred.
+    /// Returns true if the patch was applied in full.
     pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
+        self.errors.is_empty() && self.needs_input.is_none()
     }
 
     /// Summary string for tool output.
     pub fn summary(&self) -> String {
+        if let Some(ni) = &self.needs_input {
+            return format!(
+                "No changes applied — {} needed, nothing was written",
+                plural(ni.decisions.len(), "decision")
+            );
+        }
         let mut parts = Vec::new();
         if self.files_added > 0 {
             parts.push(format!("{} added", self.files_added));
@@ -132,6 +166,230 @@ impl PatchResult {
         } else {
             parts.join(", ")
         }
+    }
+}
+
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// ANAI-298 B: the caller's pick for one hunk that matched several places.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// File path exactly as written in the patch's `*** Update File:` line.
+    pub file: String,
+    /// 1-based hunk number within that file.
+    pub hunk: usize,
+    /// 1-based line, in the file as it is on disk, where the chosen match starts.
+    pub at_line: usize,
+}
+
+/// What a retry carries: the `state_token` it was offered and its choices.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    pub state_token: Option<String>,
+    pub choices: Vec<Choice>,
+}
+
+impl Selection {
+    /// Read `state_token` and `choices` from tool input. Absent fields give an
+    /// empty selection; malformed ones are an error saying what to send.
+    pub fn from_input(input: &serde_json::Value) -> Result<Self, String> {
+        use serde_json::Value;
+        let state_token = match input.get("state_token") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or(
+                        "'state_token' must be the string from the NOT APPLIED result. \
+                         Nothing was written.",
+                    )?
+                    .to_string(),
+            ),
+        };
+        let mut choices = Vec::new();
+        match input.get("choices") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for (i, item) in items.iter().enumerate() {
+                    let file = item.get("file").and_then(Value::as_str);
+                    let hunk = item.get("hunk").and_then(Value::as_u64);
+                    let at_line = item.get("at_line").and_then(Value::as_u64);
+                    match (file, hunk, at_line) {
+                        (Some(f), Some(h), Some(l)) if h > 0 && l > 0 => choices.push(Choice {
+                            file: f.to_string(),
+                            hunk: h as usize,
+                            at_line: l as usize,
+                        }),
+                        _ => {
+                            return Err(format!(
+                                "choices[{i}] must be {{\"file\": <path>, \"hunk\": <n>, \
+                                 \"at_line\": <n>}} with at_line set to one of the numbers \
+                                 offered (copy a candidate's `choice`); got {item}. \
+                                 Nothing was written."
+                            ))
+                        }
+                    }
+                }
+            }
+            Some(other) => {
+                return Err(format!(
+                    "'choices' must be an array, got {other}. Nothing was written."
+                ))
+            }
+        }
+        if !choices.is_empty() && state_token.is_none() {
+            return Err(
+                "'choices' must be sent with the 'state_token' from the NOT APPLIED \
+                        result they came from. Nothing was written."
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            state_token,
+            choices,
+        })
+    }
+
+    fn choice_for(&self, file: &str, hunk: usize) -> Option<&Choice> {
+        self.choices
+            .iter()
+            .find(|c| c.file == file && c.hunk == hunk)
+    }
+}
+
+/// One quoted line: its 1-based number in the file on disk (`None` for a
+/// line an earlier hunk of this patch adds) and its text.
+pub type QuotedLine = (Option<usize>, String);
+
+/// One place an ambiguous hunk could go.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    /// 1-based line where the hunk's anchor starts. This is the choice.
+    pub at_line: usize,
+    /// Nearest line above with less indentation than the anchor — usually
+    /// the enclosing fn or block header.
+    pub within: Option<QuotedLine>,
+    /// Lines just before and just after the anchor. The anchor itself is
+    /// identical at every candidate, so these are what tell them apart.
+    pub before: Vec<QuotedLine>,
+    pub after: Vec<QuotedLine>,
+}
+
+/// One hunk that needs the caller to choose where it goes.
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub file: String,
+    pub hunk: usize,
+    /// Short identifier: the hunk's first changed line.
+    pub label: String,
+    /// Every match found, including any beyond the candidates listed.
+    pub total: usize,
+    pub candidates: Vec<Candidate>,
+    pub note: Option<String>,
+    /// The same situation as a one-paragraph error message.
+    pub message: String,
+}
+
+/// ANAI-298 B: the patch was not applied because hunks need a choice.
+#[derive(Debug, Clone)]
+pub struct NeedsInput {
+    pub state_token: String,
+    pub decisions: Vec<Decision>,
+    /// The call carried a state_token that no longer matched.
+    pub stale_token: bool,
+}
+
+impl NeedsInput {
+    /// The tool result text: one line of prose, then JSON. The prose line is
+    /// deliberate — the result is sent with `is_error=false` so it is not
+    /// read as "the tool is broken", and the first line keeps it from being
+    /// read as success.
+    pub fn render(&self, patch: &str) -> String {
+        use serde_json::json;
+        let n = self.decisions.len();
+        let mut head = format!(
+            "NOT APPLIED — {} needed. Nothing was changed. Some hunks match more than one \
+             place, so apply_patch will not guess. Retry apply_patch with the same patch, \
+             this state_token, and one choice per hunk listed below (copy the `choice` of \
+             the candidate you mean).",
+            plural(n, "decision")
+        );
+        if self.stale_token {
+            head.push_str(
+                " Your previous state_token no longer matched (a file or the patch changed), \
+                 so its choices were ignored; these choices are fresh.",
+            );
+        }
+        let quoted = |q: &QuotedLine| json!({ "line": q.0, "text": q.1 });
+        let shown = &self.decisions[..n.min(MAX_DECISIONS)];
+        let decisions: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|d| {
+                let candidates: Vec<serde_json::Value> = d
+                    .candidates
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "at_line": c.at_line,
+                            "within": c.within.as_ref().map(quoted),
+                            "before": c.before.iter().map(quoted).collect::<Vec<_>>(),
+                            "after": c.after.iter().map(quoted).collect::<Vec<_>>(),
+                            "choice": { "file": d.file, "hunk": d.hunk, "at_line": c.at_line },
+                        })
+                    })
+                    .collect();
+                json!({
+                    "file": d.file,
+                    "hunk": d.hunk,
+                    "first_change": d.label,
+                    "matches": d.total,
+                    "n_more": d.total.saturating_sub(d.candidates.len()),
+                    "note": d.note,
+                    "candidates": candidates,
+                })
+            })
+            .collect();
+        let retry_choices: Vec<serde_json::Value> = shown
+            .iter()
+            .map(|d| {
+                let options: Vec<String> =
+                    d.candidates.iter().map(|c| c.at_line.to_string()).collect();
+                json!({
+                    "file": d.file,
+                    "hunk": d.hunk,
+                    "at_line": format!("PICK ONE OF {}", options.join(", ")),
+                })
+            })
+            .collect();
+        let patch_arg = if patch.len() <= MAX_ECHO_PATCH {
+            patch.to_string()
+        } else {
+            "(patch too large to echo here — resend your previous patch unchanged)".to_string()
+        };
+        let body = json!({
+            "status": "needs_input",
+            "applied": false,
+            "state_token": self.state_token,
+            "decisions": decisions,
+            "n_more_decisions": n.saturating_sub(MAX_DECISIONS),
+            "retry": {
+                "tool": "apply_patch",
+                "arguments": {
+                    "patch": patch_arg,
+                    "state_token": self.state_token,
+                    "choices": retry_choices,
+                },
+            },
+        });
+        format!(
+            "{head}\n{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        )
     }
 }
 
@@ -461,6 +719,9 @@ enum Action {
         raw: String,
         path: PathBuf,
     },
+    /// ANAI-298 B: a hunk needs the caller's choice; the patch will not be
+    /// written, so there is nothing to do here.
+    Pending,
 }
 
 /// In-memory view of files as earlier ops in this patch leave them.
@@ -484,6 +745,8 @@ async fn plan_op(
     workspace_root: &Path,
     file_policy: Option<&openfang_types::config::FilePolicy>,
     overlay: &mut Overlay,
+    sel: &Selection,
+    pending: &mut Vec<Decision>,
 ) -> Result<Action, String> {
     match op {
         PatchOp::AddFile { path, content } => {
@@ -504,8 +767,12 @@ async fn plan_op(
             let source = resolve_patch_path(path, workspace_root, file_policy)
                 .map_err(|e| format!("{path}: {e}"))?;
             let original = read_planned(&source, path, overlay).await?;
-            let patched =
-                apply_hunks(&original, hunks).map_err(|e| format!("patch {path}: {e}"))?;
+            let Some(patched) = apply_hunks_with(&original, hunks, path, sel, pending)
+                .map_err(|e| format!("patch {path}: {e}"))?
+            else {
+                // ANAI-298 B: at least one hunk needs the caller to choose.
+                return Ok(Action::Pending);
+            };
             // ANAI-254: the counter must derive from a confirmed *change*, not
             // merely from a successful write.
             if move_to.is_none() && patched == original {
@@ -628,6 +895,7 @@ async fn commit(action: Action, agent_id: Option<&str>, result: &mut PatchResult
                 Err(e) => result.errors.push(format!("write {}: {}", raw, e)),
             }
         }
+        Action::Pending => {}
         Action::Delete { raw, path } => {
             // ANAI-149 D2: capture the content before it is gone, so a
             // deleted identity file is still recoverable from the audit record.
@@ -666,11 +934,17 @@ async fn commit(action: Action, agent_id: Option<&str>, result: &mut PatchResult
 /// two untouched. This is planning, not filesystem-transactional rollback: an
 /// I/O failure part-way through the write phase can still leave earlier
 /// writes in place.
+///
+/// ANAI-298 B: hunks that match several places are collected, across every
+/// file, into `needs_input` instead of failing, and nothing is written.
+/// `sel` carries a retry's `state_token` and choices; they are honoured only
+/// if the token still matches the patch and the files.
 pub async fn apply_patch(
     ops: &[PatchOp],
     workspace_root: &Path,
     file_policy: Option<&openfang_types::config::FilePolicy>,
     agent_id: Option<&str>,
+    sel: &Selection,
 ) -> PatchResult {
     let mut result = PatchResult::default();
 
@@ -685,26 +959,127 @@ pub async fn apply_patch(
     }
     if !precheck_errors.is_empty() {
         result.errors = precheck_errors;
+        pilot_log(agent_id, "rejected", "-", sel, false, 0);
         return result;
     }
+
+    // ANAI-298 B: fingerprint the patch and every target before planning, so
+    // choices are honoured only against the exact state they were offered for.
+    let token = state_token(ops, workspace_root, file_policy).await;
+    let token_matched = sel.state_token.as_deref() == Some(token.as_str());
+    let no_choices = Selection::default();
+    let active = if token_matched { sel } else { &no_choices };
+    result.stale_selection = sel.state_token.is_some() && !token_matched;
 
     // ANAI-298: plan everything; report every failing op at once.
     let mut overlay = Overlay::new();
     let mut actions = Vec::new();
+    let mut pending = Vec::new();
     for op in ops {
-        match plan_op(op, workspace_root, file_policy, &mut overlay).await {
+        match plan_op(
+            op,
+            workspace_root,
+            file_policy,
+            &mut overlay,
+            active,
+            &mut pending,
+        )
+        .await
+        {
             Ok(action) => actions.push(action),
             Err(e) => result.errors.push(e),
         }
     }
     if !result.errors.is_empty() {
+        pilot_log(
+            agent_id,
+            "rejected",
+            &token,
+            sel,
+            token_matched,
+            pending.len(),
+        );
+        return result;
+    }
+    if !pending.is_empty() {
+        pilot_log(
+            agent_id,
+            "needs_input",
+            &token,
+            sel,
+            token_matched,
+            pending.len(),
+        );
+        result.needs_input = Some(NeedsInput {
+            state_token: token,
+            decisions: pending,
+            stale_token: result.stale_selection,
+        });
         return result;
     }
 
     for action in actions {
         commit(action, agent_id, &mut result).await;
     }
+    let outcome = if result.is_ok() {
+        "applied"
+    } else {
+        "rejected"
+    };
+    pilot_log(agent_id, outcome, &token, sel, token_matched, 0);
     result
+}
+
+/// Fingerprint of the patch and the current bytes of every file it targets.
+async fn state_token(
+    ops: &[PatchOp],
+    workspace_root: &Path,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+) -> String {
+    let mut h = Sha256::new();
+    for op in ops {
+        let desc = format!("{op:?}");
+        h.update((desc.len() as u64).to_le_bytes());
+        h.update(desc.as_bytes());
+        for raw in op_targets(op) {
+            match resolve_patch_path(raw, workspace_root, file_policy) {
+                Ok(p) => match tokio::fs::read(&p).await {
+                    Ok(bytes) => {
+                        h.update(b"F");
+                        h.update((bytes.len() as u64).to_le_bytes());
+                        h.update(&bytes);
+                    }
+                    Err(_) => h.update(b"-"),
+                },
+                Err(_) => h.update(b"!"),
+            }
+        }
+    }
+    hex::encode(&h.finalize()[..12])
+}
+
+/// ANAI-298 B pilot. One line per call at info (the daemon's default level)
+/// under `apply_patch.pilot`: "do agents retry after needs_input?" is the
+/// count of `token_matched=true` lines against `outcome=needs_input` lines.
+fn pilot_log(
+    agent: Option<&str>,
+    outcome: &str,
+    token: &str,
+    sel: &Selection,
+    token_matched: bool,
+    decisions: usize,
+) {
+    info!(
+        target: "apply_patch.pilot",
+        agent = agent.unwrap_or("-"),
+        outcome,
+        state_token = token,
+        retry = sel.state_token.is_some(),
+        token_matched,
+        choices = sel.choices.len(),
+        decisions,
+        "apply_patch outcome"
+    );
 }
 
 /// Split content into lines, keeping each line's terminator (`"\n"`,
@@ -745,7 +1120,32 @@ fn split_lines(content: &str) -> (Vec<String>, Vec<&'static str>) {
 /// must match exactly one place at or after where the previous hunk ended;
 /// there, `old_lines` are replaced with `new_lines`. See the module docs for
 /// the placement rules.
+#[cfg(test)]
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
+    let mut pending = Vec::new();
+    match apply_hunks_with(content, hunks, "", &Selection::default(), &mut pending)? {
+        Some(out) => Ok(out),
+        None => Err(pending
+            .into_iter()
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+            .join("; ")),
+    }
+}
+
+/// [`apply_hunks`] with the caller's choices. `Ok(None)` means at least one
+/// hunk matched several places with no valid choice: each such hunk is pushed
+/// onto `pending`, and nothing may be written. Later hunks are still checked,
+/// searching forward from the earliest place the unresolved hunk could end,
+/// so one response covers every ambiguity in the file. If the caller then
+/// picks a later place, a later hunk may need a second round.
+fn apply_hunks_with(
+    content: &str,
+    hunks: &[Hunk],
+    file: &str,
+    sel: &Selection,
+    pending: &mut Vec<Decision>,
+) -> Result<Option<String>, String> {
     let (mut lines, mut ends) = split_lines(content);
     let crlf = ends.iter().filter(|e| **e == "\r\n").count();
     let lf = ends.iter().filter(|e| **e == "\n").count();
@@ -756,6 +1156,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
     let mut origin: Vec<Option<usize>> = (1..=lines.len()).map(Some).collect();
     // ANAI-298: hunks search forward from where the previous one ended.
     let mut cursor = 0usize;
+    let mut unresolved = false;
 
     for (hunk_idx, hunk) in hunks.iter().enumerate() {
         let n = hunk_idx + 1;
@@ -782,7 +1183,51 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
         let pos = if pattern.is_empty() {
             lines.len()
         } else {
-            locate(&lines, &origin, &pattern, cursor, hunk, n)?
+            let chosen = sel.choice_for(file, n);
+            match locate(&lines, &origin, &pattern, cursor, hunk, n)? {
+                Located::At(p) => {
+                    if let Some(c) = chosen {
+                        if origin[p] != Some(c.at_line) {
+                            return Err(format!(
+                                "Hunk {n} ({}): the choice at_line {} is not where it \
+                                 matches — it now matches only at {}. Drop that choice \
+                                 or re-read the file.",
+                                hunk_label(hunk),
+                                c.at_line,
+                                describe_line(&origin, p)
+                            ));
+                        }
+                    }
+                    p
+                }
+                Located::Ambiguous { hits, message } => {
+                    let picked = chosen
+                        .and_then(|c| hits.iter().copied().find(|&h| origin[h] == Some(c.at_line)));
+                    if let Some(p) = picked {
+                        p
+                    } else {
+                        let note = chosen.map(|c| {
+                            format!(
+                                "your choice at_line {} is not one of this hunk's matches; \
+                                 pick one of the at_line values listed",
+                                c.at_line
+                            )
+                        });
+                        let d = decision(
+                            &lines, &origin, &pattern, hunk, file, n, &hits, message, note,
+                        );
+                        if d.candidates.is_empty() {
+                            // Every match sits in lines this patch adds; there is
+                            // nothing on disk to choose.
+                            return Err(d.message);
+                        }
+                        pending.push(d);
+                        unresolved = true;
+                        cursor = hits[0] + hunk.context_before.len() + hunk.old_lines.len();
+                        continue;
+                    }
+                }
+            }
         };
 
         let start = pos + hunk.context_before.len();
@@ -793,6 +1238,9 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
         origin.splice(start..end, std::iter::repeat_n(None, added));
         cursor = start + added;
     }
+    if unresolved {
+        return Ok(None);
+    }
 
     let mut out = String::with_capacity(content.len() + 64);
     let last = lines.len();
@@ -802,7 +1250,7 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
             out.push_str(if end.is_empty() { nl } else { end });
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Every start index `>= from` where `pattern` matches `lines`, compared
@@ -870,6 +1318,100 @@ fn hunk_label(h: &Hunk) -> String {
     }
 }
 
+/// Where a hunk's anchor matched.
+enum Located {
+    At(usize),
+    /// Several places. `message` is the stand-alone error text.
+    Ambiguous {
+        hits: Vec<usize>,
+        message: String,
+    },
+}
+
+fn clip(s: &str) -> String {
+    if s.chars().count() <= MAX_LINE_CHARS {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(MAX_LINE_CHARS).collect();
+        format!("{head}…")
+    }
+}
+
+fn indent_of(s: &str) -> usize {
+    s.len() - s.trim_start().len()
+}
+
+/// Describe an ambiguous hunk's candidates for the caller to choose from.
+#[allow(clippy::too_many_arguments)]
+fn decision(
+    lines: &[String],
+    origin: &[Option<usize>],
+    pattern: &[&str],
+    hunk: &Hunk,
+    file: &str,
+    n: usize,
+    hits: &[usize],
+    message: String,
+    note: Option<String>,
+) -> Decision {
+    let anchor_indent = pattern
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| indent_of(l))
+        .unwrap_or(0);
+    let quote = |k: usize| (origin[k], clip(&lines[k]));
+    let mut candidates = Vec::new();
+    let mut unselectable = 0usize;
+    for &h in hits {
+        let Some(at_line) = origin[h] else {
+            unselectable += 1;
+            continue;
+        };
+        if candidates.len() >= MAX_LISTED {
+            continue;
+        }
+        let end = h + pattern.len();
+        let within = (h.saturating_sub(WITHIN_SCAN)..h)
+            .rev()
+            .find(|&k| {
+                let t = lines[k].trim();
+                !t.is_empty()
+                    && indent_of(&lines[k]) < anchor_indent
+                    && !t.chars().all(|c| matches!(c, '}' | ']' | ')' | ';' | ','))
+            })
+            .map(quote);
+        candidates.push(Candidate {
+            at_line,
+            within,
+            before: (h.saturating_sub(SHOWN_CONTEXT)..h).map(quote).collect(),
+            after: (end..(end + SHOWN_CONTEXT).min(lines.len()))
+                .map(quote)
+                .collect(),
+        });
+    }
+    let mut notes: Vec<String> = note.into_iter().collect();
+    if unselectable > 0 {
+        notes.push(format!(
+            "{} more {} inside lines this patch adds and cannot be chosen",
+            unselectable,
+            if unselectable == 1 {
+                "match is"
+            } else {
+                "matches are"
+            }
+        ));
+    }
+    Decision {
+        file: file.to_string(),
+        hunk: n,
+        label: hunk_label(hunk),
+        total: hits.len(),
+        candidates,
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+        message,
+    }
+}
+
 /// Find the single place `pattern` belongs, searching from `cursor` (and
 /// from the `@@` scope line, when the hunk names one). Zero or several
 /// matches is an error that says which, and where.
@@ -880,7 +1422,7 @@ fn locate(
     cursor: usize,
     hunk: &Hunk,
     n: usize,
-) -> Result<usize, String> {
+) -> Result<Located, String> {
     let label = hunk_label(hunk);
     let mut from = cursor;
     let mut where_ = if cursor == 0 {
@@ -924,17 +1466,18 @@ fn locate(
                         describe_line(origin, *one)
                     );
                 }
-                return Ok(*one);
+                return Ok(Located::At(*one));
             }
             _ => {
-                return Err(format!(
+                let message = format!(
                     "Hunk {n} ({label}) is ambiguous: its context and '-' lines match \
                      {} places{where_}, starting at {}. Add context lines that occur only \
                      at the intended place, or start the hunk with `@@ <text of a unique \
                      line above it>` (e.g. the enclosing fn signature).",
                     hits.len(),
                     list_lines(origin, &hits)
-                ));
+                );
+                return Ok(Located::Ambiguous { hits, message });
             }
         }
     }
@@ -1242,7 +1785,7 @@ mod tests {
             },
         ];
 
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
         assert!(result.is_ok());
         assert_eq!(result.files_added, 1);
         assert_eq!(result.files_updated, 1);
@@ -1276,7 +1819,7 @@ mod tests {
             path: "doomed.txt".to_string(),
         }];
 
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
         assert!(result.is_ok());
         assert_eq!(result.files_deleted, 1);
         assert!(!dir.join("doomed.txt").exists());
@@ -1313,7 +1856,7 @@ mod tests {
             },
         ];
 
-        let result = apply_patch(&ops, &dir, Some(&policy), None).await;
+        let result = apply_patch(&ops, &dir, Some(&policy), None, &Selection::default()).await;
         assert!(
             !result.is_ok(),
             "patch must be rejected when any target is policy-denied"
@@ -1373,7 +1916,7 @@ mod tests {
             move_to: None,
             hunks: vec![hunk(&["alpha"], &["bravo"], &["bravo"], &[])],
         }];
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
 
         assert_eq!(
             result.files_updated, 0,
@@ -1724,7 +2267,7 @@ mod tests {
             update("one.txt", vec![hunk(&["a"], &["b"], &["B"], &[])]),
             update("two.txt", vec![hunk(&["x"], &["NOPE"], &["Y"], &[])]),
         ];
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
         assert!(!result.is_ok());
         assert_eq!(result.files_updated, 0);
         assert_eq!(
@@ -1749,7 +2292,7 @@ mod tests {
             },
             update("n.txt", vec![hunk(&["a"], &["b"], &["B"], &[])]),
         ];
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
         assert!(result.is_ok(), "{:?}", result.errors);
         assert_eq!(
             std::fs::read_to_string(dir.join("n.txt")).unwrap(),
@@ -1770,9 +2313,244 @@ mod tests {
                 path: "ghost.txt".to_string(),
             },
         ];
-        let result = apply_patch(&ops, &dir, None, None).await;
+        let result = apply_patch(&ops, &dir, None, None, &Selection::default()).await;
         assert!(!result.is_ok());
         assert!(!dir.join("n.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- ANAI-298 B: needs_input round trip ----
+
+    const TWIN: &str = "fn a() {\n    call();\n}\nfn b() {\n    call();\n}\n";
+
+    fn twin_hunk() -> Hunk {
+        hunk(&[], &["    call();"], &["    other();"], &["}"])
+    }
+
+    async fn ask(dir: &Path, ops: &[PatchOp]) -> NeedsInput {
+        let r = apply_patch(ops, dir, None, None, &Selection::default()).await;
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert!(!r.is_ok());
+        r.needs_input
+            .expect("an ambiguous hunk must come back as needs_input")
+    }
+
+    fn pick(ni: &NeedsInput, file: &str, hunk: usize, at_line: usize) -> Selection {
+        Selection {
+            state_token: Some(ni.state_token.clone()),
+            choices: vec![Choice {
+                file: file.to_string(),
+                hunk,
+                at_line,
+            }],
+        }
+    }
+
+    fn at_lines(d: &Decision) -> Vec<usize> {
+        d.candidates.iter().map(|c| c.at_line).collect()
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_hunk_asks_instead_of_failing_and_writes_nothing() {
+        let dir = temp_dir("ask");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ni = ask(&dir, &[update("t.rs", vec![twin_hunk()])]).await;
+        assert_eq!(std::fs::read_to_string(dir.join("t.rs")).unwrap(), TWIN);
+        assert_eq!(ni.decisions.len(), 1);
+        let d = &ni.decisions[0];
+        assert_eq!((d.file.as_str(), d.hunk, d.total), ("t.rs", 1, 2));
+        assert_eq!(at_lines(d), vec![2, 5]);
+        // The anchor is identical at both; `within` is what tells them apart.
+        let within: Vec<&str> = d
+            .candidates
+            .iter()
+            .map(|c| c.within.as_ref().unwrap().1.as_str())
+            .collect();
+        assert_eq!(within, vec!["fn a() {", "fn b() {"]);
+        assert!(!ni.stale_token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_the_token_and_a_choice_applies_there() {
+        let dir = temp_dir("choose");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ops = vec![update("t.rs", vec![twin_hunk()])];
+        let ni = ask(&dir, &ops).await;
+        let r = apply_patch(&ops, &dir, None, None, &pick(&ni, "t.rs", 1, 5)).await;
+        assert!(r.is_ok(), "{:?} {:?}", r.errors, r.needs_input);
+        assert_eq!(r.files_updated, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("t.rs")).unwrap(),
+            "fn a() {\n    call();\n}\nfn b() {\n    other();\n}\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stale_token_voids_its_choices_and_asks_again() {
+        let dir = temp_dir("stale");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ops = vec![update("t.rs", vec![twin_hunk()])];
+        let ni = ask(&dir, &ops).await;
+        // Another writer shifts the file between the question and the answer.
+        let moved = format!("// moved\n{TWIN}");
+        std::fs::write(dir.join("t.rs"), &moved).unwrap();
+        let r = apply_patch(&ops, &dir, None, None, &pick(&ni, "t.rs", 1, 5)).await;
+        let again = r.needs_input.expect("stale choices must not be applied");
+        assert!(again.stale_token);
+        assert_ne!(again.state_token, ni.state_token);
+        assert_eq!(at_lines(&again.decisions[0]), vec![3, 6]);
+        assert_eq!(std::fs::read_to_string(dir.join("t.rs")).unwrap(), moved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_changed_patch_also_voids_the_token() {
+        let dir = temp_dir("stalepatch");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ni = ask(&dir, &[update("t.rs", vec![twin_hunk()])]).await;
+        let other = vec![update(
+            "t.rs",
+            vec![hunk(&[], &["    call();"], &["    third();"], &["}"])],
+        )];
+        let r = apply_patch(&other, &dir, None, None, &pick(&ni, "t.rs", 1, 5)).await;
+        assert!(r.needs_input.expect("must ask again").stale_token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_choice_that_is_not_a_match_is_asked_again_with_a_note() {
+        let dir = temp_dir("badpick");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ops = vec![update("t.rs", vec![twin_hunk()])];
+        let ni = ask(&dir, &ops).await;
+        let r = apply_patch(&ops, &dir, None, None, &pick(&ni, "t.rs", 1, 4)).await;
+        let again = r
+            .needs_input
+            .expect("an off-target pick must not be applied");
+        let note = again.decisions[0].note.as_deref().unwrap_or("");
+        assert!(note.contains("at_line 4"), "{note}");
+        assert_eq!(std::fs::read_to_string(dir.join("t.rs")).unwrap(), TWIN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn every_ambiguous_hunk_in_every_file_is_reported_at_once() {
+        let dir = temp_dir("askall");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        std::fs::write(dir.join("u.rs"), TWIN).unwrap();
+        std::fs::write(dir.join("c.txt"), "a\nb\n").unwrap();
+        let ops = vec![
+            update("c.txt", vec![hunk(&["a"], &["b"], &["B"], &[])]),
+            update("t.rs", vec![twin_hunk()]),
+            update("u.rs", vec![twin_hunk()]),
+        ];
+        let ni = ask(&dir, &ops).await;
+        let files: Vec<&str> = ni.decisions.iter().map(|d| d.file.as_str()).collect();
+        assert_eq!(files, vec!["t.rs", "u.rs"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c.txt")).unwrap(),
+            "a\nb\n",
+            "the unambiguous file must not be written either"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_hunks_are_offered_only_places_below_the_earliest_candidate() {
+        let mut pending = Vec::new();
+        let out = apply_hunks_with(
+            "x\nk\nx\nk\nx\n",
+            &[
+                hunk(&[], &["k"], &["K"], &[]),
+                hunk(&[], &["x"], &["X"], &[]),
+            ],
+            "f",
+            &Selection::default(),
+            &mut pending,
+        )
+        .unwrap();
+        assert!(out.is_none());
+        assert_eq!(pending.len(), 2);
+        assert_eq!(at_lines(&pending[0]), vec![2, 4]);
+        // Line 1 is above every place hunk 1 could go, so it is not offered.
+        assert_eq!(at_lines(&pending[1]), vec![3, 5]);
+    }
+
+    #[test]
+    fn candidates_are_capped_but_the_total_is_kept() {
+        let content = "    dup();\n".repeat(500);
+        let mut pending = Vec::new();
+        apply_hunks_with(
+            &content,
+            &[hunk(&[], &["    dup();"], &["    one();"], &[])],
+            "f",
+            &Selection::default(),
+            &mut pending,
+        )
+        .unwrap();
+        let d = &pending[0];
+        assert_eq!(d.total, 500);
+        assert_eq!(d.candidates.len(), MAX_LISTED);
+        let ni = NeedsInput {
+            state_token: "t".to_string(),
+            decisions: pending.clone(),
+            stale_token: false,
+        };
+        let text = ni.render("p");
+        assert!(text.len() < 32 * 1024, "response is {} bytes", text.len());
+        assert!(text.contains("\"n_more\": 490"), "{text}");
+    }
+
+    #[test]
+    fn selection_requires_a_token_and_numeric_picks() {
+        use serde_json::json;
+        let e =
+            Selection::from_input(&json!({"choices": [{"file": "a", "hunk": 1, "at_line": 2}]}))
+                .unwrap_err();
+        assert!(e.contains("state_token"), "{e}");
+        // Copying the retry template without making the pick is refused.
+        let e = Selection::from_input(&json!({
+            "state_token": "t",
+            "choices": [{"file": "a", "hunk": 1, "at_line": "PICK ONE OF 2, 5"}]
+        }))
+        .unwrap_err();
+        assert!(e.contains("at_line"), "{e}");
+        let s = Selection::from_input(&json!({"patch": "x"})).unwrap();
+        assert!(s.state_token.is_none() && s.choices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_rendered_question_leads_with_not_applied_and_its_choices_round_trip() {
+        use serde_json::json;
+        let dir = temp_dir("render");
+        std::fs::write(dir.join("t.rs"), TWIN).unwrap();
+        let ops = vec![update("t.rs", vec![twin_hunk()])];
+        let ni = ask(&dir, &ops).await;
+        let text = ni.render("PATCH TEXT");
+        let (first, rest) = text.split_once('\n').unwrap();
+        assert!(
+            first.starts_with("NOT APPLIED — 1 decision needed. Nothing was changed."),
+            "{first}"
+        );
+        let v: serde_json::Value = serde_json::from_str(rest).unwrap();
+        assert_eq!(v["status"], "needs_input");
+        assert_eq!(v["applied"], false);
+        let args = &v["retry"]["arguments"];
+        assert_eq!(args["patch"], "PATCH TEXT");
+        assert_eq!(args["state_token"], ni.state_token.as_str());
+        // A candidate's `choice`, copied verbatim with the token, is a valid retry.
+        let choice = v["decisions"][0]["candidates"][1]["choice"].clone();
+        let sel = Selection::from_input(
+            &json!({"state_token": args["state_token"], "choices": [choice]}),
+        )
+        .unwrap();
+        let r = apply_patch(&ops, &dir, None, None, &sel).await;
+        assert!(r.is_ok(), "{:?} {:?}", r.errors, r.needs_input);
+        assert!(std::fs::read_to_string(dir.join("t.rs"))
+            .unwrap()
+            .ends_with("fn b() {\n    other();\n}\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

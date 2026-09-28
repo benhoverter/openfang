@@ -699,13 +699,34 @@ pub fn built_in_tools() -> Vec<Tool> {
             "apply_patch",
             "Apply a multi-hunk diff patch to add, update, move, or delete files. \
              Use this for targeted edits instead of full file overwrites. Paths in \
-             the patch are resolved relative to the agent workspace.",
+             the patch are resolved relative to the agent workspace. If a hunk \
+             matches more than one place, nothing is written and the result starts \
+             with NOT APPLIED and lists each place: retry with the same patch, the \
+             returned state_token, and one choice per listed hunk.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "patch": {
                         "type": "string",
                         "description": "The patch in *** Begin Patch / *** End Patch format. Use *** Add File:, *** Update File:, *** Delete File: markers. Hunks use @@ headers with space (context), - (remove), + (add) prefixed lines."
+                    },
+                    // ANAI-298 B: retry arguments after a NOT APPLIED result.
+                    "state_token": {
+                        "type": "string",
+                        "description": "Only when retrying after a NOT APPLIED result: the state_token it returned. Ties your choices to the file contents they were offered for."
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Only when retrying after a NOT APPLIED result: one entry per listed hunk, copied from the `choice` of the candidate you mean.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": { "type": "string" },
+                                "hunk": { "type": "integer" },
+                                "at_line": { "type": "integer" }
+                            },
+                            "required": ["file", "hunk", "at_line"]
+                        }
                     }
                 },
                 "required": ["patch"]

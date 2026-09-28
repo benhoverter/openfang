@@ -1287,13 +1287,30 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "apply_patch".to_string(),
-            description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
+            description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites. If a hunk matches more than one place, nothing is written and the result starts with NOT APPLIED and lists each place: retry with the same patch, the returned state_token, and one choice per listed hunk.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "patch": {
                         "type": "string",
                         "description": "The patch in *** Begin Patch / *** End Patch format. Use *** Add File:, *** Update File:, *** Delete File: markers. Hunks use @@ headers with space (context), - (remove), + (add) prefixed lines."
+                    },
+                    "state_token": {
+                        "type": "string",
+                        "description": "Only when retrying after a NOT APPLIED result: the state_token it returned. Ties your choices to the file contents they were offered for."
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Only when retrying after a NOT APPLIED result: one entry per listed hunk, copied from the `choice` of the candidate you mean.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "file": { "type": "string" },
+                                "hunk": { "type": "integer" },
+                                "at_line": { "type": "integer" }
+                            },
+                            "required": ["file", "hunk", "at_line"]
+                        }
                     }
                 },
                 "required": ["patch"]
@@ -4019,9 +4036,33 @@ async fn tool_apply_patch(
     let patch_str = input["patch"].as_str().ok_or("Missing 'patch' parameter")?;
     let root = workspace_root.ok_or("apply_patch requires a workspace root")?;
     let ops = crate::apply_patch::parse_patch(patch_str)?;
-    let result = crate::apply_patch::apply_patch(&ops, root, file_policy, caller_agent_id).await;
+    let sel = crate::apply_patch::Selection::from_input(input)?;
+    let result =
+        crate::apply_patch::apply_patch(&ops, root, file_policy, caller_agent_id, &sel).await;
+    // ANAI-298 B: a hunk that matched several places is a question back to
+    // the agent, not a failure. It goes out as Ok (is_error=false) so it is
+    // not read as "the tool is broken"; its first line says NOT APPLIED so it
+    // is not read as success either.
+    if let Some(needs) = &result.needs_input {
+        return Ok(needs.render(patch_str));
+    }
     if result.is_ok() {
-        Ok(result.summary())
+        let mut out = result.summary();
+        if result.stale_selection {
+            out.push_str(
+                " (the state_token sent was stale, so its choices were ignored; \
+                 every hunk matched exactly one place without them)",
+            );
+        }
+        return Ok(out);
+    }
+    let written = result.files_added + result.files_updated + result.files_deleted;
+    if written == 0 {
+        Err(format!(
+            "{}. Errors: {}",
+            result.summary(),
+            result.errors.join("; ")
+        ))
     } else {
         Err(format!(
             "Patch partially applied: {}. Errors: {}",
@@ -14659,6 +14700,44 @@ mod image_read_tests {
             "file_read on an image must name the call that works: {}",
             read.content
         );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_needs_input_is_not_an_error_and_says_not_applied() {
+        // ANAI-298 B: the question must reach the agent with is_error=false
+        // (no "tool failed" framing) and a first line that cannot be read as
+        // success.
+        let dir = tempfile::tempdir().unwrap();
+        let twin = "fn a() {\n    call();\n}\nfn b() {\n    call();\n}\n";
+        std::fs::write(dir.path().join("t.rs"), twin).unwrap();
+        let patch = "*** Begin Patch\n*** Update File: t.rs\n@@\n-    call();\n+    other();\n }\n*** End Patch";
+        let out = tool_apply_patch(
+            &serde_json::json!({ "patch": patch }),
+            Some(dir.path()),
+            None,
+            None,
+        )
+        .await
+        .expect("needs_input must be Ok, not Err");
+        assert!(out.starts_with("NOT APPLIED"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("t.rs")).unwrap(),
+            twin
+        );
+
+        // A plain rejection no longer claims a partial apply.
+        let bad =
+            "*** Begin Patch\n*** Update File: t.rs\n@@\n-    nope();\n+    x();\n*** End Patch";
+        let err = tool_apply_patch(
+            &serde_json::json!({ "patch": bad }),
+            Some(dir.path()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.contains("partially applied"), "{err}");
+        assert!(err.contains("nothing was written"), "{err}");
     }
 
     #[test]
