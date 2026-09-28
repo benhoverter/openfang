@@ -11,7 +11,7 @@
 //! +line1
 //! +line2
 //! *** Update File: path/to/existing.rs
-//! @@ context_before @@
+//! @@ fn enclosing_function
 //!  unchanged_line
 //! -old_line
 //! +new_line
@@ -19,9 +19,28 @@
 //! *** Delete File: path/to/old.rs
 //! *** End Patch
 //! ```
+//!
+//! How a hunk is placed (ANAI-298):
+//! - The anchor is the WHOLE hunk: leading context, `-` lines and trailing
+//!   context, matched as one contiguous block.
+//! - Hunks are searched forward, each starting where the previous one ended,
+//!   so they must be listed in file order.
+//! - Text after `@@` names a line at or above the change (e.g. the enclosing
+//!   `fn` signature); the search starts at that line. A bare `@@` or a
+//!   unified-diff range (`@@ -12,5 +12,6 @@`) carries no scope.
+//! - Exact matches are tried first, then matches ignoring trailing
+//!   whitespace. More than one match is refused, never guessed.
+//! - Every hunk in every file is resolved before anything is written; one
+//!   failure rejects the whole patch.
+//! - Untouched lines keep their own line ending; inserted lines take the
+//!   file's dominant one.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
+
+/// Most match locations quoted in one error message.
+const MAX_LISTED: usize = 10;
 
 /// A single operation in a patch.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +58,7 @@ pub enum PatchOp {
 }
 
 /// A single hunk within a file update — describes one contiguous change region.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Hunk {
     /// Lines of unchanged context before the change (for anchoring).
     pub context_before: Vec<String>,
@@ -49,6 +68,11 @@ pub struct Hunk {
     pub new_lines: Vec<String>,
     /// Lines of unchanged context after the change (for anchoring).
     pub context_after: Vec<String>,
+    /// Text from the `@@` header naming a line at or above the change; the
+    /// search for this hunk starts at the first line containing it. `None`
+    /// for a bare `@@`, a unified-diff range, or the second and later regions
+    /// of a split hunk.
+    pub scope: Option<String>,
 }
 
 /// Result of applying a patch.
@@ -87,6 +111,19 @@ impl PatchResult {
         if self.files_moved > 0 {
             parts.push(format!("{} moved", self.files_moved));
         }
+        if parts.is_empty() && !self.errors.is_empty() {
+            // ANAI-298: planning refuses the whole patch before any write, so
+            // say so plainly — the caller's wrapper text may not.
+            return format!(
+                "No changes applied — patch rejected, nothing was written ({} {})",
+                self.errors.len(),
+                if self.errors.len() == 1 {
+                    "error"
+                } else {
+                    "errors"
+                }
+            );
+        }
         if !self.errors.is_empty() {
             parts.push(format!("{} errors", self.errors.len()));
         }
@@ -96,6 +133,143 @@ impl PatchResult {
             parts.join(", ")
         }
     }
+}
+
+/// True for a line that starts a new file operation. Checked on the raw
+/// line: hunk content always carries a ` `/`-`/`+` prefix, so a content line
+/// such as ` *** banner ***` or `+@@ note` can never end a hunk early.
+fn is_op_marker(raw: &str) -> bool {
+    raw.starts_with("*** Add File:")
+        || raw.starts_with("*** Update File:")
+        || raw.starts_with("*** Delete File:")
+}
+
+/// `-12,5 +12,6` — the line-range part of a unified-diff hunk header.
+fn looks_like_unified_range(s: &str) -> bool {
+    let is_range = |t: &str, sign: char| {
+        t.strip_prefix(sign)
+            .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit() || c == ','))
+    };
+    let mut it = s.split_whitespace();
+    matches!((it.next(), it.next()), (Some(a), Some(b)) if is_range(a, '-') && is_range(b, '+'))
+}
+
+/// Scope text from a `@@` header line. `@@`, `@@ @@` and a bare unified
+/// range give `None`; `@@ fn foo`, `@@ fn foo @@` and
+/// `@@ -3,4 +3,5 @@ fn foo` all give `fn foo`.
+fn parse_hunk_header(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix("@@")?.trim();
+    let rest = if looks_like_unified_range(rest) {
+        rest.find("@@").map_or("", |p| rest[p + 2..].trim())
+    } else {
+        rest.strip_suffix("@@").unwrap_or(rest).trim()
+    };
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
+}
+
+/// Parse one hunk body starting at `body[start]` (the line after its `@@`
+/// header, if it had one). Returns the hunks it holds — more than one when
+/// the body has several change regions — and the index of the first line
+/// after it.
+fn parse_hunk_body(
+    body: &[&str],
+    start: usize,
+    scope: Option<String>,
+    path: &str,
+    line_base: usize,
+) -> Result<(Vec<Hunk>, usize), String> {
+    let mut out = Vec::new();
+    let mut cur = Hunk {
+        scope,
+        ..Default::default()
+    };
+    let mut in_change = false;
+    let mut past_change = false;
+    // Unprefixed blank lines at the tail of the current context run. Those
+    // at the very end of the hunk are formatting, not context: dropped below
+    // so a stray blank line before `*** End Patch` cannot fail the match.
+    let mut trailing_bare = 0usize;
+    let mut i = start;
+
+    while i < body.len() {
+        let hl = body[i];
+        if hl.starts_with("@@") || is_op_marker(hl) {
+            break;
+        }
+        if hl.trim() == "*** End of File" {
+            i += 1;
+            break;
+        }
+        let (kind, text, bare) = if let Some(s) = hl.strip_prefix('-') {
+            ('-', s, false)
+        } else if let Some(s) = hl.strip_prefix('+') {
+            ('+', s, false)
+        } else if let Some(s) = hl.strip_prefix(' ') {
+            (' ', s, false)
+        } else if hl.trim().is_empty() {
+            (' ', "", true)
+        } else {
+            // ANAI-298: this used to be folded in as context, so a malformed
+            // patch was partly applied instead of refused.
+            return Err(format!(
+                "{path}: patch line {}: a hunk line must start with ' ' (context), \
+                 '-' (remove) or '+' (add), got: {hl}",
+                line_base + i
+            ));
+        };
+
+        if kind == ' ' {
+            if in_change || past_change {
+                past_change = true;
+                in_change = false;
+                cur.context_after.push(text.to_string());
+            } else {
+                cur.context_before.push(text.to_string());
+            }
+            trailing_bare = if bare { trailing_bare + 1 } else { 0 };
+        } else {
+            // ANAI-254: a change line that resumes *after* trailing context
+            // begins a new hunk; the shared context anchors both.
+            if past_change {
+                let carry = std::mem::take(&mut cur.context_after);
+                let done = std::mem::replace(
+                    &mut cur,
+                    Hunk {
+                        context_before: carry.clone(),
+                        ..Default::default()
+                    },
+                );
+                out.push(Hunk {
+                    context_after: carry,
+                    ..done
+                });
+                past_change = false;
+            }
+            in_change = true;
+            trailing_bare = 0;
+            if kind == '-' {
+                cur.old_lines.push(text.to_string());
+            } else {
+                cur.new_lines.push(text.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    let tail = if in_change || past_change {
+        &mut cur.context_after
+    } else {
+        &mut cur.context_before
+    };
+    for _ in 0..trailing_bare {
+        tail.pop();
+    }
+    out.push(cur);
+    Ok((out, i))
 }
 
 /// Parse a patch string into a list of `PatchOp`s.
@@ -122,6 +296,8 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
     }
 
     let body = &lines[begin + 1..end];
+    // 1-based line number, within `input`, of `body[0]`.
+    let line_base = begin + 2;
     let mut i = 0;
 
     while i < body.len() {
@@ -138,20 +314,27 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
             }
             i += 1;
 
-            // Collect content lines (prefixed with +)
+            // Collect content lines (prefixed with +). An unprefixed blank
+            // line is an empty line of content, except at the very end.
             let mut content_lines = Vec::new();
-            while i < body.len() && !body[i].trim().starts_with("***") {
+            let mut trailing_bare = 0usize;
+            while i < body.len() && !is_op_marker(body[i]) {
                 let l = body[i];
                 if let Some(stripped) = l.strip_prefix('+') {
                     content_lines.push(stripped.to_string());
-                } else if !l.trim().is_empty() {
+                    trailing_bare = 0;
+                } else if l.trim().is_empty() {
+                    content_lines.push(String::new());
+                    trailing_bare += 1;
+                } else {
                     return Err(format!(
-                        "Expected '+' prefix in Add File content, got: {}",
-                        l
+                        "{path}: patch line {}: expected '+' prefix in Add File content, got: {l}",
+                        line_base + i
                     ));
                 }
                 i += 1;
             }
+            content_lines.truncate(content_lines.len() - trailing_bare);
             ops.push(PatchOp::AddFile {
                 path,
                 content: content_lines.join("\n"),
@@ -169,88 +352,30 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
             }
             i += 1;
 
-            // Parse hunks
+            // Parse hunks. A hunk starts at an `@@` header, or directly at a
+            // prefixed line when the first hunk has no header.
             let mut hunks = Vec::new();
-            while i < body.len() && !body[i].trim().starts_with("***") {
-                let l = body[i].trim();
-                if l.starts_with("@@") {
+            while i < body.len() && !is_op_marker(body[i]) {
+                let raw = body[i];
+                if raw.trim().is_empty() || raw.trim() == "*** End of File" {
                     i += 1;
-                    // Parse hunk body
-                    let mut context_before = Vec::new();
-                    let mut old_lines = Vec::new();
-                    let mut new_lines = Vec::new();
-                    let mut context_after = Vec::new();
-                    let mut in_change = false;
-                    let mut past_change = false;
-
-                    while i < body.len()
-                        && !body[i].trim().starts_with("@@")
-                        && !body[i].trim().starts_with("***")
-                    {
-                        let hl = body[i];
-                        // ANAI-254: a change line that resumes *after* trailing
-                        // context begins a new hunk. Folding it into the current
-                        // hunk merged two non-adjacent regions into one anchor
-                        // (context_before + all old_lines) that can never match
-                        // the file, so every multi-region hunk failed.
-                        if past_change && (hl.starts_with('-') || hl.starts_with('+')) {
-                            let carry = std::mem::take(&mut context_after);
-                            hunks.push(Hunk {
-                                context_before: std::mem::take(&mut context_before),
-                                old_lines: std::mem::take(&mut old_lines),
-                                new_lines: std::mem::take(&mut new_lines),
-                                context_after: carry.clone(),
-                            });
-                            context_before = carry;
-                            past_change = false;
-                        }
-                        if let Some(stripped) = hl.strip_prefix('-') {
-                            in_change = true;
-                            past_change = false;
-                            old_lines.push(stripped.to_string());
-                        } else if let Some(stripped) = hl.strip_prefix('+') {
-                            in_change = true;
-                            past_change = false;
-                            new_lines.push(stripped.to_string());
-                        } else if let Some(stripped) = hl.strip_prefix(' ') {
-                            if in_change || past_change {
-                                past_change = true;
-                                in_change = false;
-                                context_after.push(stripped.to_string());
-                            } else {
-                                context_before.push(stripped.to_string());
-                            }
-                        } else if hl.trim().is_empty() {
-                            // Blank line counts as context
-                            if in_change || past_change {
-                                past_change = true;
-                                in_change = false;
-                                context_after.push(String::new());
-                            } else {
-                                context_before.push(String::new());
-                            }
-                        } else {
-                            // Unrecognized line, treat as context
-                            if in_change || past_change {
-                                past_change = true;
-                                in_change = false;
-                                context_after.push(hl.to_string());
-                            } else {
-                                context_before.push(hl.to_string());
-                            }
-                        }
-                        i += 1;
-                    }
-
-                    hunks.push(Hunk {
-                        context_before,
-                        old_lines,
-                        new_lines,
-                        context_after,
-                    });
-                } else {
-                    i += 1;
+                    continue;
                 }
+                let scope = if raw.starts_with("@@") {
+                    i += 1;
+                    parse_hunk_header(raw)
+                } else if raw.starts_with([' ', '-', '+']) {
+                    None
+                } else {
+                    return Err(format!(
+                        "{path}: patch line {}: expected an '@@' hunk header or a hunk \
+                         line starting with ' ', '-' or '+', got: {raw}",
+                        line_base + i
+                    ));
+                };
+                let (mut parsed, next) = parse_hunk_body(body, i, scope, &path, line_base)?;
+                hunks.append(&mut parsed);
+                i = next;
             }
 
             if hunks.is_empty() {
@@ -276,7 +401,11 @@ pub fn parse_patch(input: &str) -> Result<Vec<PatchOp>, String> {
         } else if line.is_empty() {
             i += 1;
         } else {
-            return Err(format!("Unexpected line in patch: {}", line));
+            return Err(format!(
+                "patch line {}: unexpected line in patch: {}",
+                line_base + i,
+                line
+            ));
         }
     }
 
@@ -313,17 +442,230 @@ fn op_targets(op: &PatchOp) -> Vec<&str> {
     }
 }
 
+/// One filesystem change the plan has committed to.
+enum Action {
+    Add {
+        raw: String,
+        path: PathBuf,
+        content: String,
+    },
+    Update {
+        raw: String,
+        source: PathBuf,
+        target: PathBuf,
+        original: String,
+        patched: String,
+        moved: bool,
+    },
+    Delete {
+        raw: String,
+        path: PathBuf,
+    },
+}
+
+/// In-memory view of files as earlier ops in this patch leave them.
+/// `None` marks a file deleted (or moved away) earlier in the patch.
+type Overlay = HashMap<PathBuf, Option<String>>;
+
+async fn read_planned(path: &Path, raw: &str, overlay: &Overlay) -> Result<String, String> {
+    match overlay.get(path) {
+        Some(Some(c)) => Ok(c.clone()),
+        Some(None) => Err(format!("{raw}: deleted or moved earlier in this patch")),
+        None => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("read {raw}: {e}")),
+    }
+}
+
+/// Resolve one op completely — paths, file contents, every hunk — without
+/// writing anything.
+async fn plan_op(
+    op: &PatchOp,
+    workspace_root: &Path,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    overlay: &mut Overlay,
+) -> Result<Action, String> {
+    match op {
+        PatchOp::AddFile { path, content } => {
+            let resolved = resolve_patch_path(path, workspace_root, file_policy)
+                .map_err(|e| format!("{path}: {e}"))?;
+            overlay.insert(resolved.clone(), Some(content.clone()));
+            Ok(Action::Add {
+                raw: path.clone(),
+                path: resolved,
+                content: content.clone(),
+            })
+        }
+        PatchOp::UpdateFile {
+            path,
+            move_to,
+            hunks,
+        } => {
+            let source = resolve_patch_path(path, workspace_root, file_policy)
+                .map_err(|e| format!("{path}: {e}"))?;
+            let original = read_planned(&source, path, overlay).await?;
+            let patched =
+                apply_hunks(&original, hunks).map_err(|e| format!("patch {path}: {e}"))?;
+            // ANAI-254: the counter must derive from a confirmed *change*, not
+            // merely from a successful write.
+            if move_to.is_none() && patched == original {
+                return Err(format!(
+                    "{}: hunks applied cleanly but produced no change — \
+                     the file already matches the patched content. \
+                     Nothing was written.",
+                    path
+                ));
+            }
+            let target = match move_to {
+                Some(new_path) => resolve_patch_path(new_path, workspace_root, file_policy)
+                    .map_err(|e| format!("{new_path}: {e}"))?,
+                None => source.clone(),
+            };
+            if target != source {
+                overlay.insert(source.clone(), None);
+            }
+            overlay.insert(target.clone(), Some(patched.clone()));
+            Ok(Action::Update {
+                raw: path.clone(),
+                source,
+                target,
+                original,
+                patched,
+                moved: move_to.is_some(),
+            })
+        }
+        PatchOp::DeleteFile { path } => {
+            let resolved = resolve_patch_path(path, workspace_root, file_policy)
+                .map_err(|e| format!("{path}: {e}"))?;
+            let exists = match overlay.get(&resolved) {
+                Some(state) => state.is_some(),
+                None => tokio::fs::metadata(&resolved).await.is_ok(),
+            };
+            if !exists {
+                return Err(format!("delete {path}: file not found"));
+            }
+            overlay.insert(resolved.clone(), None);
+            Ok(Action::Delete {
+                raw: path.clone(),
+                path: resolved,
+            })
+        }
+    }
+}
+
+/// Carry out one planned change and record it in the context audit.
+async fn commit(action: Action, agent_id: Option<&str>, result: &mut PatchResult) {
+    match action {
+        Action::Add { raw, path, content } => {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    result.errors.push(format!("mkdir {}: {}", raw, e));
+                    return;
+                }
+            }
+            // ANAI-149 D2: an "add" can land on an existing context file, so
+            // snapshot before overwriting.
+            let before = if crate::context_audit::is_audited(&path) {
+                crate::context_audit::capture_before(&path).await
+            } else {
+                None
+            };
+            match tokio::fs::write(&path, &content).await {
+                Ok(()) => {
+                    result.files_added += 1;
+                    crate::context_audit::record_write(
+                        agent_id,
+                        "apply_patch",
+                        &path,
+                        before.as_deref(),
+                        Some(content.as_str()),
+                    )
+                    .await;
+                }
+                Err(e) => result.errors.push(format!("write {}: {}", raw, e)),
+            }
+        }
+        Action::Update {
+            raw,
+            source,
+            target,
+            original,
+            patched,
+            moved,
+        } => {
+            if let Some(parent) = target.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            match tokio::fs::write(&target, &patched).await {
+                Ok(()) => {
+                    result.files_updated += 1;
+                    if moved {
+                        result.files_moved += 1;
+                    }
+                    // ANAI-149 D2. On a move the destination has no prior
+                    // content of its own, so the diff is against nothing
+                    // rather than against the source file.
+                    crate::context_audit::record_write(
+                        agent_id,
+                        "apply_patch",
+                        &target,
+                        if moved { None } else { Some(original.as_str()) },
+                        Some(patched.as_str()),
+                    )
+                    .await;
+                    if moved && target != source {
+                        let _ = tokio::fs::remove_file(&source).await;
+                        crate::context_audit::record_write(
+                            agent_id,
+                            "apply_patch",
+                            &source,
+                            Some(original.as_str()),
+                            None,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => result.errors.push(format!("write {}: {}", raw, e)),
+            }
+        }
+        Action::Delete { raw, path } => {
+            // ANAI-149 D2: capture the content before it is gone, so a
+            // deleted identity file is still recoverable from the audit record.
+            let before = if crate::context_audit::is_audited(&path) {
+                crate::context_audit::capture_before(&path).await
+            } else {
+                None
+            };
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    result.files_deleted += 1;
+                    crate::context_audit::record_write(
+                        agent_id,
+                        "apply_patch",
+                        &path,
+                        before.as_deref(),
+                        None,
+                    )
+                    .await;
+                }
+                Err(e) => result.errors.push(format!("delete {}: {}", raw, e)),
+            }
+        }
+    }
+}
+
 /// Apply parsed patch operations against the filesystem.
 ///
 /// All file paths are confined to `workspace_root` via sandbox resolution and
 /// governed by `file_policy` when active.
 ///
-/// F3: a policy pre-pass validates *every* target against workspace
-/// confinement and `file_policy` before any write, so a denied target later in
-/// the patch cannot leave earlier targets partially written. This is a policy
-/// pre-check, not filesystem-transactional rollback — a mid-apply I/O failure
-/// can still leave partial writes (std offers no clean rollback) — but no write
-/// occurs past a policy-*denied* target.
+/// F3: a policy pre-pass validates *every* target before anything else.
+/// ANAI-298: every op is then planned in memory — each file read, every hunk
+/// located and applied — and the patch is written only if the whole plan
+/// succeeded. A hunk that fails in the third file therefore leaves the first
+/// two untouched. This is planning, not filesystem-transactional rollback: an
+/// I/O failure part-way through the write phase can still leave earlier
+/// writes in place.
 pub async fn apply_patch(
     ops: &[PatchOp],
     workspace_root: &Path,
@@ -346,304 +688,288 @@ pub async fn apply_patch(
         return result;
     }
 
+    // ANAI-298: plan everything; report every failing op at once.
+    let mut overlay = Overlay::new();
+    let mut actions = Vec::new();
     for op in ops {
-        match op {
-            PatchOp::AddFile { path, content } => {
-                match resolve_patch_path(path, workspace_root, file_policy) {
-                    Ok(resolved) => {
-                        if let Some(parent) = resolved.parent() {
-                            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                                result.errors.push(format!("mkdir {}: {}", path, e));
-                                continue;
-                            }
-                        }
-                        // ANAI-149 D2: an "add" can land on an existing
-                        // context file, so snapshot before overwriting.
-                        let before = if crate::context_audit::is_audited(&resolved) {
-                            crate::context_audit::capture_before(&resolved).await
-                        } else {
-                            None
-                        };
-                        match tokio::fs::write(&resolved, content).await {
-                            Ok(()) => {
-                                result.files_added += 1;
-                                crate::context_audit::record_write(
-                                    agent_id,
-                                    "apply_patch",
-                                    &resolved,
-                                    before.as_deref(),
-                                    Some(content),
-                                )
-                                .await;
-                            }
-                            Err(e) => result.errors.push(format!("write {}: {}", path, e)),
-                        }
+        match plan_op(op, workspace_root, file_policy, &mut overlay).await {
+            Ok(action) => actions.push(action),
+            Err(e) => result.errors.push(e),
+        }
+    }
+    if !result.errors.is_empty() {
+        return result;
+    }
+
+    for action in actions {
+        commit(action, agent_id, &mut result).await;
+    }
+    result
+}
+
+/// Split content into lines, keeping each line's terminator (`"\n"`,
+/// `"\r\n"`, or `""` for a final line with none).
+fn split_lines(content: &str) -> (Vec<String>, Vec<&'static str>) {
+    let mut text = Vec::new();
+    let mut ends = Vec::new();
+    let mut rest = content;
+    while !rest.is_empty() {
+        match rest.find('\n') {
+            Some(p) => {
+                let line = &rest[..p];
+                match line.strip_suffix('\r') {
+                    Some(s) => {
+                        text.push(s.to_string());
+                        ends.push("\r\n");
                     }
-                    Err(e) => result.errors.push(format!("{}: {}", path, e)),
+                    None => {
+                        text.push(line.to_string());
+                        ends.push("\n");
+                    }
                 }
+                rest = &rest[p + 1..];
             }
-
-            PatchOp::UpdateFile {
-                path,
-                move_to,
-                hunks,
-            } => {
-                let resolved = match resolve_patch_path(path, workspace_root, file_policy) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        result.errors.push(format!("{}: {}", path, e));
-                        continue;
-                    }
-                };
-
-                // Read existing content
-                let original = match tokio::fs::read_to_string(&resolved).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        result.errors.push(format!("read {}: {}", path, e));
-                        continue;
-                    }
-                };
-
-                // Apply hunks sequentially
-                match apply_hunks(&original, hunks) {
-                    Ok(patched) => {
-                        // ANAI-254: the counter must derive from a confirmed
-                        // *change*, not merely from a successful write. A patch
-                        // whose hunks resolved to byte-identical content used to
-                        // report "1 updated" for a file that never changed, and
-                        // any verification run downstream then certified source
-                        // that was never edited.
-                        if move_to.is_none() && patched == original {
-                            result.errors.push(format!(
-                                "{}: hunks applied cleanly but produced no change — \
-                                 the file already matches the patched content. \
-                                 Nothing was written.",
-                                path
-                            ));
-                            continue;
-                        }
-                        // Determine target path (move or in-place)
-                        let target = if let Some(new_path) = move_to {
-                            match resolve_patch_path(new_path, workspace_root, file_policy) {
-                                Ok(t) => {
-                                    result.files_moved += 1;
-                                    t
-                                }
-                                Err(e) => {
-                                    result.errors.push(format!("{}: {}", new_path, e));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            resolved.clone()
-                        };
-
-                        if let Some(parent) = target.parent() {
-                            let _ = tokio::fs::create_dir_all(parent).await;
-                        }
-
-                        match tokio::fs::write(&target, &patched).await {
-                            Ok(()) => {
-                                result.files_updated += 1;
-                                // ANAI-149 D2. On a move the destination has no
-                                // prior content of its own, so the diff is
-                                // against nothing rather than against the
-                                // source file.
-                                crate::context_audit::record_write(
-                                    agent_id,
-                                    "apply_patch",
-                                    &target,
-                                    if move_to.is_some() {
-                                        None
-                                    } else {
-                                        Some(original.as_str())
-                                    },
-                                    Some(patched.as_str()),
-                                )
-                                .await;
-                                // If moved, delete original
-                                if move_to.is_some() && target != resolved {
-                                    let _ = tokio::fs::remove_file(&resolved).await;
-                                    crate::context_audit::record_write(
-                                        agent_id,
-                                        "apply_patch",
-                                        &resolved,
-                                        Some(original.as_str()),
-                                        None,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("write {}: {}", path, e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        result.errors.push(format!("patch {}: {}", path, e));
-                    }
-                }
-            }
-
-            PatchOp::DeleteFile { path } => {
-                match resolve_patch_path(path, workspace_root, file_policy) {
-                    Ok(resolved) => {
-                        // ANAI-149 D2: capture the content before it is gone,
-                        // so a deleted identity file is still recoverable from
-                        // the audit record.
-                        let before = if crate::context_audit::is_audited(&resolved) {
-                            crate::context_audit::capture_before(&resolved).await
-                        } else {
-                            None
-                        };
-                        match tokio::fs::remove_file(&resolved).await {
-                            Ok(()) => {
-                                result.files_deleted += 1;
-                                crate::context_audit::record_write(
-                                    agent_id,
-                                    "apply_patch",
-                                    &resolved,
-                                    before.as_deref(),
-                                    None,
-                                )
-                                .await;
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("delete {}: {}", path, e));
-                            }
-                        }
-                    }
-                    Err(e) => result.errors.push(format!("{}: {}", path, e)),
-                }
+            None => {
+                text.push(rest.to_string());
+                ends.push("");
+                rest = "";
             }
         }
     }
-
-    result
+    (text, ends)
 }
 
 /// Apply a sequence of hunks to file content.
 ///
-/// Each hunk's `context_before` + `old_lines` are searched for in the content.
-/// When found, `old_lines` are replaced with `new_lines`. Includes fuzzy
-/// whitespace fallback on mismatch.
+/// Each hunk's full anchor (`context_before` + `old_lines` + `context_after`)
+/// must match exactly one place at or after where the previous hunk ended;
+/// there, `old_lines` are replaced with `new_lines`. See the module docs for
+/// the placement rules.
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, String> {
-    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-
-    // Track if original file ended with newline
-    let trailing_newline = content.ends_with('\n');
+    let (mut lines, mut ends) = split_lines(content);
+    let crlf = ends.iter().filter(|e| **e == "\r\n").count();
+    let lf = ends.iter().filter(|e| **e == "\n").count();
+    let nl: &'static str = if crlf > lf { "\r\n" } else { "\n" };
+    let had_trailing_newline = ends.last().is_some_and(|e| !e.is_empty());
+    // 1-based line number in the original file of each current line; `None`
+    // for lines inserted by an earlier hunk. Used only for messages.
+    let mut origin: Vec<Option<usize>> = (1..=lines.len()).map(Some).collect();
+    // ANAI-298: hunks search forward from where the previous one ended.
+    let mut cursor = 0usize;
 
     for (hunk_idx, hunk) in hunks.iter().enumerate() {
-        let anchor: Vec<&str> = hunk
+        let n = hunk_idx + 1;
+
+        // ANAI-254: a hunk carrying neither `-` nor `+` lines changes nothing.
+        if hunk.old_lines.is_empty() && hunk.new_lines.is_empty() {
+            return Err(format!(
+                "Hunk {} is context-only: it has no '-' or '+' lines, so there is \
+                 nothing to apply. A hunk must state at least one removal or addition.",
+                n
+            ));
+        }
+
+        let pattern: Vec<&str> = hunk
+            .context_before
+            .iter()
+            .chain(hunk.old_lines.iter())
+            .chain(hunk.context_after.iter())
+            .map(|s| s.as_str())
+            .collect();
+
+        // A pure insertion with no anchor at all has nowhere to go but the
+        // end of the file.
+        let pos = if pattern.is_empty() {
+            lines.len()
+        } else {
+            locate(&lines, &origin, &pattern, cursor, hunk, n)?
+        };
+
+        let start = pos + hunk.context_before.len();
+        let end = start + hunk.old_lines.len();
+        let added = hunk.new_lines.len();
+        lines.splice(start..end, hunk.new_lines.iter().cloned());
+        ends.splice(start..end, std::iter::repeat_n(nl, added));
+        origin.splice(start..end, std::iter::repeat_n(None, added));
+        cursor = start + added;
+    }
+
+    let mut out = String::with_capacity(content.len() + 64);
+    let last = lines.len();
+    for (k, (line, end)) in lines.iter().zip(ends.iter()).enumerate() {
+        out.push_str(line);
+        if k + 1 < last || had_trailing_newline {
+            out.push_str(if end.is_empty() { nl } else { end });
+        }
+    }
+    Ok(out)
+}
+
+/// Every start index `>= from` where `pattern` matches `lines`, compared
+/// exactly or ignoring trailing whitespace.
+fn find_matches(lines: &[String], pattern: &[&str], from: usize, fuzzy: bool) -> Vec<usize> {
+    if pattern.is_empty() || pattern.len() > lines.len() {
+        return Vec::new();
+    }
+    (from..=lines.len() - pattern.len())
+        .filter(|&s| {
+            pattern.iter().enumerate().all(|(j, p)| {
+                if fuzzy {
+                    lines[s + j].trim_end() == p.trim_end()
+                } else {
+                    lines[s + j] == *p
+                }
+            })
+        })
+        .collect()
+}
+
+/// Human description of the current line at `pos`, in original-file terms.
+fn describe_line(origin: &[Option<usize>], pos: usize) -> String {
+    match origin.get(pos) {
+        Some(Some(l)) => format!("line {l}"),
+        Some(None) => "a line added by an earlier hunk".to_string(),
+        None => "the end of the file".to_string(),
+    }
+}
+
+/// "lines 4, 19, 52 (and 3 more)" in original-file terms.
+fn list_lines(origin: &[Option<usize>], hits: &[usize]) -> String {
+    let shown: Vec<String> = hits
+        .iter()
+        .take(MAX_LISTED)
+        .map(|&p| match origin.get(p) {
+            Some(Some(l)) => l.to_string(),
+            _ => "(added line)".to_string(),
+        })
+        .collect();
+    let noun = if hits.len() == 1 { "line" } else { "lines" };
+    let more = if hits.len() > MAX_LISTED {
+        format!(" (and {} more)", hits.len() - MAX_LISTED)
+    } else {
+        String::new()
+    };
+    format!("{noun} {}{more}", shown.join(", "))
+}
+
+/// Short identifier for a hunk in messages: its first changed line.
+fn hunk_label(h: &Hunk) -> String {
+    let first = h
+        .old_lines
+        .first()
+        .map(|l| ('-', l))
+        .or_else(|| h.new_lines.first().map(|l| ('+', l)));
+    match first {
+        Some((sign, text)) => {
+            let t = text.trim();
+            let short: String = t.chars().take(60).collect();
+            let ell = if t.chars().count() > 60 { "…" } else { "" };
+            format!("first change `{sign}{short}{ell}`")
+        }
+        None => "empty".to_string(),
+    }
+}
+
+/// Find the single place `pattern` belongs, searching from `cursor` (and
+/// from the `@@` scope line, when the hunk names one). Zero or several
+/// matches is an error that says which, and where.
+fn locate(
+    lines: &[String],
+    origin: &[Option<usize>],
+    pattern: &[&str],
+    cursor: usize,
+    hunk: &Hunk,
+    n: usize,
+) -> Result<usize, String> {
+    let label = hunk_label(hunk);
+    let mut from = cursor;
+    let mut where_ = if cursor == 0 {
+        " in the file".to_string()
+    } else {
+        format!(
+            " at or after {} (where the previous hunk ended)",
+            describe_line(origin, cursor)
+        )
+    };
+
+    if let Some(scope) = hunk.scope.as_deref() {
+        match (cursor..lines.len()).find(|&k| lines[k].contains(scope)) {
+            Some(k) => {
+                from = k;
+                where_ = format!(
+                    " at or after the '@@ {scope}' line ({})",
+                    describe_line(origin, k)
+                );
+            }
+            None => {
+                return Err(format!(
+                    "Hunk {n} ({label}) failed: its '@@ {scope}' header must quote text \
+                     from a line at or above the change, but no line{where_} contains it. \
+                     Copy the header text exactly from the file (e.g. `@@ fn handle_request`), \
+                     or use a bare `@@`."
+                ));
+            }
+        }
+    }
+
+    for fuzzy in [false, true] {
+        let hits = find_matches(lines, pattern, from, fuzzy);
+        match hits.as_slice() {
+            [] => continue,
+            [one] => {
+                if fuzzy {
+                    warn!(
+                        "Patch hunk {} matched ignoring trailing whitespace at {}",
+                        n,
+                        describe_line(origin, *one)
+                    );
+                }
+                return Ok(*one);
+            }
+            _ => {
+                return Err(format!(
+                    "Hunk {n} ({label}) is ambiguous: its context and '-' lines match \
+                     {} places{where_}, starting at {}. Add context lines that occur only \
+                     at the intended place, or start the hunk with `@@ <text of a unique \
+                     line above it>` (e.g. the enclosing fn signature).",
+                    hits.len(),
+                    list_lines(origin, &hits)
+                ));
+            }
+        }
+    }
+
+    // Not found. Say why, as precisely as we can.
+    let anywhere = find_matches(lines, pattern, 0, true);
+    if !anywhere.is_empty() {
+        return Err(format!(
+            "Hunk {n} ({label}) failed: no match{where_}. It does match at {}, above \
+             where the search started. Hunks must be listed in file order, top to bottom, \
+             and an `@@` header must name a line above the change.",
+            list_lines(origin, &anywhere)
+        ));
+    }
+    if !hunk.context_after.is_empty() {
+        let head: Vec<&str> = hunk
             .context_before
             .iter()
             .chain(hunk.old_lines.iter())
             .map(|s| s.as_str())
             .collect();
-
-        // ANAI-254: a hunk carrying neither `-` nor `+` lines changes nothing.
-        // It used to "apply" cleanly, rewrite the file with identical bytes and
-        // still count as `1 updated` — a success report for work that never
-        // happened. Refuse loudly instead.
-        if hunk.old_lines.is_empty() && hunk.new_lines.is_empty() {
+        let partial = find_matches(lines, &head, from, true);
+        if !head.is_empty() && !partial.is_empty() {
             return Err(format!(
-                "Hunk {} is context-only: it has no '-' or '+' lines, so there is \
-                 nothing to apply. A hunk must state at least one removal or addition.",
-                hunk_idx + 1
+                "Hunk {n} ({label}) failed: its leading context and '-' lines match at {}, \
+                 but its trailing context lines do not follow them there. Re-read the \
+                 file and copy the lines after the change exactly.",
+                list_lines(origin, &partial)
             ));
         }
-
-        if anchor.is_empty() {
-            // Pure insertion with no leading anchor. ANAI-254: this used to
-            // append at end-of-file unconditionally, silently landing the
-            // insertion nowhere near where the patch said it went. Prefer the
-            // trailing context as the anchor and insert *before* it; only fall
-            // back to appending when the hunk supplied no anchor at all.
-            let after: Vec<&str> = hunk.context_after.iter().map(|s| s.as_str()).collect();
-            if after.is_empty() {
-                lines.extend(hunk.new_lines.iter().cloned());
-                continue;
-            }
-            let pos = find_anchor(&lines, &after)
-                .or_else(|| find_anchor_fuzzy(&lines, &after))
-                .ok_or_else(|| {
-                    format!(
-                        "Hunk {} failed: could not find the trailing context lines in file",
-                        hunk_idx + 1
-                    )
-                })?;
-            lines.splice(pos..pos, hunk.new_lines.iter().cloned());
-            continue;
-        }
-
-        // Find the anchor in the file
-        let pos = find_anchor(&lines, &anchor)
-            .or_else(|| find_anchor_fuzzy(&lines, &anchor))
-            .ok_or_else(|| {
-                format!(
-                    "Hunk {} failed: could not find context/old lines in file",
-                    hunk_idx + 1
-                )
-            })?;
-
-        // Replace: remove context_before + old_lines, insert context_before + new_lines
-        let remove_count = hunk.context_before.len() + hunk.old_lines.len();
-        let mut replacement: Vec<String> = hunk.context_before.clone();
-        replacement.extend(hunk.new_lines.iter().cloned());
-
-        lines.splice(pos..pos + remove_count, replacement);
     }
-
-    let mut result = lines.join("\n");
-    if trailing_newline && !result.ends_with('\n') {
-        result.push('\n');
-    }
-    Ok(result)
-}
-
-/// Find an exact match for the anchor lines in the file.
-fn find_anchor(file_lines: &[String], anchor: &[&str]) -> Option<usize> {
-    if anchor.is_empty() {
-        return Some(file_lines.len());
-    }
-    if anchor.len() > file_lines.len() {
-        return None;
-    }
-
-    'outer: for start in 0..=file_lines.len() - anchor.len() {
-        for (j, expected) in anchor.iter().enumerate() {
-            if file_lines[start + j] != *expected {
-                continue 'outer;
-            }
-        }
-        return Some(start);
-    }
-    None
-}
-
-/// Fuzzy anchor matching — trims trailing whitespace before comparing.
-fn find_anchor_fuzzy(file_lines: &[String], anchor: &[&str]) -> Option<usize> {
-    if anchor.is_empty() {
-        return Some(file_lines.len());
-    }
-    if anchor.len() > file_lines.len() {
-        return None;
-    }
-
-    'outer: for start in 0..=file_lines.len() - anchor.len() {
-        for (j, expected) in anchor.iter().enumerate() {
-            if file_lines[start + j].trim_end() != expected.trim_end() {
-                continue 'outer;
-            }
-        }
-        warn!(
-            "Patch hunk matched with fuzzy whitespace at line {}",
-            start + 1
-        );
-        return Some(start);
-    }
-    None
+    Err(format!(
+        "Hunk {n} ({label}) failed: could not find its context and '-' lines{where_}. \
+         Re-read the file and copy them exactly; only trailing whitespace is ignored."
+    ))
 }
 
 #[cfg(test)]
@@ -781,6 +1107,7 @@ mod tests {
             old_lines: vec!["line2".to_string()],
             new_lines: vec!["replaced".to_string()],
             context_after: vec![],
+            scope: None,
         }];
         let result = apply_hunks(content, &hunks).unwrap();
         assert!(result.contains("replaced"));
@@ -798,12 +1125,14 @@ mod tests {
                 old_lines: vec!["b".to_string()],
                 new_lines: vec!["B".to_string()],
                 context_after: vec![],
+                scope: None,
             },
             Hunk {
                 context_before: vec!["c".to_string()],
                 old_lines: vec!["d".to_string()],
                 new_lines: vec!["D".to_string(), "D2".to_string()],
                 context_after: vec![],
+                scope: None,
             },
         ];
         let result = apply_hunks(content, &hunks).unwrap();
@@ -821,6 +1150,7 @@ mod tests {
             old_lines: vec!["also_nonexistent".to_string()],
             new_lines: vec!["new".to_string()],
             context_after: vec![],
+            scope: None,
         }];
         assert!(apply_hunks(content, &hunks).is_err());
     }
@@ -833,6 +1163,7 @@ mod tests {
             old_lines: vec!["line2".to_string()],
             new_lines: vec!["replaced".to_string()],
             context_after: vec![],
+            scope: None,
         }];
         let result = apply_hunks(content, &hunks).unwrap();
         assert!(result.contains("replaced"));
@@ -846,6 +1177,7 @@ mod tests {
             old_lines: vec!["old_line".to_string()],
             new_lines: vec!["new_line".to_string()],
             context_after: vec![],
+            scope: None,
         }];
         let result = apply_hunks(content, &hunks).unwrap();
         assert!(result.contains("header"));
@@ -858,27 +1190,27 @@ mod tests {
     }
 
     #[test]
-    fn test_find_anchor_exact() {
+    fn test_find_matches_exact() {
         let lines: Vec<String> = vec!["a", "b", "c", "d"]
             .into_iter()
             .map(String::from)
             .collect();
-        assert_eq!(find_anchor(&lines, &["b", "c"]), Some(1));
+        assert_eq!(find_matches(&lines, &["b", "c"], 0, false), vec![1]);
     }
 
     #[test]
-    fn test_find_anchor_not_found() {
+    fn test_find_matches_not_found() {
         let lines: Vec<String> = vec!["a", "b", "c"].into_iter().map(String::from).collect();
-        assert_eq!(find_anchor(&lines, &["x", "y"]), None);
+        assert!(find_matches(&lines, &["x", "y"], 0, false).is_empty());
     }
 
     #[test]
-    fn test_find_anchor_fuzzy() {
+    fn test_find_matches_fuzzy() {
         let lines: Vec<String> = vec!["a  ", "b\t", "c"]
             .into_iter()
             .map(String::from)
             .collect();
-        assert_eq!(find_anchor_fuzzy(&lines, &["a", "b"]), Some(0));
+        assert_eq!(find_matches(&lines, &["a", "b"], 0, true), vec![0]);
     }
 
     #[tokio::test]
@@ -905,6 +1237,7 @@ mod tests {
                     old_lines: vec!["line2".to_string()],
                     new_lines: vec!["replaced".to_string()],
                     context_after: vec![],
+                    scope: None,
                 }],
             },
         ];
@@ -1005,6 +1338,7 @@ mod tests {
             old_lines: old.iter().map(|s| s.to_string()).collect(),
             new_lines: new.iter().map(|s| s.to_string()).collect(),
             context_after: after.iter().map(|s| s.to_string()).collect(),
+            scope: None,
         }
     }
 
@@ -1105,5 +1439,340 @@ mod tests {
         let out = apply_hunks("alpha\nbravo\ncharlie\ndelta\n", hunks)
             .expect("both regions must anchor against the file");
         assert_eq!(out, "alpha\nBRAVO\ncharlie\nDELTA\n");
+    }
+
+    // ---- ANAI-298: line endings ----
+
+    #[test]
+    fn crlf_line_endings_survive_a_patch() {
+        let out = apply_hunks(
+            "alpha\r\nbravo\r\ncharlie\r\n",
+            &[hunk(
+                &["alpha"],
+                &["bravo"],
+                &["BRAVO", "BRAVO2"],
+                &["charlie"],
+            )],
+        )
+        .unwrap();
+        assert_eq!(out, "alpha\r\nBRAVO\r\nBRAVO2\r\ncharlie\r\n");
+    }
+
+    #[test]
+    fn mixed_line_endings_are_preserved_line_by_line() {
+        // Untouched lines keep their own terminator; inserted lines take the
+        // file's dominant one (CRLF here, 2 of 3).
+        let out = apply_hunks(
+            "alpha\r\nbravo\ncharlie\r\n",
+            &[hunk(&["bravo"], &[], &["NEW"], &["charlie"])],
+        )
+        .unwrap();
+        assert_eq!(out, "alpha\r\nbravo\nNEW\r\ncharlie\r\n");
+    }
+
+    #[test]
+    fn a_file_without_a_trailing_newline_stays_that_way() {
+        let out = apply_hunks(
+            "alpha\r\nbravo",
+            &[hunk(&["alpha"], &["bravo"], &["B"], &[])],
+        )
+        .unwrap();
+        assert_eq!(out, "alpha\r\nB");
+    }
+
+    // ---- ANAI-298 / ANAI-120: placement ----
+
+    fn scoped(scope: &str, mut h: Hunk) -> Hunk {
+        h.scope = Some(scope.to_string());
+        h
+    }
+
+    fn update(path: &str, hunks: Vec<Hunk>) -> PatchOp {
+        PatchOp::UpdateFile {
+            path: path.to_string(),
+            move_to: None,
+            hunks,
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("of_patch_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_later_hunk_searches_forward_from_the_previous_one() {
+        // ANAI-298: hunk 2's anchor also occurs above hunk 1. Searching from
+        // line 1 edited the first copy; it must edit the one below hunk 1.
+        let out = apply_hunks(
+            "x\ntarget\ny\nA\nB\nx\ntarget\ny\n",
+            &[
+                hunk(&["A"], &["B"], &["B2"], &[]),
+                hunk(&["x"], &["target"], &["T"], &["y"]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, "x\ntarget\ny\nA\nB2\nx\nT\ny\n");
+    }
+
+    #[test]
+    fn a_hunk_matching_two_places_is_refused_and_names_both() {
+        // ANAI-120: near-duplicate blocks. Taking the first match silently
+        // edited the wrong copy.
+        let err = apply_hunks(
+            "fn a() {\n    call();\n}\nfn b() {\n    call();\n}\n",
+            &[hunk(&[], &["    call();"], &["    other();"], &["}"])],
+        )
+        .expect_err("two equal matches must not be guessed between");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        assert!(
+            err.contains("lines 2, 5"),
+            "must list the candidates, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trailing_context_is_part_of_the_anchor() {
+        // media.rs: an insertion after a bare `}` landed after the FIRST `}`
+        // because the trailing context was never checked.
+        let out = apply_hunks(
+            "fn a() {\n}\n\nfn b() {\n}\n\nfn tail() {}\n",
+            &[hunk(&["}", ""], &[], &["// NEW", ""], &["fn tail() {}"])],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "fn a() {\n}\n\nfn b() {\n}\n\n// NEW\n\nfn tail() {}\n"
+        );
+    }
+
+    #[test]
+    fn an_at_at_scope_narrows_the_search() {
+        let out = apply_hunks(
+            "fn a() {\n    call();\n}\nfn b() {\n    call();\n}\n",
+            &[scoped(
+                "fn b",
+                hunk(&[], &["    call();"], &["    other();"], &["}"]),
+            )],
+        )
+        .unwrap();
+        assert_eq!(out, "fn a() {\n    call();\n}\nfn b() {\n    other();\n}\n");
+    }
+
+    #[test]
+    fn an_at_at_scope_that_is_not_in_the_file_is_an_error() {
+        let err = apply_hunks(
+            "fn a() {\n    call();\n}\n",
+            &[scoped(
+                "fn zzz",
+                hunk(&[], &["    call();"], &["    x();"], &[]),
+            )],
+        )
+        .expect_err("a scope naming nothing must not be ignored");
+        assert!(err.contains("fn zzz"), "got: {err}");
+    }
+
+    #[test]
+    fn out_of_order_hunks_are_refused_with_a_file_order_hint() {
+        let err = apply_hunks(
+            "a\nb\nc\nd\n",
+            &[
+                hunk(&["c"], &["d"], &["D"], &[]),
+                hunk(&["a"], &["b"], &["B"], &[]),
+            ],
+        )
+        .expect_err("hunk 2 lies above hunk 1");
+        assert!(err.contains("file order"), "got: {err}");
+        assert!(
+            err.contains("line 1"),
+            "must say where it does match, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_trailing_context_is_diagnosed_as_such() {
+        let err = apply_hunks("a\nb\nc\n", &[hunk(&["a"], &["b"], &["B"], &["WRONG"])])
+            .expect_err("trailing context does not match");
+        assert!(err.contains("trailing context"), "got: {err}");
+    }
+
+    #[test]
+    fn context_lines_keep_the_files_own_whitespace() {
+        // The fuzzy tier matches despite trailing whitespace; the context
+        // lines themselves must not be rewritten to the patch's version.
+        let out =
+            apply_hunks("keep  \nold\n", &[hunk(&["keep"], &["old"], &["new"], &[])]).unwrap();
+        assert_eq!(out, "keep  \nnew\n");
+    }
+
+    // ---- ANAI-298: parser strictness ----
+
+    fn only_update_hunks(patch: &str) -> Vec<Hunk> {
+        match parse_patch(patch).unwrap().remove(0) {
+            PatchOp::UpdateFile { hunks, .. } => hunks,
+            other => panic!("expected an update op, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_lines_that_look_like_markers_stay_in_the_hunk() {
+        let hunks = only_update_hunks(
+            "*** Begin Patch\n\
+             *** Update File: README.md\n\
+             @@\n\
+             \x20*** bold banner ***\n\
+             -@@ old note\n\
+             +@@ new note\n\
+             \x20tail\n\
+             *** End Patch\n",
+        );
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].context_before, vec!["*** bold banner ***"]);
+        assert_eq!(hunks[0].old_lines, vec!["@@ old note"]);
+        assert_eq!(hunks[0].new_lines, vec!["@@ new note"]);
+        assert_eq!(hunks[0].context_after, vec!["tail"]);
+    }
+
+    #[test]
+    fn an_unprefixed_hunk_line_is_rejected_with_its_line_number() {
+        let err = parse_patch(
+            "*** Begin Patch\n\
+             *** Update File: f.txt\n\
+             @@\n\
+             \x20keep\n\
+             oops no prefix\n\
+             +new\n\
+             *** End Patch\n",
+        )
+        .expect_err("a line with no ' '/'-'/'+' prefix is malformed");
+        assert!(err.contains("patch line 5"), "got: {err}");
+    }
+
+    #[test]
+    fn trailing_bare_blank_lines_are_not_context() {
+        let hunks = only_update_hunks(
+            "*** Begin Patch\n\
+             *** Update File: f.txt\n\
+             @@\n\
+             \x20a\n\
+             -b\n\
+             +B\n\
+             \n\
+             \n\
+             *** End Patch\n",
+        );
+        assert!(
+            hunks[0].context_after.is_empty(),
+            "got {:?}",
+            hunks[0].context_after
+        );
+        assert_eq!(apply_hunks("a\nb\n", &hunks).unwrap(), "a\nB\n");
+    }
+
+    #[test]
+    fn hunk_headers_yield_a_scope_only_when_they_name_something() {
+        assert_eq!(parse_hunk_header("@@"), None);
+        assert_eq!(parse_hunk_header("@@ @@"), None);
+        assert_eq!(parse_hunk_header("@@ -12,5 +12,6 @@"), None);
+        assert_eq!(
+            parse_hunk_header("@@ -3 +3,2 @@ fn foo()"),
+            Some("fn foo()".into())
+        );
+        assert_eq!(parse_hunk_header("@@ fn foo"), Some("fn foo".into()));
+        assert_eq!(parse_hunk_header("@@ fn foo @@"), Some("fn foo".into()));
+    }
+
+    #[test]
+    fn a_first_hunk_without_a_header_is_accepted() {
+        let hunks = only_update_hunks(
+            "*** Begin Patch\n*** Update File: f.txt\n a\n-b\n+B\n*** End Patch\n",
+        );
+        assert_eq!(apply_hunks("a\nb\n", &hunks).unwrap(), "a\nB\n");
+    }
+
+    #[test]
+    fn a_split_hunk_keeps_its_scope_on_the_first_region_only() {
+        let hunks = only_update_hunks(
+            "*** Begin Patch\n*** Update File: f.txt\n@@ fn b\n a\n-b\n+B\n c\n-d\n+D\n*** End Patch\n",
+        );
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].scope.as_deref(), Some("fn b"));
+        assert_eq!(hunks[1].scope, None);
+    }
+
+    #[test]
+    fn blank_lines_inside_add_file_content_are_kept() {
+        let ops =
+            parse_patch("*** Begin Patch\n*** Add File: n.txt\n+one\n\n+three\n\n*** End Patch\n")
+                .unwrap();
+        match &ops[0] {
+            PatchOp::AddFile { content, .. } => assert_eq!(content, "one\n\nthree"),
+            other => panic!("expected an add op, got {other:?}"),
+        }
+    }
+
+    // ---- ANAI-298: all or nothing across files ----
+
+    #[tokio::test]
+    async fn a_failing_hunk_in_a_later_file_leaves_earlier_files_untouched() {
+        let dir = temp_dir("atomic");
+        std::fs::write(dir.join("one.txt"), "a\nb\n").unwrap();
+        std::fs::write(dir.join("two.txt"), "x\ny\n").unwrap();
+        let ops = vec![
+            update("one.txt", vec![hunk(&["a"], &["b"], &["B"], &[])]),
+            update("two.txt", vec![hunk(&["x"], &["NOPE"], &["Y"], &[])]),
+        ];
+        let result = apply_patch(&ops, &dir, None, None).await;
+        assert!(!result.is_ok());
+        assert_eq!(result.files_updated, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("one.txt")).unwrap(),
+            "a\nb\n"
+        );
+        assert!(
+            result.summary().contains("nothing was written"),
+            "{}",
+            result.summary()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_update_can_follow_an_add_of_the_same_file_in_one_patch() {
+        let dir = temp_dir("overlay");
+        let ops = vec![
+            PatchOp::AddFile {
+                path: "n.txt".to_string(),
+                content: "a\nb\n".to_string(),
+            },
+            update("n.txt", vec![hunk(&["a"], &["b"], &["B"], &[])]),
+        ];
+        let result = apply_patch(&ops, &dir, None, None).await;
+        assert!(result.is_ok(), "{:?}", result.errors);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.txt")).unwrap(),
+            "a\nB\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_file_rejects_the_patch_before_any_write() {
+        let dir = temp_dir("delmissing");
+        let ops = vec![
+            PatchOp::AddFile {
+                path: "n.txt".to_string(),
+                content: "x".to_string(),
+            },
+            PatchOp::DeleteFile {
+                path: "ghost.txt".to_string(),
+            },
+        ];
+        let result = apply_patch(&ops, &dir, None, None).await;
+        assert!(!result.is_ok());
+        assert!(!dir.join("n.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
