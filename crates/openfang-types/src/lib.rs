@@ -24,6 +24,7 @@ pub mod model_catalog;
 pub mod path_facts;
 pub mod paths;
 pub mod scheduler;
+pub mod secret_scrub;
 pub mod security_flags;
 pub mod serde_compat;
 pub mod taint;
