@@ -1423,6 +1423,26 @@ pub async fn run_agent_loop(
                         }
                     }
 
+                    // Stand-in floor (native path; the bridge runs the same
+                    // check). Refuse a call that would write back a credential
+                    // stand-in this daemon issued. See `secret_scrub`.
+                    if let Some(scrubber) = openfang_types::secret_scrub::global() {
+                        if let Err(message) = scrubber.check_args(&tool_call.input.to_string()) {
+                            warn!(
+                                tool = %tool_call.name,
+                                agent = %manifest.name,
+                                "refused tool call carrying an issued credential stand-in"
+                            );
+                            tool_result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                content: message,
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                    }
+
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
                     let effective_file_policy = manifest.file_policy.as_ref();
@@ -1474,6 +1494,35 @@ pub async fn run_agent_loop(
                             }
                         }
                         None => exec_fut.await,
+                    };
+
+                    // Secret floor (native path). The bridge scrubs results for
+                    // Claude Code agents; this covers API-provider agents and
+                    // any CLI turn that fell back to one. Runs before the hook
+                    // and the truncation, so neither sees or cuts a raw secret.
+                    let result = match openfang_types::secret_scrub::global() {
+                        Some(scrubber) => {
+                            let openfang_types::tool::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } = result;
+                            let (content, replaced) = scrubber.scrub_for_model(content);
+                            if replaced > 0 {
+                                warn!(
+                                    tool = %tool_call.name,
+                                    agent = %manifest.name,
+                                    replaced,
+                                    "replaced credentials in tool result"
+                                );
+                            }
+                            openfang_types::tool::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            }
+                        }
+                        None => result,
                     };
 
                     // Fire AfterToolCall hook
@@ -3152,6 +3201,26 @@ pub async fn run_agent_loop_streaming(
                         }
                     }
 
+                    // Stand-in floor (native path; the bridge runs the same
+                    // check). Refuse a call that would write back a credential
+                    // stand-in this daemon issued. See `secret_scrub`.
+                    if let Some(scrubber) = openfang_types::secret_scrub::global() {
+                        if let Err(message) = scrubber.check_args(&tool_call.input.to_string()) {
+                            warn!(
+                                tool = %tool_call.name,
+                                agent = %manifest.name,
+                                "refused tool call carrying an issued credential stand-in"
+                            );
+                            tool_result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                content: message,
+                                is_error: true,
+                            });
+                            continue;
+                        }
+                    }
+
                     // Resolve effective exec policy (per-agent override or global)
                     let effective_exec_policy = manifest.exec_policy.as_ref();
                     let effective_file_policy = manifest.file_policy.as_ref();
@@ -3203,6 +3272,35 @@ pub async fn run_agent_loop_streaming(
                             }
                         }
                         None => exec_fut.await,
+                    };
+
+                    // Secret floor (native path). The bridge scrubs results for
+                    // Claude Code agents; this covers API-provider agents and
+                    // any CLI turn that fell back to one. Runs before the hook
+                    // and the truncation, so neither sees or cuts a raw secret.
+                    let result = match openfang_types::secret_scrub::global() {
+                        Some(scrubber) => {
+                            let openfang_types::tool::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } = result;
+                            let (content, replaced) = scrubber.scrub_for_model(content);
+                            if replaced > 0 {
+                                warn!(
+                                    tool = %tool_call.name,
+                                    agent = %manifest.name,
+                                    replaced,
+                                    "replaced credentials in tool result"
+                                );
+                            }
+                            openfang_types::tool::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            }
+                        }
+                        None => result,
                     };
 
                     // Fire AfterToolCall hook

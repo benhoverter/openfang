@@ -47,7 +47,7 @@ use openfang_mcp_bridge::protocol::{
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
 use openfang_types::bridge_auth::Token;
-use openfang_types::secret_scrub::{env_name_is_credential, secrets_in_arg, SecretScrubber};
+use openfang_types::secret_scrub::SecretScrubber;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -186,7 +186,8 @@ impl BridgeIpcServer {
         authority: Arc<BridgeAuthority>,
     ) -> std::io::Result<Self> {
         let socket_path = socket_path(&kernel.config.home_dir)?;
-        let scrubber = Arc::new(SecretScrubber::new(known_secrets(&kernel.config)));
+        // The kernel owns the scrubber (shared with the native agent loop).
+        let scrubber = kernel.secret_scrubber.clone();
         info!(
             known_secrets = scrubber.known_len(),
             "bridge IPC: tool-result secret scrubber armed"
@@ -424,12 +425,27 @@ async fn handle_connection(
                     "bridge IPC: dispatching call"
                 );
 
-                let result = dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await;
-                // Secret floor: like the frame clamp below, every result —
-                // native or upstream MCP — passes this line, so this is the
-                // one place a credential in tool output can be stopped before
-                // it reaches the model. Scrub before clamping so the clamp
-                // never cuts a secret in half and leaves a raw prefix behind.
+                // Stand-in floor: refuse a call whose arguments carry a
+                // credential stand-in this daemon issued. Writing one back
+                // replaces a live credential with a fake (secret_scrub docs).
+                let result = match scrubber.check_args(&call.args.to_string()) {
+                    Err(message) => {
+                        warn!(
+                            request_id = call.request_id,
+                            tool = %call.tool_name,
+                            agent = %call.agent_id,
+                            agent_name = %call_agent_name,
+                            "bridge IPC: refused call carrying an issued credential stand-in"
+                        );
+                        CallResult::Error { message }
+                    }
+                    Ok(()) => dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await,
+                };
+                // Secret floor, first layer: every result for a Claude Code
+                // agent (native or upstream MCP) passes this line. The native
+                // agent loop runs the same scrub for API-provider turns.
+                // Scrub before clamping so the clamp never cuts a secret in
+                // half and leaves a raw prefix behind.
                 let (result, scrubbed) = scrub_call_result(result, &scrubber);
                 if scrubbed > 0 {
                     warn!(
@@ -582,67 +598,16 @@ fn truncate_to_json_budget(s: &str, budget: usize) -> &str {
     s
 }
 
-/// Every credential value the daemon can see, for exact-match scrubbing.
-///
-/// Sources: each MCP server's passed-through env vars, its headers, and its
-/// stdio `args` (the incident that motivated this was a bearer token in argv,
-/// printed by `pgrep -lf`), plus every daemon env var whose name reads like a
-/// credential (`*_TOKEN`, `*_API_KEY`, ...). Short values are dropped by
-/// [`SecretScrubber`] itself.
-///
-/// Read once at listener start. A config or env change needs a daemon bounce
-/// to be covered, the same as the MCP servers it describes.
-fn known_secrets(config: &openfang_types::config::KernelConfig) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for server in &config.mcp_servers {
-        for name in &server.env {
-            // Entries are documented as names; tolerate `NAME=value` too.
-            match name.split_once('=') {
-                Some((_, v)) => out.push(v.to_string()),
-                None => {
-                    if let Ok(v) = std::env::var(name) {
-                        out.push(v);
-                    }
-                }
-            }
-        }
-        for header in &server.headers {
-            out.extend(secrets_in_arg(header));
-        }
-        if let openfang_types::config::McpTransportEntry::Stdio { args, .. } = &server.transport {
-            for arg in args {
-                out.extend(secrets_in_arg(arg));
-            }
-        }
-    }
-    for (name, value) in std::env::vars() {
-        if env_name_is_credential(&name) {
-            out.push(value);
-        }
-    }
-    out
-}
-
 /// Scrub credentials out of a tool result's text. Returns the result and how
 /// many values were replaced.
 ///
 /// Leaves `is_error` and any images untouched: the scrub changes what the
 /// model reads, never whether the call succeeded. When anything was replaced
-/// a one-line notice is appended so the model knows the values it sees are
-/// stand-ins, not credentials it can use.
+/// a one-line notice is prepended (so the frame clamp, which cuts from the
+/// end, can never drop it) telling the model the values are stand-ins.
 fn scrub_call_result(result: CallResult, scrubber: &SecretScrubber) -> (CallResult, usize) {
     fn apply(text: String, scrubber: &SecretScrubber) -> (String, usize) {
-        let s = scrubber.scrub(&text);
-        let n = s.total();
-        if n == 0 {
-            return (text, 0);
-        }
-        let mut out = s.text;
-        out.push_str(&format!(
-            "\n\n[openfang: {n} credential-shaped value(s) in this result were replaced \
-             with stand-ins of the same shape. They are not usable credentials.]"
-        ));
-        (out, n)
+        scrubber.scrub_for_model(text)
     }
     match result {
         CallResult::Ok { content, is_error } => {
