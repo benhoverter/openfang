@@ -129,7 +129,7 @@
 //! "fix" this by tightening the follow: that reopens the SS16/SS19 leak.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -403,7 +403,7 @@ pub struct SecretScrubber {
     /// An `RwLock` so refusal checks and the shape passes' lookups run in
     /// parallel; only emitting a new stand-in takes the write lock. Not
     /// capped by eviction: dropping an entry would let its write-back through.
-    issued: RwLock<HashSet<String>>,
+    issued: RwLock<Issued>,
     /// Set once a private-key block has been removed. Until then the
     /// removed-key marker is ordinary text and is not refused.
     pem_redacted: AtomicBool,
@@ -459,7 +459,7 @@ impl SecretScrubber {
     pub fn with_key(known: impl IntoIterator<Item = String>, key: [u8; 32]) -> Self {
         Self {
             known: RwLock::new(normalize_known(known)),
-            issued: RwLock::new(HashSet::new()),
+            issued: RwLock::new(Issued::default()),
             pem_redacted: AtomicBool::new(false),
             key,
             allow_standin_writes: false,
@@ -479,6 +479,14 @@ impl SecretScrubber {
     #[must_use]
     pub fn known_len(&self) -> usize {
         self.known.read().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// How many distinct stand-ins have been issued since this scrubber was
+    /// built. Grows for the life of the boot (nothing is evicted); callers
+    /// may log it to watch that growth.
+    #[must_use]
+    pub fn issued_len(&self) -> usize {
+        self.issued.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Whether [`Self::check_args`] is switched off by the operator.
@@ -578,11 +586,11 @@ impl SecretScrubber {
         self.find_issued_in(&issued, text)
     }
 
-    fn find_issued_in(&self, issued: &HashSet<String>, text: &str) -> Option<String> {
+    fn find_issued_in(&self, issued: &Issued, text: &str) -> Option<String> {
         if self.pem_redacted.load(Ordering::Relaxed) && text.contains(PEM_REMOVED_MARKER) {
             return Some(PEM_REMOVED_MARKER.to_string());
         }
-        issued.iter().find(|s| text.contains(s.as_str())).cloned()
+        issued.find_in(text).map(str::to_string)
     }
 
     /// Refuse raw text containing a stand-in this scrubber issued. Prefer
@@ -668,7 +676,7 @@ impl SecretScrubber {
         let mut issued = self.issued.write().unwrap_or_else(|e| e.into_inner());
         // No cap: an unrecorded stand-in is one whose write-back is not
         // refused, which reopens the hazard the refusal exists for.
-        issued.insert(fake.clone());
+        issued.insert(&fake);
         fake
     }
 
@@ -828,6 +836,71 @@ impl SecretScrubber {
             out.push_str(run);
         }
     }
+}
+
+/// Bytes of a stand-in used as its lookup key. Every issued stand-in is at
+/// least [`MIN_KNOWN_SECRET_LEN`] / [`MIN_ASSIGNED_VALUE_LEN`] bytes, so in
+/// practice all of them are indexed; shorter ones fall back to a scan.
+const ISSUED_KEY_LEN: usize = 8;
+
+/// The stand-ins issued this boot, indexed so a refusal check costs time in
+/// the length of the text checked rather than in the number issued (SS15).
+///
+/// `find_in` has exactly the semantics of "does `text` contain any issued
+/// stand-in as a substring" — it is not a token lookup, so a stand-in pasted
+/// inside a longer word is still found.
+#[derive(Default)]
+struct Issued {
+    /// Exact membership, for [`SecretScrubber::is_issued`].
+    set: HashSet<String>,
+    /// First [`ISSUED_KEY_LEN`] bytes → the stand-ins starting with them.
+    by_prefix: HashMap<[u8; ISSUED_KEY_LEN], Vec<Box<str>>>,
+    /// Stand-ins shorter than the key. Not expected; scanned linearly.
+    short: Vec<Box<str>>,
+}
+
+impl Issued {
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    fn contains(&self, s: &str) -> bool {
+        self.set.contains(s)
+    }
+
+    fn insert(&mut self, s: &str) {
+        if !self.set.insert(s.to_string()) {
+            return;
+        }
+        match prefix_key(s.as_bytes()) {
+            Some(k) => self.by_prefix.entry(k).or_default().push(s.into()),
+            None => self.short.push(s.into()),
+        }
+    }
+
+    /// The issued stand-in occurring earliest in `text`, if any.
+    fn find_in(&self, text: &str) -> Option<&str> {
+        let bytes = text.as_bytes();
+        if !self.by_prefix.is_empty() && bytes.len() >= ISSUED_KEY_LEN {
+            for i in 0..=bytes.len() - ISSUED_KEY_LEN {
+                let Some(cands) = prefix_key(&bytes[i..]).and_then(|k| self.by_prefix.get(&k))
+                else {
+                    continue;
+                };
+                if let Some(hit) = cands.iter().find(|c| bytes[i..].starts_with(c.as_bytes())) {
+                    return Some(hit);
+                }
+            }
+        }
+        self.short
+            .iter()
+            .find(|s| text.contains(&***s))
+            .map(|s| &**s)
+    }
+}
+
+fn prefix_key(b: &[u8]) -> Option<[u8; ISSUED_KEY_LEN]> {
+    b.get(..ISSUED_KEY_LEN)?.try_into().ok()
 }
 
 /// Offset just past the end of a PEM header, measured from the byte after
@@ -1531,6 +1604,49 @@ mod tests {
         assert!(s
             .check_args_value(&serde_json::json!({"command": "git status"}))
             .is_ok());
+    }
+
+    /// SS15: the indexed lookup keeps substring semantics. A stand-in glued
+    /// to other word characters, or one of thousands, is still found, and
+    /// the answer matches the old linear scan.
+    #[test]
+    fn issued_index_matches_linear_scan() {
+        let s = scrubber(&[]);
+        let mut fakes = Vec::new();
+        for i in 0..3000u32 {
+            let tok = format!("{}{:0>36}", concat!("gh", "p_"), i);
+            let out = s.scrub(&format!("t={tok}")).text;
+            fakes.push(out[2..].to_string());
+        }
+        assert_eq!(s.issued_len(), 3000);
+        let issued = s.issued.read().unwrap_or_else(|e| e.into_inner());
+        let linear = |t: &str| issued.set.iter().any(|f| t.contains(f.as_str()));
+        let probes = [
+            format!("prefix{}suffix", fakes[1234]),
+            format!("{} at the end", fakes[2999]),
+            fakes[0][..fakes[0].len() - 1].to_string(),
+            "nothing here at all, just a plain sentence of text".to_string(),
+            format!("ünï {} ünï", fakes[7]),
+        ];
+        for p in &probes {
+            assert_eq!(issued.find_in(p).is_some(), linear(p), "{p}");
+        }
+        assert_eq!(issued.find_in(&probes[0]), Some(fakes[1234].as_str()));
+    }
+
+    /// SS15: stand-ins shorter than the index key still go through the
+    /// fallback scan.
+    #[test]
+    fn issued_index_short_fallback() {
+        let mut i = Issued::default();
+        i.insert("abc");
+        i.insert("abcdefghijkl");
+        assert_eq!(i.len(), 2);
+        assert_eq!(i.find_in("xxabcxx"), Some("abc"));
+        assert_eq!(i.find_in("xxabcdefghijklxx"), Some("abcdefghijkl"));
+        assert_eq!(i.find_in("ab"), None);
+        i.insert("abc");
+        assert_eq!(i.len(), 2, "re-insert must not duplicate");
     }
 
     /// Q3: the removed-key marker is refused only once a key was removed.
