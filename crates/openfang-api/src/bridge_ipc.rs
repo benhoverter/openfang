@@ -47,6 +47,7 @@ use openfang_mcp_bridge::protocol::{
 use openfang_runtime::mcp::{extract_mcp_server_from_known, is_mcp_tool};
 use openfang_types::agent::AgentId;
 use openfang_types::bridge_auth::Token;
+use openfang_types::secret_scrub::SecretScrubber;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -185,6 +186,12 @@ impl BridgeIpcServer {
         authority: Arc<BridgeAuthority>,
     ) -> std::io::Result<Self> {
         let socket_path = socket_path(&kernel.config.home_dir)?;
+        // The kernel owns the scrubber (shared with the native agent loop).
+        let scrubber = kernel.secret_scrubber.clone();
+        info!(
+            known_secrets = scrubber.known_len(),
+            "bridge IPC: tool-result secret scrubber armed"
+        );
 
         // Remove any stale socket from a prior unclean shutdown. UnixListener
         // refuses to bind if the path exists, even if no one's listening.
@@ -212,6 +219,7 @@ impl BridgeIpcServer {
         let accept_shutdown = shutdown.clone();
         let _accept_kernel = kernel.clone();
         let accept_authority = authority.clone();
+        let accept_scrubber = scrubber.clone();
 
         tokio::spawn(async move {
             loop {
@@ -226,8 +234,9 @@ impl BridgeIpcServer {
                                 info!("bridge IPC: accepted connection");
                                 let conn_kernel = _accept_kernel.clone();
                                 let conn_authority = accept_authority.clone();
+                                let conn_scrubber = accept_scrubber.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_connection(stream, conn_kernel, conn_authority).await {
+                                    if let Err(e) = handle_connection(stream, conn_kernel, conn_authority, conn_scrubber).await {
                                         debug!(error = %e, "bridge IPC connection ended with error");
                                     }
                                 });
@@ -328,6 +337,7 @@ async fn handle_connection(
     mut stream: UnixStream,
     kernel: Arc<OpenFangKernel>,
     authority: Arc<BridgeAuthority>,
+    scrubber: Arc<SecretScrubber>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = stream.split();
     let mut read_half = tokio::io::BufReader::new(read_half);
@@ -415,7 +425,38 @@ async fn handle_connection(
                     "bridge IPC: dispatching call"
                 );
 
-                let result = dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await;
+                // Stand-in floor: refuse a call whose arguments carry a
+                // credential stand-in this daemon issued. Writing one back
+                // replaces a live credential with a fake (secret_scrub docs).
+                let result = match scrubber.check_args_value(&call.args) {
+                    Err(message) => {
+                        warn!(
+                            request_id = call.request_id,
+                            tool = %call.tool_name,
+                            agent = %call.agent_id,
+                            agent_name = %call_agent_name,
+                            "bridge IPC: refused call carrying an issued credential stand-in"
+                        );
+                        CallResult::Error { message }
+                    }
+                    Ok(()) => dispatch_call(&call, &kernel, identity.agent_id.as_ref()).await,
+                };
+                // Secret floor, first layer: every result for a Claude Code
+                // agent (native or upstream MCP) passes this line. The native
+                // agent loop runs the same scrub for API-provider turns.
+                // Scrub before clamping so the clamp never cuts a secret in
+                // half and leaves a raw prefix behind.
+                let (result, scrubbed) = scrub_call_result(result, &scrubber);
+                if scrubbed > 0 {
+                    warn!(
+                        request_id = call.request_id,
+                        tool = %call.tool_name,
+                        agent = %call.agent_id,
+                        agent_name = %call_agent_name,
+                        replaced = scrubbed,
+                        "bridge IPC: replaced credentials in tool result"
+                    );
+                }
                 // Frame floor: every result, native or upstream, passes
                 // through here. Oversized frames are refused by the codec and
                 // the refusal closes the connection, so clamping must happen
@@ -555,6 +596,44 @@ fn truncate_to_json_budget(s: &str, budget: usize) -> &str {
         cost = next;
     }
     s
+}
+
+/// Scrub credentials out of a tool result's text. Returns the result and how
+/// many values were replaced.
+///
+/// Leaves `is_error` and any images untouched: the scrub changes what the
+/// model reads, never whether the call succeeded. When anything was replaced
+/// a one-line notice is prepended (so the frame clamp, which cuts from the
+/// end, can never drop it) telling the model the values are stand-ins.
+fn scrub_call_result(result: CallResult, scrubber: &SecretScrubber) -> (CallResult, usize) {
+    fn apply(text: String, scrubber: &SecretScrubber) -> (String, usize) {
+        scrubber.scrub_for_model(text)
+    }
+    match result {
+        CallResult::Ok { content, is_error } => {
+            let (content, n) = apply(content, scrubber);
+            (CallResult::Ok { content, is_error }, n)
+        }
+        CallResult::Error { message } => {
+            let (message, n) = apply(message, scrubber);
+            (CallResult::Error { message }, n)
+        }
+        CallResult::Rich {
+            content,
+            is_error,
+            images,
+        } => {
+            let (content, n) = apply(content, scrubber);
+            (
+                CallResult::Rich {
+                    content,
+                    is_error,
+                    images,
+                },
+                n,
+            )
+        }
+    }
 }
 
 /// Clamp a dispatch result so its response frame cannot exceed
@@ -2542,6 +2621,76 @@ mod tests {
                  manifest-derived OPENFANG_BRIDGE_ALLOWED.",
             );
         }
+    }
+
+    /// The incident: `pgrep -lf` output carrying an MCP server's bearer token.
+    /// The scrub must remove the value, keep `is_error` as it was, and tell
+    /// the model the value is a stand-in.
+    #[test]
+    fn tool_result_credentials_are_scrubbed() {
+        // Split so this file never holds a credential-shaped literal.
+        let token = concat!("sbp_", "live9f8e7d6c5b4a3f", "2e1d0c9b8a7f6e5d4c3b2a1");
+        let scrubber = SecretScrubber::with_key(vec![token.to_string()], [3u8; 32]);
+        let result = CallResult::Ok {
+            content: format!("41234 node mcp-remote --header Authorization:Bearer {token}"),
+            is_error: false,
+        };
+        let (out, n) = scrub_call_result(result, &scrubber);
+        assert!(n >= 1);
+        match out {
+            CallResult::Ok { content, is_error } => {
+                assert!(!is_error, "scrub must never change is_error");
+                assert!(!content.contains(token));
+                assert!(content.contains("not usable credentials"));
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_tool_result_is_byte_identical() {
+        let scrubber = SecretScrubber::with_key(Vec::new(), [3u8; 32]);
+        let content = "commit d395d39 feat(apply_patch): ask which match\nok".to_string();
+        let (out, n) = scrub_call_result(
+            CallResult::Ok {
+                content: content.clone(),
+                is_error: true,
+            },
+            &scrubber,
+        );
+        assert_eq!(n, 0);
+        match out {
+            CallResult::Ok {
+                content: c,
+                is_error,
+            } => {
+                assert_eq!(c, content);
+                assert!(is_error);
+            }
+            other => panic!("variant changed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_and_rich_variants_are_scrubbed_too() {
+        let token = concat!("ghp_", "A1b2C3d4E5f6G7h8I9", "j0K1l2M3n4O5p6Q7r8");
+        let scrubber = SecretScrubber::with_key(Vec::new(), [3u8; 32]);
+        let (out, _) = scrub_call_result(
+            CallResult::Error {
+                message: format!("auth failed for {token}"),
+            },
+            &scrubber,
+        );
+        assert!(!format!("{out:?}").contains(token));
+        let (out, _) = scrub_call_result(
+            CallResult::Rich {
+                content: format!("caption {token}"),
+                is_error: false,
+                images: Vec::new(),
+            },
+            &scrubber,
+        );
+        assert!(!format!("{out:?}").contains(token));
     }
 
     #[test]

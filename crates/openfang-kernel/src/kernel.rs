@@ -256,6 +256,10 @@ pub struct OpenFangKernel {
     pub extension_health: openfang_extensions::health::HealthMonitor,
     /// Effective MCP server list (manual config + extension-installed, merged at boot).
     pub effective_mcp_servers: std::sync::RwLock<Vec<openfang_types::config::McpServerConfigEntry>>,
+    /// Credential scrubber for tool results. Installed process-wide at boot so
+    /// the bridge and the native agent loop share one key and one stand-in
+    /// record; its known set is refreshed after MCP connect.
+    pub secret_scrubber: Arc<openfang_types::secret_scrub::SecretScrubber>,
     /// Delivery receipt tracker (bounded LRU, max 10K entries).
     pub delivery_tracker: DeliveryTracker,
     /// Cron job scheduler.
@@ -1568,6 +1572,28 @@ impl OpenFangKernel {
         // active from boot; hot-reload rewrites it later).
         let boot_model_override = config.model_override.clone();
 
+        // Built from the effective server list (configured + extension), and
+        // rebuilt after MCP connect, when vault-only credentials reach the env.
+        let secret_scrubber = {
+            let fresh = Arc::new(openfang_types::secret_scrub::SecretScrubber::new(
+                openfang_types::secret_scrub::known_secrets_from(&all_mcp_servers),
+            ));
+            if !openfang_types::secret_scrub::install_global(fresh.clone()) {
+                // Only expected when one process boots several kernels
+                // (tests). This kernel then shares the first one's key,
+                // stand-in record and known set.
+                warn!("secret scrubber already installed; reusing the existing one");
+            }
+            openfang_types::secret_scrub::global()
+                .cloned()
+                .unwrap_or(fresh)
+        };
+        info!(
+            known_secrets = secret_scrubber.known_len(),
+            standin_writes_allowed = secret_scrubber.allows_standin_writes(),
+            "tool-result secret scrubber armed"
+        );
+
         let kernel = Self {
             config,
             registry: AgentRegistry::new(),
@@ -1605,6 +1631,7 @@ impl OpenFangKernel {
             extension_registry: std::sync::RwLock::new(extension_registry),
             extension_health,
             effective_mcp_servers: std::sync::RwLock::new(all_mcp_servers),
+            secret_scrubber,
             delivery_tracker: DeliveryTracker::new(),
             cron_scheduler,
             approval_manager,
@@ -8966,6 +8993,21 @@ impl OpenFangKernel {
     }
 
     /// Connect to all configured MCP servers and cache their tool definitions.
+    /// Rebuild the scrubber's known-secret set from the effective MCP servers
+    /// and the current env. Runs after MCP connect: that is where vault-only
+    /// credentials are first copied into `std::env`.
+    fn refresh_secret_scrubber(&self) {
+        let servers = self
+            .effective_mcp_servers
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let n = self
+            .secret_scrubber
+            .replace_known(openfang_types::secret_scrub::known_secrets_from(&servers));
+        info!(known_secrets = n, "secret scrubber: known set refreshed");
+    }
+
     async fn connect_mcp_servers(self: &Arc<Self>) {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
         use openfang_types::config::McpTransportEntry;
@@ -9033,6 +9075,8 @@ impl OpenFangKernel {
                 }
             }
         }
+
+        self.refresh_secret_scrubber();
 
         let tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
         if tool_count > 0 {
@@ -9144,6 +9188,8 @@ impl OpenFangKernel {
                 }
             }
         }
+
+        self.refresh_secret_scrubber();
 
         // 6. Remove connections for uninstalled integrations
         let removed: Vec<String> = already_connected
