@@ -107,7 +107,7 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Credential prefixes. A run starting with one of these, followed by at least
 /// [`MIN_PREFIXED_BODY`] more token characters including a digit, is a secret.
@@ -190,12 +190,24 @@ pub const PEM_REMOVED_MARKER: &str = concat!("[openfang: private", " key removed
 const PEM_BLOCK_OPEN: &str = concat!("-----BEGIN ", "PRIVATE", " KEY-----\n");
 const PEM_BLOCK_CLOSE: &str = concat!("\n-----END ", "PRIVATE", " KEY-----");
 
-/// How far past a private-key header with no END marker the redaction runs.
-/// A 4096-bit RSA PEM is about 3.3 KB, so a truncated real key is fully
-/// covered; the bound stops one `grep -r` hit from wiping the rest of the
-/// output. Not "stop at the first non-base64 line": `rg -n` prefixes every
-/// key line with `path:N:`, and that rule would leak the key.
+/// Minimum redaction past a private-key header with no END marker. The bound
+/// stops one `grep -r` hit from wiping the rest of the output. It counts
+/// output bytes, not key bytes, so on its own a per-line prefix (`rg -n`,
+/// `cat -n`) or a large key can push key lines past it: see
+/// [`KEY_LINE_MIN_TOKEN`] for how the redaction continues.
 const MAX_UNTERMINATED_PEM: usize = 8 * 1024;
+
+/// Hard stop for an unterminated private-key redaction, however key-like the
+/// lines keep looking. A 16384-bit RSA PEM is about 12.7 KB raw.
+const MAX_UNTERMINATED_PEM_HARD: usize = 64 * 1024;
+
+/// Past [`MAX_UNTERMINATED_PEM`], redaction continues line by line while a
+/// line's last token (after the last `:`, space or tab) is at least this many
+/// base64 characters. That follows prefixed key lines without following
+/// ordinary source. Not "stop at the first non-base64 line": the prefix would
+/// make every key line fail that test and leak the tail, which holds the
+/// factors.
+const KEY_LINE_MIN_TOKEN: usize = 40;
 
 /// Daemon env var that turns off [`SecretScrubber::check_args`].
 pub const ALLOW_STANDIN_WRITES_ENV: &str = "OPENFANG_SCRUB_ALLOW_STANDIN_WRITES";
@@ -369,7 +381,10 @@ pub struct SecretScrubber {
     /// connect, which is when vault-only credentials reach the env.
     known: RwLock<Vec<String>>,
     /// Every stand-in emitted so far, exactly as it appeared in the output.
-    issued: Mutex<HashSet<String>>,
+    /// An `RwLock` so refusal checks and the shape passes' lookups run in
+    /// parallel; only emitting a new stand-in takes the write lock. Not
+    /// capped by eviction: dropping an entry would let its write-back through.
+    issued: RwLock<HashSet<String>>,
     /// Set once a private-key block has been removed. Until then the
     /// removed-key marker is ordinary text and is not refused.
     pem_redacted: AtomicBool,
@@ -425,7 +440,7 @@ impl SecretScrubber {
     pub fn with_key(known: impl IntoIterator<Item = String>, key: [u8; 32]) -> Self {
         Self {
             known: RwLock::new(normalize_known(known)),
-            issued: Mutex::new(HashSet::new()),
+            issued: RwLock::new(HashSet::new()),
             pem_redacted: AtomicBool::new(false),
             key,
             allow_standin_writes: false,
@@ -540,7 +555,7 @@ impl SecretScrubber {
     /// if a private key has been removed this boot.
     #[must_use]
     pub fn find_issued(&self, text: &str) -> Option<String> {
-        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        let issued = self.issued.read().unwrap_or_else(|e| e.into_inner());
         self.find_issued_in(&issued, text)
     }
 
@@ -572,7 +587,7 @@ impl SecretScrubber {
         }
         let mut leaves: Vec<&str> = Vec::new();
         collect_strings(args, &mut leaves);
-        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        let issued = self.issued.read().unwrap_or_else(|e| e.into_inner());
         leaves
             .into_iter()
             .find_map(|leaf| self.find_issued_in(&issued, leaf))
@@ -631,7 +646,7 @@ impl SecretScrubber {
     /// Emit a stand-in and record it for [`Self::check_args`].
     fn issue(&self, secret: &str) -> String {
         let fake = self.stand_in(secret);
-        let mut issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        let mut issued = self.issued.write().unwrap_or_else(|e| e.into_inner());
         if issued.len() < MAX_ISSUED {
             issued.insert(fake.clone());
         }
@@ -644,7 +659,7 @@ impl SecretScrubber {
     /// that never reached the model).
     fn is_issued(&self, s: &str) -> bool {
         self.issued
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .contains(s)
     }
@@ -652,13 +667,12 @@ impl SecretScrubber {
     /// Replace PEM private-key blocks.
     ///
     /// The header ends at the first of: its closing `-----`, a real newline,
-    /// or a literal `\n` (single-line JSON). A private-key header with no END
-    /// marker (a truncated read) is redacted for [`MAX_UNTERMINATED_PEM`]
-    /// bytes past the header, or to the end of the text if that is sooner.
-    /// Returns the text, the block count, and the bytes cut that way.
+    /// or a literal `\n` (single-line JSON). An END marker only closes the
+    /// block if it falls inside the window [`pem_window`] defines; a private
+    /// key with no END there (a truncated read) is redacted to the window's
+    /// end. Returns the text, the block count, and the bytes cut that way.
     fn scrub_pem(&self, text: &str) -> (String, usize, usize) {
         const BEGIN: &str = "-----BEGIN ";
-        const END: &str = "-----END ";
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         let mut count = 0usize;
@@ -677,19 +691,9 @@ impl SecretScrubber {
             out.push_str(PEM_REMOVED_MARKER);
             out.push_str(PEM_BLOCK_CLOSE);
             count += 1;
-            rest = match rest[header_end..].find(END) {
-                Some(e) => {
-                    let e = header_end + e + END.len();
-                    match rest[e..].find("-----") {
-                        Some(t) => &rest[e + t + 5..],
-                        None => "",
-                    }
-                }
-                None => {
-                    let mut stop = (header_end + MAX_UNTERMINATED_PEM).min(rest.len());
-                    while !rest.is_char_boundary(stop) {
-                        stop -= 1;
-                    }
+            rest = match pem_window(rest, header_end) {
+                PemStop::End(resume) => &rest[resume..],
+                PemStop::Cut(stop) => {
                     cut_bytes += stop - header_end;
                     out.push_str(&format!(
                         "\n[openfang: no END marker; {} byte(s) after this header were removed]\n",
@@ -817,6 +821,93 @@ fn pem_header_end(s: &str) -> Option<usize> {
         .flatten()
         .min()
         .filter(|&i| i <= MAX_HEADER)
+}
+
+/// Where the redaction of a private key that starts at `header_end` stops.
+#[derive(Debug, PartialEq, Eq)]
+enum PemStop {
+    /// An END marker inside the window; resume at this offset, just past its
+    /// closing `-----` (or the end of its line).
+    End(usize),
+    /// No END marker inside the window; redact up to this offset.
+    Cut(usize),
+}
+
+/// Walk the lines after a private-key header (split on real newlines and on
+/// literal `\n`) and decide where the redaction stops:
+/// - every line inside the first [`MAX_UNTERMINATED_PEM`] bytes is redacted;
+/// - past that, lines are redacted while [`is_key_line`] holds;
+/// - nothing past [`MAX_UNTERMINATED_PEM_HARD`] is redacted;
+/// - an END marker closes the block only inside that window (SS17), so a
+///   `-----END CERTIFICATE-----` from another file further down does not
+///   make the redaction unbounded again.
+fn pem_window(rest: &str, header_end: usize) -> PemStop {
+    const END: &str = "-----END ";
+    let soft = floor_boundary(rest, header_end + MAX_UNTERMINATED_PEM);
+    let hard = floor_boundary(rest, header_end + MAX_UNTERMINATED_PEM_HARD);
+    // Next literal `\n` at or after `ls`, rescanned only once passed, so the
+    // walk stays linear in the window.
+    let find_lit = |from: usize| rest[from..hard].find("\\n").map(|i| from + i);
+    let mut lit = find_lit(header_end);
+    let mut ls = header_end;
+    while ls < hard {
+        if lit.is_some_and(|p| p < ls) {
+            lit = find_lit(ls);
+        }
+        let nl = rest[ls..hard].find('\n').map(|i| (ls + i, ls + i + 1));
+        let (le, next) = match (nl, lit.map(|p| (p, p + 2))) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b).unwrap_or((hard, hard)),
+        };
+        let line = &rest[ls..le];
+        if let Some(i) = line.find(END) {
+            let at = ls + i;
+            if at > soft && ls < soft {
+                // An END far along a line that started inside the minimum
+                // window and is not a key line: not this key's END.
+                return PemStop::Cut(soft);
+            }
+            let e = at + END.len();
+            return PemStop::End(rest[e..le].find("-----").map_or(le, |t| e + t + 5));
+        }
+        if le <= soft {
+            ls = next;
+            continue;
+        }
+        if le == hard && hard < rest.len() {
+            return PemStop::Cut(hard);
+        }
+        if is_key_line(line, next >= rest.len()) {
+            ls = next;
+            continue;
+        }
+        return PemStop::Cut(if ls < soft { soft } else { ls });
+    }
+    PemStop::Cut(hard)
+}
+
+/// True for a line that still looks like private-key body: its last token
+/// (after the last `:`, space or tab, so `path:N:` and `cat -n` prefixes are
+/// skipped) is base64 and at least [`KEY_LINE_MIN_TOKEN`] long. The final
+/// line of the whole text may be shorter: that is where a truncated read
+/// ends.
+fn is_key_line(line: &str, last_in_text: bool) -> bool {
+    let line = line.trim_end_matches('\r');
+    let tok = line.rsplit([':', ' ', '\t']).next().unwrap_or("");
+    !tok.is_empty()
+        && tok
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        && (tok.len() >= KEY_LINE_MIN_TOKEN || last_in_text)
+}
+
+/// `min(i, s.len())`, moved back to a char boundary.
+fn floor_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 fn is_key_byte(b: u8) -> bool {
@@ -1184,6 +1275,112 @@ mod tests {
         assert!(r.text.starts_with("a.pem:1:"));
         let (notice, _) = s.scrub_for_model(text);
         assert!(notice.contains("8192 byte(s)"), "{}", &notice[..300]);
+    }
+
+    /// Deterministic base64 body lines of PEM width, `/` and `+` included.
+    fn fake_key_lines(n: usize) -> Vec<String> {
+        let alphabet: Vec<u8> = concat!(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "abcdefghijklmnopqrstuvwxyz",
+            "0123456789+/",
+        )
+        .bytes()
+        .collect();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        (0..n)
+            .map(|_| {
+                (0..64)
+                    .map(|_| {
+                        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                        char::from(alphabet[(x >> 58) as usize])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// SS16: an 8192-bit key read through `rg -n` with a long path prefix
+    /// runs well past 8 KiB of output. None of it may survive, the tail
+    /// least of all (that is where the factors are).
+    #[test]
+    fn prefixed_large_truncated_key_does_not_leak_past_minimum() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let path = "/Users/someone/.openfang/workspaces/some-agent/projects/some-project/keys/deploy-key-2026.pem";
+        let lines = fake_key_lines(100); // ~6.4 KB of base64: 8192-bit size
+        let mut text = format!("{path}:1:{header}\n");
+        for (i, l) in lines.iter().enumerate() {
+            text.push_str(&format!("{path}:{}:{l}\n", i + 2));
+        }
+        // Under the old fixed 8 KiB cap, roughly the last half leaked.
+        assert!(
+            text.len() > MAX_UNTERMINATED_PEM * 3 / 2,
+            "fixture too small"
+        );
+        let r = s.scrub(&text);
+        for l in &lines {
+            assert!(!r.text.contains(&l[..20]), "key line survived: {l}");
+        }
+        assert!(r.pem_cut_bytes > MAX_UNTERMINATED_PEM);
+        // Same body behind `cat -n` (tab after the number).
+        let mut tabbed = format!("     1\t{header}\n");
+        for (i, l) in lines.iter().enumerate() {
+            tabbed.push_str(&format!("{:>6}\t{l}\n", i + 2));
+        }
+        let r = s.scrub(&tabbed);
+        for l in &lines {
+            assert!(!r.text.contains(&l[..20]), "cat -n line survived: {l}");
+        }
+    }
+
+    /// SS16 negative: a `grep -r` header hit followed by ordinary source
+    /// still stops at the 8 KiB minimum.
+    #[test]
+    fn header_hit_followed_by_source_stops_at_minimum() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let src = "src/lib.rs:12:    let value = compute_something(argument_one, argument_two);\n";
+        let text = format!("docs/a.md:3:{header}\n{}", src.repeat(400));
+        let r = s.scrub(&text);
+        assert_eq!(r.pem_cut_bytes, MAX_UNTERMINATED_PEM);
+        assert!(r.text.contains("compute_something"), "tail lost");
+    }
+
+    /// The redaction never runs past the hard stop, however key-like the
+    /// lines keep looking.
+    #[test]
+    fn unterminated_redaction_has_a_hard_stop() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let body = fake_key_lines(2000).join("\n");
+        let r = s.scrub(&format!("{header}\n{body}\n"));
+        assert_eq!(r.pem_cut_bytes, MAX_UNTERMINATED_PEM_HARD);
+    }
+
+    /// SS17: an END marker far below, from another file, does not close an
+    /// unterminated key and make the redaction unbounded.
+    #[test]
+    fn distant_end_marker_does_not_extend_redaction() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let src = "src/lib.rs:12:    let value = compute_something(argument_one, argument_two);\n";
+        let text = format!(
+            "a.md:3:{header}\n{}c.pem:9:-----END CERTIFICATE-----\nkept tail\n",
+            src.repeat(400)
+        );
+        let r = s.scrub(&text);
+        assert_eq!(r.pem_cut_bytes, MAX_UNTERMINATED_PEM);
+        assert!(r.text.contains("END CERTIFICATE"), "distant END swallowed");
+        assert!(r.text.contains("kept tail"));
+        // A real END inside the window still closes the block.
+        let lines = fake_key_lines(3).join("\n");
+        let closed = format!(
+            "{header}\n{lines}\n{}\nafter",
+            concat!("-----END RSA ", "PRIVATE", " KEY-----")
+        );
+        let r = s.scrub(&closed);
+        assert_eq!(r.pem_cut_bytes, 0);
+        assert!(r.text.ends_with("\nafter"), "{}", r.text);
     }
 
     /// SS4: single-line JSON (`jq -c`) has a literal `\n`, not a newline.
