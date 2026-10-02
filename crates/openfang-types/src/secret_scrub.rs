@@ -115,6 +115,18 @@
 //!   factoring needs.
 //! - An unrelated END marker within 8 KiB of a truncated key closes it early.
 //! - PuTTY `.ppk` keys have no PEM header and are never caught by this pass.
+//! - Forced colour output (`--color=always`, `bat -f`, `delta`) leaves an ANSI
+//!   reset such as `\x1b[0m` at line end, which stops the follow at 8 KiB.
+//!   `shell_exec` is not a terminal, so tools do not colour by default.
+//! - Key lines stored as quoted array items (`"MIIE…",` in YAML/JSON) are not
+//!   followed past 8 KiB. Trimming `",` would open the follow to every array
+//!   of long strings.
+//!
+//! Accepted over-redaction (fails closed, nothing leaks): a stray PEM header
+//! with no END, followed 8 KiB later by consecutive lines that each end in
+//! 40+ base64 characters (go.sum, comment-less `known_hosts`, `git rev-list`,
+//! dot-free path listings), is followed up to the 64 KiB hard stop. Do not
+//! "fix" this by tightening the follow: that reopens the SS16/SS19 leak.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -899,13 +911,15 @@ fn pem_window(rest: &str, header_end: usize) -> PemStop {
 /// `path-N-` (grep/rg `-A` context lines, SS19), `cat -n` tabs all pass.
 /// Base64 never contains `-`, `.` or `:`, so the run starts after the prefix.
 /// Line-end decoration is trimmed first: a real CR, a literal `\r` (single-
-/// line JSON of a CRLF key), and `cat -A`/`cat -e`'s `$` and `^M`. The final
+/// line JSON of a CRLF key), `cat -A`/`cat -e`'s `$` and `^M`, and trailing
+/// spaces/tabs (editor pastes, `diff -y`/`pr`/`column` padding). The final
 /// line of the whole text may be shorter: that is where a truncated read
 /// ends.
 fn is_key_line(line: &str, last_in_text: bool) -> bool {
     let mut line = line;
     loop {
         let t = line
+            .trim_end_matches([' ', '\t'])
             .trim_end_matches('\r')
             .trim_end_matches('$')
             .trim_end_matches("^M")
@@ -1390,8 +1404,17 @@ mod tests {
         assert!(is_key_line(&format!("{k}$"), false));
         assert!(is_key_line(&format!("{k}^M$"), false));
         assert!(is_key_line(&format!("{k}\r"), false));
+        // L1: trailing whitespace (paste, `diff -y`/`column` padding).
+        assert!(is_key_line(&format!("{k}   "), false));
+        assert!(is_key_line(&format!("{k}\t\t"), false));
+        assert!(is_key_line(&format!("{k} \r"), false));
+        assert!(is_key_line(&format!("{k}  $"), false));
         assert!(!is_key_line(
             "    let value = compute_something(a, b);",
+            false
+        ));
+        assert!(!is_key_line(
+            "    let value = compute_something(a, b);   ",
             false
         ));
         assert!(!is_key_line("short/base64==", false));
