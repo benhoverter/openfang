@@ -11,13 +11,20 @@
 //! ## Where it runs
 //!
 //! The kernel owns one [`SecretScrubber`] and installs it with
-//! [`install_global`]. Two call sites use it, and both are required:
+//! [`install_global`]. Three call sites use it, and all are required:
 //!
 //! - `bridge_ipc::handle_connection`, for every tool result of a Claude Code
 //!   agent (native and upstream MCP);
 //! - `agent_loop`, for every tool result on the native driver path: agents on
 //!   a non-CLI provider, and any CLI agent whose turn falls back to an API
-//!   provider.
+//!   provider;
+//! - `routes::mcp_http`, the MCP-over-HTTP endpoint. Anything calling it is a
+//!   model client by construction.
+//!
+//! Only tool results are scrubbed. Recalled memories injected into the
+//! system prompt, inbound `agent_send` text and channel messages reach the
+//! model without passing any of these sites, and anything written to memory
+//! before this filter existed comes back raw.
 //!
 //! ## What it does
 //!
@@ -48,14 +55,28 @@
 //! A stand-in written back to disk silently replaces a live credential with a
 //! fake one: read a config file, write the whole thing back, and the next
 //! bounce breaks auth with nothing reporting it. So every stand-in this
-//! scrubber emits is recorded, and [`SecretScrubber::check_args`] refuses any
-//! tool call whose arguments contain one. Both call sites run that check
+//! scrubber emits is recorded, and [`SecretScrubber::check_args_value`]
+//! refuses any tool call whose arguments contain one. Every call site runs
+//! that check
 //! before dispatch, for every tool, because content is written by
 //! `shell_exec`, MCP writes and `agent_send` as well as the file tools.
+//!
+//! The refusal applies to read and search calls too: `grep <stand-in>` to
+//! find where a value came from is refused like a write. The removed-key
+//! marker is refused only once this scrubber has actually removed a private
+//! key, so the bare marker text is not blocked on a boot that never did.
 //!
 //! The record is per boot. A session that spans a daemon bounce can still
 //! write an old stand-in; that is accepted. An operator can turn the refusal
 //! off with `OPENFANG_SCRUB_ALLOW_STANDIN_WRITES=1` in the daemon environment.
+//!
+//! ## This file must scrub clean
+//!
+//! The module's own source passes through the scrubber on every read. Test
+//! fixtures and the marker literals are therefore built with `concat!` so no
+//! single literal is credential-shaped; `module_source_is_left_alone` pins it.
+//! A fixture written as one literal makes this file unreadable and uneditable
+//! for the whole fleet once deployed.
 //!
 //! ## What it deliberately does not do
 //!
@@ -85,6 +106,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// Credential prefixes. A run starting with one of these, followed by at least
@@ -161,7 +183,19 @@ const BASE64_FILE_MAGIC: &[&str] = &["iVBORw0KGgo", "/9j/", "R0lGOD", "UklGR", "
 
 /// What a removed private-key block is replaced with. Also refused on the way
 /// back in: writing it over a key file destroys the key.
-pub const PEM_REMOVED_MARKER: &str = "[openfang: private key removed]";
+pub const PEM_REMOVED_MARKER: &str = concat!("[openfang: private", " key removed]");
+
+/// The block a removed private key is replaced with, split so this source
+/// file never holds a contiguous private-key header.
+const PEM_BLOCK_OPEN: &str = concat!("-----BEGIN ", "PRIVATE", " KEY-----\n");
+const PEM_BLOCK_CLOSE: &str = concat!("\n-----END ", "PRIVATE", " KEY-----");
+
+/// How far past a private-key header with no END marker the redaction runs.
+/// A 4096-bit RSA PEM is about 3.3 KB, so a truncated real key is fully
+/// covered; the bound stops one `grep -r` hit from wiping the rest of the
+/// output. Not "stop at the first non-base64 line": `rg -n` prefixes every
+/// key line with `path:N:`, and that rule would leak the key.
+const MAX_UNTERMINATED_PEM: usize = 8 * 1024;
 
 /// Daemon env var that turns off [`SecretScrubber::check_args`].
 pub const ALLOW_STANDIN_WRITES_ENV: &str = "OPENFANG_SCRUB_ALLOW_STANDIN_WRITES";
@@ -186,6 +220,9 @@ const CREDENTIAL_KEY_HINTS: &[&str] = &[
 
 /// Substrings of an environment variable *name* that mark its value as a
 /// credential worth exact-matching. Used by callers assembling the known set.
+/// No bare `AUTH`: it matches `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` and
+/// `SSH_AUTH_SOCK`, and would scramble an author's name in every result.
+/// `*_AUTH_TOKEN` is already covered by `TOKEN`.
 pub const CREDENTIAL_ENV_HINTS: &[&str] = &[
     "TOKEN",
     "SECRET",
@@ -196,14 +233,16 @@ pub const CREDENTIAL_ENV_HINTS: &[&str] = &[
     "ACCESS_KEY",
     "PRIVATE_KEY",
     "CREDENTIAL",
-    "AUTH",
+    "AUTHORIZATION",
 ];
 
 static GLOBAL: OnceLock<Arc<SecretScrubber>> = OnceLock::new();
 
 /// Install the process-wide scrubber. The kernel calls this once at boot so
 /// the bridge and the native agent loop share one key and one stand-in
-/// record. Returns false if one was already installed (the first one stays).
+/// record. Returns false if one was already installed (the first one stays);
+/// callers should log that, because a second kernel then scrubs with the
+/// first one's key and record.
 pub fn install_global(scrubber: Arc<SecretScrubber>) -> bool {
     GLOBAL.set(scrubber).is_ok()
 }
@@ -331,6 +370,9 @@ pub struct SecretScrubber {
     known: RwLock<Vec<String>>,
     /// Every stand-in emitted so far, exactly as it appeared in the output.
     issued: Mutex<HashSet<String>>,
+    /// Set once a private-key block has been removed. Until then the
+    /// removed-key marker is ordinary text and is not refused.
+    pem_redacted: AtomicBool,
     key: [u8; 32],
     allow_standin_writes: bool,
 }
@@ -352,6 +394,8 @@ pub struct Scrubbed {
     pub known: usize,
     /// Replacements made by the shape pass.
     pub shaped: usize,
+    /// Bytes removed after private-key headers that had no END marker.
+    pub pem_cut_bytes: usize,
 }
 
 impl Scrubbed {
@@ -382,6 +426,7 @@ impl SecretScrubber {
         Self {
             known: RwLock::new(normalize_known(known)),
             issued: Mutex::new(HashSet::new()),
+            pem_redacted: AtomicBool::new(false),
             key,
             allow_standin_writes: false,
         }
@@ -424,13 +469,17 @@ impl SecretScrubber {
                 }
             }
         }
-        let (out, pem) = self.scrub_pem(&out);
+        let (out, pem, pem_cut_bytes) = self.scrub_pem(&out);
+        if pem > 0 {
+            self.pem_redacted.store(true, Ordering::Relaxed);
+        }
         let (out, assigned) = self.scrub_assignments(&out);
         let (out, runs) = self.scrub_runs(&out);
         Scrubbed {
             text: out,
             known,
             shaped: pem + assigned + runs,
+            pem_cut_bytes,
         }
     }
 
@@ -444,45 +493,90 @@ impl SecretScrubber {
         if n == 0 {
             return (text, 0);
         }
+        let cut = if s.pem_cut_bytes > 0 {
+            format!(
+                " A private-key header with no END marker was found; {} byte(s) \
+                 after it were removed.",
+                s.pem_cut_bytes
+            )
+        } else {
+            String::new()
+        };
         (
             format!(
                 "[openfang: {n} credential-shaped value(s) in this result were replaced \
                  with stand-ins of the same shape. They are not usable credentials, and \
-                 a tool call that contains one is refused.]\n\n{}",
+                 a tool call that contains one is refused.{cut}]\n\n{}",
                 s.text
             ),
             n,
         )
     }
 
-    /// The first issued stand-in (or the removed-key marker) found in `text`.
+    /// Scrub a tool result's content for the model. `tool_use_id` and
+    /// `is_error` are never changed. Returns the result and the count.
+    #[must_use]
+    pub fn scrub_tool_result(
+        &self,
+        result: crate::tool::ToolResult,
+    ) -> (crate::tool::ToolResult, usize) {
+        let crate::tool::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } = result;
+        let (content, n) = self.scrub_for_model(content);
+        (
+            crate::tool::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            },
+            n,
+        )
+    }
+
+    /// The first issued stand-in found in `text`, or the removed-key marker
+    /// if a private key has been removed this boot.
     #[must_use]
     pub fn find_issued(&self, text: &str) -> Option<String> {
-        if text.contains(PEM_REMOVED_MARKER) {
+        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        self.find_issued_in(&issued, text)
+    }
+
+    fn find_issued_in(&self, issued: &HashSet<String>, text: &str) -> Option<String> {
+        if self.pem_redacted.load(Ordering::Relaxed) && text.contains(PEM_REMOVED_MARKER) {
             return Some(PEM_REMOVED_MARKER.to_string());
         }
-        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
         issued.iter().find(|s| text.contains(s.as_str())).cloned()
     }
 
-    /// Refuse a tool call whose serialized arguments contain a stand-in this
-    /// scrubber issued. `Err` carries the message to return to the model.
+    /// Refuse raw text containing a stand-in this scrubber issued. Prefer
+    /// [`Self::check_args_value`] for tool arguments: in serialized JSON a
+    /// stand-in containing `"` or `\` appears escaped and is missed here.
     pub fn check_args(&self, args_text: &str) -> Result<(), String> {
         if self.allow_standin_writes {
             return Ok(());
         }
-        match self.find_issued(args_text) {
-            None => Ok(()),
-            Some(s) => Err(format!(
-                "Refused before running: the arguments contain `{s}`, which is a stand-in \
-                 OpenFang showed you in place of a real credential. Writing or sending it \
-                 would replace the real value with a fake one. Nothing was run. Leave that \
-                 value out: edit only the lines that do not contain it (apply_patch on \
-                 those lines), or refer to the credential by its environment variable \
-                 name. Operator override: {ALLOW_STANDIN_WRITES_ENV}=1 in the daemon \
-                 environment."
-            )),
+        self.find_issued(args_text)
+            .map_or(Ok(()), |s| Err(refusal(&s)))
+    }
+
+    /// Refuse a tool call whose arguments contain a stand-in this scrubber
+    /// issued. Tests each unescaped string value and object key, so a
+    /// stand-in containing `"` or `\` is still found. `Err` carries the
+    /// message to return to the model.
+    pub fn check_args_value(&self, args: &serde_json::Value) -> Result<(), String> {
+        if self.allow_standin_writes {
+            return Ok(());
         }
+        let mut leaves: Vec<&str> = Vec::new();
+        collect_strings(args, &mut leaves);
+        let issued = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        leaves
+            .into_iter()
+            .find_map(|leaf| self.find_issued_in(&issued, leaf))
+            .map_or(Ok(()), |s| Err(refusal(&s)))
     }
 
     /// Same-shape stand-in: keep the credential prefix, then replace each
@@ -559,27 +653,29 @@ impl SecretScrubber {
     ///
     /// The header ends at the first of: its closing `-----`, a real newline,
     /// or a literal `\n` (single-line JSON). A private-key header with no END
-    /// marker (a truncated read) is redacted to the end of the text: every
-    /// byte after it is key material.
-    fn scrub_pem(&self, text: &str) -> (String, usize) {
+    /// marker (a truncated read) is redacted for [`MAX_UNTERMINATED_PEM`]
+    /// bytes past the header, or to the end of the text if that is sooner.
+    /// Returns the text, the block count, and the bytes cut that way.
+    fn scrub_pem(&self, text: &str) -> (String, usize, usize) {
         const BEGIN: &str = "-----BEGIN ";
         const END: &str = "-----END ";
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
         let mut count = 0usize;
+        let mut cut_bytes = 0usize;
         while let Some(start) = rest.find(BEGIN) {
             let after = start + BEGIN.len();
             let header_end = pem_header_end(&rest[after..]).map(|i| after + i);
-            let Some(header_end) = header_end.filter(|&e| rest[start..e].contains("PRIVATE KEY"))
-            else {
+            let is_private = |e: usize| rest[start..e].contains(concat!("PRIVATE", " KEY"));
+            let Some(header_end) = header_end.filter(|&e| is_private(e)) else {
                 out.push_str(&rest[..after]);
                 rest = &rest[after..];
                 continue;
             };
             out.push_str(&rest[..start]);
-            out.push_str("-----BEGIN PRIVATE KEY-----\n");
+            out.push_str(PEM_BLOCK_OPEN);
             out.push_str(PEM_REMOVED_MARKER);
-            out.push_str("\n-----END PRIVATE KEY-----");
+            out.push_str(PEM_BLOCK_CLOSE);
             count += 1;
             rest = match rest[header_end..].find(END) {
                 Some(e) => {
@@ -589,11 +685,22 @@ impl SecretScrubber {
                         None => "",
                     }
                 }
-                None => "",
+                None => {
+                    let mut stop = (header_end + MAX_UNTERMINATED_PEM).min(rest.len());
+                    while !rest.is_char_boundary(stop) {
+                        stop -= 1;
+                    }
+                    cut_bytes += stop - header_end;
+                    out.push_str(&format!(
+                        "\n[openfang: no END marker; {} byte(s) after this header were removed]\n",
+                        stop - header_end
+                    ));
+                    &rest[stop..]
+                }
             };
         }
         out.push_str(rest);
-        (out, count)
+        (out, count, cut_bytes)
     }
 
     /// `NAME=value`, `NAME: value`, `"name": "value"` where NAME reads like a
@@ -716,6 +823,34 @@ fn is_key_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
 }
 
+/// The message a refused tool call returns to the model.
+fn refusal(standin: &str) -> String {
+    format!(
+        "Refused before running: the arguments contain `{standin}`, which is a stand-in \
+         OpenFang showed you in place of a real credential. Writing or sending it \
+         would replace the real value with a fake one. Nothing was run. Leave that \
+         value out: edit only the lines that do not contain it (apply_patch on \
+         those lines), or refer to the credential by its environment variable \
+         name. Operator override: {ALLOW_STANDIN_WRITES_ENV}=1 in the daemon \
+         environment."
+    )
+}
+
+/// Every string value and object key in `v`, unescaped.
+fn collect_strings<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_strings(i, out)),
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                out.push(k);
+                collect_strings(val, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Value side of a credential-named assignment.
 ///
 /// Each exclusion here came from running the shape pass over the repo's own
@@ -795,6 +930,17 @@ mod tests {
 
     const KEY: [u8; 32] = [7u8; 32];
 
+    // Fixtures are split with `concat!` so this file scrubs clean (see the
+    // module docs and `module_source_is_left_alone`). Keep every piece under
+    // 32 characters and never put a prefix and 16+ body characters together.
+    const GHP: &str = concat!("ghp_", "A1b2C3d4E5f6G7h8I9", "j0K1l2M3n4O5p6Q7r8");
+    const SBP: &str = concat!("sbp_", "live9f8e7d6c5b4a3f", "2e1d0c9b8a7f6e5d4c3b2a1");
+    const SBP_SHORT: &str = concat!("sbp_", "live9f8e7d6c", "5b4a3f2e1d0c");
+    const SK_ANT: &str = concat!("sk-ant-", "api03-AbCdEf", "0123456789xyzXYZ");
+    const LIN: &str = concat!("lin_api_", "Zz9Yy8Xx7Ww6", "Vv5Uu4Tt3Ss2Rr1");
+    const LOWER: &str = concat!("lowercase7", "only3value");
+    const PLAIN: &str = concat!("plainlower9", "case7value");
+
     fn scrubber(known: &[&str]) -> SecretScrubber {
         SecretScrubber::with_key(known.iter().map(|s| (*s).to_string()), KEY)
     }
@@ -802,7 +948,7 @@ mod tests {
     /// The incident: `pgrep -lf` printing an MCP server's argv.
     #[test]
     fn pgrep_bearer_line_is_scrubbed_by_known_value() {
-        let token = "sbp_live9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1";
+        let token = SBP;
         let s = scrubber(&[token]);
         let line = format!(
             "41234 node /x/mcp-remote https://mcp.example --header Authorization:Bearer {token}"
@@ -816,7 +962,7 @@ mod tests {
     #[test]
     fn unknown_prefixed_token_is_scrubbed_by_shape() {
         let s = scrubber(&[]);
-        let tok = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let tok = GHP;
         let r = s.scrub(&format!("token is {tok} ok"));
         assert!(!r.text.contains(tok));
         assert!(r.text.starts_with("token is ghp_"));
@@ -827,7 +973,7 @@ mod tests {
     #[test]
     fn stand_in_is_deterministic_and_same_shape() {
         let s = scrubber(&[]);
-        let tok = "sk-ant-api03-AbCdEf0123456789xyzXYZ";
+        let tok = SK_ANT;
         let a = s.stand_in(tok);
         let b = s.stand_in(tok);
         assert_eq!(a, b);
@@ -845,13 +991,13 @@ mod tests {
     fn different_keys_give_different_stand_ins() {
         let a = SecretScrubber::with_key(Vec::new(), [1u8; 32]);
         let b = SecretScrubber::with_key(Vec::new(), [2u8; 32]);
-        let tok = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let tok = GHP;
         assert_ne!(a.stand_in(tok), b.stand_in(tok));
     }
 
     #[test]
     fn same_secret_twice_maps_to_same_stand_in() {
-        let tok = "lin_api_Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1";
+        let tok = LIN;
         let s = scrubber(&[tok]);
         let r = s.scrub(&format!("a={tok}\nb={tok}"));
         let lines: Vec<&str> = r.text.lines().collect();
@@ -887,16 +1033,15 @@ mod tests {
     fn credential_named_assignment_value_is_scrubbed() {
         let s = scrubber(&[]);
         for line in [
-            "LINEAR_API_KEY=plainlower9case7value",
-            "export NOTION_TOKEN='lowercase7only3value'",
-            "\"api_key\": \"lowercase7only3value\"",
-            "Authorization: Bearer lowercase7only3value",
-            "https://api.example.com/v1?access_token=lowercase7only3value&x=1",
+            format!("LINEAR_API_KEY={PLAIN}"),
+            format!("export NOTION_TOKEN='{LOWER}'"),
+            format!("\"api_key\": \"{LOWER}\""),
+            format!("Authorization: Bearer {LOWER}"),
+            format!("https://api.example.com/v1?access_token={LOWER}&x=1"),
         ] {
-            let r = s.scrub(line);
+            let r = s.scrub(&line);
             assert!(
-                !r.text.contains("lowercase7only3value")
-                    && !r.text.contains("plainlower9case7value"),
+                !r.text.contains(LOWER) && !r.text.contains(PLAIN),
                 "{line} -> {}",
                 r.text
             );
@@ -922,14 +1067,20 @@ mod tests {
     #[test]
     fn variable_name_survives_when_value_is_scrubbed() {
         let s = scrubber(&[]);
-        let r = s.scrub("GITHUB_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8");
+        let r = s.scrub(&format!("GITHUB_TOKEN={GHP}"));
         assert!(r.text.starts_with("GITHUB_TOKEN=ghp_"), "{}", r.text);
     }
 
     #[test]
     fn private_key_block_is_removed() {
         let s = scrubber(&[]);
-        let text = "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nAAAA/BBBB+cccc\n-----END OPENSSH PRIVATE KEY-----\nafter";
+        let text = concat!(
+            "before\n-----BEGIN OPENSSH ",
+            "PRIVATE",
+            " KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nAAAA/BBBB+cccc\n-----END OPENSSH ",
+            "PRIVATE",
+            " KEY-----\nafter",
+        );
         let r = s.scrub(text);
         assert!(!r.text.contains("b3BlbnNzaC1rZXktdjEAAAAA"));
         assert!(r.text.starts_with("before\n"));
@@ -957,10 +1108,10 @@ mod tests {
 
     #[test]
     fn secrets_in_arg_extracts_bearer_and_flag_values() {
-        let got = secrets_in_arg("Authorization: Bearer sbp_live9f8e7d6c5b4a3f2e1d0c");
-        assert!(got.iter().any(|s| s == "sbp_live9f8e7d6c5b4a3f2e1d0c"));
-        let got = secrets_in_arg("--access-token=lowercase7only3value");
-        assert!(got.iter().any(|s| s == "lowercase7only3value"));
+        let got = secrets_in_arg(&format!("Authorization: Bearer {SBP_SHORT}"));
+        assert!(got.iter().any(|s| s == SBP_SHORT));
+        let got = secrets_in_arg(&format!("--access-token={LOWER}"));
+        assert!(got.iter().any(|s| s == LOWER));
         assert!(secrets_in_arg("--verbose").is_empty());
         assert!(secrets_in_arg("https://mcp.linear.app/sse").is_empty());
     }
@@ -973,9 +1124,19 @@ mod tests {
         assert!(!env_name_is_credential("RUST_LOG"));
     }
 
+    /// SS14: author identity and the ssh-agent socket are not credentials.
+    #[test]
+    fn env_name_hint_skips_author_and_auth_sock() {
+        for name in ["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "SSH_AUTH_SOCK"] {
+            assert!(!env_name_is_credential(name), "{name}");
+        }
+        assert!(env_name_is_credential("HTTP_AUTHORIZATION"));
+        assert!(env_name_is_credential("GH_AUTH_TOKEN"));
+    }
+
     #[test]
     fn debug_never_prints_secrets() {
-        let tok = "lin_api_Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1";
+        let tok = LIN;
         let s = scrubber(&[tok]);
         assert!(!format!("{s:?}").contains(tok));
     }
@@ -988,40 +1149,71 @@ mod tests {
         assert!(secrets_in_arg("--api-token=$NOTION_TOKEN_VALUE").is_empty());
         assert!(secrets_in_arg("--auth-token=/Users/x/.config/token.json").is_empty());
         // A real value next to the placeholder shape still counts.
-        let got = secrets_in_arg("Authorization:Bearer sbp_live9f8e7d6c5b4a3f2e1d0c");
-        assert!(got.iter().any(|s| s == "sbp_live9f8e7d6c5b4a3f2e1d0c"));
+        let got = secrets_in_arg(&format!("Authorization:Bearer {SBP_SHORT}"));
+        assert!(got.iter().any(|s| s == SBP_SHORT));
     }
 
-    /// SS4: a truncated private key (no END marker) is redacted to the end.
+    /// SS4: a truncated private key (no END marker) is redacted.
     #[test]
     fn truncated_private_key_is_removed_to_end() {
         let s = scrubber(&[]);
-        let text = "head\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA/x+y/z\nAAAA/BBBB+cc";
+        let text = concat!(
+            "head\n-----BEGIN RSA ",
+            "PRIVATE",
+            " KEY-----\nMIIEowIBAAKCAQEA/x+y/z\nAAAA/BBBB+cc",
+        );
         let r = s.scrub(text);
         assert!(!r.text.contains("MIIEowIBAAKCAQEA"), "{}", r.text);
         assert!(!r.text.contains("AAAA/BBBB"), "{}", r.text);
         assert!(r.text.starts_with("head\n"));
         assert!(r.text.contains(PEM_REMOVED_MARKER));
+        assert!(r.pem_cut_bytes > 0);
+    }
+
+    /// SS12: the unterminated redaction stops 8 KiB past the header, so one
+    /// `grep -r` hit does not wipe every match after it.
+    #[test]
+    fn unterminated_private_key_redaction_is_bounded() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let body = "QUJD\n".repeat(3000);
+        let text = format!("a.pem:1:{header}\n{body}other.rs:9: fn still_here() {{}}\n");
+        let r = s.scrub(&text);
+        assert_eq!(r.pem_cut_bytes, MAX_UNTERMINATED_PEM);
+        assert!(r.text.contains("fn still_here()"), "tail lost");
+        assert!(r.text.starts_with("a.pem:1:"));
+        let (notice, _) = s.scrub_for_model(text);
+        assert!(notice.contains("8192 byte(s)"), "{}", &notice[..300]);
     }
 
     /// SS4: single-line JSON (`jq -c`) has a literal `\n`, not a newline.
     #[test]
     fn single_line_json_private_key_is_removed() {
         let s = scrubber(&[]);
-        let text = r#"{"key":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN/Bgkq+hkiG9w\n-----END PRIVATE KEY-----\n","ok":true}"#;
+        let text = concat!(
+            r#"{"key":"-----BEGIN "#,
+            "PRIVATE",
+            r#" KEY-----\nMIIEvQIBADAN/Bgkq+hkiG9w\n-----END "#,
+            "PRIVATE",
+            r#" KEY-----\n","ok":true}"#,
+        );
         let r = s.scrub(text);
         assert!(!r.text.contains("MIIEvQIBADAN"), "{}", r.text);
         assert!(r.text.starts_with(r#"{"key":""#));
         assert!(r.text.contains(r#""ok":true}"#), "{}", r.text);
         // Same shape, no END and no real newline at all.
-        let cut = r#"{"key":"-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBBB/xx+yy"#;
+        let cut = concat!(
+            r#"{"key":"-----BEGIN EC "#,
+            "PRIVATE",
+            r#" KEY-----\nMHcCAQEEIBBB/xx+yy"#,
+        );
         assert!(!s.scrub(cut).text.contains("MHcCAQEEIBBB"));
     }
 
     /// SS8: a known-pass stand-in is not replaced again by the shape pass.
     #[test]
     fn known_stand_in_is_not_rescrubbed() {
-        let tok = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let tok = GHP;
         let s = scrubber(&[tok]);
         let r = s.scrub(&format!("x {tok} y"));
         assert_eq!(r.known, 1);
@@ -1032,9 +1224,9 @@ mod tests {
     /// (b): every emitted stand-in is refused on the way back in.
     #[test]
     fn issued_stand_ins_are_refused_in_args() {
-        let known = "lin_api_Zz9Yy8Xx7Ww6Vv5Uu4Tt3Ss2Rr1";
+        let known = LIN;
         let s = scrubber(&[known]);
-        let shaped = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let shaped = GHP;
         let out = s.scrub(&format!("{known}\nGITHUB={shaped}")).text;
         let fake_known = out.lines().next().unwrap_or_default().to_string();
         let fake_shaped = out.lines().nth(1).unwrap_or_default()[7..].to_string();
@@ -1046,18 +1238,81 @@ mod tests {
                 err.contains(fake.as_str()) && err.contains("Nothing was run"),
                 "{err}"
             );
+            assert!(s.check_args_value(&args).is_err());
         }
         // Clean args, and the original secret itself, pass.
         assert!(s.check_args(r#"{"command":"git status"}"#).is_ok());
         assert!(s.check_args(known).is_ok());
-        // The removed-key marker is refused too.
-        assert!(s.check_args(PEM_REMOVED_MARKER).is_err());
+        assert!(s
+            .check_args_value(&serde_json::json!({"command": "git status"}))
+            .is_ok());
+    }
+
+    /// Q3: the removed-key marker is refused only once a key was removed.
+    #[test]
+    fn marker_refused_only_after_a_key_was_removed() {
+        let s = scrubber(&[]);
+        let args = serde_json::json!({ "content": PEM_REMOVED_MARKER });
+        assert!(s.check_args_value(&args).is_ok());
+        let pem = concat!("-----BEGIN ", "PRIVATE", " KEY-----\nMIIEvQ\n-----END ");
+        let _ = s.scrub(&format!("{pem}{}", concat!("PRIVATE", " KEY-----")));
+        assert!(s.check_args_value(&args).is_err());
+    }
+
+    /// SS13: a known secret holding `"` or `\` is JSON-escaped in the
+    /// serialized args; the value walk still finds its stand-in.
+    #[test]
+    fn stand_in_with_quote_is_found_in_parsed_args() {
+        let secret = r#"Pa55"wo\rd-Xy9zQ"#;
+        let s = scrubber(&[secret]);
+        let fake = s.scrub(secret).text;
+        assert_ne!(fake, secret);
+        let args = serde_json::json!({ "content": format!("pw = {fake}") });
+        assert!(
+            s.check_args(&args.to_string()).is_ok(),
+            "escaped form misses"
+        );
+        assert!(s.check_args_value(&args).is_err());
+        // Object keys are checked too.
+        let keyed = serde_json::json!({ fake.clone(): 1 });
+        assert!(s.check_args_value(&keyed).is_err());
+    }
+
+    #[test]
+    fn scrub_tool_result_keeps_id_and_error_flag() {
+        let s = scrubber(&[]);
+        let r = crate::tool::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: format!("x {GHP}"),
+            is_error: true,
+        };
+        let (out, n) = s.scrub_tool_result(r);
+        assert_eq!(n, 1);
+        assert_eq!(out.tool_use_id, "call_1");
+        assert!(out.is_error);
+        assert!(!out.content.contains(GHP));
+    }
+
+    /// SS11: this file is read and patched by agents through the scrubber.
+    /// If any of it is credential-shaped, the fleet can neither read nor edit
+    /// it once deployed.
+    #[test]
+    fn module_source_is_left_alone() {
+        let src = include_str!("secret_scrub.rs");
+        let r = scrubber(&[]).scrub(src);
+        let first_diff = src
+            .lines()
+            .zip(r.text.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map(|(i, (a, _))| format!("line {}: {a}", i + 1));
+        assert_eq!(r.total(), 0, "first changed: {first_diff:?}");
     }
 
     #[test]
     fn scrub_for_model_puts_notice_first() {
         let s = scrubber(&[]);
-        let tok = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let tok = GHP;
         let (out, n) = s.scrub_for_model(format!("token {tok}"));
         assert_eq!(n, 1);
         assert!(
@@ -1082,9 +1337,9 @@ mod tests {
     fn new_prefixes_and_single_segment_guard() {
         let s = scrubber(&[]);
         for tok in [
-            "whsec_A1b2C3d4E5f6G7h8I9j0K1l2",
-            "re_A1b2C3d4E5f6G7h8I9j0K1l2",
-            "sb_secret_A1b2C3d4E5f6G7h8I9j0",
+            concat!("whsec_", "A1b2C3d4E5f6", "G7h8I9j0K1l2"),
+            concat!("re_", "A1b2C3d4E5f6", "G7h8I9j0K1l2"),
+            concat!("sb_secret_", "A1b2C3d4E5f6", "G7h8I9j0"),
         ] {
             assert!(!s.scrub(tok).text.contains(tok), "{tok}");
         }

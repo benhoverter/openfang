@@ -428,7 +428,7 @@ async fn handle_connection(
                 // Stand-in floor: refuse a call whose arguments carry a
                 // credential stand-in this daemon issued. Writing one back
                 // replaces a live credential with a fake (secret_scrub docs).
-                let result = match scrubber.check_args(&call.args.to_string()) {
+                let result = match scrubber.check_args_value(&call.args) {
                     Err(message) => {
                         warn!(
                             request_id = call.request_id,
@@ -2628,7 +2628,8 @@ mod tests {
     /// the model the value is a stand-in.
     #[test]
     fn tool_result_credentials_are_scrubbed() {
-        let token = "sbp_live9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1";
+        // Split so this file never holds a credential-shaped literal.
+        let token = concat!("sbp_", "live9f8e7d6c5b4a3f", "2e1d0c9b8a7f6e5d4c3b2a1");
         let scrubber = SecretScrubber::with_key(vec![token.to_string()], [3u8; 32]);
         let result = CallResult::Ok {
             content: format!("41234 node mcp-remote --header Authorization:Bearer {token}"),
@@ -2672,7 +2673,7 @@ mod tests {
 
     #[test]
     fn error_and_rich_variants_are_scrubbed_too() {
-        let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let token = concat!("ghp_", "A1b2C3d4E5f6G7h8I9", "j0K1l2M3n4O5p6Q7r8");
         let scrubber = SecretScrubber::with_key(Vec::new(), [3u8; 32]);
         let (out, _) = scrub_call_result(
             CallResult::Error {

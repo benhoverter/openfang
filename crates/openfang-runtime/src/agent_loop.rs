@@ -86,6 +86,52 @@ fn tool_timeout_for(tool_name: &str) -> Option<Duration> {
     }
 }
 
+/// Stand-in floor for the native path (the bridge runs the same check).
+/// Returns the refusal message when the call's arguments carry a credential
+/// stand-in this daemon issued; `None` means dispatch. See `secret_scrub`.
+///
+/// Takes the scrubber as a parameter so tests can pass a local one: the
+/// process-wide one is a first-writer-wins `OnceLock` and cannot be reset.
+fn guard_args(
+    scrubber: Option<&openfang_types::secret_scrub::SecretScrubber>,
+    tool_name: &str,
+    agent_name: &str,
+    input: &serde_json::Value,
+) -> Option<String> {
+    let message = scrubber?.check_args_value(input).err()?;
+    warn!(
+        tool = %tool_name,
+        agent = %agent_name,
+        "refused tool call carrying an issued credential stand-in"
+    );
+    Some(message)
+}
+
+/// Secret floor for the native path. The bridge scrubs results for Claude
+/// Code agents; this covers API-provider agents and any CLI turn that fell
+/// back to one. Callers run it before the AfterToolCall hook and before
+/// truncation, so neither sees or cuts a raw secret.
+fn scrub_result(
+    scrubber: Option<&openfang_types::secret_scrub::SecretScrubber>,
+    tool_name: &str,
+    agent_name: &str,
+    result: openfang_types::tool::ToolResult,
+) -> openfang_types::tool::ToolResult {
+    let Some(scrubber) = scrubber else {
+        return result;
+    };
+    let (result, replaced) = scrubber.scrub_tool_result(result);
+    if replaced > 0 {
+        warn!(
+            tool = %tool_name,
+            agent = %agent_name,
+            replaced,
+            "replaced credentials in tool result"
+        );
+    }
+    result
+}
+
 /// Maximum consecutive MaxTokens continuations before returning partial response.
 /// Raised from 3 to 5 to allow longer-form generation.
 const MAX_CONTINUATIONS: u32 = 5;
@@ -1423,24 +1469,20 @@ pub async fn run_agent_loop(
                         }
                     }
 
-                    // Stand-in floor (native path; the bridge runs the same
-                    // check). Refuse a call that would write back a credential
-                    // stand-in this daemon issued. See `secret_scrub`.
-                    if let Some(scrubber) = openfang_types::secret_scrub::global() {
-                        if let Err(message) = scrubber.check_args(&tool_call.input.to_string()) {
-                            warn!(
-                                tool = %tool_call.name,
-                                agent = %manifest.name,
-                                "refused tool call carrying an issued credential stand-in"
-                            );
-                            tool_result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                content: message,
-                                is_error: true,
-                            });
-                            continue;
-                        }
+                    // Stand-in floor (native path). See `guard_args`.
+                    if let Some(message) = guard_args(
+                        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
+                        &tool_call.name,
+                        &manifest.name,
+                        &tool_call.input,
+                    ) {
+                        tool_result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            content: message,
+                            is_error: true,
+                        });
+                        continue;
                     }
 
                     // Resolve effective exec policy (per-agent override or global)
@@ -1496,34 +1538,14 @@ pub async fn run_agent_loop(
                         None => exec_fut.await,
                     };
 
-                    // Secret floor (native path). The bridge scrubs results for
-                    // Claude Code agents; this covers API-provider agents and
-                    // any CLI turn that fell back to one. Runs before the hook
-                    // and the truncation, so neither sees or cuts a raw secret.
-                    let result = match openfang_types::secret_scrub::global() {
-                        Some(scrubber) => {
-                            let openfang_types::tool::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } = result;
-                            let (content, replaced) = scrubber.scrub_for_model(content);
-                            if replaced > 0 {
-                                warn!(
-                                    tool = %tool_call.name,
-                                    agent = %manifest.name,
-                                    replaced,
-                                    "replaced credentials in tool result"
-                                );
-                            }
-                            openfang_types::tool::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            }
-                        }
-                        None => result,
-                    };
+                    // Secret floor (native path), before the hook and the
+                    // truncation. See `scrub_result`.
+                    let result = scrub_result(
+                        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
+                        &tool_call.name,
+                        &manifest.name,
+                        result,
+                    );
 
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
@@ -3201,24 +3223,20 @@ pub async fn run_agent_loop_streaming(
                         }
                     }
 
-                    // Stand-in floor (native path; the bridge runs the same
-                    // check). Refuse a call that would write back a credential
-                    // stand-in this daemon issued. See `secret_scrub`.
-                    if let Some(scrubber) = openfang_types::secret_scrub::global() {
-                        if let Err(message) = scrubber.check_args(&tool_call.input.to_string()) {
-                            warn!(
-                                tool = %tool_call.name,
-                                agent = %manifest.name,
-                                "refused tool call carrying an issued credential stand-in"
-                            );
-                            tool_result_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                content: message,
-                                is_error: true,
-                            });
-                            continue;
-                        }
+                    // Stand-in floor (native path). See `guard_args`.
+                    if let Some(message) = guard_args(
+                        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
+                        &tool_call.name,
+                        &manifest.name,
+                        &tool_call.input,
+                    ) {
+                        tool_result_blocks.push(ContentBlock::ToolResult {
+                            tool_use_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            content: message,
+                            is_error: true,
+                        });
+                        continue;
                     }
 
                     // Resolve effective exec policy (per-agent override or global)
@@ -3274,34 +3292,14 @@ pub async fn run_agent_loop_streaming(
                         None => exec_fut.await,
                     };
 
-                    // Secret floor (native path). The bridge scrubs results for
-                    // Claude Code agents; this covers API-provider agents and
-                    // any CLI turn that fell back to one. Runs before the hook
-                    // and the truncation, so neither sees or cuts a raw secret.
-                    let result = match openfang_types::secret_scrub::global() {
-                        Some(scrubber) => {
-                            let openfang_types::tool::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } = result;
-                            let (content, replaced) = scrubber.scrub_for_model(content);
-                            if replaced > 0 {
-                                warn!(
-                                    tool = %tool_call.name,
-                                    agent = %manifest.name,
-                                    replaced,
-                                    "replaced credentials in tool result"
-                                );
-                            }
-                            openfang_types::tool::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            }
-                        }
-                        None => result,
-                    };
+                    // Secret floor (native path), before the hook and the
+                    // truncation. See `scrub_result`.
+                    let result = scrub_result(
+                        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
+                        &tool_call.name,
+                        &manifest.name,
+                        result,
+                    );
 
                     // Fire AfterToolCall hook
                     if let Some(hook_reg) = hooks {
@@ -8147,5 +8145,69 @@ mod tests {
 
         assert!(result.silent, "the driver answered NO_REPLY");
         assert_stale_heartbeats_pruned(&memory, session_id, "silent exit (streaming)");
+    }
+
+    // ── SS10: native-path secret floor, tested with a local scrubber ──
+
+    fn local_scrubber() -> openfang_types::secret_scrub::SecretScrubber {
+        openfang_types::secret_scrub::SecretScrubber::with_key(Vec::new(), [9u8; 32])
+    }
+
+    /// Split so this file never holds a credential-shaped literal.
+    const SCRUB_FIXTURE: &str = concat!("ghp_", "A1b2C3d4E5f6G7h8I9", "j0K1l2M3n4O5p6Q7r8");
+
+    #[test]
+    fn scrub_result_replaces_secret_and_keeps_id_and_flag() {
+        let s = local_scrubber();
+        let raw = openfang_types::tool::ToolResult {
+            tool_use_id: "tu_1".into(),
+            content: format!("pgrep says {SCRUB_FIXTURE}"),
+            is_error: false,
+        };
+        let out = scrub_result(Some(&s), "shell_exec", "a", raw);
+        assert_eq!(out.tool_use_id, "tu_1");
+        assert!(!out.is_error, "is_error must never change");
+        assert!(!out.content.contains(SCRUB_FIXTURE), "{}", out.content);
+        assert!(out.content.starts_with("[openfang: 1 credential"));
+    }
+
+    #[test]
+    fn scrub_result_without_scrubber_is_identity() {
+        let raw = openfang_types::tool::ToolResult {
+            tool_use_id: "tu_2".into(),
+            content: format!("x {SCRUB_FIXTURE}"),
+            is_error: true,
+        };
+        let out = scrub_result(None, "shell_exec", "a", raw);
+        assert_eq!(out.content, format!("x {SCRUB_FIXTURE}"));
+        assert!(out.is_error);
+    }
+
+    #[test]
+    fn guard_args_refuses_issued_stand_in_only() {
+        let s = local_scrubber();
+        let scrubbed = scrub_result(
+            Some(&s),
+            "file_read",
+            "a",
+            openfang_types::tool::ToolResult {
+                tool_use_id: "tu_3".into(),
+                content: format!("TOKEN={SCRUB_FIXTURE}"),
+                is_error: false,
+            },
+        );
+        let fake = scrubbed
+            .content
+            .lines()
+            .last()
+            .and_then(|l| l.strip_prefix("TOKEN="))
+            .expect("stand-in line")
+            .to_string();
+        let write = serde_json::json!({ "path": "c.toml", "content": format!("t = \"{fake}\"") });
+        let refusal = guard_args(Some(&s), "file_write", "a", &write).expect("refused");
+        assert!(refusal.contains("Nothing was run"), "{refusal}");
+        let clean = serde_json::json!({ "command": "git status" });
+        assert!(guard_args(Some(&s), "shell_exec", "a", &clean).is_none());
+        assert!(guard_args(None, "file_write", "a", &write).is_none());
     }
 }

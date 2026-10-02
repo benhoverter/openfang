@@ -7275,6 +7275,26 @@ pub async fn mcp_http(
             .unwrap_or_else(|e| e.into_inner())
             .snapshot();
 
+        // Stand-in floor (SS9). Anything calling this endpoint is a model
+        // client, so it gets the same refusal and scrub as the bridge and
+        // the native agent loop. See `openfang_types::secret_scrub`.
+        let scrubber = state.kernel.secret_scrubber.clone();
+        if let Err(message) = scrubber.check_args_value(&arguments) {
+            tracing::warn!(
+                tool = %tool_name,
+                agent = ?agent_id_opt,
+                "mcp-http: refused call carrying an issued credential stand-in"
+            );
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.get("id").cloned(),
+                "result": {
+                    "content": [{"type": "text", "text": message}],
+                    "isError": true,
+                }
+            }));
+        }
+
         // Execute the tool via the kernel's tool runner
         let kernel_handle: Arc<dyn openfang_runtime::kernel_handle::KernelHandle> =
             state.kernel.clone() as Arc<dyn openfang_runtime::kernel_handle::KernelHandle>;
@@ -7315,6 +7335,15 @@ pub async fn mcp_http(
             None, // origin (no channel origin on MCP-HTTP tool path)
         )
         .await;
+        let (result, replaced) = scrubber.scrub_tool_result(result);
+        if replaced > 0 {
+            tracing::warn!(
+                tool = %tool_name,
+                agent = ?agent_id_opt,
+                replaced,
+                "mcp-http: replaced credentials in tool result"
+            );
+        }
 
         return Json(serde_json::json!({
             "jsonrpc": "2.0",

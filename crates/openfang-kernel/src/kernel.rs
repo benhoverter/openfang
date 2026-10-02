@@ -1578,7 +1578,12 @@ impl OpenFangKernel {
             let fresh = Arc::new(openfang_types::secret_scrub::SecretScrubber::new(
                 openfang_types::secret_scrub::known_secrets_from(&all_mcp_servers),
             ));
-            openfang_types::secret_scrub::install_global(fresh.clone());
+            if !openfang_types::secret_scrub::install_global(fresh.clone()) {
+                // Only expected when one process boots several kernels
+                // (tests). This kernel then shares the first one's key,
+                // stand-in record and known set.
+                warn!("secret scrubber already installed; reusing the existing one");
+            }
             openfang_types::secret_scrub::global()
                 .cloned()
                 .unwrap_or(fresh)
