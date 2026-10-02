@@ -103,6 +103,18 @@
 //! - Within one boot, the mapping is deterministic, so an agent holding a
 //!   candidate value can confirm a guess by getting it scrubbed. That only
 //!   matters for low-entropy secrets.
+//!
+//! Known gaps, accepted under the accidents-only model above:
+//!
+//! - A private key deliberately re-wrapped into lines shorter than 40
+//!   characters (`fold`, `base64 -w32`) with no END marker, read so that it
+//!   runs past 8 KiB of output, leaks the lines past 8 KiB. No standard tool
+//!   wraps that short (openssl 64, ssh-keygen 70, `base64` 76).
+//! - If a tool appends a notice after a truncated key, the short final key
+//!   line before it is not followed: at most 39 characters, far below what
+//!   factoring needs.
+//! - An unrelated END marker within 8 KiB of a truncated key closes it early.
+//! - PuTTY `.ppk` keys have no PEM header and are never caught by this pass.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -173,10 +185,6 @@ const MIN_ASSIGNED_VALUE_LEN: usize = 12;
 /// `Llama-4-Maverick-17B-128E-Instruct-FP8` do not.
 const MIN_OPAQUE_SEGMENT: usize = 20;
 
-/// Upper bound on recorded stand-ins. Past it, new stand-ins still replace
-/// secrets but are no longer refused on the way back in.
-const MAX_ISSUED: usize = 100_000;
-
 /// Base64 file signatures. An inline image or PDF is not a credential, and
 /// scrambling it breaks any patch whose context includes it.
 const BASE64_FILE_MAGIC: &[&str] = &["iVBORw0KGgo", "/9j/", "R0lGOD", "UklGR", "JVBERi0"];
@@ -202,8 +210,7 @@ const MAX_UNTERMINATED_PEM: usize = 8 * 1024;
 const MAX_UNTERMINATED_PEM_HARD: usize = 64 * 1024;
 
 /// Past [`MAX_UNTERMINATED_PEM`], redaction continues line by line while a
-/// line's last token (after the last `:`, space or tab) is at least this many
-/// base64 characters. That follows prefixed key lines without following
+/// line ends in at least this many consecutive base64 characters. That follows prefixed key lines without following
 /// ordinary source. Not "stop at the first non-base64 line": the prefix would
 /// make every key line fail that test and leak the tail, which holds the
 /// factors.
@@ -647,9 +654,9 @@ impl SecretScrubber {
     fn issue(&self, secret: &str) -> String {
         let fake = self.stand_in(secret);
         let mut issued = self.issued.write().unwrap_or_else(|e| e.into_inner());
-        if issued.len() < MAX_ISSUED {
-            issued.insert(fake.clone());
-        }
+        // No cap: an unrecorded stand-in is one whose write-back is not
+        // refused, which reopens the hazard the refusal exists for.
+        issued.insert(fake.clone());
         fake
     }
 
@@ -886,19 +893,34 @@ fn pem_window(rest: &str, header_end: usize) -> PemStop {
     PemStop::Cut(hard)
 }
 
-/// True for a line that still looks like private-key body: its last token
-/// (after the last `:`, space or tab, so `path:N:` and `cat -n` prefixes are
-/// skipped) is base64 and at least [`KEY_LINE_MIN_TOKEN`] long. The final
+/// True for a line that still looks like private-key body: it ENDS in a run
+/// of base64 at least [`KEY_LINE_MIN_TOKEN`] long. Whatever precedes the run
+/// is ignored, so no list of prefix separators is needed: `path:N:` (`rg -n`),
+/// `path-N-` (grep/rg `-A` context lines, SS19), `cat -n` tabs all pass.
+/// Base64 never contains `-`, `.` or `:`, so the run starts after the prefix.
+/// Line-end decoration is trimmed first: a real CR, a literal `\r` (single-
+/// line JSON of a CRLF key), and `cat -A`/`cat -e`'s `$` and `^M`. The final
 /// line of the whole text may be shorter: that is where a truncated read
 /// ends.
 fn is_key_line(line: &str, last_in_text: bool) -> bool {
-    let line = line.trim_end_matches('\r');
-    let tok = line.rsplit([':', ' ', '\t']).next().unwrap_or("");
-    !tok.is_empty()
-        && tok
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
-        && (tok.len() >= KEY_LINE_MIN_TOKEN || last_in_text)
+    let mut line = line;
+    loop {
+        let t = line
+            .trim_end_matches('\r')
+            .trim_end_matches('$')
+            .trim_end_matches("^M")
+            .trim_end_matches("\\r");
+        if t.len() == line.len() {
+            break;
+        }
+        line = t;
+    }
+    let run = line
+        .bytes()
+        .rev()
+        .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        .count();
+    run > 0 && (run >= KEY_LINE_MIN_TOKEN || last_in_text)
 }
 
 /// `min(i, s.len())`, moved back to a char boundary.
@@ -1331,6 +1353,49 @@ mod tests {
         for l in &lines {
             assert!(!r.text.contains(&l[..20]), "cat -n line survived: {l}");
         }
+    }
+
+    /// SS19: `grep -A`/`rg -A` context lines use `-` as the separator
+    /// (`path-12-MIIE…`, or `path-MIIE…` without `-n`). The tail must not
+    /// survive.
+    #[test]
+    fn grep_context_prefixed_key_does_not_leak() {
+        let s = scrubber(&[]);
+        let header = concat!("-----BEGIN RSA ", "PRIVATE", " KEY-----");
+        let path = "/Users/someone/.openfang/workspaces/some-agent/projects/some-project/keys/deploy-key-2026.pem";
+        let lines = fake_key_lines(100);
+        let mut numbered = format!("{path}:1:{header}\n");
+        let mut bare = format!("{path}:{header}\n");
+        for (i, l) in lines.iter().enumerate() {
+            numbered.push_str(&format!("{path}-{}-{l}\n", i + 2));
+            bare.push_str(&format!("{path}-{l}\n"));
+        }
+        assert!(numbered.len() > MAX_UNTERMINATED_PEM * 3 / 2);
+        for text in [&numbered, &bare] {
+            let r = s.scrub(text);
+            for l in &lines {
+                assert!(!r.text.contains(&l[..20]), "grep -A line survived: {l}");
+            }
+        }
+    }
+
+    /// SS19: line-end decoration does not stop the follow: literal `\r`
+    /// from single-line JSON of a CRLF key, and `cat -A`'s `^M$`.
+    #[test]
+    fn key_line_trims_line_end_decoration() {
+        let k = concat!("MIIEowIBAAKCAQEA/abc+", "defGHIJKLMNOPQRSTUVWXYZ012345");
+        assert!(is_key_line(k, false));
+        assert!(is_key_line(&format!("p-12-{k}"), false));
+        assert!(is_key_line(&format!("{k}\\r"), false));
+        assert!(is_key_line(&format!("{k}$"), false));
+        assert!(is_key_line(&format!("{k}^M$"), false));
+        assert!(is_key_line(&format!("{k}\r"), false));
+        assert!(!is_key_line(
+            "    let value = compute_something(a, b);",
+            false
+        ));
+        assert!(!is_key_line("short/base64==", false));
+        assert!(is_key_line("short/base64==", true));
     }
 
     /// SS16 negative: a `grep -r` header hit followed by ordinary source
