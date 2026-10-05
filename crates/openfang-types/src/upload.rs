@@ -139,7 +139,35 @@ impl UploadTarget {
         if self.max_bytes == 0 {
             errs.push("max_bytes is 0, so nothing could be sent".to_string());
         }
+        if let Some(host) = self.multi_tenant_root_host() {
+            errs.push(format!(
+                "url_prefix is the bare root of {host}, a host where anyone can own \
+                 a bucket, so it would match URLs presigned for someone else's \
+                 storage. Include the bucket in the prefix (https://{host}/<bucket>/) \
+                 or use the bucket's own hostname"
+            ));
+        }
         errs
+    }
+
+    /// `Some(host)` when `url_prefix` names a shared, path-style object-store
+    /// host with no bucket segment. On those hosts the first path segment is
+    /// the owner, and anyone can create one.
+    fn multi_tenant_root_host(&self) -> Option<String> {
+        let rest = self.url_prefix.get(8..)?; // after "https://"
+        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let host = authority
+            .rsplit_once(':')
+            .map_or(authority, |(h, _)| h)
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let shared = host == "storage.googleapis.com"
+            || host == "storage.cloud.google.com"
+            || host == "s3.amazonaws.com"
+            || ((host.starts_with("s3.") || host.starts_with("s3-"))
+                && host.ends_with(".amazonaws.com"));
+        let bucketless = path.trim_matches('/').is_empty();
+        (shared && bucketless).then_some(host)
     }
 }
 
@@ -267,6 +295,33 @@ max_bytes     = 50_000_000
         t.content_types = vec!["image/png".into()];
         t.max_bytes = 0;
         assert!(!t.static_errors().is_empty());
+    }
+
+    #[test]
+    fn bare_shared_object_store_roots_are_refused() {
+        let mut t = target(&["image/png"]);
+        for bad in [
+            "https://s3.amazonaws.com/",
+            "https://s3.us-west-2.amazonaws.com",
+            "https://S3.AMAZONAWS.COM:443/",
+            "https://storage.googleapis.com/",
+        ] {
+            t.url_prefix = bad.into();
+            assert!(!t.static_errors().is_empty(), "{bad} must be refused");
+        }
+        for ok in [
+            "https://s3.amazonaws.com/my-bucket/",
+            "https://my-bucket.s3.amazonaws.com/",
+            "https://storage.googleapis.com/my-bucket/up/",
+            "https://late-media.613d73a46130ed0083c059a837d6511b.r2.cloudflarestorage.com/temp/",
+        ] {
+            t.url_prefix = ok.into();
+            assert!(
+                t.static_errors().is_empty(),
+                "{ok}: {:?}",
+                t.static_errors()
+            );
+        }
     }
 
     #[test]

@@ -481,6 +481,25 @@ impl SecretScrubber {
         self.known.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// How many of the known values occur, verbatim, anywhere in `bytes`.
+    /// Exact-match pass only: no shape pass, and no stand-ins are issued, so
+    /// this is safe to run over binary data (an outbound file, say). It
+    /// catches accidents, not a determined writer: base64, compression or any
+    /// other re-encoding of a secret is not seen. Never reveals which value
+    /// matched.
+    #[must_use]
+    pub fn known_hits_in_bytes(&self, bytes: &[u8]) -> usize {
+        let set = self.known.read().unwrap_or_else(|e| e.into_inner());
+        set.iter()
+            .filter(|s| {
+                let needle = s.as_bytes();
+                !needle.is_empty()
+                    && needle.len() <= bytes.len()
+                    && bytes.windows(needle.len()).any(|w| w == needle)
+            })
+            .count()
+    }
+
     /// How many distinct stand-ins have been issued since this scrubber was
     /// built. Grows for the life of the boot (nothing is evicted); callers
     /// may log it to watch that growth.
@@ -1143,6 +1162,17 @@ mod tests {
 
     fn scrubber(known: &[&str]) -> SecretScrubber {
         SecretScrubber::with_key(known.iter().map(|s| (*s).to_string()), KEY)
+    }
+
+    #[test]
+    fn known_hits_in_bytes_finds_exact_values_in_binary() {
+        let s = scrubber(&[SBP]);
+        let mut pdf = b"%PDF-1.7\n\x00\xff".to_vec();
+        pdf.extend_from_slice(format!("token = \"{SBP}\"\n").as_bytes());
+        assert_eq!(s.known_hits_in_bytes(&pdf), 1);
+        assert_eq!(s.known_hits_in_bytes(b"\x89PNG\r\n\x1a\n\x00\x00"), 0);
+        assert_eq!(s.known_hits_in_bytes(b""), 0);
+        assert_eq!(s.issued_len(), 0, "a byte scan must not issue stand-ins");
     }
 
     /// The incident: `pgrep -lf` printing an MCP server's argv.

@@ -28,6 +28,23 @@
 //! * **Presigned URLs are credentials.** The query string never appears in a
 //!   result, an error, or a log line. Everything outward-facing uses
 //!   [`redact`]: scheme, host, port, path.
+//! * **Known secrets are refused in the bytes.** The type sniff only checks a
+//!   file's first 16 bytes, so `%PDF-1.7\n<config.toml>` passes as a PDF.
+//!   Every file is therefore scanned with the secret scrubber's exact-match
+//!   pass and refused on any hit. The shape pass is not run: on compressed
+//!   media it is noise. This stops accidents, not a determined agent: a
+//!   base64'd or Flate-compressed secret is not seen. `web_fetch` with a body
+//!   remains the wider outbound channel.
+//! * **No proxy.** The client ignores `HTTPS_PROXY`/`ALL_PROXY` and system
+//!   proxy settings: through a proxy the proxy resolves the host, and the
+//!   pinned, checked addresses would describe a connection that never
+//!   happens.
+//!
+//! Not covered: a presigner that signs with temporary credentials puts
+//! `X-Amz-Security-Token=` in the URL, and the global scrubber's assignment
+//! rule replaces that value with a stand-in before the call arrives. The
+//! stand-in refusal then blocks the call. That fails closed, but such
+//! presigners will not work until it is handled.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -240,7 +257,7 @@ pub(crate) fn is_forbidden_ip(ip: &IpAddr) -> bool {
                 || v4.is_documentation()
                 || o[0] == 0
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64.0.0/10 CGNAT
-                || o == [192, 0, 0, 192]
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24 IETF protocol assignments
                 || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18.0.0/15 benchmarking
                 || o[0] >= 240
         }
@@ -252,9 +269,13 @@ pub(crate) fn is_forbidden_ip(ip: &IpAddr) -> bool {
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
+                || s[..6].iter().all(|&x| x == 0) // ::/96 deprecated IPv4-compatible
                 || (s[0] & 0xfe00) == 0xfc00 // unique local
                 || (s[0] & 0xffc0) == 0xfe80 // link local
-                || (s[0] == 0x64 && s[1] == 0xff9b) // NAT64, can reach v4 internals
+                || (s[0] & 0xffc0) == 0xfec0 // site local (deprecated)
+                || (s[0] == 0x64 && s[1] == 0xff9b) // NAT64 64:ff9b::/32, incl. local-use 64:ff9b:1::/48
+                || s[0] == 0x2002 // 6to4, embeds a v4 address
+                || (s[0] == 0x2001 && s[1] == 0) // Teredo
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
         }
     }
@@ -319,9 +340,64 @@ pub(crate) fn sniff_upload_mime(head: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// Refuse bytes that contain a value the secret scrubber knows. Exact match
+/// only; see the module docs for what this does and does not catch. With no
+/// scrubber installed (tests, or a daemon that failed to build one) there is
+/// nothing to match against and the upload proceeds, logged.
+pub(crate) fn refuse_known_secrets(
+    bytes: &[u8],
+    scrubber: Option<&openfang_types::secret_scrub::SecretScrubber>,
+    raw_path: &str,
+) -> Result<(), String> {
+    let Some(s) = scrubber else {
+        warn!("file_upload: no secret scrubber installed; file bytes not scanned");
+        return Ok(());
+    };
+    let hits = s.known_hits_in_bytes(bytes);
+    if hits > 0 {
+        return Err(format!(
+            "'{raw_path}' contains {hits} known credential value(s) in its bytes. \
+             Uploading it would send them off the machine. Nothing was sent."
+        ));
+    }
+    Ok(())
+}
+
+/// The path the open file descriptor actually refers to, from the kernel.
+/// `None` where the platform offers no way to ask.
+#[cfg(target_os = "macos")]
+fn fd_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: F_GETPATH writes a NUL-terminated path of at most MAXPATHLEN
+    // (== PATH_MAX) bytes into the buffer, which is larger than that.
+    let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if r == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    Some(std::ffi::OsStr::from_bytes(&buf[..len]).into())
+}
+
+#[cfg(target_os = "linux")]
+fn fd_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn fd_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Read the file without following a symlink at its final component. The
 /// path was canonicalised by the resolver; `O_NOFOLLOW` closes the window
-/// where that last component is swapped for a link afterwards.
+/// where that last component is swapped for a link afterwards. After the
+/// open, the kernel's own path for the descriptor must equal `path`, which
+/// catches an intermediate directory swapped in between; and a file with
+/// more than one hard link is refused, since canonicalising never sees a
+/// hard link into the workspace from outside it.
 async fn read_no_follow(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -341,6 +417,27 @@ async fn read_no_follow(path: &Path, max: u64) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("could not stat the file: {e}"))?;
         if !meta.is_file() {
             return Err("not a regular file".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() > 1 {
+                return Err(format!(
+                    "the file has {} hard links; file_upload only sends files \
+                     with exactly one",
+                    meta.nlink()
+                ));
+            }
+        }
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            match fd_path(&file) {
+                Some(real) if real == path => {}
+                _ => {
+                    return Err("the file opened is not the one the path resolved to (a \
+                         directory on the path changed during the call)"
+                        .to_string())
+                }
+            }
         }
         if meta.len() > max {
             return Err(format!(
@@ -422,6 +519,11 @@ pub(crate) async fn run(
             )
         ));
     }
+    refuse_known_secrets(
+        &bytes,
+        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
+        raw_path,
+    )?;
 
     let sha256 = {
         use sha2::{Digest, Sha256};
@@ -433,6 +535,7 @@ pub(crate) async fn run(
 
     let client = reqwest::Client::builder()
         .user_agent(crate::USER_AGENT)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .resolve_to_addrs(host.trim_start_matches('[').trim_end_matches(']'), &addrs)
@@ -709,6 +812,14 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "64:ff9b::a00:1",
+            "64:ff9b:1::a00:1",
+            "192.0.0.1",
+            "192.0.0.170",
+            "::7f00:1",
+            "::a00:1",
+            "2002:a00:1::",
+            "2001:0:4136:e378::1",
+            "fec0::1",
         ] {
             let ip: IpAddr = ip.parse().unwrap();
             assert!(is_forbidden_ip(&ip), "{ip} must be forbidden");
@@ -765,14 +876,57 @@ mod tests {
         targets: &[UploadTarget],
     ) -> Result<String, String> {
         let input = serde_json::json!({ "path": name, "url": url, "content_type": ct });
-        run(
-            &input,
-            name,
-            &dir.path().join(name),
-            targets,
-            Some("tester"),
+        // The resolver hands `run` a canonical path; on macOS the tempdir
+        // lives under /var -> /private/var, so canonicalise like it does.
+        let root = dir.path().canonicalize().unwrap();
+        run(&input, name, &root.join(name), targets, Some("tester")).await
+    }
+
+    #[test]
+    fn known_secrets_in_the_bytes_are_refused() {
+        let secret = concat!("sk-upload", "-test-0123456789abcdef");
+        let s =
+            openfang_types::secret_scrub::SecretScrubber::with_key([secret.to_string()], [7u8; 32]);
+        let mut disguised = b"%PDF-1.7\n".to_vec();
+        disguised.extend_from_slice(format!("api_key = \"{secret}\"\n").as_bytes());
+        let e = refuse_known_secrets(&disguised, Some(&s), "x.pdf").unwrap_err();
+        assert!(e.contains("Nothing was sent") && !e.contains(secret), "{e}");
+        assert!(refuse_known_secrets(&png_bytes(), Some(&s), "a.png").is_ok());
+        assert!(refuse_known_secrets(&disguised, None, "x.pdf").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hard_linked_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), png_bytes()).unwrap();
+        std::fs::hard_link(dir.path().join("a.png"), dir.path().join("b.png")).unwrap();
+        let e = run_with(
+            &dir,
+            "b.png",
+            ZERNIO_URL,
+            "image/png",
+            &[target(ZERNIO_PREFIX)],
         )
         .await
+        .unwrap_err();
+        assert!(e.contains("hard links"), "{e}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_non_canonical_path_is_refused_after_open() {
+        // Stands in for a directory swapped between resolve and open: the
+        // descriptor's real path differs from the one we were handed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.png"), png_bytes()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let e = read_no_follow(&root.join("sub/../a.png"), 1_000)
+            .await
+            .unwrap_err();
+        assert!(e.contains("not the one the path resolved to"), "{e}");
+        assert!(read_no_follow(&root.join("a.png"), 1_000).await.is_ok());
     }
 
     /// Refusals that must happen before any network I/O. The URL host is a
