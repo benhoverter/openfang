@@ -28,6 +28,7 @@ pub mod copilot_oauth;
 pub mod docker_sandbox;
 pub mod drivers;
 pub mod embedding;
+pub mod file_upload;
 pub mod gatekeeper;
 // ANAI-252: offline corpus replay. Test-only; never in the shipped binary.
 #[cfg(test)]

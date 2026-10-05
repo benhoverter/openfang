@@ -282,6 +282,10 @@ pub const PRIVILEGED_DEFAULT_DENY: &[&str] = &[
     "browser_screenshot",
     "browser_run_js",
     "browser_back",
+    // Sends workspace bytes off the machine, the same class as
+    // `browser_run_js`: a manifest has to name it. It is also inert without
+    // `[[upload_targets]]` in that manifest.
+    "file_upload",
 ];
 
 /// The `memory_note` doctrine as a SUBPROCESS agent reads it (ANAI-270).
@@ -333,6 +337,12 @@ pub const FILE_GREP_DESCRIPTION: &str = "Search a file, or recursively a directo
 /// Byte-identical to `openfang_runtime::tool_runner::IMAGE_READ_DESCRIPTION`
 /// and pinned equal by the cross-crate test in `openfang-api`.
 pub const IMAGE_READ_DESCRIPTION: &str = "Look at an image file. Returns the image itself (PNG, JPEG, GIF or WebP) as an image you can see, plus one line of text giving its type, size and sha256. Paths are relative to the agent workspace and resolve through the same file policy as file_read, so it reaches exactly the files file_read reaches. The type is decided by the file's bytes, not its name. A file over the operator's size limit ([media] image_read_max_bytes, default 3,750,000 bytes) is refused whole, never truncated. SVG is text: read it with file_read.";
+
+/// Advertised description for `file_upload`.
+///
+/// Byte-identical to `openfang_runtime::tool_runner::FILE_UPLOAD_DESCRIPTION`
+/// and pinned equal by the cross-crate test in `openfang-api`.
+pub const FILE_UPLOAD_DESCRIPTION: &str = "Upload one workspace file to a URL the operator allowed for you in agent.toml ([[upload_targets]]), typically a presigned upload URL another tool just returned. Sends the file's bytes as the body of an HTTP PUT with Content-Type set to content_type, and returns only the HTTP status and ETag, never the response body. Pass the url exactly as you received it: it is sent unchanged, and a URL that is not under an allowed target is refused before anything is read or sent. The file's type is checked from its bytes and must match content_type. Paths resolve through the same file policy as file_read. Treat a presigned URL as a password: do not post it in channels.";
 
 pub fn built_in_tools() -> Vec<Tool> {
     use serde_json::json;
@@ -401,6 +411,23 @@ pub fn built_in_tools() -> Vec<Tool> {
                     "path": { "type": "string", "description": "The image file to read" }
                 },
                 "required": ["path"]
+            })),
+        ),
+        // Mirrors `openfang_runtime::tool_runner` -> `file_upload`. Schema
+        // duplicated from `file_upload_input_schema()` and pinned equal by the
+        // cross-crate test in `openfang-api`. Workspace-scoped via the
+        // daemon-side `FS_SANDBOXED_TOOLS` gate; privileged-deny by default.
+        Tool::new(
+            "file_upload",
+            FILE_UPLOAD_DESCRIPTION,
+            obj(json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "The workspace file to upload" },
+                    "url": { "type": "string", "description": "The upload URL, exactly as received (for a presigned URL, the whole string including its query)" },
+                    "content_type": { "type": "string", "description": "MIME type of the file, e.g. image/png. Must match the file's bytes and be accepted by the target." }
+                },
+                "required": ["path", "url", "content_type"]
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `file_write`. Workspace-
@@ -1218,6 +1245,7 @@ mod tests {
                 "file_list",
                 "file_grep",
                 "image_read",
+                "file_upload",
                 "file_write",
                 "create_directory",
                 "web_fetch",

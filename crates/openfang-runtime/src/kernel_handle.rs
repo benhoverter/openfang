@@ -559,6 +559,19 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// The caller's `[[upload_targets]]`, read from its registered manifest
+    /// at call time: where `file_upload` may send its files.
+    ///
+    /// Empty means nowhere, and that is also the default — an unknown agent,
+    /// or a handle that does not implement this (mocks, tests), gets no
+    /// targets and `file_upload` refuses. Fail closed: this is the one gate
+    /// between a workspace file and the network, so "cannot determine" must
+    /// read as "not allowed", the opposite of `agent_tool_names`.
+    fn agent_upload_targets(&self, agent_id: &str) -> Vec<openfang_types::upload::UploadTarget> {
+        let _ = agent_id;
+        Vec::new()
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 

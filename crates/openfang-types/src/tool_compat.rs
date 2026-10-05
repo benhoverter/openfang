@@ -65,6 +65,7 @@ pub fn is_known_openfang_tool(name: &str) -> bool {
             | "file_list"
             | "file_grep"
             | "image_read"
+            | "file_upload"
             | "create_directory"
             | "shell_exec"
             | "web_search"

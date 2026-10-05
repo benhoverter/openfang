@@ -44,6 +44,8 @@ pub const FS_SANDBOXED_TOOLS: &[&str] = &[
     "shell_exec",
     "apply_patch",
     "file_convert",
+    // Reads a workspace file to send it; the path is file_read's.
+    "file_upload",
 ];
 
 /// Check if a tool name refers to a shell execution tool.
@@ -750,6 +752,25 @@ pub async fn execute_tool(
         // File conversion tool (recipe-driven, allowlisted formats)
         "file_convert" => tool_file_convert(input, workspace_root, file_policy).await,
 
+        // Upload a workspace file to an operator-allowed target. The targets
+        // come from the caller's manifest via the kernel; with no kernel or no
+        // targets the tool refuses (fail closed).
+        "file_upload" => {
+            let targets = match (kernel, caller_agent_id) {
+                (Some(kh), Some(id)) => kh.agent_upload_targets(id),
+                _ => Vec::new(),
+            };
+            tool_file_upload(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+                &targets,
+                caller_agent_id,
+            )
+            .await
+        }
+
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
             // Taint check: block URLs containing secrets/PII from being exfiltrated
@@ -1205,6 +1226,11 @@ pub fn image_read_input_schema() -> serde_json::Value {
     })
 }
 
+/// `file_upload`'s advertised description and schema. Defined beside the tool
+/// in [`crate::file_upload`]; re-exported here so the cross-crate drift test
+/// finds them where it finds the other tools'.
+pub use crate::file_upload::{file_upload_input_schema, FILE_UPLOAD_DESCRIPTION};
+
 /// `file_grep`'s advertised argument schema. Duplicated in the bridge (the
 /// crate seam is one-way) and pinned equal by a cross-crate test in
 /// `openfang-api`.
@@ -1273,6 +1299,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             name: "image_read".to_string(),
             description: IMAGE_READ_DESCRIPTION.to_string(),
             input_schema: image_read_input_schema(),
+        },
+        ToolDefinition {
+            name: "file_upload".to_string(),
+            description: FILE_UPLOAD_DESCRIPTION.to_string(),
+            input_schema: file_upload_input_schema(),
         },
         ToolDefinition {
             name: "create_directory".to_string(),
@@ -2226,7 +2257,7 @@ fn fs_tool_single_path<'a>(
     input: &'a serde_json::Value,
 ) -> Option<(bool, &'a str)> {
     let needs_write = match tool_name {
-        "file_read" | "file_list" | "file_grep" | "image_read" => false,
+        "file_read" | "file_list" | "file_grep" | "image_read" | "file_upload" => false,
         "file_write" | "create_directory" => true,
         _ => return None,
     };
@@ -2658,6 +2689,26 @@ async fn tool_image_read(
          The image follows as a separate image block.",
         bytes.len()
     ))
+}
+
+/// `file_upload`: send one workspace file to an `[[upload_targets]]` entry.
+///
+/// Path handling is `file_read`'s, unchanged — same resolver, same read tier,
+/// same pre-pass and prevalidation — so it can send exactly the files
+/// `file_read` could read and nothing else. Everything past the path lives in
+/// [`crate::file_upload::run`].
+async fn tool_file_upload(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
+    targets: &[openfang_types::upload::UploadTarget],
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
+    crate::file_upload::run(input, raw_path, &resolved, targets, caller_agent_id).await
 }
 
 async fn tool_file_read(

@@ -1000,8 +1000,8 @@ const OPERATIONAL_GUIDELINES: &str = "\
 /// Map a tool name to its category for grouping.
 pub fn tool_category(name: &str) -> &'static str {
     match name {
-        "file_read" | "file_write" | "file_list" | "file_grep" | "image_read" | "file_delete"
-        | "file_move" | "file_copy" | "file_search" => "Files",
+        "file_read" | "file_write" | "file_list" | "file_grep" | "image_read" | "file_upload"
+        | "file_delete" | "file_move" | "file_copy" | "file_search" => "Files",
 
         "web_search" | "web_fetch" => "Web",
 
@@ -1046,6 +1046,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "file_list" => "list directory contents",
         "file_grep" => "search file contents by regex, returning line numbers",
         "image_read" => "look at an image file (PNG, JPEG, GIF, WebP)",
+        "file_upload" => {
+            "upload a workspace file to an operator-allowed URL (e.g. a presigned upload URL)"
+        }
         "file_delete" => "delete a file",
         "file_move" => "move or rename a file",
         "file_copy" => "copy a file",

@@ -250,3 +250,69 @@ fn image_read_is_granted_and_classified_wherever_file_read_is() {
         "image_read"
     ));
 }
+
+// ---- file_upload ---------------------------------------------------------------
+
+#[test]
+fn the_bridge_and_the_runtime_describe_file_upload_identically() {
+    assert_eq!(
+        openfang_mcp_bridge::FILE_UPLOAD_DESCRIPTION,
+        openfang_runtime::tool_runner::FILE_UPLOAD_DESCRIPTION,
+        "the bridge's file_upload description has drifted from the runtime's"
+    );
+}
+
+#[test]
+fn both_tool_surfaces_serve_the_same_file_upload_tool() {
+    let runtime = openfang_runtime::tool_runner::builtin_tool_definitions()
+        .into_iter()
+        .find(|d| d.name == "file_upload")
+        .expect("the runtime defines file_upload");
+    let bridge = openfang_mcp_bridge::built_in_tools()
+        .into_iter()
+        .find(|t| t.name == "file_upload")
+        .expect("the bridge advertises file_upload");
+
+    assert_eq!(
+        runtime.description,
+        openfang_runtime::tool_runner::FILE_UPLOAD_DESCRIPTION
+    );
+    assert_eq!(
+        bridge.description.as_deref(),
+        Some(openfang_mcp_bridge::FILE_UPLOAD_DESCRIPTION)
+    );
+    assert_eq!(
+        runtime.input_schema,
+        openfang_runtime::tool_runner::file_upload_input_schema()
+    );
+    assert_eq!(
+        serde_json::to_value(&*bridge.input_schema).unwrap(),
+        runtime.input_schema,
+        "the bridge's hand-copied file_upload schema has drifted from the runtime's"
+    );
+}
+
+/// file_upload sends workspace bytes off the machine. It must be dispatchable,
+/// workspace-scoped, privileged (a manifest has to name it), never counted as
+/// read-only, and reserved against MCP shadowing.
+#[test]
+fn file_upload_is_privileged_and_workspace_scoped() {
+    assert!(openfang_api::bridge_ipc::ALLOWED_TOOLS.contains(&"file_upload"));
+    assert!(openfang_mcp_bridge::PRIVILEGED_DEFAULT_DENY.contains(&"file_upload"));
+    assert!(
+        !openfang_mcp_bridge::DEFAULT_ALLOWED.contains(&"file_upload"),
+        "file_upload must never be reachable from the no-env-var fallback"
+    );
+    assert!(
+        openfang_runtime::tool_runner::FS_SANDBOXED_TOOLS.contains(&"file_upload"),
+        "file_upload takes a path, so it must be workspace-scoped on the bridge"
+    );
+    assert!(
+        !openfang_types::turn::READ_ONLY_TOOLS.contains(&"file_upload"),
+        "file_upload has an effect outside the machine; it is not read-only"
+    );
+    assert!(openfang_runtime::mcp::RESERVED_BUILTIN_NAMES.contains(&"file_upload"));
+    assert!(openfang_types::tool_compat::is_known_openfang_tool(
+        "file_upload"
+    ));
+}

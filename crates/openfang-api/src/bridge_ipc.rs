@@ -121,6 +121,9 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "browser_screenshot",
     "browser_run_js",
     "browser_back",
+    // Privileged-deny (sends workspace bytes off the machine); inert without
+    // `[[upload_targets]]` in the caller's manifest.
+    "file_upload",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace
@@ -2545,21 +2548,23 @@ mod tests {
         // 26 -> 27, and `PRIVILEGED_DEFAULT_DENY` stays at 9.
         // ANAI-297: 36 -> 37 (`image_read`). Granted with file_read, so
         // `DEFAULT_ALLOWED` moves too, 27 -> 28.
-        assert_eq!(ALLOWED_TOOLS.len(), 37, "ALLOWED_TOOLS surface cardinality");
+        // file_upload: 37 -> 38. Privileged-deny, so `PRIVILEGED_DEFAULT_DENY`
+        // goes 9 -> 10 and `DEFAULT_ALLOWED` stays at 28.
+        assert_eq!(ALLOWED_TOOLS.len(), 38, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            37,
+            38,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
             PRIVILEGED_DEFAULT_DENY.len(),
-            9,
-            "PRIVILEGED_DEFAULT_DENY cardinality (agent lifecycle x4 + browser click/type/screenshot/run_js/back)"
+            10,
+            "PRIVILEGED_DEFAULT_DENY cardinality (agent lifecycle x4 + browser click/type/screenshot/run_js/back + file_upload)"
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
             28,
-            "DEFAULT_ALLOWED bridge-default cardinality (37 − 9 privileged)"
+            "DEFAULT_ALLOWED bridge-default cardinality (38 − 10 privileged)"
         );
     }
 

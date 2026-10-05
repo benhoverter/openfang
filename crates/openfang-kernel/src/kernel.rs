@@ -11660,6 +11660,16 @@ impl KernelHandle for OpenFangKernel {
         )
     }
 
+    /// `file_upload`'s allowlist: the caller's manifest `[[upload_targets]]`,
+    /// from the registry. Same uuid-or-name resolver as the methods above; an
+    /// unresolvable caller gets none, so the tool refuses.
+    fn agent_upload_targets(&self, agent_id: &str) -> Vec<openfang_types::upload::UploadTarget> {
+        self.resolve_agent_ref(agent_id)
+            .and_then(|id| self.registry.get(id))
+            .map(|entry| entry.manifest.upload_targets.clone())
+            .unwrap_or_default()
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,
