@@ -513,6 +513,7 @@ mod tests {
                 tool_blocklist: vec![],
                 cache_context: false,
                 max_history_messages: None,
+                upload_targets: Vec::new(),
             },
             state: AgentState::Created,
             mode: AgentMode::default(),

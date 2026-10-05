@@ -744,6 +744,13 @@ pub struct AgentManifest {
     /// `agent_send` results stay focused. See issue #871.
     #[serde(default)]
     pub max_history_messages: Option<usize>,
+    /// Where `file_upload` may send this agent's files (`[[upload_targets]]`).
+    /// Empty, the default, means nowhere: the tool refuses every call. Plain
+    /// `default` rather than `vec_lenient`, on purpose: a malformed row must
+    /// fail the manifest load, not be dropped silently. See
+    /// [`crate::upload`].
+    #[serde(default)]
+    pub upload_targets: Vec<crate::upload::UploadTarget>,
 }
 
 /// Runtime default for `AgentManifest::max_history_messages` when the agent
@@ -888,6 +895,7 @@ impl Default for AgentManifest {
             tool_blocklist: Vec::new(),
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         }
     }
 }
@@ -1407,6 +1415,7 @@ mod tests {
             tool_blocklist: Vec::new(),
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

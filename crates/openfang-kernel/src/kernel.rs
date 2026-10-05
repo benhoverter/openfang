@@ -13736,6 +13736,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -13782,6 +13783,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
         let mut disk = entry.clone();
         disk.description = "new".to_string();
@@ -13835,6 +13837,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
         let mut disk = entry.clone();
         disk.workspace = Some(std::path::PathBuf::from("/new"));
@@ -13881,6 +13884,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
 
         let mut disk = entry.clone();
@@ -13935,6 +13939,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
 
         let mut disk = entry.clone();
@@ -13998,6 +14003,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         };
 
         // Current kernel config now says mode = Full.
@@ -14114,6 +14120,7 @@ mod tests {
             tool_blocklist: vec![],
             cache_context: false,
             max_history_messages: None,
+            upload_targets: Vec::new(),
         }
     }
 

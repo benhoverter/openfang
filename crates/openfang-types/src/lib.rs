@@ -32,6 +32,7 @@ pub mod tool;
 pub mod tool_compat;
 pub mod turn;
 pub mod turn_context;
+pub mod upload;
 pub mod wake;
 pub mod watchdog;
 pub mod webhook;
