@@ -37,6 +37,11 @@ pub struct UploadTarget {
     /// fragment or credentials, and is matched on whole path segments: a
     /// prefix ending in `/` covers everything beneath it, and one that does
     /// not covers itself and `<prefix>/...`, never `<prefix>x`.
+    ///
+    /// Credentials (`user@` / `user:pass@` before the host) fail the
+    /// manifest load itself, not just the call: a password in an allowlist
+    /// row is a config error the operator should see at boot.
+    #[serde(deserialize_with = "de_url_prefix")]
     pub url_prefix: String,
     /// Request shape. Only `PUT` (raw body) exists today; a target that needs
     /// multipart POST gets a new variant, not a free-form string.
@@ -70,6 +75,35 @@ impl UploadMethod {
 /// Hard ceiling on any target's `max_bytes`, whatever the manifest says. The
 /// file is read whole into memory before sending, so this bounds that too.
 pub const UPLOAD_MAX_BYTES_CEILING: u64 = 512 * 1024 * 1024;
+
+/// The authority (`user:pass@host:port`) of a URL-ish string: the text
+/// between `scheme://` and the first `/`, `?`, `#` or `\` after it. Empty
+/// when there is no `://`.
+fn authority_of(raw: &str) -> &str {
+    let Some((_, rest)) = raw.split_once("://") else {
+        return "";
+    };
+    let end = rest.find(['/', '?', '#', '\\']).unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// `url_prefix` deserializer: refuses userinfo at load time. Everything else
+/// is left to [`UploadTarget::static_errors`] and the runtime's parser, which
+/// refuse a bad row at call time.
+fn de_url_prefix<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    if authority_of(&s).contains('@') {
+        // Never echo the value: it may hold a password.
+        return Err(serde::de::Error::custom(
+            "url_prefix must not carry credentials (user@ or user:pass@ before \
+             the host); put the bare https://host/path prefix here",
+        ));
+    }
+    Ok(s)
+}
 
 impl UploadTarget {
     /// Does this target accept `content_type`? Case-insensitive. `type/*`
@@ -165,7 +199,16 @@ impl UploadTarget {
             || host == "storage.cloud.google.com"
             || host == "s3.amazonaws.com"
             || ((host.starts_with("s3.") || host.starts_with("s3-"))
-                && host.ends_with(".amazonaws.com"));
+                && host.ends_with(".amazonaws.com"))
+            // Backblaze B2 S3 API: s3.<region>.backblazeb2.com
+            || (host.starts_with("s3.") && host.ends_with(".backblazeb2.com"))
+            // Wasabi: s3.wasabisys.com, s3.<region>.wasabisys.com
+            || (host.starts_with("s3.") && host.ends_with(".wasabisys.com"))
+            // DigitalOcean Spaces path-style: <region>.digitaloceanspaces.com
+            // (bucket-style <bucket>.<region>.… has one more label and is
+            // owned by that bucket).
+            || host == "digitaloceanspaces.com"
+            || (host.ends_with(".digitaloceanspaces.com") && host.split('.').count() == 3);
         let bucketless = path.trim_matches('/').is_empty();
         (shared && bucketless).then_some(host)
     }
@@ -305,6 +348,11 @@ max_bytes     = 50_000_000
             "https://s3.us-west-2.amazonaws.com",
             "https://S3.AMAZONAWS.COM:443/",
             "https://storage.googleapis.com/",
+            "https://s3.us-west-004.backblazeb2.com/",
+            "https://s3.wasabisys.com/",
+            "https://s3.eu-central-1.wasabisys.com",
+            "https://nyc3.digitaloceanspaces.com/",
+            "https://SFO3.DigitalOceanSpaces.com:443",
         ] {
             t.url_prefix = bad.into();
             assert!(!t.static_errors().is_empty(), "{bad} must be refused");
@@ -314,6 +362,10 @@ max_bytes     = 50_000_000
             "https://my-bucket.s3.amazonaws.com/",
             "https://storage.googleapis.com/my-bucket/up/",
             "https://late-media.613d73a46130ed0083c059a837d6511b.r2.cloudflarestorage.com/temp/",
+            "https://s3.us-west-004.backblazeb2.com/my-bucket/",
+            "https://s3.wasabisys.com/my-bucket/",
+            "https://my-space.nyc3.digitaloceanspaces.com/",
+            "https://nyc3.digitaloceanspaces.com/my-space/",
         ] {
             t.url_prefix = ok.into();
             assert!(
@@ -331,5 +383,30 @@ max_bytes     = 50_000_000
         assert_eq!(t.effective_max_bytes(), UPLOAD_MAX_BYTES_CEILING);
         t.max_bytes = 5;
         assert_eq!(t.effective_max_bytes(), 5);
+    }
+
+    /// Credentials in `url_prefix` fail the manifest load, not just the call.
+    /// Our own message never repeats the value. The toml crate's error
+    /// display does quote the offending source line, so the full error can
+    /// contain it; that text is the operator's own file, already on disk.
+    #[test]
+    fn credentials_in_url_prefix_fail_the_manifest_load() {
+        let host = "late-media.613d73a46130ed0083c059a837d6511b.r2.cloudflarestorage.com";
+        let pw = concat!("hunter", "2pw");
+        for creds in ["user@".to_string(), format!("user:{pw}@"), ":@".to_string()] {
+            let bad = ZERNIO.replace(
+                &format!("https://{host}/"),
+                &format!("https://{creds}{host}/"),
+            );
+            assert_ne!(bad, ZERNIO, "fixture replace must hit");
+            let err = toml::from_str::<AgentManifest>(&bad).unwrap_err();
+            assert!(err.message().contains("credentials"), "{err}");
+            assert!(!err.message().contains(pw), "password echoed: {err}");
+        }
+        // '@' after the host is not userinfo; static_errors still refuses it
+        // at call time, but it is not a load failure.
+        let in_path = ZERNIO.replace("/temp/", "/te@mp/");
+        let m: AgentManifest = toml::from_str(&in_path).unwrap();
+        assert!(!m.upload_targets[0].static_errors().is_empty());
     }
 }
