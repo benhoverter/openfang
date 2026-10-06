@@ -489,7 +489,14 @@ impl SecretScrubber {
     /// matched.
     #[must_use]
     pub fn known_hits_in_bytes(&self, bytes: &[u8]) -> usize {
-        let set = self.known.read().unwrap_or_else(|e| e.into_inner());
+        // Snapshot, then drop the guard before the scan: the scan is
+        // known.len() x file size, and holding the read lock that long blocks
+        // `replace_known`. The clone holds live secret values; it stays in
+        // this frame and is never logged or stored.
+        let set: Vec<String> = {
+            let guard = self.known.read().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
         set.iter()
             .filter(|s| {
                 let needle = s.as_bytes();
