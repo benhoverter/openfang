@@ -386,9 +386,30 @@ fn fd_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn fd_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
-    None
+/// Is the opened file the one `path` names? `real` is the kernel's path for
+/// the descriptor. An exact match is the normal case. On a case-insensitive
+/// volume (the macOS default) the kernel reports the on-disk case while the
+/// resolver keeps the caller's, so a path that differs from `real` only in
+/// letter case is accepted too, but only when `path`, read without following
+/// a final symlink, has the opened file's device and inode. Any other
+/// difference (a directory swapped for a link elsewhere) is refused.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn opened_is_resolved(real: Option<&Path>, path: &Path, opened: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(real) = real else {
+        return false;
+    };
+    if real == path {
+        return true;
+    }
+    let (Some(a), Some(b)) = (real.to_str(), path.to_str()) else {
+        return false;
+    };
+    if a.to_lowercase() != b.to_lowercase() {
+        return false;
+    }
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.dev() == opened.dev() && m.ino() == opened.ino())
 }
 
 /// Read the file without following a symlink at its final component. The
@@ -429,15 +450,11 @@ async fn read_no_follow(path: &Path, max: u64) -> Result<Vec<u8>, String> {
                 ));
             }
         }
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
-            match fd_path(&file) {
-                Some(real) if real == path => {}
-                _ => {
-                    return Err("the file opened is not the one the path resolved to (a \
-                         directory on the path changed during the call)"
-                        .to_string())
-                }
-            }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if !opened_is_resolved(fd_path(&file).as_deref(), &path, &meta) {
+            return Err("the file opened is not the one the path resolved to (a \
+                 directory on the path changed during the call)"
+                .to_string());
         }
         if meta.len() > max {
             return Err(format!(
@@ -519,16 +536,21 @@ pub(crate) async fn run(
             )
         ));
     }
-    refuse_known_secrets(
-        &bytes,
-        openfang_types::secret_scrub::global().map(|s| s.as_ref()),
-        raw_path,
-    )?;
-
-    let sha256 = {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&bytes))
-    };
+    // The secret scan is known-set x file size and the hash is linear in the
+    // file: both run on the blocking pool, not on the async worker that is
+    // serving other tool calls.
+    let scrubber = openfang_types::secret_scrub::global().cloned();
+    let path_for_scan = raw_path.to_string();
+    let (bytes, sha256) = tokio::task::spawn_blocking(move || {
+        refuse_known_secrets(&bytes, scrubber.as_deref(), &path_for_scan)?;
+        let sha256 = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        Ok::<_, String>((bytes, sha256))
+    })
+    .await
+    .map_err(|e| format!("'{raw_path}': the secret scan task failed ({e}). Nothing was sent."))??;
     let host = url.host_str().unwrap_or_default().to_string();
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs = resolve_public(&host, port).await?;
@@ -927,6 +949,42 @@ mod tests {
             .unwrap_err();
         assert!(e.contains("not the one the path resolved to"), "{e}");
         assert!(read_no_follow(&root.join("a.png"), 1_000).await.is_ok());
+    }
+
+    /// On a case-insensitive volume the kernel reports the on-disk case; a
+    /// path that differs only in case is the same file and must not be
+    /// refused. Skipped on a case-sensitive volume, where the open fails.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn a_case_only_path_difference_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Case.png"), png_bytes()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let other_case = root.join("case.png");
+        if !other_case.exists() {
+            return; // case-sensitive volume
+        }
+        let got = read_no_follow(&other_case, 1_000).await;
+        assert!(got.is_ok(), "{got:?}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn case_only_match_still_needs_the_same_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.png"), png_bytes()).unwrap();
+        std::fs::write(dir.path().join("b.png"), png_bytes()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let a_meta = std::fs::metadata(root.join("a.png")).unwrap();
+        let a = root.join("a.png");
+        let upper = root.join("A.png");
+        assert!(opened_is_resolved(Some(&a), &a, &a_meta));
+        // Text differs beyond case: refused regardless of inode.
+        assert!(!opened_is_resolved(Some(&a), &root.join("b.png"), &a_meta));
+        // Case-only difference but the descriptor is a different file.
+        let b_meta = std::fs::metadata(root.join("b.png")).unwrap();
+        assert!(!opened_is_resolved(Some(&a), &upper, &b_meta));
+        assert!(!opened_is_resolved(None, &a, &a_meta));
     }
 
     /// Refusals that must happen before any network I/O. The URL host is a
