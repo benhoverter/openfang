@@ -351,6 +351,24 @@ pub trait KernelHandle: Send + Sync {
         Err("Memory search is not available on this kernel handle".to_string())
     }
 
+    /// ANAI-305: read one of the CALLER's own memory rows whole, by id.
+    ///
+    /// The read a truncation marker on a recalled row points at. The inner
+    /// shape is JSON for the same reason [`Self::memory_search`] is; `Err` is
+    /// a sentence for the model (bad id, not yours, deleted).
+    ///
+    /// Defaulted to an error, not to an empty answer, for the reason
+    /// `memory_search` is: "no such row" from a handle that cannot look is a
+    /// lie the reader would act on.
+    async fn memory_read_row(
+        &self,
+        caller_agent_id: Option<&str>,
+        reference: &str,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (caller_agent_id, reference);
+        Err("Reading a memory by id is not available on this kernel handle".to_string())
+    }
+
     /// ANAI-166 (ADR 0002 §2.2): append an unstructured note to the CALLER's
     /// memory, attributed to the caller's currently open episode.
     ///

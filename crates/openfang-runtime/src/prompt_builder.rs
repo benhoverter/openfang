@@ -782,7 +782,15 @@ pub fn build_memory_section(memories: &[RecalledMemory], granted_tools: &[String
                 Some(k) => format!("recalled {k}"),
                 None => "recalled memory".to_string(),
             };
-            let capped = cap_str(&mem.content, budget_for_kind(kind), &label);
+            // ANAI-305: a cut row names the id that reads it whole. Every row
+            // here is the agent's own (recall filters on agent_id), so the id
+            // is always one `memory_recall(id:)` will answer.
+            let short = mem
+                .id
+                .as_deref()
+                .map(openfang_memory::semantic::short_note_id);
+            let recover = short.map_or(Recover::Nothing, Recover::MemoryRow);
+            let capped = cap_section(&mem.content, budget_for_kind(kind), &label, recover);
             out.push_str(&format!("- {}{}\n", provenance_tag(mem), capped));
         }
     }
@@ -1227,6 +1235,8 @@ enum Recover<'a> {
     /// The section was derived from this file (code blocks stripped, say), so
     /// a line number would point at the wrong place: name the file only.
     File(&'a str),
+    /// A recalled memory row, readable whole by this short id (ANAI-305).
+    MemoryRow(&'a str),
 }
 
 /// The clause a truncation marker carries saying how to read what was cut.
@@ -1239,6 +1249,7 @@ fn recovery_clause(recover: Recover<'_>, s: &str, cut_at: usize) -> String {
             format!("; the rest starts at line {line}: file_read `{path}` with offset={line}")
         }
         Recover::File(path) => format!("; file_read `{path}` for the full text"),
+        Recover::MemoryRow(id) => format!("; memory_recall(id: \"{id}\") returns it whole"),
     }
 }
 
@@ -1601,6 +1612,41 @@ mod tests {
         let section = build_memory_section(&memories, &[]);
         assert!(section.contains("recalled note truncated"));
         assert!(section.contains("1000 of 2000 chars shown"));
+    }
+
+    /// ANAI-305: a cut row says how to read it whole — for every kind, not
+    /// just notes, because the id in the marker is the only handle a turn or
+    /// summary ever shows. A row that fits gets no id and no marker.
+    #[test]
+    fn a_cut_recalled_row_names_the_call_that_reads_it_whole() {
+        let memories = vec![
+            RecalledMemory::of_kind(Some("turn".to_string()), "t".repeat(1000))
+                .with_id("3f2a1b9c-0000-4000-8000-000000000000"),
+            RecalledMemory::of_kind(Some("summary".to_string()), "short")
+                .with_id("77777777-0000-4000-8000-000000000000"),
+        ];
+        let section = build_memory_section(&memories, &[]);
+        assert!(
+            section.contains("500 omitted; memory_recall(id: \"3f2a1b9c\") returns it whole …]"),
+            "{section}"
+        );
+        assert!(
+            !section.contains("77777777"),
+            "an uncut row needs no handle"
+        );
+    }
+
+    /// A row with no id (a caller that could not supply one) keeps the plain
+    /// marker rather than pointing at a call that cannot work.
+    #[test]
+    fn a_cut_row_without_an_id_keeps_the_plain_marker() {
+        let memories = vec![RecalledMemory::of_kind(
+            Some("turn".to_string()),
+            "t".repeat(1000),
+        )];
+        let section = build_memory_section(&memories, &[]);
+        assert!(section.contains("500 omitted …]"), "{section}");
+        assert!(!section.contains("memory_recall(id:"));
     }
 
     // -----------------------------------------------------------------

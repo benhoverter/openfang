@@ -1528,7 +1528,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "memory_recall".to_string(),
-            description: "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Exactly one of the two.".to_string(),
+            description: "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Pass 'id' to read one of your memories whole: the id a truncation marker or a note's tag shows. Exactly one of the three.".to_string(),
             // ANAI-166: schema evolution is ADDITIVE ONLY. `key` is never
             // removed and never repurposed; `required` drops to empty because
             // `anyOf` support is uneven across providers and the MCP bridge
@@ -1542,6 +1542,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "query": { "type": "string", "description": "What you are looking for, in plain words. Searches by meaning when embeddings are configured, by text match otherwise." },
                     "key": { "type": "string", "description": "Exact storage key, for values written with memory_store. Prefix with 'shared:' for cross-agent state." },
+                    "id": { "type": "string", "description": "A memory's id, e.g. \"1a2b3c4d\" from a '[… recalled turn truncated …]' marker or a note's tag. Returns that one memory uncut." },
                     "scope": { "type": "string", "description": "Optional: restrict to one memory scope, e.g. 'episodic'." },
                     "kind": { "type": "string", "description": "Optional: restrict to one kind of memory, e.g. 'note'." },
                     "limit": { "type": "integer", "description": "Maximum results to return (default 5, maximum 25)." }
@@ -5139,10 +5140,18 @@ async fn tool_memory_recall(
         .as_str()
         .map(str::trim)
         .filter(|q| !q.is_empty());
+    let id = input["id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|i| !i.is_empty());
 
-    match (key, query) {
-        (Some(key), None) => memory_recall_by_key(kh, caller_agent_id, key),
-        (None, Some(query)) => {
+    match (key, query, id) {
+        (Some(key), None, None) => memory_recall_by_key(kh, caller_agent_id, key),
+        (None, None, Some(id)) => {
+            let row = kh.memory_read_row(caller_agent_id, id).await?;
+            Ok(render_recalled_row(&row))
+        }
+        (None, Some(query), None) => {
             let limit = input["limit"]
                 .as_u64()
                 .map(|n| n as usize)
@@ -5162,17 +5171,70 @@ async fn tool_memory_recall(
                 .await?;
             Ok(format_recall_hits(query, &found))
         }
-        (Some(_), Some(_)) => Err(
-            "Pass either 'query' (to search by meaning) or 'key' (to look up an exact stored \
-             key), not both. If you want a keyed value, use 'key'; otherwise describe what you \
-             are looking for in 'query'."
+        (None, None, None) => Err(
+            "Missing parameter: pass 'query' to search your memory, 'key' to look up an exact \
+             stored key, or 'id' to read one memory whole."
                 .to_string(),
         ),
-        (None, None) => Err(
-            "Missing parameter: pass 'query' to search your memory, or 'key' to look up an exact \
-             stored key."
+        _ => Err(
+            "Pass exactly one of 'query' (to search by meaning), 'key' (to look up an exact \
+             stored key) or 'id' (to read one memory whole by the id a marker or tag shows), \
+             not several."
                 .to_string(),
         ),
+    }
+}
+
+/// Render one row read by id (ANAI-305): the whole text, plus whatever about
+/// the row a reader would otherwise misread — that a note was replaced, or
+/// the slot a fact lives at.
+fn render_recalled_row(row: &serde_json::Value) -> String {
+    let id = row["id"].as_str().unwrap_or("?");
+    let kind = row["kind"].as_str().unwrap_or("memory");
+    let created = row["created_at"].as_str().unwrap_or("?");
+    let content = row["content"].as_str().unwrap_or("");
+    let mut out = format!(
+        "[{created} · {kind} · id:{}] ({} chars, whole)\n",
+        openfang_memory::semantic::short_note_id(id),
+        content.chars().count()
+    );
+    if let Some(slot) = recall_address_line(&row["address"], row["status"].as_str()) {
+        out.push_str(&slot);
+    }
+    if let Some(next) = row["superseded_by"].as_str() {
+        let next = openfang_memory::semantic::short_note_id(next);
+        out.push_str(&format!(
+            "SUPERSEDED by id:{next} — this is a replaced version, kept as history. Read the \
+             current one with memory_recall(id: \"{next}\").\n"
+        ));
+    }
+    out.push_str(content);
+    out.push('\n');
+    out
+}
+
+/// The `slot: …` line for a fact row (ANAI-305), or `None` for any other
+/// row. Names the exact `memory_fact` arguments, because the point of showing
+/// an address is that the reader writes THAT key instead of minting another.
+fn recall_address_line(address: &serde_json::Value, status: Option<&str>) -> Option<String> {
+    let slot = address["slot"].as_str()?;
+    let call = memory_fact_call(address);
+    let status = status.map(|s| format!(", {s}")).unwrap_or_default();
+    Some(format!(
+        "slot: `{slot}`{status} — read or rewrite it with {call}\n"
+    ))
+}
+
+/// The exact `memory_fact` call that reads the slot `address` names
+/// (ANAI-305). `scope_ref` is omitted for agent scope, where it is implicit.
+fn memory_fact_call(address: &serde_json::Value) -> String {
+    let scope = address["scope"].as_str().unwrap_or("?");
+    let key = address["claim_key"].as_str().unwrap_or("?");
+    let scope_ref = address["scope_ref"].as_str().unwrap_or("");
+    if scope == "agent" || scope_ref.is_empty() {
+        format!("memory_fact(scope: \"{scope}\", key: \"{key}\")")
+    } else {
+        format!("memory_fact(scope: \"{scope}\", scope_ref: \"{scope_ref}\", key: \"{key}\")")
     }
 }
 
@@ -5219,7 +5281,14 @@ fn format_recall_hits(query: &str, found: &serde_json::Value) -> String {
             ("note", Some(id)) => format!(" · id:{}", openfang_memory::semantic::short_note_id(id)),
             _ => String::new(),
         };
-        out.push_str(&format!("\n[{created} · {kind}{id}]\n{content}\n"));
+        out.push_str(&format!("\n[{created} · {kind}{id}]\n"));
+        // ANAI-305: a fact hit names its slot, so "find it by meaning" ends
+        // in an address the agent can write rather than a claim it cannot.
+        if let Some(slot) = recall_address_line(&hit["address"], None) {
+            out.push_str(&slot);
+        }
+        out.push_str(content);
+        out.push('\n');
     }
     out
 }
@@ -5984,7 +6053,77 @@ fn tool_memory_status(
             }
         }
     }
+    out.push_str(&render_status_slots(&status));
     Ok(out)
+}
+
+/// Characters of an open slot's claim `memory_status` shows inline (ANAI-305).
+/// A status call is orientation, not a read: twenty full claims of the size
+/// the busiest agents write would be tens of KB.
+const STATUS_CLAIM_PREVIEW_CHARS: usize = 200;
+
+/// The claim-slot half of `memory_status` (ANAI-305).
+///
+/// The kernel has computed `open_claim_slots` since ANAI-268 and this tool
+/// never rendered it, so the field the tool description promises — "the claim
+/// slots you already hold" — never reached an agent. Every line carries the
+/// exact `memory_fact` call that reads the slot, because a preview that is cut
+/// without saying how to get the rest is the silent cut ANAI-304 rules out.
+fn render_status_slots(status: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some(err) = status["open_claim_slots_error"].as_str() {
+        out.push_str(&format!(
+            "Open claim slots: could not be read ({err}). This is NOT \"you hold none\".\n"
+        ));
+        return out;
+    }
+    let slots = status["open_claim_slots"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let more: Vec<&str> = status["more_open_claim_slots"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if slots.is_empty() && more.is_empty() {
+        out.push_str("Open claim slots: none you can see.\n");
+        return out;
+    }
+    out.push_str(&format!(
+        "Open claim slots ({}):\n",
+        slots.len() + more.len()
+    ));
+    for slot in &slots {
+        let addr = slot["slot"].as_str().unwrap_or("?");
+        let claim = slot["claim"].as_str().unwrap_or("");
+        let total = claim.chars().count();
+        let call = memory_fact_call(slot);
+        let verify = if slot["should_verify"].as_bool() == Some(true) {
+            " [verify]"
+        } else {
+            ""
+        };
+        if total <= STATUS_CLAIM_PREVIEW_CHARS {
+            out.push_str(&format!("  - `{addr}`{verify} — {claim}\n"));
+        } else {
+            let preview: String = claim.chars().take(STATUS_CLAIM_PREVIEW_CHARS).collect();
+            out.push_str(&format!(
+                "  - `{addr}`{verify} — {preview}[… {} of {total} chars shown; {call} reads it whole …]\n",
+                STATUS_CLAIM_PREVIEW_CHARS
+            ));
+        }
+    }
+    if !more.is_empty() {
+        out.push_str(&format!(
+            "  … and {} more, by address (read any with memory_fact): {}\n",
+            more.len(),
+            more.iter()
+                .map(|a| format!("`{a}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -11676,7 +11815,17 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("not both"), "unhelpful error: {err}");
+        assert!(err.contains("not several"), "unhelpful error: {err}");
+
+        // ANAI-305: `id` is the third door and obeys the same rule.
+        let err = tool_memory_recall(
+            &serde_json::json!({"query": "anything", "id": "1a2b3c4d"}),
+            Some(&kh),
+            Some("agent-x"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("exactly one"), "unhelpful error: {err}");
     }
 
     #[tokio::test]
@@ -11687,6 +11836,99 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("'query'"), "unhelpful error: {err}");
         assert!(err.contains("'key'"), "unhelpful error: {err}");
+        assert!(err.contains("'id'"), "unhelpful error: {err}");
+    }
+
+    /// ANAI-305: a row read by id comes back whole, says it is whole, and
+    /// carries what a reader would otherwise misread — a replaced note's
+    /// successor, a fact's slot and the exact call that rewrites it.
+    #[test]
+    fn a_row_read_by_id_renders_whole_with_its_successor_and_slot() {
+        let note = serde_json::json!({
+            "id": "1a2b3c4d-0000-4000-8000-000000000000",
+            "kind": "note",
+            "content": "n".repeat(3000),
+            "created_at": "2026-10-07T00:00:00Z",
+            "superseded_by": "5e6f7a8b-0000-4000-8000-000000000000",
+            "address": null,
+            "status": null,
+        });
+        let out = render_recalled_row(&note);
+        assert!(out.starts_with("[2026-10-07T00:00:00Z · note · id:1a2b3c4d] (3000 chars, whole)"));
+        assert!(out.contains("SUPERSEDED by id:5e6f7a8b"));
+        assert!(out.contains(&"n".repeat(3000)), "uncut");
+
+        let fact = serde_json::json!({
+            "id": "9f9f9f9f-0000-4000-8000-000000000000",
+            "kind": "fact",
+            "content": "main @ abc",
+            "created_at": "2026-10-07T00:00:00Z",
+            "superseded_by": null,
+            "address": {"slot": "openfang/repo.trunk_head", "scope": "project",
+                        "scope_ref": "openfang", "claim_key": "repo.trunk_head"},
+            "status": "settled",
+        });
+        let out = render_recalled_row(&fact);
+        assert!(
+            out.contains(
+                "slot: `openfang/repo.trunk_head`, settled — read or rewrite it with \
+             memory_fact(scope: \"project\", scope_ref: \"openfang\", key: \"repo.trunk_head\")"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("SUPERSEDED"));
+    }
+
+    /// ANAI-305: a fact hit in a search names its slot; other kinds do not.
+    #[test]
+    fn a_fact_search_hit_names_its_slot() {
+        let found = serde_json::json!({"mode": "semantic", "results": [
+            {"id": "a", "kind": "fact", "content": "c", "created_at": "t",
+             "address": {"slot": "repo.x", "scope": "agent", "scope_ref": "uuid",
+                         "claim_key": "repo.x"}},
+            {"id": "b", "kind": "turn", "content": "d", "created_at": "t", "address": null},
+        ]});
+        let out = format_recall_hits("q", &found);
+        assert!(
+            out.contains(
+                "slot: `repo.x` — read or rewrite it with \
+                              memory_fact(scope: \"agent\", key: \"repo.x\")"
+            ),
+            "{out}"
+        );
+        assert_eq!(out.matches("slot:").count(), 1);
+    }
+
+    /// ANAI-305: `memory_status` renders the open slots the kernel has
+    /// returned since ANAI-268 and the tool silently dropped. Long claims are
+    /// cut WITH the call that reads them whole; past the body limit, every
+    /// remaining open slot is still named by address.
+    #[test]
+    fn memory_status_renders_every_open_slot() {
+        let status = serde_json::json!({
+            "open_claim_slots": [
+                {"slot": "kimiya/project.kimiya.a", "scope": "project",
+                 "scope_ref": "kimiya", "claim_key": "project.kimiya.a",
+                 "claim": "x".repeat(500), "should_verify": true},
+                {"slot": "memory.loop", "scope": "agent", "scope_ref": "uuid",
+                 "claim_key": "memory.loop", "claim": "short", "should_verify": false},
+            ],
+            "more_open_claim_slots": ["kimiya/project.kimiya.b", "kimiya/project.kimiya.c"],
+            "open_claim_slots_error": null,
+        });
+        let out = render_status_slots(&status);
+        assert!(out.contains("Open claim slots (4):"), "{out}");
+        assert!(out.contains("`kimiya/project.kimiya.a` [verify] — "));
+        assert!(out.contains(
+            "[… 200 of 500 chars shown; memory_fact(scope: \"project\", scope_ref: \"kimiya\", \
+             key: \"project.kimiya.a\") reads it whole …]"
+        ), "{out}");
+        assert!(out.contains("`memory.loop` — short\n"));
+        assert!(out.contains("2 more, by address"));
+        assert!(out.contains("`kimiya/project.kimiya.c`"));
+
+        let failed = serde_json::json!({"open_claim_slots": [], "open_claim_slots_error": "boom"});
+        assert!(render_status_slots(&failed).contains("NOT \"you hold none\""));
     }
 
     #[tokio::test]

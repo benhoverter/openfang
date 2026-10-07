@@ -664,12 +664,13 @@ pub fn built_in_tools() -> Vec<Tool> {
         // that actually catches this.
         Tool::new(
             "memory_recall",
-            "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Exactly one of the two.",
+            "Search YOUR OWN memory for relevant context: pass 'query' with what you are looking for, in words. Pass 'key' instead for an exact stored key ('shared:' prefix reads the cross-agent namespace). Pass 'id' to read one of your memories whole: the id a truncation marker or a note's tag shows. Exactly one of the three.",
             obj(json!({
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "What you are looking for, in plain words. Searches by meaning when embeddings are configured, by text match otherwise." },
                     "key": { "type": "string", "description": "Exact storage key, for values written with memory_store. Prefix with 'shared:' for cross-agent state." },
+                    "id": { "type": "string", "description": "A memory's id, e.g. \"1a2b3c4d\" from a '[… recalled turn truncated …]' marker or a note's tag. Returns that one memory uncut." },
                     "scope": { "type": "string", "description": "Optional: restrict to one memory scope, e.g. 'episodic'." },
                     "kind": { "type": "string", "description": "Optional: restrict to one kind of memory, e.g. 'note'." },
                     "limit": { "type": "integer", "description": "Maximum results to return (default 5, maximum 25)." }

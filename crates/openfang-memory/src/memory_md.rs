@@ -436,7 +436,11 @@ pub fn render_managed_block(
         // that do not apply to it.
         out.push_str(&body);
         if omitted_mine > 0 {
-            out.push_str(&omission_footer(omitted_mine, "open slot(s)"));
+            out.push_str(&omission_footer(
+                omitted_mine,
+                "open slot(s)",
+                Reach::Status,
+            ));
         }
     } else {
         out.push_str("## Your open loops\n\n");
@@ -450,7 +454,11 @@ pub fn render_managed_block(
             out.push_str(&body);
         }
         if omitted_mine > 0 {
-            out.push_str(&omission_footer(omitted_mine, "of your open slot(s)"));
+            out.push_str(&omission_footer(
+                omitted_mine,
+                "of your open slot(s)",
+                Reach::Status,
+            ));
         }
         if !owned.is_empty() {
             out.push_str(
@@ -466,6 +474,7 @@ pub fn render_managed_block(
                     "of your slot(s)",
                     owned.len().saturating_sub(OWNED_SLOT_CAP),
                     OWNED_SLOT_CAP,
+                    Reach::Recall,
                 ));
             }
         }
@@ -482,6 +491,7 @@ pub fn render_managed_block(
                     "sibling slot(s)",
                     siblings.len().saturating_sub(SIBLING_SLOT_CAP),
                     SIBLING_SLOT_CAP,
+                    Reach::Status,
                 ));
             }
         }
@@ -490,11 +500,42 @@ pub fn render_managed_block(
     format!("{MANAGED_BEGIN}\n{header}\n\n{out}{MANAGED_END}")
 }
 
+/// Where an agent can actually read what a footer says was omitted
+/// (ANAI-305).
+///
+/// Every footer used to say "Use `memory_recall` for these", which was true
+/// of none of them: recall searches only the caller's own rows and shows no
+/// slot address, so it could never reach a sibling's slot and could not name
+/// an own slot's address. Each section now names the one tool that does.
+#[derive(Debug, Clone, Copy)]
+enum Reach {
+    /// Open slots, own or sibling: `memory_status` lists every one by address.
+    Status,
+    /// Own slots of any status: recall by meaning, filtered to facts, now
+    /// shows each hit's slot address.
+    Recall,
+}
+
+impl Reach {
+    fn hint(self) -> &'static str {
+        match self {
+            Reach::Status => {
+                "`memory_status` lists every open slot by address; read one with `memory_fact`"
+            }
+            Reach::Recall => {
+                "`memory_recall` with `kind: \"fact\"` finds them by meaning and shows each \
+                 one's slot address"
+            }
+        }
+    }
+}
+
 /// The visible "there was more" line. Omissions are reported, never silent.
-fn omission_footer(omitted: usize, what: &str) -> String {
+fn omission_footer(omitted: usize, what: &str, reach: Reach) -> String {
     format!(
         "\n_[… {omitted} more {what} omitted: managed block is at its \
-         {BLOCK_BUDGET_CHARS}-char budget. Use `memory_recall` for these.]_\n"
+         {BLOCK_BUDGET_CHARS}-char budget. {}.]_\n",
+        reach.hint()
     )
 }
 
@@ -502,7 +543,7 @@ fn omission_footer(omitted: usize, what: &str) -> String {
 /// actually cut it (ANAI-303). Two limits can apply — the section's count cap
 /// and the block's char budget — and the old footer blamed the cap for cuts
 /// the budget made, which sends a reader to tune the wrong number.
-fn address_footer(omitted: usize, what: &str, past_cap: usize, cap: usize) -> String {
+fn address_footer(omitted: usize, what: &str, past_cap: usize, cap: usize, reach: Reach) -> String {
     let past_budget = omitted.saturating_sub(past_cap);
     let why = match (past_cap > 0, past_budget > 0) {
         (true, true) => format!(
@@ -512,7 +553,10 @@ fn address_footer(omitted: usize, what: &str, past_cap: usize, cap: usize) -> St
         (true, false) => format!("this section is capped at {cap}"),
         _ => format!("the managed block is at its {BLOCK_BUDGET_CHARS}-char budget"),
     };
-    format!("\n_[… {omitted} more {what} not listed: {why}. Use `memory_recall` for these.]_\n")
+    format!(
+        "\n_[… {omitted} more {what} not listed: {why}. {}.]_\n",
+        reach.hint()
+    )
 }
 
 /// Replace the managed region of `existing` with `block`, preserving every byte
@@ -767,6 +811,9 @@ mod tests {
         let block = render(&facts);
         assert!(block.contains(&format!("capped at {OWNED_SLOT_CAP}")));
         assert!(block.contains("3 more of your slot(s) not listed"));
+        // ANAI-305: own settled slots are not in memory_status (open-only);
+        // recall filtered to facts is what reaches them, with their address.
+        assert!(block.contains("`memory_recall` with `kind: \"fact\"`"));
     }
 
     /// `block_claims` is the filter the renderer's contract assumes: own slots
@@ -1005,6 +1052,10 @@ mod tests {
             SIBLING_SLOT_CAP
         );
         assert!(block.contains("more sibling slot(s) not listed"));
+        // ANAI-305: recall cannot reach a sibling's row at all, so the
+        // footer must point at the tool that lists every open slot.
+        assert!(block.contains("`memory_status` lists every open slot by address"));
+        assert!(!block.contains("Use `memory_recall` for these"));
     }
 
     /// Self-authored loops are never capped by the sibling budget: forty of

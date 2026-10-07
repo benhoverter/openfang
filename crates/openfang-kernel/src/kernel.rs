@@ -10596,6 +10596,7 @@ fn open_slot_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
             serde_json::json!(openfang_memory::memory_md::display_key(f)),
         );
         obj.insert("scope".to_string(), serde_json::json!(f.scope));
+        obj.insert("scope_ref".to_string(), serde_json::json!(f.scope_ref));
         obj.insert("claim_key".to_string(), serde_json::json!(f.claim_key));
     }
     v
@@ -10608,6 +10609,33 @@ fn open_slot_json(f: &openfang_memory::fact::Fact) -> serde_json::Value {
 /// than the write it is meant to inform. Twenty is well above what any agent
 /// in the fleet currently holds, so the cap is a ceiling rather than a filter.
 const MEMORY_STATUS_SLOT_LIMIT: usize = 20;
+
+/// How deep `memory_status` reads before splitting full bodies from bare
+/// addresses (ANAI-305). Matches the sweep's own bound, so status can name
+/// every open slot the managed block could have listed.
+const MEMORY_STATUS_SLOT_SCAN: usize = 200;
+
+/// A fact row's slot address, for `memory_recall` (ANAI-305), or `None` for
+/// any row that is not a fact.
+///
+/// `slot` is spelled the way the managed block and `memory_status` spell it —
+/// bare for agent scope, `scope_ref/claim_key` otherwise — and the parts are
+/// carried alongside so the reader can hand them to `memory_fact` unchanged.
+fn fact_row_address(row: &openfang_memory::semantic::StoredRow) -> Option<serde_json::Value> {
+    let claim_key = row.claim_key.as_deref()?;
+    let scope_ref = row.scope_ref.as_deref().unwrap_or("");
+    let slot = if row.scope == "agent" || scope_ref.is_empty() {
+        claim_key.to_string()
+    } else {
+        format!("{scope_ref}/{claim_key}")
+    };
+    Some(serde_json::json!({
+        "slot": slot,
+        "scope": row.scope,
+        "scope_ref": scope_ref,
+        "claim_key": claim_key,
+    }))
+}
 
 /// How deep the write-time slot-neighbourhood scan reads (ANAI-277).
 ///
@@ -11985,7 +12013,7 @@ impl KernelHandle for OpenFangKernel {
             agent_id,
             &declared,
             &|ancestor: &str| may_read_project(&self.registry, agent_id, ancestor),
-            MEMORY_STATUS_SLOT_LIMIT,
+            MEMORY_STATUS_SLOT_SCAN,
         ) {
             Ok(s) => (s, None),
             // Degrade rather than fail: the idle countdown worked before this
@@ -12002,7 +12030,23 @@ impl KernelHandle for OpenFangKernel {
                 (Vec::new(), Some(e.to_string()))
             }
         };
-        let slots_json: Vec<serde_json::Value> = slots.iter().map(open_slot_json).collect();
+        // ANAI-305: full bodies for the first MEMORY_STATUS_SLOT_LIMIT, and
+        // the ADDRESS of every one past that. The managed block's overflow
+        // footer sends an agent here for the open slots it could not list;
+        // capping the answer at the same kind of limit would make that
+        // pointer a dead end — kimiya's scope held 35 open slots against a
+        // limit of 20 when this was written. An address is ~50 bytes and is
+        // all `memory_fact` needs to read the rest.
+        let slots_json: Vec<serde_json::Value> = slots
+            .iter()
+            .take(MEMORY_STATUS_SLOT_LIMIT)
+            .map(open_slot_json)
+            .collect();
+        let more_slots: Vec<String> = slots
+            .iter()
+            .skip(MEMORY_STATUS_SLOT_LIMIT)
+            .map(openfang_memory::memory_md::display_key)
+            .collect();
 
         Ok(serde_json::json!({
             "episode": status.current.as_ref().map(episode_json),
@@ -12011,6 +12055,7 @@ impl KernelHandle for OpenFangKernel {
             "minutes_until_timer_close": status.minutes_until_timer_close,
             "recent_episodes": status.recent.iter().map(episode_json).collect::<Vec<_>>(),
             "open_claim_slots": slots_json,
+            "more_open_claim_slots": more_slots,
             "open_claim_slots_error": slots_error,
         }))
     }
@@ -12434,26 +12479,37 @@ impl KernelHandle for OpenFangKernel {
             .await
             .map_err(|e| format!("Memory search failed: {e}"))?;
 
-        let results: Vec<serde_json::Value> = hits
-            .iter()
-            .map(|frag| {
-                serde_json::json!({
-                    "id": frag.id.0.to_string(),
+        let mut results: Vec<serde_json::Value> = Vec::with_capacity(hits.len());
+        for frag in &hits {
+            let kind = frag.metadata.get(MEMORY_KIND_KEY).and_then(|v| v.as_str());
+            let id = frag.id.0.to_string();
+            // ANAI-305: a fact's text without its slot address is a claim the
+            // reader cannot rewrite, and an address is what the managed
+            // block's overflow footer sends an agent here to find. Fragments
+            // do not carry the fact columns, so read them back per fact hit —
+            // at most `limit` point lookups, best-effort.
+            let address = if kind == Some(openfang_memory::fact::KIND_FACT) {
+                match self.memory.read_own_row_async(agent_id, &id).await {
+                    Ok(Ok(row)) => fact_row_address(&row),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            results.push(serde_json::json!({
+                    "id": id,
                     "content": frag.content,
                     "scope": frag.scope,
-                    "kind": frag
-                        .metadata
-                        .get(MEMORY_KIND_KEY)
-                        .and_then(|v| v.as_str()),
+                    "kind": kind,
+                    "address": address,
                     "episode_id": frag
                         .metadata
                         .get(EPISODE_ID_KEY)
                         .and_then(|v| v.as_str()),
                     "tags": frag.metadata.get("tags"),
                     "created_at": frag.created_at.to_rfc3339(),
-                })
-            })
-            .collect();
+            }));
+        }
 
         Ok(serde_json::json!({
             // Reported so a caller can tell a genuinely empty memory from a
@@ -12462,6 +12518,28 @@ impl KernelHandle for OpenFangKernel {
             "mode": mode,
             "count": results.len(),
             "results": results,
+        }))
+    }
+
+    async fn memory_read_row(
+        &self,
+        caller_agent_id: Option<&str>,
+        reference: &str,
+    ) -> Result<serde_json::Value, String> {
+        let agent_id = resolve_memory_caller(&self.registry, caller_agent_id)?;
+        let row = self
+            .memory
+            .read_own_row_async(agent_id, reference)
+            .await
+            .map_err(|e| format!("Memory read failed: {e}"))??;
+        Ok(serde_json::json!({
+            "id": row.id,
+            "kind": row.kind,
+            "content": row.content,
+            "created_at": row.created_at,
+            "superseded_by": row.superseded_by,
+            "address": fact_row_address(&row),
+            "status": row.status,
         }))
     }
 

@@ -330,6 +330,19 @@ impl MemorySubstrate {
             .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
+    /// Async wrapper for [`SemanticStore::read_own_row`] (ANAI-305).
+    pub async fn read_own_row_async(
+        &self,
+        agent_id: AgentId,
+        reference: &str,
+    ) -> OpenFangResult<Result<crate::semantic::StoredRow, String>> {
+        let store = self.semantic.clone();
+        let reference = reference.to_string();
+        tokio::task::spawn_blocking(move || store.read_own_row(agent_id, &reference))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// Async wrapper for [`SemanticStore::note_neighbours`] (ANAI-270 step 3).
     pub async fn note_neighbours_async(
         &self,

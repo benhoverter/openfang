@@ -76,6 +76,45 @@ pub struct ResolvedNote {
     pub chars: usize,
 }
 
+/// One of an agent's own rows, read whole by id (ANAI-305).
+///
+/// The answer to a truncation marker on a recalled row: the prompt shows a
+/// row cut to its kind's budget, names its id, and this is what the id buys.
+/// It carries the claim-slot address when the row is a fact, because a fact's
+/// text without its address is a claim the reader cannot rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRow {
+    /// The full row id.
+    pub id: String,
+    /// `turn` / `note` / `summary` / `fact` / `store`, or `None` pre-v13.
+    pub kind: Option<String>,
+    /// The whole text, uncut.
+    pub content: String,
+    /// As stored (RFC 3339).
+    pub created_at: String,
+    /// For a superseded note: the id of the note that replaced it.
+    pub superseded_by: Option<String>,
+    /// `agent` / `project` / `user` for a fact; the memory scope otherwise.
+    pub scope: String,
+    /// The fact's `scope_ref`, if it is a fact.
+    pub scope_ref: Option<String>,
+    /// The fact's `claim_key`, if it is a fact.
+    pub claim_key: Option<String>,
+    /// The fact's `status`, if it is a fact.
+    pub status: Option<String>,
+}
+
+/// Normalise an agent-supplied row reference and check it is a safe prefix.
+///
+/// The charset check is what makes the `LIKE` that follows safe: hex digits
+/// and '-' carry no wildcard meaning, so the pattern is a pure prefix.
+fn normalise_row_ref(reference: &str) -> Option<String> {
+    let reference = reference.trim().to_ascii_lowercase();
+    (reference.chars().count() >= NOTE_REF_LEN
+        && reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+    .then_some(reference)
+}
+
 /// Cosine floor for listing an existing note as a neighbour of one just
 /// written without `supersedes` (ANAI-270 step 3).
 ///
@@ -852,15 +891,13 @@ impl SemanticStore {
         agent_id: AgentId,
         reference: &str,
     ) -> OpenFangResult<Result<ResolvedNote, String>> {
-        let reference = reference.trim().to_ascii_lowercase();
-        if reference.chars().count() < NOTE_REF_LEN
-            || !reference.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-        {
+        let Some(reference) = normalise_row_ref(reference) else {
+            let reference = reference.trim().to_ascii_lowercase();
             return Ok(Err(format!(
                 "'{reference}' is not a note id. Pass the id shown in the note's tag, \
                  e.g. [note · 2d · id:1a2b3c4d] → \"1a2b3c4d\" (at least {NOTE_REF_LEN} characters)."
             )));
-        }
+        };
 
         let conn = self
             .conn
@@ -962,6 +999,90 @@ impl SemanticStore {
         } else {
             Ok(Err(refusals.join(" ")))
         }
+    }
+
+    /// Read one of `agent_id`'s own rows whole, by full id or a prefix of at
+    /// least [`NOTE_REF_LEN`] characters (ANAI-305).
+    ///
+    /// Same shape as [`Self::resolve_note_ref`]: the outer `Result` is the
+    /// store, the inner `Err` is a sentence for the model. Own rows only —
+    /// recall never surfaces another agent's rows, so nothing a marker points
+    /// at is ever out of reach, and a guess at a sibling's id gets the same
+    /// answer as a guess at nothing.
+    ///
+    /// Any kind, and rows recall hides are readable on purpose: a superseded
+    /// note and a turn absorbed into its episode summary are still the
+    /// record, and the caller says which they are. A deleted row is refused —
+    /// deletion is the one state that means "not part of memory any more".
+    pub fn read_own_row(
+        &self,
+        agent_id: AgentId,
+        reference: &str,
+    ) -> OpenFangResult<Result<StoredRow, String>> {
+        let Some(reference) = normalise_row_ref(reference) else {
+            let reference = reference.trim();
+            return Ok(Err(format!(
+                "'{reference}' is not a memory id. Pass the id a truncation marker or a \
+                 note's tag shows, e.g. \"1a2b3c4d\" (at least {NOTE_REF_LEN} characters)."
+            )));
+        };
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, content, created_at, deleted, superseded_by, scope,
+                        scope_ref, claim_key, status
+                 FROM memories WHERE agent_id = ?1 AND id LIKE ?2 LIMIT 2",
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+        let rows: Vec<(StoredRow, i64)> = stmt
+            .query_map(
+                rusqlite::params![agent_id.0.to_string(), format!("{reference}%")],
+                |r| {
+                    Ok((
+                        StoredRow {
+                            id: r.get(0)?,
+                            kind: r.get(1)?,
+                            content: r.get(2)?,
+                            created_at: r.get(3)?,
+                            superseded_by: r.get(5)?,
+                            scope: r.get(6)?,
+                            scope_ref: r.get(7)?,
+                            claim_key: r.get(8)?,
+                            status: r.get(9)?,
+                        },
+                        r.get(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+
+        let (row, deleted) = match rows.len() {
+            0 => {
+                return Ok(Err(format!(
+                    "No memory of yours has id '{reference}'. Ids come from a truncation \
+                     marker or a note's tag in your own recalled memories."
+                )))
+            }
+            1 => rows.into_iter().next().expect("one row"),
+            _ => {
+                return Ok(Err(format!(
+                    "'{reference}' matches more than one of your memories. Pass more of the id."
+                )))
+            }
+        };
+        if deleted != 0 {
+            return Ok(Err(format!(
+                "Memory '{}' was deleted; it is no longer part of your memory.",
+                short_note_id(&row.id)
+            )));
+        }
+        Ok(Ok(row))
     }
 
     /// Link `old_id` to its successor `new_id` (ANAI-270): set the old row's
@@ -2385,6 +2506,81 @@ mod tests {
             .unwrap()
             .unwrap_err()
             .contains("at most 8"));
+    }
+
+    // --- ANAI-305: read one of your own rows whole, by id --------------------
+
+    /// Any kind, whole, by short or full id — including a superseded note,
+    /// which recall hides but which is still the record.
+    #[test]
+    fn read_own_row_returns_the_whole_row_of_any_kind() {
+        let store = setup();
+        let agent = AgentId::new();
+        let long = "x".repeat(5000);
+        let turn = write(&store, agent, &long, kind_meta(KIND_TURN.into()))
+            .0
+            .to_string();
+
+        let got = store
+            .read_own_row(agent, &short_note_id(&turn).to_ascii_uppercase())
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.id, turn);
+        assert_eq!(got.content.len(), 5000, "uncut");
+        assert_eq!(got.kind.as_deref(), Some(KIND_TURN));
+        assert_eq!(got.claim_key, None);
+
+        let old = note(&store, agent, "old");
+        let new = note(&store, agent, "new");
+        store.supersede_note(&old, &new).unwrap();
+        let got = store.read_own_row(agent, &old).unwrap().unwrap();
+        assert_eq!(got.superseded_by.as_deref(), Some(new.as_str()));
+    }
+
+    /// A fact row comes back with its slot address.
+    #[test]
+    fn read_own_row_carries_a_facts_address() {
+        let store = setup();
+        let agent = AgentId::new();
+        let fact = write(&store, agent, "main @ abc", kind_meta(KIND_FACT.into()))
+            .0
+            .to_string();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET scope = 'project', scope_ref = 'openfang',
+                        claim_key = 'repo.trunk_head', status = 'settled' WHERE id = ?1",
+                [&fact],
+            )
+            .unwrap();
+        let got = store.read_own_row(agent, &fact).unwrap().unwrap();
+        assert_eq!(got.scope, "project");
+        assert_eq!(got.scope_ref.as_deref(), Some("openfang"));
+        assert_eq!(got.claim_key.as_deref(), Some("repo.trunk_head"));
+        assert_eq!(got.status.as_deref(), Some("settled"));
+    }
+
+    /// Never another agent's row, never a deleted one, never a wildcard.
+    #[test]
+    fn read_own_row_refuses_what_is_not_yours_or_not_live() {
+        let store = setup();
+        let agent = AgentId::new();
+        let theirs = note(&store, AgentId::new(), "a sibling's note");
+        let gone = note(&store, agent, "gone");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE memories SET deleted = 1 WHERE id = ?1", [&gone])
+            .unwrap();
+
+        let refuse = |r: &str| store.read_own_row(agent, r).unwrap().unwrap_err();
+        assert!(refuse("1a2b").contains("not a memory id"), "too short");
+        assert!(refuse("1a2b%%%%").contains("not a memory id"), "wildcards");
+        assert!(refuse(&theirs).contains("No memory of yours"), "sibling's");
+        assert!(refuse(&gone).contains("deleted"));
     }
 
     // --- ANAI-270 step 3: neighbour hint on a plain note write ---------------
