@@ -18,11 +18,14 @@ use std::{collections::HashMap, fs};
 
 use tracing::{debug, warn};
 
-/// Maximum size of `context.md` to inject into the prompt (32 KB).
+/// Ceiling on how much of `context.md` is read into memory (ANAI-304).
 ///
-/// Matches the cap used by [`crate::workspace_context`] and the kernel's
-/// identity-file reader so a runaway file cannot blow up the prompt.
-const MAX_CONTEXT_BYTES: u64 = 32_768;
+/// A guard against a runaway file, not a prompt budget: the prompt builder
+/// caps the Live Context section far lower (8k chars) and marks that cut. This
+/// used to be a 32 KB cut with no marker, which only made the prompt marker's
+/// counts measure against 32 KB instead of the real file. Same ceiling as the
+/// kernel's identity-file reader.
+const MAX_CONTEXT_BYTES: u64 = 1024 * 1024;
 
 /// Filename that agents use for per-turn refreshable context.
 pub const CONTEXT_FILENAME: &str = "context.md";
@@ -115,7 +118,7 @@ fn store_cached(path: &Path, content: &str) {
 
 /// Read the file, returning Ok(None) if it is missing or empty, and
 /// Ok(Some(...)) if it has usable content. Oversized files are truncated to
-/// [`MAX_CONTEXT_BYTES`] so prompt size remains bounded.
+/// [`MAX_CONTEXT_BYTES`] with a marker naming where the rest is (ANAI-304).
 fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
@@ -131,7 +134,20 @@ fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     }
     if meta.len() > MAX_CONTEXT_BYTES {
         let truncated = crate::str_utils::safe_truncate_str(&content, MAX_CONTEXT_BYTES as usize);
-        return Ok(Some(truncated.to_string()));
+        let next_line = truncated.matches('\n').count() + 1;
+        warn!(
+            path = %path.display(),
+            cap_bytes = MAX_CONTEXT_BYTES,
+            actual_bytes = content.len(),
+            "context.md exceeds the read ceiling; cut with a marker"
+        );
+        return Ok(Some(format!(
+            "{truncated}\n[… {CONTEXT_FILENAME} cut at read: {} of {} bytes loaded; the rest \
+             starts at line {next_line}: file_read `{}` with offset={next_line} …]",
+            truncated.len(),
+            content.len(),
+            path.display()
+        )));
     }
     Ok(Some(content))
 }
@@ -154,6 +170,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// ANAI-304: a context.md over the read ceiling is cut with a marker that
+    /// names the file and the line to resume from, never silently.
+    #[test]
+    fn oversized_context_md_is_cut_with_an_actionable_marker() {
+        let ws = fresh_workspace("oversized");
+        let path = ws.join(CONTEXT_FILENAME);
+        let line = format!("{}\n", "x".repeat(1023));
+        let lines = (MAX_CONTEXT_BYTES as usize / line.len()) + 4;
+        fs::write(&path, line.repeat(lines)).unwrap();
+
+        let out = load_context_md(&ws, false).unwrap();
+        let resume = MAX_CONTEXT_BYTES as usize / line.len() + 1;
+        assert!(out.contains("context.md cut at read:"), "marker missing");
+        assert!(out.contains(&format!(
+            "the rest starts at line {resume}: file_read `{}` with offset={resume}",
+            path.display()
+        )));
+        let _ = fs::remove_dir_all(&ws);
     }
 
     #[test]

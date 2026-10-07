@@ -497,11 +497,14 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // external writers (e.g. cron jobs refreshing live data) show up on the
     // very next message. See issue #843.
     if let Some(ref live) = ctx.context_md {
-        let trimmed = live.trim();
-        if !trimmed.is_empty() {
+        if !live.trim().is_empty() {
+            // ANAI-304: trim only the end, so a line number in the cut marker
+            // is a line number in the file.
+            let body = live.trim_end();
+            let path = identity_path(ctx.workspace_path.as_deref(), "context.md");
             sections.push(format!(
                 "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
-                cap_str(trimmed, BUDGET_CONTEXT_MD, "context.md")
+                cap_section(body, BUDGET_CONTEXT_MD, "context.md", Recover::FileLine(&path))
             ));
         }
     }
@@ -1239,7 +1242,8 @@ fn recovery_clause(recover: Recover<'_>, s: &str, cut_at: usize) -> String {
     }
 }
 
-/// Where an identity file lives, for a truncation marker to name.
+/// Where a file behind a prompt section lives, for a truncation marker to name.
+/// Identity files sit in `state_dir`; `context.md` sits in the workspace.
 fn identity_path(state_dir: Option<&str>, file: &str) -> String {
     match state_dir {
         Some(dir) => std::path::Path::new(dir).join(file).display().to_string(),
@@ -2200,6 +2204,25 @@ mod tests {
             build_persona_section(None, None, None, Some(&huge), None, Some("/state/agent"));
         let expected = std::path::Path::new("/state/agent").join("MEMORY.md");
         assert!(section.contains(&format!("file_read `{}` with offset=1", expected.display())));
+    }
+
+    /// Live Context keeps leading lines so its marker's line is the file's line.
+    #[test]
+    fn test_live_context_marker_counts_lines_from_the_file_start() {
+        let ctx = PromptContext {
+            workspace_path: Some("/ws".to_string()),
+            context_md: Some(format!("\n\n{}", "c".repeat(BUDGET_CONTEXT_MD + 5))),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&ctx);
+        let expected = std::path::Path::new("/ws").join("context.md");
+        assert!(
+            prompt.contains(&format!(
+                "the rest starts at line 3: file_read `{}` with offset=3",
+                expected.display()
+            )),
+            "{prompt}"
+        );
     }
 
     #[test]
