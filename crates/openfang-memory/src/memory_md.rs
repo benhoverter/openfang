@@ -78,6 +78,25 @@
 //! siblings' open loops by address and author. Siblings' settled slots are not
 //! listed at all — they are neither this agent's business nor addresses it may
 //! write.
+//!
+//! # Why the address sections have reserved budget (ANAI-303)
+//!
+//! All three sections used to draw on one [`BLOCK_BUDGET_CHARS`] pool and fill
+//! in order, so open loops — the one section with claim bodies, and the one
+//! with no count cap — spent it before either address list got a line.
+//! Measured live on 2026-10-07: `kimiya-alpha` held 13 open loops, and her
+//! block listed 2 of 22 owned addresses and 0 of 32 sibling loops. The agents
+//! that write the most facts were exactly the ones shown the fewest addresses,
+//! which inverts ANAI-279. The footers then blamed the count caps for a cut the
+//! shared budget made.
+//!
+//! The fix allocates by *boundedness*. Address lines are short and capped by
+//! count, so their worst case is known; open loops are long and uncapped. Each
+//! address section is guaranteed [`OWNED_RESERVE_CHARS`] /
+//! [`SIBLING_RESERVE_CHARS`] first, open loops take everything that is left,
+//! and any budget the loops do not use flows back to the address lists. A
+//! reserve an agent does not need costs it nothing: the unused part goes to
+//! the loops, so a solo agent's render is unchanged.
 
 use chrono::{DateTime, Utc};
 
@@ -113,6 +132,17 @@ pub const SIBLING_SLOT_CAP: usize = 12;
 /// address list long enough to skim past stops serving that purpose. Open
 /// loops remain uncapped — they are business, not vocabulary.
 pub const OWNED_SLOT_CAP: usize = 24;
+
+/// Characters guaranteed to the "Slots you already own" list before open loops
+/// are rendered (ANAI-303). Roughly eighteen addresses of the
+/// `project.<slug>.<slot>` shape. Unused reserve flows to the open loops.
+pub const OWNED_RESERVE_CHARS: usize = 1000;
+
+/// Characters guaranteed to the "Open in your projects" list before open loops
+/// are rendered (ANAI-303). Roughly seven sibling lines with an author name.
+/// Smaller than the owned reserve on purpose: an agent's own addresses are the
+/// ones it may write, so they are the ones a duplicate key collides with.
+pub const SIBLING_RESERVE_CHARS: usize = 600;
 
 /// Why a splice was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,12 +273,29 @@ fn cap(s: &str, max: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// How many of `lines[from..]` fit in `budget` chars, taken as a prefix, and
+/// how many chars they spend. Stops at the first line that does not fit, so a
+/// section never skips a long line to show a later short one out of order.
+fn fit(lines: &[String], from: usize, budget: usize) -> (usize, usize) {
+    let mut taken = 0usize;
+    let mut spent = 0usize;
+    for line in &lines[from..] {
+        let len = line.chars().count();
+        if spent + len > budget {
+            break;
+        }
+        spent += len;
+        taken += 1;
+    }
+    (taken, spent)
+}
+
 /// Render the managed block — markers included — from an agent's claim slots.
 ///
 /// `facts` must already be filtered by [`block_claims`] and ordered the way the
-/// caller wants them displayed. Entries are emitted until
-/// [`BLOCK_BUDGET_CHARS`] would be exceeded; any remainder is reported in a
-/// visible footer rather than dropped silently.
+/// caller wants them displayed. The sections share [`BLOCK_BUDGET_CHARS`], with
+/// a reserve held back for each address list (ANAI-303); any remainder is
+/// reported in a visible footer that names the limit that actually cut it.
 ///
 /// `now` is injected rather than read from the clock so the staleness trailers
 /// are testable and so one sweep dates every line by the same instant.
@@ -292,63 +339,69 @@ pub fn render_managed_block(
         }
     }
 
-    let mut body = String::new();
-    let mut used = 0usize;
-    let mut rendered_mine = 0usize;
+    let mine_lines: Vec<String> = mine
+        .iter()
+        .map(|fact| {
+            format!(
+                "- `{}` — {} {}\n",
+                display_key(fact),
+                render_claim(&fact.claim),
+                trailer(fact, now),
+            )
+        })
+        .collect();
 
-    for fact in &mine {
-        let line = format!(
-            "- `{}` — {} {}\n",
-            display_key(fact),
-            render_claim(&fact.claim),
-            trailer(fact, now),
-        );
-        // Reserve room for the footer we may still need to append.
-        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
-            break;
-        }
-        used += line.chars().count();
-        body.push_str(&line);
-        rendered_mine += 1;
-    }
+    // Address and status only. This section is vocabulary, not content: the
+    // claim is one `memory_fact` read away, and pasting settled prose into
+    // every prompt is the spend ADR 0002 §2.5 refuses. The trailing `— …` is
+    // not decoration: `managed_block_keys` only counts entries in that shape,
+    // so an address-only line would be invisible to the sweep's added/removed
+    // diff.
+    let owned_lines: Vec<String> = owned
+        .iter()
+        .take(OWNED_SLOT_CAP)
+        .map(|fact| format!("- `{}` — _{}_\n", display_key(fact), fact.status.as_str()))
+        .collect();
 
-    let mut owned_body = String::new();
-    let mut rendered_owned = 0usize;
+    // Address and author only: the demotion *is* the missing claim body.
+    let sibling_lines: Vec<String> = siblings
+        .iter()
+        .take(SIBLING_SLOT_CAP)
+        .map(|fact| {
+            let who = fact
+                .authored_by
+                .as_deref()
+                .and_then(author_label)
+                .unwrap_or_else(|| "another agent".to_string());
+            format!("- `{}` — _open loop, {}_\n", display_key(fact), who)
+        })
+        .collect();
 
-    for fact in owned.iter().take(OWNED_SLOT_CAP) {
-        // Address and status only. This section is vocabulary, not content:
-        // the claim is one `memory_fact` read away, and pasting settled prose
-        // into every prompt is the spend ADR 0002 §2.5 refuses. The trailing
-        // `— …` is not decoration: `managed_block_keys` only counts entries in
-        // that shape, so an address-only line would be invisible to the
-        // sweep's added/removed diff.
-        let line = format!("- `{}` — _{}_\n", display_key(fact), fact.status.as_str());
-        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
-            break;
-        }
-        used += line.chars().count();
-        owned_body.push_str(&line);
-        rendered_owned += 1;
-    }
+    // ANAI-303: the bounded address lists are guaranteed their reserves first,
+    // the unbounded open loops take what is left, and whatever the loops leave
+    // flows back to the address lists, own addresses before siblings'.
+    let (mut rendered_owned, owned_spent) = fit(&owned_lines, 0, OWNED_RESERVE_CHARS);
+    let (mut rendered_siblings, sibling_spent) = fit(&sibling_lines, 0, SIBLING_RESERVE_CHARS);
+    let mut used = owned_spent + sibling_spent;
+    let (rendered_mine, mine_spent) = fit(&mine_lines, 0, BLOCK_BUDGET_CHARS.saturating_sub(used));
+    used += mine_spent;
+    let (more_owned, more_owned_spent) = fit(
+        &owned_lines,
+        rendered_owned,
+        BLOCK_BUDGET_CHARS.saturating_sub(used),
+    );
+    rendered_owned += more_owned;
+    used += more_owned_spent;
+    let (more_siblings, _) = fit(
+        &sibling_lines,
+        rendered_siblings,
+        BLOCK_BUDGET_CHARS.saturating_sub(used),
+    );
+    rendered_siblings += more_siblings;
 
-    let mut sibling_body = String::new();
-    let mut rendered_siblings = 0usize;
-
-    for fact in siblings.iter().take(SIBLING_SLOT_CAP) {
-        let who = fact
-            .authored_by
-            .as_deref()
-            .and_then(author_label)
-            .unwrap_or_else(|| "another agent".to_string());
-        // Address and author only: the demotion *is* the missing claim body.
-        let line = format!("- `{}` — _open loop, {}_\n", display_key(fact), who);
-        if used + line.chars().count() > BLOCK_BUDGET_CHARS {
-            break;
-        }
-        used += line.chars().count();
-        sibling_body.push_str(&line);
-        rendered_siblings += 1;
-    }
+    let body: String = mine_lines[..rendered_mine].concat();
+    let owned_body: String = owned_lines[..rendered_owned].concat();
+    let sibling_body: String = sibling_lines[..rendered_siblings].concat();
 
     let omitted_mine = mine.len().saturating_sub(rendered_mine);
     let omitted_owned = owned.len().saturating_sub(rendered_owned);
@@ -390,9 +443,11 @@ pub fn render_managed_block(
             );
             out.push_str(&owned_body);
             if omitted_owned > 0 {
-                out.push_str(&format!(
-                    "\n_[… {omitted_owned} more of your slot(s) not listed: this section is \
-                     capped at {OWNED_SLOT_CAP}. Use `memory_recall` for these.]_\n"
+                out.push_str(&address_footer(
+                    omitted_owned,
+                    "of your slot(s)",
+                    owned.len().saturating_sub(OWNED_SLOT_CAP),
+                    OWNED_SLOT_CAP,
                 ));
             }
         }
@@ -404,9 +459,11 @@ pub fn render_managed_block(
             );
             out.push_str(&sibling_body);
             if omitted_siblings > 0 {
-                out.push_str(&format!(
-                    "\n_[… {omitted_siblings} more sibling slot(s) not listed: this section is \
-                     capped at {SIBLING_SLOT_CAP}. Use `memory_recall` for these.]_\n"
+                out.push_str(&address_footer(
+                    omitted_siblings,
+                    "sibling slot(s)",
+                    siblings.len().saturating_sub(SIBLING_SLOT_CAP),
+                    SIBLING_SLOT_CAP,
                 ));
             }
         }
@@ -421,6 +478,23 @@ fn omission_footer(omitted: usize, what: &str) -> String {
         "\n_[… {omitted} more {what} omitted: managed block is at its \
          {BLOCK_BUDGET_CHARS}-char budget. Use `memory_recall` for these.]_\n"
     )
+}
+
+/// The "there was more" line for an address list, naming the limit that
+/// actually cut it (ANAI-303). Two limits can apply — the section's count cap
+/// and the block's char budget — and the old footer blamed the cap for cuts
+/// the budget made, which sends a reader to tune the wrong number.
+fn address_footer(omitted: usize, what: &str, past_cap: usize, cap: usize) -> String {
+    let past_budget = omitted.saturating_sub(past_cap);
+    let why = match (past_cap > 0, past_budget > 0) {
+        (true, true) => format!(
+            "{past_cap} past this section's cap of {cap}, {past_budget} past the \
+             managed block's {BLOCK_BUDGET_CHARS}-char budget"
+        ),
+        (true, false) => format!("this section is capped at {cap}"),
+        _ => format!("the managed block is at its {BLOCK_BUDGET_CHARS}-char budget"),
+    };
+    format!("\n_[… {omitted} more {what} not listed: {why}. Use `memory_recall` for these.]_\n")
 }
 
 /// Replace the managed region of `existing` with `block`, preserving every byte
@@ -925,5 +999,131 @@ mod tests {
         let block = render_named(&[sibling_slot("legal.dpa_status", "x")]);
         assert!(block.contains("## Your open loops"));
         assert!(block.contains("You have not written an open claim slot"));
+    }
+
+    // --- ANAI-303: reserved budget for the address lists -----------------
+
+    /// An open loop at the value cap, the shape a prolific agent's loops take.
+    fn long_loop(i: usize) -> Fact {
+        slot(
+            "project",
+            "kimiya",
+            &format!("project.kimiya.spike_{i:02}"),
+            &"w ".repeat(VALUE_CAP_CHARS),
+        )
+    }
+
+    fn owned_address(i: usize) -> Fact {
+        let mut f = slot(
+            "project",
+            "kimiya",
+            &format!("project.kimiya.settled_slot_{i:02}"),
+            "background",
+        );
+        f.status = FactStatus::Settled;
+        f
+    }
+
+    fn sibling_loop(i: usize) -> Fact {
+        sibling_slot(&format!("project.kimiya.compliance_item_{i:02}"), "body")
+    }
+
+    /// The measured failure, 2026-10-07: kimiya-alpha's 13 open loops spent
+    /// the shared budget, and her block listed 2 of 22 owned addresses and 0
+    /// of 32 sibling loops — the agents writing the most facts were shown the
+    /// fewest addresses.
+    #[test]
+    fn open_loops_cannot_starve_the_address_lists() {
+        let mut facts: Vec<Fact> = (0..13).map(long_loop).collect();
+        facts.extend((0..22).map(owned_address));
+        facts.extend((0..32).map(sibling_loop));
+        let block = render_named(&facts);
+
+        let owned = block.matches("— _settled_").count();
+        let siblings = block
+            .matches("_open loop, kimiya-reviewer-compliance_")
+            .count();
+        assert!(owned >= 15, "owned addresses listed: {owned}");
+        assert!(siblings >= 5, "sibling addresses listed: {siblings}");
+        // Loops still get the bulk of the block, and the cut is reported.
+        assert!(block.matches("_[stable]_").count() >= 6);
+        assert!(block.contains("of your open slot(s) omitted"));
+    }
+
+    /// The footer names the limit that cut the list. The old one said
+    /// "capped at 24" for a section showing 2 of 22.
+    #[test]
+    fn address_footers_name_the_limit_that_actually_cut() {
+        let mut facts: Vec<Fact> = (0..13).map(long_loop).collect();
+        facts.extend((0..22).map(owned_address));
+        facts.extend((0..32).map(sibling_loop));
+        let block = render_named(&facts);
+
+        // 22 owned is under the cap of 24: anything missing is the budget's.
+        assert!(!block.contains(&format!("capped at {OWNED_SLOT_CAP}")));
+        assert!(block.contains(&format!(
+            "of your slot(s) not listed: the managed block is at its \
+             {BLOCK_BUDGET_CHARS}-char budget"
+        )));
+        // 32 siblings is over the cap of 12: both limits cut, and both say so.
+        assert!(block.contains(&format!("20 past this section's cap of {SIBLING_SLOT_CAP}")));
+    }
+
+    /// A reserve an agent does not use costs it nothing: one owned address
+    /// must not shrink the loop section by a thousand characters.
+    #[test]
+    fn unused_reserve_flows_to_the_open_loops() {
+        let loops_only: Vec<Fact> = (0..40).map(long_loop).collect();
+        let solo = render(&loops_only);
+
+        let mut with_one = loops_only.clone();
+        with_one.push(owned_address(0));
+        let block = render(&with_one);
+
+        let solo_loops = solo.matches("_[stable]_").count();
+        let loops = block.matches("_[stable]_").count();
+        // At most one loop line gives way to the one address line.
+        assert!(loops + 1 >= solo_loops, "{loops} vs {solo_loops}");
+        assert!(block.contains("settled_slot_00"));
+    }
+
+    /// And the reverse: budget the loops do not use flows back, so a list
+    /// longer than its reserve is shown whole when there is room for it.
+    #[test]
+    fn budget_the_loops_leave_flows_back_to_the_addresses() {
+        let mut facts = vec![long_loop(0)];
+        facts.extend((0..OWNED_SLOT_CAP).map(owned_address));
+        let owned_chars: usize = facts[1..]
+            .iter()
+            .map(|f| {
+                format!("- `{}` — _settled_\n", display_key(f))
+                    .chars()
+                    .count()
+            })
+            .sum();
+        assert!(
+            owned_chars > OWNED_RESERVE_CHARS,
+            "test must exceed the reserve"
+        );
+
+        let block = render(&facts);
+        assert_eq!(block.matches("— _settled_").count(), OWNED_SLOT_CAP);
+        assert!(!block.contains("not listed"));
+    }
+
+    /// The reserves are a split of the block budget, not an addition to it.
+    #[test]
+    fn the_partitioned_block_stays_inside_its_budget() {
+        let mut facts: Vec<Fact> = (0..60).map(long_loop).collect();
+        facts.extend((0..60).map(owned_address));
+        facts.extend((0..60).map(sibling_loop));
+        let block = render_named(&facts);
+        let listed: usize = block
+            .lines()
+            .filter(|l| l.starts_with("- `"))
+            .map(|l| l.chars().count() + 1)
+            .sum();
+        assert!(listed <= BLOCK_BUDGET_CHARS, "{listed}");
+        const { assert!(OWNED_RESERVE_CHARS + SIBLING_RESERVE_CHARS < BLOCK_BUDGET_CHARS) };
     }
 }
