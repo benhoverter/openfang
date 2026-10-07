@@ -97,6 +97,22 @@
 //! and any budget the loops do not use flows back to the address lists. A
 //! reserve an agent does not need costs it nothing: the unused part goes to
 //! the loops, so a solo agent's render is unchanged.
+//!
+//! # Why the budget is 12 000 and the block can never be truncated away (ANAI-303)
+//!
+//! The block's own budget was not the limit that bit. The prompt builder caps
+//! the whole of MEMORY.md and used to keep the *head* — and the sweep appends
+//! this block at the *tail*. Any agent whose hand-written prose outgrew the
+//! other half of the file lost its block entirely, with no error anywhere:
+//! measured live, this agent's 11.8 KB MEMORY.md put the block past char 8000
+//! and none of its open loops or slot addresses reached its prompt.
+//!
+//! So the prompt builder now keeps this block whole and truncates the prose
+//! around it, and both ceilings were raised together (block 4000 → 12 000,
+//! file 8000 → 24 000). The binding cost is not tokens — 12 000 chars is
+//! roughly 3–4k tokens, under 2% of a 200k window — but attention: text that
+//! rides in every turn of every agent has to stay short enough to be read.
+//! The block keeps the same half-the-file proportion it always had.
 
 use chrono::{DateTime, Utc};
 
@@ -110,9 +126,11 @@ pub const MANAGED_END: &str = "<!-- openfang:managed:end -->";
 
 /// Maximum characters the rendered managed block may occupy.
 ///
-/// `BUDGET_MEMORY` in the prompt builder is 8000 chars (ANAI-167); half is
-/// reserved for the block so hand-written prose always has room to survive.
-pub const BLOCK_BUDGET_CHARS: usize = 4000;
+/// `BUDGET_MEMORY_MD` in the prompt builder is 24 000 chars (ANAI-303); half
+/// is reserved for the block so hand-written prose always has room to
+/// survive. The prompt builder keeps the block whole when the file is over
+/// budget, so this is the block's ceiling in the prompt as well as on disk.
+pub const BLOCK_BUDGET_CHARS: usize = 12_000;
 
 /// Maximum characters rendered for a single claim before elision.
 pub const VALUE_CAP_CHARS: usize = 240;
@@ -552,6 +570,24 @@ fn append_block(existing: &str, block: &str) -> String {
         "\n\n"
     };
     format!("{existing}{sep}{block}\n")
+}
+
+/// Byte range of the managed block in `text`, markers included.
+///
+/// Returns `None` unless the block is well-formed by the same rules
+/// [`splice_managed_block`] enforces: exactly one begin marker, an end marker
+/// after it, and no end marker before it. The prompt builder uses this to keep
+/// the block whole when MEMORY.md is over budget (ANAI-303); on a malformed
+/// file it falls back to plain truncation rather than guessing a region.
+pub fn managed_block_range(text: &str) -> Option<std::ops::Range<usize>> {
+    let mut begins = text.match_indices(MANAGED_BEGIN).map(|(i, _)| i);
+    let begin = begins.next()?;
+    if begins.next().is_some() || text[..begin].contains(MANAGED_END) {
+        return None;
+    }
+    let body = begin + MANAGED_BEGIN.len();
+    let rel_end = text[body..].find(MANAGED_END)?;
+    Some(begin..body + rel_end + MANAGED_END.len())
 }
 
 /// Extract the slot addresses currently listed inside `text`'s managed region.
@@ -1031,10 +1067,11 @@ mod tests {
     /// The measured failure, 2026-10-07: kimiya-alpha's 13 open loops spent
     /// the shared budget, and her block listed 2 of 22 owned addresses and 0
     /// of 32 sibling loops — the agents writing the most facts were shown the
-    /// fewest addresses.
+    /// fewest addresses. At the 12 000 budget her shape no longer reaches the
+    /// ceiling (pinned below), so this drives the same failure with 40 loops.
     #[test]
     fn open_loops_cannot_starve_the_address_lists() {
-        let mut facts: Vec<Fact> = (0..13).map(long_loop).collect();
+        let mut facts: Vec<Fact> = (0..40).map(long_loop).collect();
         facts.extend((0..22).map(owned_address));
         facts.extend((0..32).map(sibling_loop));
         let block = render_named(&facts);
@@ -1050,11 +1087,32 @@ mod tests {
         assert!(block.contains("of your open slot(s) omitted"));
     }
 
+    /// kimiya-alpha's measured shape (13 / 22 / 32) renders whole at the
+    /// raised budget: every loop, every owned address, and siblings cut only
+    /// by their count cap, never by the budget.
+    #[test]
+    fn the_measured_kimiya_alpha_shape_fits_the_raised_budget() {
+        let mut facts: Vec<Fact> = (0..13).map(long_loop).collect();
+        facts.extend((0..22).map(owned_address));
+        facts.extend((0..32).map(sibling_loop));
+        let block = render_named(&facts);
+
+        assert_eq!(block.matches("_[stable]_").count(), 13);
+        assert_eq!(block.matches("— _settled_").count(), 22);
+        assert_eq!(
+            block
+                .matches("_open loop, kimiya-reviewer-compliance_")
+                .count(),
+            SIBLING_SLOT_CAP
+        );
+        assert!(!block.contains("-char budget"), "{block}");
+    }
+
     /// The footer names the limit that cut the list. The old one said
     /// "capped at 24" for a section showing 2 of 22.
     #[test]
     fn address_footers_name_the_limit_that_actually_cut() {
-        let mut facts: Vec<Fact> = (0..13).map(long_loop).collect();
+        let mut facts: Vec<Fact> = (0..40).map(long_loop).collect();
         facts.extend((0..22).map(owned_address));
         facts.extend((0..32).map(sibling_loop));
         let block = render_named(&facts);
@@ -1125,5 +1183,34 @@ mod tests {
             .sum();
         assert!(listed <= BLOCK_BUDGET_CHARS, "{listed}");
         const { assert!(OWNED_RESERVE_CHARS + SIBLING_RESERVE_CHARS < BLOCK_BUDGET_CHARS) };
+    }
+
+    /// The range covers both markers and nothing outside them.
+    #[test]
+    fn managed_block_range_spans_the_markers() {
+        let text = format!("prose\n{MANAGED_BEGIN}\nbody\n{MANAGED_END}\ntail\n");
+        let r = managed_block_range(&text).unwrap();
+        assert!(text[r.clone()].starts_with(MANAGED_BEGIN));
+        assert!(text[r.clone()].ends_with(MANAGED_END));
+        assert_eq!(&text[..r.start], "prose\n");
+        assert_eq!(&text[r.end..], "\ntail\n");
+    }
+
+    /// Malformed files get no range, so the caller falls back to plain
+    /// truncation rather than keeping a region it had to guess at.
+    #[test]
+    fn managed_block_range_refuses_malformed_markers() {
+        assert_eq!(managed_block_range("no block here"), None);
+        assert_eq!(managed_block_range(&format!("{MANAGED_BEGIN}\nhalf")), None);
+        assert_eq!(
+            managed_block_range(&format!("{MANAGED_END}\n{MANAGED_BEGIN}\nx\n{MANAGED_END}")),
+            None
+        );
+        assert_eq!(
+            managed_block_range(&format!(
+                "{MANAGED_BEGIN}\na\n{MANAGED_END}\n{MANAGED_BEGIN}\nb\n{MANAGED_END}"
+            )),
+            None
+        );
     }
 }

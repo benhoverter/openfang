@@ -219,7 +219,11 @@ const BUDGET_USER_MD: usize = 500;
 /// Raised from 500 (ANAI-167): the scaffold OpenFang writes at agent creation
 /// is already ~4 KB, so the old budget discarded ~87% of the file before the
 /// model ever saw it. 8 KB fits the scaffold plus room for curated growth.
-const BUDGET_MEMORY_MD: usize = 8000;
+///
+/// Raised to 24 000 (ANAI-303), together with the managed block's own budget
+/// (12 000), and enforced by [`cap_memory_md`] so the block is kept whole and
+/// the hand-written prose around it absorbs the cut.
+const BUDGET_MEMORY_MD: usize = 24_000;
 
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
@@ -827,7 +831,7 @@ fn build_persona_section(
         if !memory.trim().is_empty() {
             parts.push(format!(
                 "## Long-Term Memory\n{}",
-                cap_str(memory, BUDGET_MEMORY_MD, "MEMORY.md")
+                cap_memory_md(memory, BUDGET_MEMORY_MD)
             ));
         }
     }
@@ -1187,6 +1191,67 @@ fn cap_str(s: &str, max_chars: usize, label: &str) -> String {
         "{}\n[… {label} truncated: {max_chars} of {total} chars shown, {dropped} omitted …]",
         safe_truncate_str(s, end)
     )
+}
+
+/// Cap MEMORY.md to `max_chars`, keeping the managed block whole (ANAI-303).
+///
+/// [`cap_str`] keeps the head of a section, and the sweep appends the managed
+/// block at the tail of MEMORY.md — so an agent whose prose outgrew the budget
+/// silently lost its open loops and slot addresses, the one part of the file
+/// the system generates on its behalf. Here the block is carved out first and
+/// the prose absorbs the cut: prose before the block is kept from its start,
+/// prose after it gets whatever remains.
+///
+/// Falls back to [`cap_str`] when there is no well-formed block, or when the
+/// block alone exceeds the budget (the block has its own, smaller ceiling, so
+/// that means a hand-edited block, not a rendered one).
+fn cap_memory_md(s: &str, max_chars: usize) -> String {
+    const LABEL: &str = "MEMORY.md";
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let Some(range) = openfang_memory::memory_md::managed_block_range(s) else {
+        return cap_str(s, max_chars, LABEL);
+    };
+    let (before, block, after) = (&s[..range.start], &s[range.clone()], &s[range.end..]);
+    let block_chars = block.chars().count();
+    if block_chars >= max_chars {
+        return cap_str(s, max_chars, LABEL);
+    }
+
+    let mut room = max_chars - block_chars;
+    let before_kept = take_chars(before, room);
+    room -= before_kept.chars().count();
+    let after_kept = take_chars(after, room);
+    let shown = max_chars;
+    let dropped = total - shown;
+    tracing::warn!(
+        section = LABEL,
+        budget_chars = max_chars,
+        actual_chars = total,
+        dropped_chars = dropped,
+        managed_block_chars = block_chars,
+        "prompt section truncated to fit its budget; managed block kept whole"
+    );
+    let marker = format!(
+        "\n[… {LABEL} truncated: {shown} of {total} chars shown, {dropped} omitted; \
+         the managed block is kept whole and the prose around it was cut …]\n"
+    );
+    if before_kept.len() < before.len() {
+        // The cut fell in the prose before the block, so nothing after it fits.
+        format!("{before_kept}{marker}\n{block}")
+    } else {
+        format!("{before}{block}{after_kept}{marker}")
+    }
+}
+
+/// The first `max_chars` characters of `s`, on a char boundary.
+fn take_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 /// Capitalize the first letter of a string.
@@ -1913,7 +1978,70 @@ mod tests {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
         let section = build_persona_section(None, None, None, Some(&huge), None);
         assert!(section.contains("MEMORY.md truncated"));
-        assert!(section.contains("8000 of 8001 chars shown, 1 omitted"));
+        assert!(section.contains("24000 of 24001 chars shown, 1 omitted"));
+    }
+
+    fn managed(body: &str) -> String {
+        use openfang_memory::memory_md::{MANAGED_BEGIN, MANAGED_END};
+        format!("{MANAGED_BEGIN}\n{body}\n{MANAGED_END}")
+    }
+
+    /// ANAI-303: the sweep appends the block at the tail, so head-keeping
+    /// truncation dropped it first. Prose past the budget must lose the cut.
+    #[test]
+    fn test_memory_md_over_budget_keeps_the_managed_block_whole() {
+        let block = managed("- `repo.trunk_head` — _settled_");
+        let file = format!("{}\n{block}\n", "p".repeat(BUDGET_MEMORY_MD));
+        let out = cap_memory_md(&file, BUDGET_MEMORY_MD);
+        assert!(out.contains(&block), "block must survive whole");
+        assert!(out.contains("managed block is kept whole"));
+        assert!(out.starts_with("ppp"), "prose keeps its head");
+        let total = file.chars().count();
+        assert!(out.contains(&format!("{BUDGET_MEMORY_MD} of {total} chars shown")));
+        let marker_at = out.find("\n[… MEMORY.md truncated").unwrap();
+        assert_eq!(
+            out[..marker_at].chars().count() + block.chars().count(),
+            BUDGET_MEMORY_MD
+        );
+    }
+
+    /// Prose after the block gets only what the block and the prose before it
+    /// leave over.
+    #[test]
+    fn test_memory_md_cut_falls_in_trailing_prose_when_head_fits() {
+        let block = managed("x");
+        let head = "h".repeat(100);
+        let file = format!("{head}{block}{}", "t".repeat(BUDGET_MEMORY_MD));
+        let out = cap_memory_md(&file, BUDGET_MEMORY_MD);
+        assert!(out.starts_with(&format!("{head}{block}t")));
+        let marker_at = out.find("\n[… MEMORY.md truncated").unwrap();
+        assert_eq!(out[..marker_at].chars().count(), BUDGET_MEMORY_MD);
+    }
+
+    /// No block, or a malformed one: plain head-keeping truncation, unchanged.
+    #[test]
+    fn test_memory_md_without_a_block_truncates_as_before() {
+        let huge = "m".repeat(BUDGET_MEMORY_MD + 10);
+        assert_eq!(
+            cap_memory_md(&huge, BUDGET_MEMORY_MD),
+            cap_str(&huge, BUDGET_MEMORY_MD, "MEMORY.md")
+        );
+        let half = format!(
+            "{}{}",
+            "m".repeat(BUDGET_MEMORY_MD),
+            openfang_memory::memory_md::MANAGED_BEGIN
+        );
+        assert_eq!(
+            cap_memory_md(&half, BUDGET_MEMORY_MD),
+            cap_str(&half, BUDGET_MEMORY_MD, "MEMORY.md")
+        );
+    }
+
+    /// Under budget the file passes through byte-identical, block and all.
+    #[test]
+    fn test_memory_md_under_budget_is_untouched() {
+        let file = format!("prose\n{}\nmore\n", managed("x"));
+        assert_eq!(cap_memory_md(&file, BUDGET_MEMORY_MD), file);
     }
 
     #[test]
