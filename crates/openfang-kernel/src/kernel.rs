@@ -706,12 +706,22 @@ fn append_daily_memory_log(state_dir: &Path, response: &str) {
     }
 }
 
-/// Read an identity file from the agent's private state directory with a size
-/// cap to prevent prompt stuffing. Returns None if the file doesn't exist or
-/// is empty. Identity files live in `state_dir`, not in the user-facing
-/// workspace (see issue #1097), so this is called with the state directory.
+/// Ceiling on how much of one identity file is read into memory (ANAI-304).
+///
+/// A guard against a pathological file, not a prompt budget: the per-section
+/// budgets live in `prompt_builder` and are all far smaller (MEMORY.md, the
+/// largest, is 24k chars). This used to be a 32 KB cap that cut silently,
+/// before the prompt builder ever saw the file. That meant a large MEMORY.md
+/// lost its tail-end managed block with no marker, and the prompt marker's
+/// counts were measured against 32 KB instead of the real file. Cutting
+/// belongs in one place, and this is not it.
+const MAX_IDENTITY_FILE_BYTES: usize = 1024 * 1024;
+
+/// Read an identity file from the agent's private state directory. Returns
+/// None if the file doesn't exist or is empty. Identity files live in
+/// `state_dir`, not in the user-facing workspace (see issue #1097), so this is
+/// called with the state directory.
 fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
-    const MAX_IDENTITY_FILE_BYTES: usize = 32_768; // 32KB cap
     let path = state_dir.join(filename);
     // Security: ensure path stays inside the state directory
     match path.canonicalize() {
@@ -735,11 +745,36 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
         &openfang_runtime::context_scan::source_label(state_dir, filename),
         &content,
     );
-    if content.len() > MAX_IDENTITY_FILE_BYTES {
-        Some(openfang_types::truncate_str(&content, MAX_IDENTITY_FILE_BYTES).to_string())
-    } else {
-        Some(content)
+    Some(cap_identity_file(
+        content,
+        &path,
+        filename,
+        MAX_IDENTITY_FILE_BYTES,
+    ))
+}
+
+/// Cut `content` to `cap` bytes if it exceeds it, never silently (ANAI-304):
+/// the cut logs a warning and leaves a marker naming the file and the line its
+/// omitted text starts on, so the agent reading it knows where to look.
+fn cap_identity_file(content: String, path: &Path, filename: &str, cap: usize) -> String {
+    if content.len() <= cap {
+        return content;
     }
+    let kept = openfang_types::truncate_str(&content, cap);
+    let next_line = kept.matches('\n').count() + 1;
+    tracing::warn!(
+        file = %path.display(),
+        cap_bytes = cap,
+        actual_bytes = content.len(),
+        "identity file exceeds the read ceiling; cut with a marker"
+    );
+    format!(
+        "{kept}\n[… {filename} cut at read: {} of {} bytes loaded; the rest starts at line \
+         {next_line}: file_read `{}` with offset={next_line} …]",
+        kept.len(),
+        content.len(),
+        path.display()
+    )
 }
 
 /// Outcome of one MEMORY.md managed-block sweep (ANAI-168).
@@ -2999,6 +3034,7 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
+                state_dir: manifest.state_dir.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
                     .state_dir
                     .as_ref()
@@ -3719,6 +3755,7 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
+                state_dir: manifest.state_dir.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
                     .state_dir
                     .as_ref()
@@ -13496,6 +13533,40 @@ mod tests {
     use super::*;
     use openfang_types::config::ExecPolicy;
     use std::collections::HashMap;
+
+    /// ANAI-304: an identity file over the read ceiling is cut with a marker
+    /// naming the file and the line its omitted text starts on, never silently.
+    #[test]
+    fn identity_file_cut_at_read_carries_an_actionable_marker() {
+        let content = "line one\nline two\nline three\n".to_string();
+        let path = Path::new("/state/agent/MEMORY.md");
+        // 12 bytes keeps "line one\nlin", so the omitted text starts on line 2.
+        let out = cap_identity_file(content, path, "MEMORY.md", 12);
+        assert!(out.starts_with("line one\nlin\n[… MEMORY.md cut at read:"));
+        assert!(out.contains("12 of 29 bytes loaded"));
+        assert!(out.contains(
+            "the rest starts at line 2: file_read `/state/agent/MEMORY.md` with offset=2"
+        ));
+    }
+
+    /// Under the ceiling the file passes through byte-identical.
+    #[test]
+    fn identity_file_under_the_ceiling_is_untouched() {
+        let content = "small\n".to_string();
+        let out = cap_identity_file(content.clone(), Path::new("x"), "SOUL.md", 12);
+        assert_eq!(out, content);
+    }
+
+    /// The read ceiling must stay above every prompt budget, or the cut moves
+    /// back in front of the prompt builder, where it lost MEMORY.md's managed
+    /// block before ANAI-304.
+    #[test]
+    fn identity_read_ceiling_sits_far_above_the_prompt_budgets() {
+        let file = format!("{}\n", "p".repeat(40_000));
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMORY.md"), &file).unwrap();
+        assert_eq!(read_identity_file(dir.path(), "MEMORY.md"), Some(file));
+    }
 
     // -----------------------------------------------------------------------
     // ANAI-268: the open claim slots `memory_status` reports

@@ -246,6 +246,11 @@ pub struct PromptContext {
     pub mcp_summary: String,
     /// Agent workspace path.
     pub workspace_path: Option<String>,
+    /// ANAI-304: the agent's private state directory, where the identity files
+    /// (AGENTS.md, MEMORY.md, …) live. Used only so a truncation marker can
+    /// name the file the omitted text is in. `None` falls back to the bare
+    /// filename, which resolves when state_dir and workspace coincide.
+    pub state_dir: Option<String>,
     /// SOUL.md content (persona).
     pub soul_md: Option<String>,
     /// USER.md content.
@@ -335,7 +340,13 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent {
         if let Some(ref agents) = ctx.agents_md {
             if !agents.trim().is_empty() {
-                sections.push(cap_str(agents, BUDGET_AGENTS_MD, "AGENTS.md"));
+                let path = identity_path(ctx.state_dir.as_deref(), "AGENTS.md");
+                sections.push(cap_section(
+                    agents,
+                    BUDGET_AGENTS_MD,
+                    "AGENTS.md",
+                    Recover::FileLine(&path),
+                ));
             }
         }
     }
@@ -371,6 +382,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             ctx.user_md.as_deref(),
             ctx.memory_md.as_deref(),
             ctx.workspace_path.as_deref(),
+            ctx.state_dir.as_deref(),
         );
         if !persona.is_empty() {
             sections.push(persona);
@@ -381,9 +393,15 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     if !ctx.is_subagent && ctx.is_autonomous {
         if let Some(ref heartbeat) = ctx.heartbeat_md {
             if !heartbeat.trim().is_empty() {
+                let path = identity_path(ctx.state_dir.as_deref(), "HEARTBEAT.md");
                 sections.push(format!(
                     "## Heartbeat Checklist\n{}",
-                    cap_str(heartbeat, BUDGET_HEARTBEAT_MD, "HEARTBEAT.md")
+                    cap_section(
+                        heartbeat,
+                        BUDGET_HEARTBEAT_MD,
+                        "HEARTBEAT.md",
+                        Recover::FileLine(&path)
+                    )
                 ));
             }
         }
@@ -447,9 +465,15 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 // Only inject if no user_name memory exists (first-run heuristic)
                 let has_user_name = ctx.recalled_memories.iter().any(|m| m.key == "user_name");
                 if !has_user_name && ctx.user_name.is_none() {
+                    let path = identity_path(ctx.state_dir.as_deref(), "BOOTSTRAP.md");
                     sections.push(format!(
                         "## First-Run Protocol\n{}",
-                        cap_str(bootstrap, BUDGET_BOOTSTRAP_MD, "BOOTSTRAP.md")
+                        cap_section(
+                            bootstrap,
+                            BUDGET_BOOTSTRAP_MD,
+                            "BOOTSTRAP.md",
+                            Recover::FileLine(&path)
+                        )
                     ));
                 }
             }
@@ -791,6 +815,7 @@ fn build_persona_section(
     user_md: Option<&str>,
     memory_md: Option<&str>,
     workspace_path: Option<&str>,
+    state_dir: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -801,9 +826,15 @@ fn build_persona_section(
     // Identity file (IDENTITY.md) — personality at a glance, before SOUL.md
     if let Some(identity) = identity_md {
         if !identity.trim().is_empty() {
+            let path = identity_path(state_dir, "IDENTITY.md");
             parts.push(format!(
                 "## Identity\n{}",
-                cap_str(identity, BUDGET_IDENTITY_MD, "IDENTITY.md")
+                cap_section(
+                    identity,
+                    BUDGET_IDENTITY_MD,
+                    "IDENTITY.md",
+                    Recover::FileLine(&path)
+                )
             ));
         }
     }
@@ -811,27 +842,32 @@ fn build_persona_section(
     if let Some(soul) = soul_md {
         if !soul.trim().is_empty() {
             let sanitized = strip_code_blocks(soul);
+            // Code blocks are stripped before the cap, so a line number in the
+            // capped text would not be a line number in the file.
+            let path = identity_path(state_dir, "SOUL.md");
             parts.push(format!(
                 "## Persona\nEmbody this identity in your tone and communication style. Be natural, not stiff or generic.\n{}",
-                cap_str(&sanitized, BUDGET_SOUL_MD, "SOUL.md")
+                cap_section(&sanitized, BUDGET_SOUL_MD, "SOUL.md", Recover::File(&path))
             ));
         }
     }
 
     if let Some(user) = user_md {
         if !user.trim().is_empty() {
+            let path = identity_path(state_dir, "USER.md");
             parts.push(format!(
                 "## User Context\n{}",
-                cap_str(user, BUDGET_USER_MD, "USER.md")
+                cap_section(user, BUDGET_USER_MD, "USER.md", Recover::FileLine(&path))
             ));
         }
     }
 
     if let Some(memory) = memory_md {
         if !memory.trim().is_empty() {
+            let path = identity_path(state_dir, "MEMORY.md");
             parts.push(format!(
                 "## Long-Term Memory\n{}",
-                cap_memory_md(memory, BUDGET_MEMORY_MD)
+                cap_memory_md(memory, BUDGET_MEMORY_MD, Recover::FileLine(&path))
             ));
         }
     }
@@ -1170,6 +1206,49 @@ fn strip_code_blocks(content: &str) -> String {
 /// ANAI-167 this truncated silently, which is how MEMORY.md spent months losing
 /// ~87% of its content with nothing in the logs to show for it.
 fn cap_str(s: &str, max_chars: usize, label: &str) -> String {
+    cap_section(s, max_chars, label, Recover::Nothing)
+}
+
+/// How the text a cap omitted can be read back (ANAI-304).
+///
+/// A marker that only says "X of Y chars shown" tells the agent something is
+/// missing but not where it is, so the agent has nothing to act on. A file-backed
+/// section names the file, and where possible the line the cut fell on.
+#[derive(Debug, Clone, Copy)]
+enum Recover<'a> {
+    /// Nothing addressable to point at.
+    Nothing,
+    /// The section is this file's own text, byte for byte, so the cut maps to
+    /// a line `file_read` can start from.
+    FileLine(&'a str),
+    /// The section was derived from this file (code blocks stripped, say), so
+    /// a line number would point at the wrong place: name the file only.
+    File(&'a str),
+}
+
+/// The clause a truncation marker carries saying how to read what was cut.
+/// `cut_at` is the byte offset in `s` of the first omitted character.
+fn recovery_clause(recover: Recover<'_>, s: &str, cut_at: usize) -> String {
+    match recover {
+        Recover::Nothing => String::new(),
+        Recover::FileLine(path) => {
+            let line = s[..cut_at].matches('\n').count() + 1;
+            format!("; the rest starts at line {line}: file_read `{path}` with offset={line}")
+        }
+        Recover::File(path) => format!("; file_read `{path}` for the full text"),
+    }
+}
+
+/// Where an identity file lives, for a truncation marker to name.
+fn identity_path(state_dir: Option<&str>, file: &str) -> String {
+    match state_dir {
+        Some(dir) => std::path::Path::new(dir).join(file).display().to_string(),
+        None => file.to_string(),
+    }
+}
+
+/// [`cap_str`] with a recovery hint in the marker.
+fn cap_section(s: &str, max_chars: usize, label: &str, recover: Recover<'_>) -> String {
     let total = s.chars().count();
     if total <= max_chars {
         return s.to_string();
@@ -1187,8 +1266,9 @@ fn cap_str(s: &str, max_chars: usize, label: &str) -> String {
         dropped_chars = dropped,
         "prompt section truncated to fit its budget"
     );
+    let clause = recovery_clause(recover, s, end);
     format!(
-        "{}\n[… {label} truncated: {max_chars} of {total} chars shown, {dropped} omitted …]",
+        "{}\n[… {label} truncated: {max_chars} of {total} chars shown, {dropped} omitted{clause} …]",
         safe_truncate_str(s, end)
     )
 }
@@ -1205,19 +1285,19 @@ fn cap_str(s: &str, max_chars: usize, label: &str) -> String {
 /// Falls back to [`cap_str`] when there is no well-formed block, or when the
 /// block alone exceeds the budget (the block has its own, smaller ceiling, so
 /// that means a hand-edited block, not a rendered one).
-fn cap_memory_md(s: &str, max_chars: usize) -> String {
+fn cap_memory_md(s: &str, max_chars: usize, recover: Recover<'_>) -> String {
     const LABEL: &str = "MEMORY.md";
     let total = s.chars().count();
     if total <= max_chars {
         return s.to_string();
     }
     let Some(range) = openfang_memory::memory_md::managed_block_range(s) else {
-        return cap_str(s, max_chars, LABEL);
+        return cap_section(s, max_chars, LABEL, recover);
     };
     let (before, block, after) = (&s[..range.start], &s[range.clone()], &s[range.end..]);
     let block_chars = block.chars().count();
     if block_chars >= max_chars {
-        return cap_str(s, max_chars, LABEL);
+        return cap_section(s, max_chars, LABEL, recover);
     }
 
     let mut room = max_chars - block_chars;
@@ -1234,11 +1314,18 @@ fn cap_memory_md(s: &str, max_chars: usize) -> String {
         managed_block_chars = block_chars,
         "prompt section truncated to fit its budget; managed block kept whole"
     );
+    let cut_before = before_kept.len() < before.len();
+    let cut_at = if cut_before {
+        before_kept.len()
+    } else {
+        range.end + after_kept.len()
+    };
+    let clause = recovery_clause(recover, s, cut_at);
     let marker = format!(
         "\n[… {LABEL} truncated: {shown} of {total} chars shown, {dropped} omitted; \
-         the managed block is kept whole and the prose around it was cut …]\n"
+         the managed block is kept whole and the prose around it was cut{clause} …]\n"
     );
-    if before_kept.len() < before.len() {
+    if cut_before {
         // The cut fell in the prose before the block, so nothing after it fits.
         format!("{before_kept}{marker}\n{block}")
     } else {
@@ -1955,7 +2042,7 @@ mod tests {
     #[test]
     fn test_persona_soul_capped_at_1000() {
         let long_soul = "x".repeat(2000);
-        let section = build_persona_section(None, Some(&long_soul), None, None, None);
+        let section = build_persona_section(None, Some(&long_soul), None, None, None, None);
         assert!(section.contains("SOUL.md truncated"));
         assert!(section.contains("1000 of 2000 chars shown, 1000 omitted"));
         assert!(section.len() < 1400);
@@ -1966,7 +2053,7 @@ mod tests {
     #[test]
     fn test_memory_md_scaffold_not_truncated() {
         let scaffold = "m".repeat(4096);
-        let section = build_persona_section(None, None, None, Some(&scaffold), None);
+        let section = build_persona_section(None, None, None, Some(&scaffold), None, None);
         assert!(section.contains("## Long-Term Memory"));
         assert!(section.contains(&scaffold));
         assert!(!section.contains("MEMORY.md truncated"));
@@ -1976,7 +2063,7 @@ mod tests {
     #[test]
     fn test_memory_md_truncates_past_budget_with_marker() {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
-        let section = build_persona_section(None, None, None, Some(&huge), None);
+        let section = build_persona_section(None, None, None, Some(&huge), None, None);
         assert!(section.contains("MEMORY.md truncated"));
         assert!(section.contains("24000 of 24001 chars shown, 1 omitted"));
     }
@@ -1992,7 +2079,7 @@ mod tests {
     fn test_memory_md_over_budget_keeps_the_managed_block_whole() {
         let block = managed("- `repo.trunk_head` — _settled_");
         let file = format!("{}\n{block}\n", "p".repeat(BUDGET_MEMORY_MD));
-        let out = cap_memory_md(&file, BUDGET_MEMORY_MD);
+        let out = cap_memory_md(&file, BUDGET_MEMORY_MD, Recover::Nothing);
         assert!(out.contains(&block), "block must survive whole");
         assert!(out.contains("managed block is kept whole"));
         assert!(out.starts_with("ppp"), "prose keeps its head");
@@ -2012,7 +2099,7 @@ mod tests {
         let block = managed("x");
         let head = "h".repeat(100);
         let file = format!("{head}{block}{}", "t".repeat(BUDGET_MEMORY_MD));
-        let out = cap_memory_md(&file, BUDGET_MEMORY_MD);
+        let out = cap_memory_md(&file, BUDGET_MEMORY_MD, Recover::Nothing);
         assert!(out.starts_with(&format!("{head}{block}t")));
         let marker_at = out.find("\n[… MEMORY.md truncated").unwrap();
         assert_eq!(out[..marker_at].chars().count(), BUDGET_MEMORY_MD);
@@ -2023,7 +2110,7 @@ mod tests {
     fn test_memory_md_without_a_block_truncates_as_before() {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 10);
         assert_eq!(
-            cap_memory_md(&huge, BUDGET_MEMORY_MD),
+            cap_memory_md(&huge, BUDGET_MEMORY_MD, Recover::Nothing),
             cap_str(&huge, BUDGET_MEMORY_MD, "MEMORY.md")
         );
         let half = format!(
@@ -2032,7 +2119,7 @@ mod tests {
             openfang_memory::memory_md::MANAGED_BEGIN
         );
         assert_eq!(
-            cap_memory_md(&half, BUDGET_MEMORY_MD),
+            cap_memory_md(&half, BUDGET_MEMORY_MD, Recover::Nothing),
             cap_str(&half, BUDGET_MEMORY_MD, "MEMORY.md")
         );
     }
@@ -2041,7 +2128,78 @@ mod tests {
     #[test]
     fn test_memory_md_under_budget_is_untouched() {
         let file = format!("prose\n{}\nmore\n", managed("x"));
-        assert_eq!(cap_memory_md(&file, BUDGET_MEMORY_MD), file);
+        assert_eq!(
+            cap_memory_md(&file, BUDGET_MEMORY_MD, Recover::Nothing),
+            file
+        );
+    }
+
+    /// ANAI-304: a cut file names itself and the line its omitted text starts
+    /// on, so the marker is something the agent can act on.
+    #[test]
+    fn test_file_marker_names_the_path_and_the_line_the_cut_fell_on() {
+        // Three 10-char lines; a 25-char budget cuts inside line 3.
+        let file = "aaaaaaaaa\nbbbbbbbbb\nccccccccc\n";
+        let out = cap_section(file, 25, "AGENTS.md", Recover::FileLine("/ws/AGENTS.md"));
+        assert!(out.contains("25 of 30 chars shown, 5 omitted"));
+        assert!(out.contains("the rest starts at line 3: file_read `/ws/AGENTS.md` with offset=3"));
+    }
+
+    /// A cut that lands exactly on a line break points at the next line.
+    #[test]
+    fn test_file_marker_on_a_line_boundary_points_at_the_next_line() {
+        let file = "aaaaaaaaa\nbbbbbbbbb\nccccccccc\n";
+        let out = cap_section(file, 20, "USER.md", Recover::FileLine("USER.md"));
+        assert!(out.contains("starts at line 3:"), "{out}");
+    }
+
+    /// A derived section names the file but never a line, which would lie.
+    #[test]
+    fn test_derived_section_marker_names_the_file_without_a_line() {
+        let out = cap_section(&"x".repeat(50), 10, "SOUL.md", Recover::File("/ws/SOUL.md"));
+        assert!(out.contains("file_read `/ws/SOUL.md` for the full text"));
+        assert!(!out.contains("offset="));
+    }
+
+    /// Sections with nothing to point at keep the old marker exactly.
+    #[test]
+    fn test_unaddressable_section_marker_is_unchanged() {
+        let out = cap_str(&"x".repeat(50), 10, "canonical context");
+        assert!(
+            out.ends_with("[… canonical context truncated: 10 of 50 chars shown, 40 omitted …]")
+        );
+    }
+
+    /// MEMORY.md with the block kept whole: the line points into the prose the
+    /// cut actually removed, measured in the original file, not the output.
+    #[test]
+    fn test_memory_md_marker_points_at_the_first_omitted_prose_line() {
+        let block = managed("- `repo.trunk_head` — _settled_");
+        // Head prose on lines 1-2, then the block, then a long trailing line.
+        let head = "line one\nline two\n";
+        let file = format!("{head}{block}\n{}", "t".repeat(BUDGET_MEMORY_MD));
+        let block_lines = block.matches('\n').count();
+        let out = cap_memory_md(&file, BUDGET_MEMORY_MD, Recover::FileLine("/ws/MEMORY.md"));
+        // Lines 1-2 are head prose, the block spans 3..=3+block_lines, and the
+        // trailing prose is the next line — the one the cut falls in.
+        let trailing_line = 3 + block_lines + 1;
+        assert!(
+            out.contains(&format!(
+                "the rest starts at line {trailing_line}: file_read `/ws/MEMORY.md` with offset={trailing_line}"
+            )),
+            "{out}"
+        );
+        assert!(out.contains(&block));
+    }
+
+    /// The persona builder wires the state directory into the marker.
+    #[test]
+    fn test_persona_markers_name_the_state_dir_path() {
+        let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
+        let section =
+            build_persona_section(None, None, None, Some(&huge), None, Some("/state/agent"));
+        let expected = std::path::Path::new("/state/agent").join("MEMORY.md");
+        assert!(section.contains(&format!("file_read `{}` with offset=1", expected.display())));
     }
 
     #[test]
