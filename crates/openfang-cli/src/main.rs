@@ -8,6 +8,7 @@ mod dotenv;
 mod launcher;
 mod mcp;
 pub mod progress;
+mod service;
 pub mod table;
 mod templates;
 mod tui;
@@ -123,6 +124,9 @@ enum Commands {
     /// Manage agents (new, list, chat, kill, spawn) [*].
     #[command(subcommand)]
     Agent(AgentCommands),
+    /// Run the daemon as a macOS launchd service (install, start, stop, restart, status) [*].
+    #[command(subcommand)]
+    Service(service::ServiceCommands),
     /// Manage workflows (list, create, run) [*].
     #[command(subcommand)]
     Workflow(WorkflowCommands),
@@ -1043,6 +1047,7 @@ fn main() {
         Some(Commands::Init { quick }) => cmd_init(quick),
         Some(Commands::Start { yolo }) => cmd_start(cli.config, yolo),
         Some(Commands::Stop) => cmd_stop(),
+        Some(Commands::Service(sub)) => service::run(sub),
         Some(Commands::Agent(sub)) => match sub {
             AgentCommands::New { template } => cmd_agent_new(cli.config, template),
             AgentCommands::Spawn { manifest } => cmd_agent_spawn(cli.config, manifest),
