@@ -52,14 +52,17 @@ const BRIDGE_ENABLED_ENV: &str = "OPENFANG_BRIDGE_ENABLED";
 /// `ExplicitOn` and `DefaultOn` both wire the bridge when they can. They
 /// differ only when wiring fails (no usable bridge binary, socket dir
 /// unwritable, ...):
-/// - `ExplicitOn` keeps CC's native-tool deny in place, so the agent ends
-///   up with no tools at all. That is deliberate: an operator who opted in
-///   is relying on OpenFang being the RBAC layer, and a broken deploy must
-///   never quietly hand agents native Bash (which bypasses the shell
-///   allowlist and the gatekeeper). Fail closed.
+/// - `ExplicitOn` requires CC's native-tool deny. If the deny set is
+///   written, the agent ends up with no tools at all; if it can't be
+///   written (no socket published, socket dir unwritable), the spawn is
+///   REFUSED (see [`spawn_must_refuse`]). Either way an operator who opted
+///   in never has a broken deploy quietly hand agents native Bash (which
+///   bypasses the shell allowlist and the gatekeeper). Fail closed.
 /// - `DefaultOn` falls back to CC's native tools, exactly as the old
 ///   default-off did, so a fresh install without the bridge binary still
-///   produces a working agent. Fail to the pre-bridge behaviour.
+///   produces a working agent. Fail to the pre-bridge behaviour. Once the
+///   bridge HAS wired, the deny is mandatory here too (bridge tools plus
+///   native tools is never a valid surface).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgeGate {
     Off,
@@ -106,13 +109,55 @@ fn bridge_gate() -> BridgeGate {
 ///
 /// - `Off` → never (no bridge, native tools are the only surface).
 /// - `ExplicitOn` → always, even if the bridge failed to wire (fail closed).
-/// - `DefaultOn` → only when the bridge actually wired ("both or neither").
-fn native_deny_applies(gate: BridgeGate, bridge_wired: bool) -> bool {
+/// - `DefaultOn` → when the bridge actually wired ("both or neither"), and
+///   also for caller-less spawns (compactor, background summaries, health
+///   probe). Those never wire the bridge and need no tools, but they read
+///   untrusted conversation text, so leaving native Bash open would be a
+///   prompt-injection-to-shell path. For them the deny is best-effort: on
+///   a platform with no bridge socket it can't be written, and that is the
+///   pre-bridge behaviour rather than a refusal (see [`spawn_must_refuse`]).
+fn native_deny_applies(gate: BridgeGate, bridge_wired: bool, has_caller: bool) -> bool {
     match gate {
         BridgeGate::Off => false,
         BridgeGate::ExplicitOn => true,
-        BridgeGate::DefaultOn => bridge_wired,
+        BridgeGate::DefaultOn => bridge_wired || !has_caller,
     }
+}
+
+/// Whether a spawn must be refused because the native-tool deny was
+/// required but could not be materialized.
+///
+/// The deny is mandatory under `ExplicitOn` (always) and under `DefaultOn`
+/// once the bridge wired. If [`try_materialize_cc_settings`] returned
+/// `None` in those cases (no socket, no parent dir, write failure), CC
+/// would spawn with native Bash/FS/web — under `ExplicitOn` that is a
+/// widening, under `DefaultOn` + wired it is bridge tools AND native
+/// tools. Refuse instead. The `DefaultOn` caller-less deny is best-effort
+/// and never refuses.
+fn spawn_must_refuse(gate: BridgeGate, bridge_wired: bool, native_deny_wired: bool) -> bool {
+    let mandatory = match gate {
+        BridgeGate::Off => false,
+        BridgeGate::ExplicitOn => true,
+        BridgeGate::DefaultOn => bridge_wired,
+    };
+    mandatory && !native_deny_wired
+}
+
+/// Error for a refused spawn. Same variant the spawn path already uses for
+/// "could not start the CLI", so callers treat it as a failed call.
+fn native_deny_refusal(gate: BridgeGate, bridge_wired: bool) -> LlmError {
+    tracing::error!(
+        ?gate,
+        bridge_wired,
+        "refusing to spawn Claude Code: the native-tool deny is required but its \
+         --settings file could not be written (bridge socket not published, socket dir \
+         missing, or write failed). Spawning anyway would expose native Bash/FS/web"
+    );
+    LlmError::Http(
+        "refusing to spawn Claude Code: native-tool deny required but could not be written \
+         (check OPENFANG_BRIDGE_SOCKET and the bridge socket dir)"
+            .to_string(),
+    )
 }
 
 /// Why the bridge binary can't be used at spawn time, if it can't.
@@ -125,11 +170,26 @@ fn bridge_bin_problem(bin: Option<&str>) -> Option<String> {
         Some("") => Some(format!("{BRIDGE_BIN_ENV} is empty")),
         Some(p) => {
             let path = std::path::Path::new(p);
-            if path.is_file() {
-                None
-            } else {
-                Some(format!("bridge binary not found at {}", path.display()))
+            if !path.is_file() {
+                return Some(format!("bridge binary not found at {}", path.display()));
             }
+            // Availability probe, not a trust boundary: a non-executable
+            // file would pass `is_file()` and then fail inside CC's MCP
+            // launcher with no named error.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let executable = std::fs::metadata(path)
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false);
+                if !executable {
+                    return Some(format!(
+                        "bridge binary at {} is not executable",
+                        path.display()
+                    ));
+                }
+            }
+            None
         }
     }
 }
@@ -941,11 +1001,12 @@ fn build_cc_settings_value(deny: &[&str], observe_hook_cmd: Option<&str>) -> ser
 /// Co-located with the bridge config under the same socket dir so cleanup
 /// is uniform: one directory, one removal pattern, one set of permissions.
 fn try_materialize_cc_settings(
+    gate: BridgeGate,
     caller_agent_id: Option<&str>,
     bridge_wired: bool,
 ) -> Option<CcSettingsFile> {
     // Policy-coupled to the bridge config — see function-level docstring.
-    if !native_deny_applies(bridge_gate(), bridge_wired) {
+    if !native_deny_applies(gate, bridge_wired, caller_agent_id.is_some()) {
         return None;
     }
 
@@ -1112,12 +1173,15 @@ impl ClaudeCodeDriver {
     ///   that ANAI-31 replaces in production.
     fn try_build_bridge_mcp_config(
         &self,
+        gate: BridgeGate,
         caller_agent_id: Option<&str>,
         allowed_tools: Option<&[String]>,
     ) -> Option<BridgeMcpConfig> {
         // Gate first — cheapest check, and when off we want zero side effects:
         // no temp file, no token generation, no log line beyond trace level.
-        let gate = bridge_gate();
+        // The gate is read ONCE per spawn by the caller and passed to both
+        // this and `try_materialize_cc_settings`, so a concurrent set_var
+        // can't split the decision between them.
         if gate == BridgeGate::Off {
             return None;
         }
@@ -1874,8 +1938,10 @@ impl LlmDriver for ClaudeCodeDriver {
         // env vars (`OPENFANG_BRIDGE_SOCKET` + `OPENFANG_BRIDGE_BIN`) and
         // the request carries a caller identity. The guard lives for the
         // remainder of the call; on drop it removes the temp config file.
+        let gate = bridge_gate();
         let _bridge_cfg = self
             .try_build_bridge_mcp_config(
+                gate,
                 request.caller_agent_id.as_deref(),
                 request.allowed_tools.as_deref(),
             )
@@ -1902,12 +1968,14 @@ impl LlmDriver for ClaudeCodeDriver {
         // `native_deny_applies` on the gate and on `bridge_wired` above:
         // default-on is "both or neither", explicit-on fails closed.
         let _cc_settings =
-            try_materialize_cc_settings(request.caller_agent_id.as_deref(), bridge_wired).inspect(
-                |s| {
+            try_materialize_cc_settings(gate, request.caller_agent_id.as_deref(), bridge_wired)
+                .inspect(|s| {
                     cmd.arg("--settings").arg(s.path());
-                },
-            );
+                });
         let native_deny_wired = _cc_settings.is_some();
+        if spawn_must_refuse(gate, bridge_wired, native_deny_wired) {
+            return Err(native_deny_refusal(gate, bridge_wired));
+        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -2152,8 +2220,10 @@ impl LlmDriver for ClaudeCodeDriver {
         // Bridge wiring (see `complete()` for full rationale). Guard kept
         // alive for the rest of the streaming function so the per-spawn
         // config file outlives the CC subprocess.
+        let gate = bridge_gate();
         let _bridge_cfg = self
             .try_build_bridge_mcp_config(
+                gate,
                 request.caller_agent_id.as_deref(),
                 request.allowed_tools.as_deref(),
             )
@@ -2172,12 +2242,14 @@ impl LlmDriver for ClaudeCodeDriver {
         // full rationale). Guard kept alive for the rest of the streaming
         // function so the settings file outlives the CC subprocess.
         let _cc_settings =
-            try_materialize_cc_settings(request.caller_agent_id.as_deref(), bridge_wired).inspect(
-                |s| {
+            try_materialize_cc_settings(gate, request.caller_agent_id.as_deref(), bridge_wired)
+                .inspect(|s| {
                     cmd.arg("--settings").arg(s.path());
-                },
-            );
+                });
         let native_deny_wired = _cc_settings.is_some();
+        if spawn_must_refuse(gate, bridge_wired, native_deny_wired) {
+            return Err(native_deny_refusal(gate, bridge_wired));
+        }
 
         Self::apply_env_filter(&mut cmd);
 
@@ -3368,25 +3440,78 @@ mod tests {
     fn test_native_deny_explicit_on_without_bridge_fails_closed() {
         // Row 1: explicit ENABLED=1, bridge could not be wired (no usable
         // BIN). The deny set stays → agent has no tools, never native Bash.
-        assert!(native_deny_applies(BridgeGate::ExplicitOn, false));
-        assert!(native_deny_applies(BridgeGate::ExplicitOn, true));
+        for caller in [true, false] {
+            assert!(native_deny_applies(BridgeGate::ExplicitOn, false, caller));
+            assert!(native_deny_applies(BridgeGate::ExplicitOn, true, caller));
+        }
     }
 
     #[test]
     fn test_native_deny_default_on_is_both_or_neither() {
         // Row 2: unset (default on), bridge not wired → native tools, no deny.
-        assert!(!native_deny_applies(BridgeGate::DefaultOn, false));
+        assert!(!native_deny_applies(BridgeGate::DefaultOn, false, true));
         // Default on and wired → deny, OpenFang is the RBAC layer.
-        assert!(native_deny_applies(BridgeGate::DefaultOn, true));
+        assert!(native_deny_applies(BridgeGate::DefaultOn, true, true));
+    }
+
+    #[test]
+    fn test_native_deny_default_on_callerless_is_denied() {
+        // B2: compactor / background summaries / health probe carry no
+        // caller, never wire the bridge, need no tools, and read untrusted
+        // text. Default-on denies native tools for them, same as explicit-on.
+        assert!(native_deny_applies(BridgeGate::DefaultOn, false, false));
+        // ...but only best-effort: no socket → no refusal.
+        assert!(!spawn_must_refuse(BridgeGate::DefaultOn, false, false));
     }
 
     #[test]
     fn test_native_deny_off_never_applies() {
         // Rows 3 + 4: explicit off and unrecognised both resolve to Off.
-        assert!(!native_deny_applies(BridgeGate::Off, false));
-        assert!(!native_deny_applies(BridgeGate::Off, true));
+        for caller in [true, false] {
+            assert!(!native_deny_applies(BridgeGate::Off, false, caller));
+            assert!(!native_deny_applies(BridgeGate::Off, true, caller));
+            assert!(!spawn_must_refuse(BridgeGate::Off, true, false));
+        }
         let (garbage, _) = parse_bridge_gate(Some("yes"));
-        assert!(!native_deny_applies(garbage, true));
+        assert!(!native_deny_applies(garbage, true, true));
+    }
+
+    #[test]
+    fn test_spawn_refused_when_mandatory_deny_missing() {
+        // B1: explicit-on with the deny settings unwritable (SOCKET unset,
+        // socket dir gone, write failed) must refuse, wired or not.
+        assert!(spawn_must_refuse(BridgeGate::ExplicitOn, false, false));
+        assert!(spawn_must_refuse(BridgeGate::ExplicitOn, true, false));
+        // Default-on + wired + settings failure would be bridge AND native.
+        assert!(spawn_must_refuse(BridgeGate::DefaultOn, true, false));
+        // Default-on unwired (row 2) falls back to native, no refusal.
+        assert!(!spawn_must_refuse(BridgeGate::DefaultOn, false, false));
+        // Deny written → never refuse.
+        for gate in [BridgeGate::ExplicitOn, BridgeGate::DefaultOn] {
+            for wired in [true, false] {
+                assert!(!spawn_must_refuse(gate, wired, true));
+            }
+        }
+    }
+
+    #[test]
+    fn test_explicit_on_socket_unset_settings_none_refuses() {
+        // B1 end-to-end over the materializer: with SOCKET unset, the
+        // settings file can't be placed, so it returns None; under
+        // explicit-on that must turn into a refusal. Passes the gate in
+        // directly (B3), so only SOCKET is read from the environment, and
+        // it is only read, never set — safe alongside parallel tests as
+        // long as no test sets OPENFANG_BRIDGE_SOCKET.
+        if std::env::var(BRIDGE_SOCKET_ENV).is_ok() {
+            return; // a real daemon env; the precondition doesn't hold
+        }
+        let s = try_materialize_cc_settings(BridgeGate::ExplicitOn, Some("agent-x"), false);
+        assert!(s.is_none(), "no socket → no settings file");
+        assert!(spawn_must_refuse(
+            BridgeGate::ExplicitOn,
+            false,
+            s.is_some()
+        ));
     }
 
     #[test]
@@ -3414,6 +3539,12 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("openfang-mcp-bridge-test-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"#!/bin/sh\n").expect("write fake bridge bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake bridge bin");
+        }
         let p = path.to_str().expect("utf8 temp path").to_string();
         assert!(
             bridge_bin_problem(Some(&p)).is_none(),
@@ -3429,21 +3560,35 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_bridge_bin_not_executable_is_a_problem() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "openfang-mcp-bridge-noexec-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write fake bridge bin");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let p = path.to_str().expect("utf8 temp path").to_string();
+        let problem = bridge_bin_problem(Some(&p));
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            problem
+                .as_deref()
+                .is_some_and(|m| m.contains("not executable")),
+            "0644 binary must be reported as not executable, got {problem:?}"
+        );
+    }
+
     #[test]
     fn test_bridge_gate_off_builds_no_config() {
         // Explicit off suppresses config generation regardless of other env.
-        // Mutates the process-global gate; this is the only test that does.
-        let original = std::env::var(BRIDGE_ENABLED_ENV).ok();
-        std::env::set_var(BRIDGE_ENABLED_ENV, "0");
+        // The gate is passed in (B3), so no process-global env is mutated.
         let driver = ClaudeCodeDriver::new(None, true);
-        let cfg = driver.try_build_bridge_mcp_config(Some("agent-x"), None);
+        let cfg = driver.try_build_bridge_mcp_config(BridgeGate::Off, Some("agent-x"), None);
         assert!(cfg.is_none(), "gate off → None regardless of other env");
-
-        // Restore.
-        match original {
-            Some(v) => std::env::set_var(BRIDGE_ENABLED_ENV, v),
-            None => std::env::remove_var(BRIDGE_ENABLED_ENV),
-        }
     }
 
     #[test]
