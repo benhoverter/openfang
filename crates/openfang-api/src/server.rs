@@ -933,7 +933,9 @@ pub async fn run_daemon(
                             warn!(
                                 bridge_bin = %p.display(),
                                 "OPENFANG_BRIDGE_BIN points at a non-existent path; \
-                                 CC bridge wiring will fail until the binary is installed"
+                                 the MCP bridge cannot be wired until it exists. Claude Code \
+                                 agents get NO tools if OPENFANG_BRIDGE_ENABLED=1 (fail-closed), \
+                                 or fall back to native tools if it is unset"
                             );
                         }
                     }
@@ -953,8 +955,12 @@ pub async fn run_daemon(
                                 } else {
                                     warn!(
                                         expected = %candidate.display(),
-                                        "bridge binary not found next to daemon; \
-                                         set OPENFANG_BRIDGE_BIN to enable CC bridge wiring"
+                                        "MCP bridge binary not found next to the daemon; \
+                                         Claude Code agents will not get OpenFang tools. \
+                                         Build/install openfang-mcp-bridge alongside the daemon \
+                                         or set OPENFANG_BRIDGE_BIN. With \
+                                         OPENFANG_BRIDGE_ENABLED=1 agents get NO tools \
+                                         (fail-closed); unset falls back to native tools"
                                     );
                                 }
                             }
