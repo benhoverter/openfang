@@ -73,16 +73,26 @@ enum BridgeGate {
 /// Pure parse of the raw gate value. The second element is `true` when the
 /// value was unrecognised (caller warns once).
 ///
+/// Surrounding whitespace is ignored and matching is case-insensitive.
+///
 /// - unset → `DefaultOn`
-/// - `1` / `true` (any case) → `ExplicitOn`
-/// - `0` / `false` (any case) → `Off`
-/// - anything else, including empty → `Off` + unrecognised
+/// - `1` / `true` / `yes` / `on` → `ExplicitOn`
+/// - `0` / `false` / `no` / `off` → `Off`
+/// - anything else, including empty → `ExplicitOn` + unrecognised. The
+///   operator set the variable but we can't tell what they meant, so take
+///   the fail-closed posture rather than the weakest one (native Bash).
 fn parse_bridge_gate(raw: Option<&str>) -> (BridgeGate, bool) {
-    match raw {
-        None => (BridgeGate::DefaultOn, false),
-        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => (BridgeGate::ExplicitOn, false),
-        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => (BridgeGate::Off, false),
-        Some(_) => (BridgeGate::Off, true),
+    let Some(v) = raw else {
+        return (BridgeGate::DefaultOn, false);
+    };
+    let v = v.trim();
+    let is = |words: &[&str]| words.iter().any(|w| v.eq_ignore_ascii_case(w));
+    if is(&["1", "true", "yes", "on"]) {
+        (BridgeGate::ExplicitOn, false)
+    } else if is(&["0", "false", "no", "off"]) {
+        (BridgeGate::Off, false)
+    } else {
+        (BridgeGate::ExplicitOn, true)
     }
 }
 
@@ -96,10 +106,11 @@ fn bridge_gate() -> BridgeGate {
     if unrecognised
         && !BRIDGE_GATE_UNRECOGNISED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
     {
-        warn!(
+        tracing::error!(
             value = %raw.as_deref().unwrap_or(""),
-            "OPENFANG_BRIDGE_ENABLED has an unrecognised value; treating as OFF. \
-             Use 1/true to enable, 0/false to disable, or unset for the default (on)"
+            "OPENFANG_BRIDGE_ENABLED has an unrecognised value; treating as explicitly ON \
+             (fail closed). Use 1/true/yes/on to enable, 0/false/no/off to disable, or \
+             unset for the default (on)"
         );
     }
     gate
@@ -219,7 +230,7 @@ fn log_bridge_bin_problem(gate: BridgeGate, problem: &str) {
             {
                 tracing::error!(
                     problem = %problem,
-                    "OPENFANG_BRIDGE_ENABLED=1 but the MCP bridge cannot be wired; \
+                    "OPENFANG_BRIDGE_ENABLED is explicitly on but the MCP bridge cannot be wired; \
                      Claude Code agents are spawning with NO tools (native tools stay denied, \
                      fail-closed). Install openfang-mcp-bridge next to the daemon or fix \
                      OPENFANG_BRIDGE_BIN"
@@ -3407,31 +3418,35 @@ mod tests {
         // Unset → on by default.
         assert_eq!(parse_bridge_gate(None), (BridgeGate::DefaultOn, false));
 
-        // Explicit truthy values.
-        for v in ["1", "true", "TRUE", "True"] {
+        // Explicit truthy values (case- and whitespace-insensitive).
+        for v in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "On", " 1", "true\n",
+        ] {
             assert_eq!(
                 parse_bridge_gate(Some(v)),
                 (BridgeGate::ExplicitOn, false),
-                "{v} must read as explicit on"
+                "{v:?} must read as explicit on"
             );
         }
 
         // Explicit opt-out wins over the default.
-        for v in ["0", "false", "False", "FALSE"] {
+        for v in [
+            "0", "false", "False", "FALSE", "no", "NO", "off", "Off", " 0 ",
+        ] {
             assert_eq!(
                 parse_bridge_gate(Some(v)),
                 (BridgeGate::Off, false),
-                "{v} must read as off"
+                "{v:?} must read as off"
             );
         }
 
-        // Unrecognised → off AND flagged so the caller warns. `yes`/`on`
-        // used to read as off silently.
-        for v in ["", "2", "yes", "on", "garbage", " 1"] {
+        // Unrecognised → explicit on (fail closed) AND flagged so the
+        // caller logs. Never the weakest posture.
+        for v in ["", "  ", "2", "enabled", "disable", "garbage", "y", "n"] {
             assert_eq!(
                 parse_bridge_gate(Some(v)),
-                (BridgeGate::Off, true),
-                "{v:?} must read as off + unrecognised"
+                (BridgeGate::ExplicitOn, true),
+                "{v:?} must read as explicit on + unrecognised"
             );
         }
     }
@@ -3466,14 +3481,27 @@ mod tests {
 
     #[test]
     fn test_native_deny_off_never_applies() {
-        // Rows 3 + 4: explicit off and unrecognised both resolve to Off.
+        // Row 3: explicit off.
         for caller in [true, false] {
             assert!(!native_deny_applies(BridgeGate::Off, false, caller));
             assert!(!native_deny_applies(BridgeGate::Off, true, caller));
             assert!(!spawn_must_refuse(BridgeGate::Off, true, false));
         }
-        let (garbage, _) = parse_bridge_gate(Some("yes"));
-        assert!(!native_deny_applies(garbage, true, true));
+        let (off, _) = parse_bridge_gate(Some("off"));
+        assert!(!native_deny_applies(off, true, true));
+    }
+
+    #[test]
+    fn test_unrecognised_gate_fails_closed() {
+        // Row 4: an unrecognised value takes the explicit-on posture, so a
+        // missing bridge leaves the agent toolless (and refuses the spawn if
+        // the deny can't be written) instead of handing it native Bash.
+        let (gate, flagged) = parse_bridge_gate(Some("garbage"));
+        assert!(flagged);
+        for caller in [true, false] {
+            assert!(native_deny_applies(gate, false, caller));
+        }
+        assert!(spawn_must_refuse(gate, false, false));
     }
 
     #[test]
