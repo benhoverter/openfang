@@ -128,8 +128,12 @@ const BUDGET_BOOTSTRAP_MD: usize = 3_000;
 const BUDGET_WORKSPACE_CONTEXT: usize = 1000;
 /// `context.md` — live per-turn context.
 const BUDGET_CONTEXT_MD: usize = 8000;
-/// Cross-channel canonical conversation summary.
-const BUDGET_CANONICAL_CONTEXT: usize = 500;
+/// Cross-channel canonical conversation summary. Sized 2026-10-19 from the
+/// live fleet: 89 of 103 stored summaries exceeded the old 500 cap; max 8,869,
+/// p90 ~7K (the text-fallback compactor holds itself to ~4K; LLM summaries
+/// run larger). This message changes every turn and caches poorly, so keep
+/// the headroom modest rather than generous.
+const BUDGET_CANONICAL_CONTEXT: usize = 12_000;
 /// A single recalled memory row, by `kind` (ANAI-231).
 ///
 /// A flat 500 was correct when every row was a raw captured turn. Consolidation
