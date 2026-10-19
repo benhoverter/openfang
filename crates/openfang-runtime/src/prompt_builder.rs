@@ -113,18 +113,27 @@ impl RecalledMemory {
 // so a section silently losing 87% of its content can't happen unnoticed again.
 // ---------------------------------------------------------------------------
 
-/// AGENTS.md — behavioral guidance.
-const BUDGET_AGENTS_MD: usize = 2000;
+/// AGENTS.md — behavioral guidance. Was 2000, which cut 44 of 86 files; the
+/// largest is 14.2 K.
+///
+/// Sized 2026-10-18 from measured fleet usage (86 workspaces): budget = largest
+/// live file plus ~10-25% headroom. Re-measure with
+/// openfang-alpha/scripts/2026-10-18-promptfile-sizes.py before changing.
+const BUDGET_AGENTS_MD: usize = 16_000;
 /// HEARTBEAT.md — autonomous checklist.
 const BUDGET_HEARTBEAT_MD: usize = 1000;
-/// BOOTSTRAP.md — first-run ritual.
-const BUDGET_BOOTSTRAP_MD: usize = 1500;
+/// BOOTSTRAP.md — first-run ritual. Was 1500 (4 cut); largest is 2.5 K.
+const BUDGET_BOOTSTRAP_MD: usize = 3_000;
 /// Workspace context section (project type, context files).
 const BUDGET_WORKSPACE_CONTEXT: usize = 1000;
 /// `context.md` — live per-turn context.
 const BUDGET_CONTEXT_MD: usize = 8000;
-/// Cross-channel canonical conversation summary.
-const BUDGET_CANONICAL_CONTEXT: usize = 500;
+/// Cross-channel canonical conversation summary. Sized 2026-10-19 from the
+/// live fleet: 89 of 103 stored summaries exceeded the old 500 cap; max 8,869,
+/// p90 ~7K (the text-fallback compactor holds itself to ~4K; LLM summaries
+/// run larger). This message changes every turn and caches poorly, so keep
+/// the headroom modest rather than generous.
+const BUDGET_CANONICAL_CONTEXT: usize = 12_000;
 /// A single recalled memory row, by `kind` (ANAI-231).
 ///
 /// A flat 500 was correct when every row was a raw captured turn. Consolidation
@@ -208,12 +217,12 @@ fn provenance_tag(mem: &RecalledMemory) -> String {
 }
 /// Prompt context contributed by prompt-only skills.
 const BUDGET_SKILL_PROMPT_CONTEXT: usize = 2000;
-/// IDENTITY.md — personality frontmatter.
-const BUDGET_IDENTITY_MD: usize = 500;
-/// SOUL.md — persona.
-const BUDGET_SOUL_MD: usize = 1000;
-/// USER.md — user context.
-const BUDGET_USER_MD: usize = 500;
+/// IDENTITY.md — personality frontmatter. Was 500 (35 cut); largest is 1.9 K.
+const BUDGET_IDENTITY_MD: usize = 2_500;
+/// SOUL.md — persona. Was 1000 (42 cut); largest is 14.3 K.
+const BUDGET_SOUL_MD: usize = 16_000;
+/// USER.md — user context. Was 500 (38 cut); largest is 2.0 K.
+const BUDGET_USER_MD: usize = 3_000;
 /// MEMORY.md — curated long-term memory index.
 ///
 /// Raised from 500 (ANAI-167): the scaffold OpenFang writes at agent creation
@@ -223,7 +232,9 @@ const BUDGET_USER_MD: usize = 500;
 /// Raised to 24 000 (ANAI-303), together with the managed block's own budget
 /// (12 000), and enforced by [`cap_memory_md`] so the block is kept whole and
 /// the hand-written prose around it absorbs the cut.
-const BUDGET_MEMORY_MD: usize = 24_000;
+///
+/// Raised to 32 000 (2026-10-18): `assistant`'s file is 29.7 K.
+const BUDGET_MEMORY_MD: usize = 32_000;
 
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
@@ -2090,12 +2101,15 @@ mod tests {
     }
 
     #[test]
-    fn test_persona_soul_capped_at_1000() {
-        let long_soul = "x".repeat(2000);
+    fn test_persona_soul_capped_at_budget() {
+        let long_soul = "x".repeat(BUDGET_SOUL_MD * 2);
         let section = build_persona_section(None, Some(&long_soul), None, None, None, None);
         assert!(section.contains("SOUL.md truncated"));
-        assert!(section.contains("1000 of 2000 chars shown, 1000 omitted"));
-        assert!(section.len() < 1400);
+        assert!(section.contains(&format!(
+            "{BUDGET_SOUL_MD} of {} chars shown, {BUDGET_SOUL_MD} omitted",
+            BUDGET_SOUL_MD * 2
+        )));
+        assert!(section.len() < BUDGET_SOUL_MD + 400);
     }
 
     /// ANAI-167: the MEMORY.md scaffold is ~4 KB. Under the old 500-char budget
@@ -2115,7 +2129,10 @@ mod tests {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
         let section = build_persona_section(None, None, None, Some(&huge), None, None);
         assert!(section.contains("MEMORY.md truncated"));
-        assert!(section.contains("24000 of 24001 chars shown, 1 omitted"));
+        assert!(section.contains(&format!(
+            "{BUDGET_MEMORY_MD} of {} chars shown, 1 omitted",
+            BUDGET_MEMORY_MD + 1
+        )));
     }
 
     fn managed(body: &str) -> String {
