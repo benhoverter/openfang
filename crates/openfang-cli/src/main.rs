@@ -9,6 +9,7 @@ mod launcher;
 mod mcp;
 pub mod progress;
 mod service;
+mod starter;
 pub mod table;
 mod templates;
 mod tui;
@@ -112,6 +113,8 @@ enum Commands {
         /// Quick mode: no prompts, just write config + .env (for CI/scripts).
         #[arg(long)]
         quick: bool,
+        #[command(flatten)]
+        starter: starter::StarterArgs,
     },
     /// Start the OpenFang kernel daemon (API server + kernel).
     Start {
@@ -1030,7 +1033,9 @@ fn main() {
                 return;
             }
             match launcher::run(cli.config.clone()) {
-                launcher::LauncherChoice::GetStarted => cmd_init(false),
+                launcher::LauncherChoice::GetStarted => {
+                    cmd_init(false, &starter::StarterArgs::default())
+                }
                 launcher::LauncherChoice::Chat => cmd_quick_chat(cli.config, None),
                 launcher::LauncherChoice::Dashboard => cmd_dashboard(),
                 launcher::LauncherChoice::DesktopApp => launcher::launch_desktop_app(),
@@ -1044,7 +1049,7 @@ fn main() {
             }
         }
         Some(Commands::Tui) => tui::run(cli.config),
-        Some(Commands::Init { quick }) => cmd_init(quick),
+        Some(Commands::Init { quick, starter }) => cmd_init(quick, &starter),
         Some(Commands::Start { yolo }) => cmd_start(cli.config, yolo),
         Some(Commands::Stop) => cmd_stop(),
         Some(Commands::Service(sub)) => service::run(sub),
@@ -1204,8 +1209,10 @@ fn main() {
             WebhooksCommands::Delete { id } => cmd_webhooks_delete(&id),
             WebhooksCommands::Test { id } => cmd_webhooks_test(&id),
         },
-        Some(Commands::Onboard { quick }) | Some(Commands::Setup { quick }) => cmd_init(quick),
-        Some(Commands::Configure) => cmd_init(false),
+        Some(Commands::Onboard { quick }) | Some(Commands::Setup { quick }) => {
+            cmd_init(quick, &starter::StarterArgs::default())
+        }
+        Some(Commands::Configure) => cmd_init(false, &starter::StarterArgs::default()),
         Some(Commands::Message {
             agent,
             text,
@@ -1440,7 +1447,7 @@ pub(crate) fn daemon_json(
 // Commands
 // ---------------------------------------------------------------------------
 
-fn cmd_init(quick: bool) {
+fn cmd_init(quick: bool, starter_args: &starter::StarterArgs) {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => {
@@ -1472,6 +1479,14 @@ fn cmd_init(quick: bool) {
                 std::process::exit(1);
             });
         }
+    }
+
+    // Starter mode installs its own agents and config instead of the 30
+    // stock templates: every agents/<name>/agent.toml is auto-spawned at
+    // boot, so a fresh starter install should hold only what was chosen.
+    if starter_args.starter {
+        starter::run(&openfang_dir, starter_args);
+        return;
     }
 
     // Install bundled agent templates (skips existing ones to preserve user edits)

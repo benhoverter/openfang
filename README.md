@@ -5,6 +5,8 @@
 <h1 align="center">OpenFang</h1>
 <h3 align="center">The Agent Operating System</h3>
 
+> **You're on a fork** (`benhoverter/openfang`), set up for macOS, Claude Code and Discord. Start with **[docs/fork/quickstart.md](docs/fork/quickstart.md)**. The openfang.sh docs and install commands below are for upstream OpenFang and won't install this fork.
+
 <p align="center">
   Open-source Agent OS built in Rust. 137K LOC. 14 crates. 1,767+ tests. Zero clippy warnings.<br/>
   <strong>One binary. Battle-tested. Agents that actually work for you.</strong>
