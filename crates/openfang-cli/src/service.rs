@@ -494,6 +494,14 @@ fn snapshot_path(label: &str) -> PathBuf {
         .join(format!("{label}.loaded.plist"))
 }
 
+/// Where install/uninstall keep copies of a replaced or removed plist.
+/// Deliberately NOT ~/Library/LaunchAgents: keep that folder to live jobs only.
+fn plist_backup_path(label: &str, kind: &str) -> PathBuf {
+    openfang_home()
+        .join("service")
+        .join(format!("{label}.plist.{kind}-{}", unix_secs()))
+}
+
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -685,7 +693,10 @@ fn install(opts: &InstallOpts) -> SvcResult<()> {
                 "`openfang service restart` to apply changes, or `openfang service install --force` to regenerate it (the old file is backed up)",
             ));
         }
-        let bak = path.with_extension(format!("plist.bak-{}", unix_secs()));
+        let bak = plist_backup_path(&opts.label, "bak");
+        if let Some(d) = bak.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
         std::fs::copy(&path, &bak).map_err(|e| {
             err(
                 format!("couldn't back up existing plist: {e}"),
@@ -741,9 +752,7 @@ fn uninstall(label: &str) -> SvcResult<()> {
         ui::success(&format!("Unloaded {label} (daemon stopped)"));
     }
     if path.exists() {
-        let keep = openfang_home()
-            .join("service")
-            .join(format!("{label}.plist.uninstalled-{}", unix_secs()));
+        let keep = plist_backup_path(label, "uninstalled");
         if let Some(d) = keep.parent() {
             let _ = std::fs::create_dir_all(d);
         }
