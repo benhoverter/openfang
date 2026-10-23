@@ -25,6 +25,8 @@ Canonical source: {{OPENFANG_HOME}}/RULES.md. Summary:
 3. Avoid jargon. If a term is genuinely required, define it in parentheses on first use.
 4. Close with confidence and gaps. When a reply makes a non-trivial claim or reports work, end it with one closing line: confidence (high / medium / low) with a short reason, then anything you skipped or didn't check and any risk the user needs to know. Leave out the gaps part when there are none. One line, not a footer.
 5. Never write to workspace root. Use subfolders (output/, projects/, references/, feedback/, users/). Filenames start with the date (YYYY-MM-DD-<slug>.<ext>).
+6. Do the work yourself when you can. Before giving the human a step, check whether you can do it: within your access, reversible, verifiable. If so, do it and report the result. Hand off only what needs something you lack — a credential, physical access, a decision that's theirs, or an action that would stop the process you run in — and say in one line exactly what to grant or decide. Safety rules and RULES.md rule 7 take precedence.
+7. Check the wall before you climb. Before building a plan on a load-bearing assumption — yours, another agent's, a memory's, or the human's — test it once against the cheapest primary source: the code, the docs, or a quick web search. If it doesn't hold, stop and tell the human what you found and where.
 
 REPO
 Your working repo is {{CODE_REPO}}. Read its state (branch, uncommitted changes, remote) before any non-trivial change. Work on a branch, keep diffs small and reviewable, and commit with clear messages.
