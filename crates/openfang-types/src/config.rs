@@ -1798,6 +1798,11 @@ pub struct KernelConfig {
     /// [`crate::gatekeeper::GatekeeperConfig::enabled`].
     #[serde(default)]
     pub gatekeeper: crate::gatekeeper::GatekeeperConfig,
+    /// Where to post problems only the host operator can fix (e.g. an
+    /// expired Claude Code login). Off unless both fields are set. Read at
+    /// daemon start.
+    #[serde(default)]
+    pub operator_alerts: OperatorAlertsConfig,
     /// Cron scheduler max total jobs across all agents. Default: 500.
     #[serde(default = "default_max_cron_jobs")]
     pub max_cron_jobs: usize,
@@ -2314,6 +2319,24 @@ fn default_thread_ttl() -> u64 {
     24
 }
 
+/// `[operator_alerts]`: channel for problems only the host operator can fix.
+/// `channel` is the adapter key (e.g. `"discord"`), `recipient` the
+/// adapter's target id (a Discord channel id). Both empty = off.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OperatorAlertsConfig {
+    pub channel: String,
+    pub recipient: String,
+}
+
+impl OperatorAlertsConfig {
+    /// Some((channel, recipient)) only when both are set.
+    pub fn target(&self) -> Option<(&str, &str)> {
+        let (c, r) = (self.channel.trim(), self.recipient.trim());
+        (!c.is_empty() && !r.is_empty()).then_some((c, r))
+    }
+}
+
 impl Default for KernelConfig {
     fn default() -> Self {
         let home_dir = openfang_home_dir();
@@ -2347,6 +2370,7 @@ impl Default for KernelConfig {
             webhook_triggers: None,
             approval: crate::approval::ApprovalPolicy::default(),
             gatekeeper: crate::gatekeeper::GatekeeperConfig::default(),
+            operator_alerts: OperatorAlertsConfig::default(),
             max_cron_jobs: default_max_cron_jobs(),
             include: Vec::new(),
             exec_policy: ExecPolicy::default(),
@@ -2481,6 +2505,7 @@ impl KernelConfig {
 
 /// SECURITY: Custom Debug impl redacts sensitive fields (api_key).
 impl std::fmt::Debug for KernelConfig {
+    // operator_alerts omitted: routing info only, nothing to debug-print.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KernelConfig")
             .field("home_dir", &self.home_dir)
@@ -6681,5 +6706,29 @@ shell_env_passthrough = ["*"]
     fn web_fetch_accepts_new_max_bytes_key() {
         let cfg: WebFetchConfig = toml::from_str("max_bytes = 654321").unwrap();
         assert_eq!(cfg.max_bytes, 654_321);
+    }
+
+    #[test]
+    fn operator_alerts_parses_and_targets() {
+        let cfg: KernelConfig = toml::from_str(
+            "[operator_alerts]\nchannel = \"discord\"\nrecipient = \"1476626559401066688\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.operator_alerts.target(),
+            Some(("discord", "1476626559401066688"))
+        );
+    }
+
+    #[test]
+    fn operator_alerts_off_unless_both_set() {
+        assert_eq!(KernelConfig::default().operator_alerts.target(), None);
+        for (c, r) in [("discord", ""), ("", "123"), ("  ", "123")] {
+            let oa = OperatorAlertsConfig {
+                channel: c.into(),
+                recipient: r.into(),
+            };
+            assert_eq!(oa.target(), None, "{c:?}/{r:?}");
+        }
     }
 }

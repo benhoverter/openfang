@@ -823,6 +823,42 @@ pub async fn build_router(
     (app, state)
 }
 
+/// Deliver runtime operator alerts (e.g. expired Claude Code login) to the
+/// `[operator_alerts]` channel, at most once per kind every 30 minutes.
+/// Unconfigured: no sink is installed and alerts stay error-level log lines.
+fn start_operator_alerts(kernel: Arc<OpenFangKernel>) {
+    use openfang_runtime::kernel_handle::KernelHandle;
+    use openfang_runtime::operator_alert::{install_sink, AlertThrottle};
+
+    let Some((channel, recipient)) = kernel.config.operator_alerts.target() else {
+        info!("operator_alerts not configured; operator alerts go to the log only");
+        return;
+    };
+    let (channel, recipient) = (channel.to_string(), recipient.to_string());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    if !install_sink(tx) {
+        warn!("operator alert sink already installed; not starting a second one");
+        return;
+    }
+    info!(%channel, %recipient, "operator alerts enabled");
+    tokio::spawn(async move {
+        let mut throttle = AlertThrottle::new(std::time::Duration::from_secs(30 * 60));
+        while let Some(alert) = rx.recv().await {
+            if !throttle.should_send(alert.kind, std::time::Instant::now()) {
+                continue;
+            }
+            let text = alert.channel_text(throttle.window());
+            if let Err(e) = <OpenFangKernel as KernelHandle>::send_channel_message(
+                &kernel, &channel, &recipient, &text, None, None,
+            )
+            .await
+            {
+                warn!(error = %e, kind = ?alert.kind, "operator alert delivery failed");
+            }
+        }
+    });
+}
+
 /// Start the OpenFang daemon: boot kernel + HTTP API server.
 ///
 /// This function blocks until Ctrl+C or a shutdown request.
@@ -874,6 +910,9 @@ pub async fn run_daemon(
     );
 
     let (app, state) = build_router(kernel.clone(), addr).await;
+
+    // After build_router so the channel adapters exist before any alert sends.
+    start_operator_alerts(kernel.clone());
 
     // Start the MCP bridge IPC listener (ANAI-30). Failure here is
     // non-fatal — the daemon can still serve HTTP without bridge support;

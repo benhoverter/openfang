@@ -1766,6 +1766,78 @@ fn log_model_accounting(
             "Claude Code served a lower-tier model than requested"
         );
     }
+    if acc.input_tokens >= LARGE_UNCACHED_INPUT_TOKENS {
+        // Diagnostic for budget spikes seen around login expiry: a healthy
+        // turn sends tens of uncached tokens. Warn level so it survives the
+        // fleet's RUST_LOG, which drops the info-level accounting line above.
+        warn!(
+            event = %"cc_large_uncached_input",
+            agent = %agent_name.unwrap_or("-"),
+            agent_id = %agent_id.unwrap_or("-"),
+            pid = %pid_s,
+            path = %path,
+            served = %served,
+            tokens_in = acc.input_tokens,
+            tokens_out = acc.output_tokens,
+            cache_read = acc.cache_read_tokens,
+            cache_write = acc.cache_write_tokens,
+            usage_source = %usage_source,
+            "Claude Code turn sent a large amount of uncached input"
+        );
+    }
+}
+
+/// Uncached input above which a turn is logged at warn level.
+const LARGE_UNCACHED_INPUT_TOKENS: u64 = 100_000;
+
+/// Stable prefix of the auth-failure error. The channel bridge keys its
+/// user-facing "login expired" message on this text; change both together.
+pub const CC_AUTH_EXPIRED_MARKER: &str = "Claude Code login expired or missing";
+
+/// True when the CLI's failure output means its login is expired or absent.
+/// Matches specific phrases only: the old bare "auth"/"login" substrings
+/// misfiled unrelated failures (any path or message containing "author").
+fn is_cli_auth_failure(detail: &str) -> bool {
+    let d = detail.to_lowercase();
+    [
+        "failed to authenticate",
+        "not authenticated",
+        "oauth session expired",
+        "oauth token has expired",
+        "not logged in",
+        "please run /login",
+        "invalid api key",
+        "invalid credentials",
+        "authentication_error",
+    ]
+    .iter()
+    .any(|p| d.contains(p))
+}
+
+/// Pull the human-readable reason out of the CLI's failure output. The CLI
+/// prints a whole JSON result object on failure; its `result` field holds the
+/// reason. Falls back to the first 300 chars of the raw text.
+fn cli_failure_reason(detail: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) {
+        if let Some(r) = v.get("result").and_then(|r| r.as_str()) {
+            return r.to_string();
+        }
+    }
+    detail.chars().take(300).collect()
+}
+
+/// Raise the operator alert and build the error message for an auth failure.
+fn report_auth_failure(detail: &str) -> String {
+    let reason = cli_failure_reason(detail);
+    crate::operator_alert::raise(
+        crate::operator_alert::OperatorAlertKind::ClaudeCodeAuthExpired,
+        reason.clone(),
+    );
+    // "not authenticated" keeps llm_errors' Auth classification.
+    format!(
+        "{CC_AUTH_EXPIRED_MARKER} (Claude Code CLI not authenticated). \
+         Run on the host: claude auth login\nDetail: {reason}"
+    )
 }
 
 /// Outcome of folding one stream-json line: the reply-body text to surface
@@ -2017,7 +2089,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let mut child = cmd.spawn().map_err(|e| {
             LlmError::Http(format!(
                 "Claude Code CLI not found or failed to start ({}). \
-                 Install: npm install -g @anthropic-ai/claude-code && claude auth",
+                 Install: npm install -g @anthropic-ai/claude-code && claude auth login",
                 e
             ))
         })?;
@@ -2107,12 +2179,8 @@ impl LlmDriver for ClaudeCodeDriver {
             );
 
             // Provide actionable error messages
-            let message = if detail.contains("not authenticated")
-                || detail.contains("auth")
-                || detail.contains("login")
-                || detail.contains("credentials")
-            {
-                format!("Claude Code CLI is not authenticated. Run: claude auth\nDetail: {detail}")
+            let message = if is_cli_auth_failure(detail) {
+                report_auth_failure(detail)
             } else if detail.contains("permission")
                 || detail.contains("--dangerously-skip-permissions")
             {
@@ -2281,7 +2349,7 @@ impl LlmDriver for ClaudeCodeDriver {
         let mut child = cmd.spawn().map_err(|e| {
             LlmError::Http(format!(
                 "Claude Code CLI not found or failed to start ({}). \
-                 Install: npm install -g @anthropic-ai/claude-code && claude auth",
+                 Install: npm install -g @anthropic-ai/claude-code && claude auth login",
                 e
             ))
         })?;
@@ -2429,6 +2497,12 @@ impl LlmDriver for ClaudeCodeDriver {
                 stderr = %stderr_text,
                 "Claude Code CLI streaming subprocess exited with error"
             );
+            if is_cli_auth_failure(&stderr_text) {
+                return Err(LlmError::Api {
+                    status: code as u16,
+                    message: report_auth_failure(&stderr_text),
+                });
+            }
             return Err(LlmError::Api {
                 status: code as u16,
                 message: format!(
@@ -3983,5 +4057,70 @@ mod anai266_accounting_labels {
         assert!(model_rank("claude-haiku-4-5").unwrap() < model_rank("claude-opus-4-5").unwrap());
         assert_eq!(model_family("claude-haiku-4-5"), "haiku");
         assert_eq!(model_family("claude-opus-4-5"), "opus");
+    }
+}
+
+#[cfg(test)]
+mod cc_auth_failure {
+    use super::*;
+
+    /// Trimmed copy of the real failure the CLI printed on 2026-10-24.
+    const EXPIRED: &str = r#"{"is_error":true,"num_turns":1,"subtype":"success","terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","type":"result","usage":{"input_tokens":0,"output_tokens":0}}"#;
+
+    #[test]
+    fn real_expiry_output_is_auth_failure() {
+        assert!(is_cli_auth_failure(EXPIRED));
+    }
+
+    #[test]
+    fn known_phrases_are_auth_failures() {
+        for s in [
+            "Error: Not logged in. Please run /login",
+            "Invalid API key",
+            "authentication_error: bad token",
+            "Claude Code is not authenticated",
+        ] {
+            assert!(is_cli_auth_failure(s), "{s}");
+        }
+    }
+
+    /// The old bare "auth"/"login" substring checks misfiled these.
+    #[test]
+    fn unrelated_failures_are_not_auth() {
+        for s in [
+            "error: could not read /Users/x/authors.md",
+            "login.rs:12: panicked at index out of bounds",
+            "API Error: 529 overloaded",
+            "",
+        ] {
+            assert!(!is_cli_auth_failure(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn reason_is_extracted_from_json_result() {
+        assert_eq!(
+            cli_failure_reason(EXPIRED),
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        );
+    }
+
+    #[test]
+    fn reason_falls_back_to_bounded_raw_text() {
+        let raw = "x".repeat(1000);
+        assert_eq!(cli_failure_reason(&raw).len(), 300);
+        assert_eq!(cli_failure_reason("plain stderr"), "plain stderr");
+    }
+
+    #[test]
+    fn message_carries_marker_command_and_auth_class() {
+        let m = report_auth_failure(EXPIRED);
+        assert!(m.starts_with(CC_AUTH_EXPIRED_MARKER));
+        assert!(m.contains("claude auth login"));
+        // keeps llm_errors' Auth classification
+        assert!(m.contains("not authenticated"));
+        // the 2 KB JSON blob does not leak into the message
+        assert!(!m.contains("subagent_stats"));
+        assert!(!m.contains("\"usage\""));
     }
 }

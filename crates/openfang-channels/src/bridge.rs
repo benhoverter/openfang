@@ -1843,6 +1843,29 @@ async fn dispatch_message(
 fn sanitize_agent_error(raw: &str) -> String {
     let lower = raw.to_lowercase();
 
+    // These three come first. The generic auth branch below folds them into
+    // "Service temporarily unavailable", and a token count in a quota message
+    // can contain "429" and trip the rate-limit branch.
+    //
+    // Marker set by the Claude Code driver (`CC_AUTH_EXPIRED_MARKER`).
+    if lower.contains("claude code login expired") {
+        return "Claude Code's login has expired on the host, so I can't answer right now. \
+                The operator needs to run `claude auth login` there."
+            .to_string();
+    }
+    // Kernel scheduler: per-agent hourly token budget (fixed one-hour window).
+    if lower.contains("token limit exceeded") {
+        return "This agent has used up its hourly token budget. \
+                It will answer again when the budget resets, within the hour."
+            .to_string();
+    }
+    // Kernel metering: per-agent or global spending caps.
+    if lower.contains("cost quota") || lower.contains("budget exceeded") {
+        return "This agent has reached its spending budget for now. \
+                The operator can raise it or wait for it to reset."
+            .to_string();
+    }
+
     if lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("429")
@@ -2757,6 +2780,49 @@ mod tests {
     use super::*;
     use crate::types::{ButtonStyle, ChannelType, InteractiveButton};
     use std::sync::Mutex;
+
+    #[test]
+    fn sanitize_cc_login_expired_is_its_own_message() {
+        // Real shape: kernel wraps the driver's message.
+        let raw = "LLM driver error: API error (1): Claude Code login expired or missing \
+                   (Claude Code CLI not authenticated). Run on the host: claude auth login\n\
+                   Detail: Failed to authenticate: OAuth session expired";
+        let msg = sanitize_agent_error(raw);
+        assert!(msg.contains("claude auth login"), "{msg}");
+        assert!(!msg.contains("temporarily unavailable"), "{msg}");
+        assert!(!msg.contains("OAuth"), "detail must not leak: {msg}");
+    }
+
+    #[test]
+    fn sanitize_token_budget_is_its_own_message() {
+        // Real producer string from the 2026-10-24 log. 3402915 contains no
+        // "429", but 3004291 does: the budget branch must win either way.
+        for raw in [
+            "Resource quota exceeded: Token limit exceeded: 3402015 / 3000000",
+            "Resource quota exceeded: Token limit exceeded: 3004291 / 3000000",
+        ] {
+            let msg = sanitize_agent_error(raw);
+            assert!(msg.contains("hourly token budget"), "{raw} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn sanitize_cost_budget_is_its_own_message() {
+        for raw in [
+            "Resource quota exceeded: Agent x exceeded hourly cost quota: $1.2 / $1.0",
+            "Resource quota exceeded: Global daily budget exceeded: $5 / $5",
+        ] {
+            let msg = sanitize_agent_error(raw);
+            assert!(msg.contains("spending budget"), "{raw} -> {msg}");
+        }
+    }
+
+    #[test]
+    fn sanitize_other_auth_still_generic() {
+        // Provider key problems stay vague for channel users.
+        let msg = sanitize_agent_error("authentication failed: invalid api key");
+        assert_eq!(msg, "Service temporarily unavailable.");
+    }
 
     #[test]
     fn test_sanitize_agent_error_provider_stall() {
