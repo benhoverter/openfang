@@ -1797,8 +1797,19 @@ pub const CC_AUTH_EXPIRED_MARKER: &str = "Claude Code login expired or missing";
 /// True when the CLI's failure output means its login is expired or absent.
 /// Matches specific phrases only: the old bare "auth"/"login" substrings
 /// misfiled unrelated failures (any path or message containing "author").
+/// When the output is the CLI's JSON result object, only its status fields
+/// are scanned: the rest (e.g. permission_denials[].tool_input) can carry
+/// agent-controlled text that must not be able to fire the operator alert.
 fn is_cli_auth_failure(detail: &str) -> bool {
-    let d = detail.to_lowercase();
+    let d = match serde_json::from_str::<serde_json::Value>(detail) {
+        Ok(v) if v.is_object() => ["result", "terminal_reason", "subtype"]
+            .iter()
+            .filter_map(|k| v.get(*k).and_then(|f| f.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .to_lowercase(),
+        _ => detail.to_lowercase(),
+    };
     [
         "failed to authenticate",
         "not authenticated",
@@ -1816,14 +1827,15 @@ fn is_cli_auth_failure(detail: &str) -> bool {
 
 /// Pull the human-readable reason out of the CLI's failure output. The CLI
 /// prints a whole JSON result object on failure; its `result` field holds the
-/// reason. Falls back to the first 300 chars of the raw text.
+/// reason. Falls back to the raw text. Either way capped at 300 chars.
 fn cli_failure_reason(detail: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(detail) {
-        if let Some(r) = v.get("result").and_then(|r| r.as_str()) {
-            return r.to_string();
-        }
-    }
-    detail.chars().take(300).collect()
+    let parsed = serde_json::from_str::<serde_json::Value>(detail).ok();
+    let text = parsed
+        .as_ref()
+        .and_then(|v| v.get("result"))
+        .and_then(|r| r.as_str())
+        .unwrap_or(detail);
+    text.chars().take(300).collect()
 }
 
 /// Raise the operator alert and build the error message for an auth failure.
@@ -4110,6 +4122,25 @@ mod cc_auth_failure {
         let raw = "x".repeat(1000);
         assert_eq!(cli_failure_reason(&raw).len(), 300);
         assert_eq!(cli_failure_reason("plain stderr"), "plain stderr");
+    }
+
+    #[test]
+    fn reason_from_json_result_is_bounded() {
+        let raw = serde_json::json!({ "result": "y".repeat(1000) }).to_string();
+        assert_eq!(cli_failure_reason(&raw).len(), 300);
+    }
+
+    /// Agent-controlled text elsewhere in the JSON must not fire the alert.
+    #[test]
+    fn json_auth_phrase_outside_status_fields_is_ignored() {
+        let raw = serde_json::json!({
+            "is_error": true,
+            "subtype": "error_during_execution",
+            "result": "tool failed",
+            "permission_denials": [{ "tool_input": { "command": "echo not logged in" } }]
+        })
+        .to_string();
+        assert!(!is_cli_auth_failure(&raw));
     }
 
     #[test]
