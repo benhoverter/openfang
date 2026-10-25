@@ -21,6 +21,7 @@ pub mod media;
 pub mod memory;
 pub mod message;
 pub mod model_catalog;
+pub mod net_facts;
 pub mod path_facts;
 pub mod paths;
 pub mod scheduler;

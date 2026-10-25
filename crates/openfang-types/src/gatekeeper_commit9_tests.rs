@@ -226,6 +226,7 @@ fn prompt_request() -> GateRequest {
         policy: DEFAULT_POLICY.to_string(),
         posture: GatePosture::Strict,
         path_facts: crate::path_facts::PathFactSheet::default(),
+        net_facts: Default::default(),
     }
 }
 

@@ -241,6 +241,7 @@ fn req(posture: GatePosture) -> GateRequest {
         },
         policy: DEFAULT_POLICY_PERMISSIVE.to_string(),
         path_facts: crate::path_facts::PathFactSheet::default(),
+        net_facts: Default::default(),
         posture,
     }
 }

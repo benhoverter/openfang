@@ -422,6 +422,8 @@ pub async fn build_gate_request(
         flags,
         policy: policy_text(posture).to_string(),
         path_facts,
+        // Commit 3 (the curl parser) fills this in. Shadow until the flip.
+        net_facts: Default::default(),
         posture,
     }
 }

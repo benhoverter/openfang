@@ -2467,6 +2467,12 @@ pub struct GateRequest {
     /// nothing" rather than "nothing to worry about".
     #[serde(default)]
     pub path_facts: crate::path_facts::PathFactSheet,
+    /// What the command's `curl` would send, and where. Shadow: computed,
+    /// carried and logged, never rendered into the prompt until the floor
+    /// flip. `#[serde(default)]` for the same fail-open reason as
+    /// `path_facts`. See [`crate::net_facts`].
+    #[serde(default)]
+    pub net_facts: crate::net_facts::NetFactSheet,
     /// Operator policy text: compiled-in default, or `~/.openfang/gatekeeper.md`
     /// when present. Daemon-read, trusted, versioned.
     pub policy: String,
@@ -6952,6 +6958,7 @@ mod tests {
             policy: DEFAULT_POLICY.to_string(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         assert!(req.flags.any());
         assert_eq!(req.floor(), GateVerdict::Escalate);
@@ -6977,6 +6984,7 @@ mod tests {
             policy: DEFAULT_POLICY.to_string(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         let p = req.user_prompt();
         // Exactly one opening and one closing fence: ours.
@@ -7343,6 +7351,7 @@ mod tests {
             policy: DEFAULT_POLICY.to_string(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         assert_eq!(req.floor(), GateVerdict::Escalate);
         assert_eq!(
@@ -7368,6 +7377,7 @@ mod tests {
             policy: DEFAULT_POLICY.to_string(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         let p = req.user_prompt();
         assert!(p.contains("<command>\ncargo test\n</command>"));
@@ -7396,6 +7406,7 @@ mod tests {
                 script_body: body,
                 ..Default::default()
             },
+            net_facts: Default::default(),
         }
     }
 
@@ -7697,6 +7708,7 @@ mod tests {
             policy: String::new(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         assert!(req.user_prompt().contains("truncated for review"));
         assert_eq!(req.command.len(), long.len());
@@ -7722,6 +7734,7 @@ mod tests {
             policy: String::new(),
             posture: GatePosture::Strict,
             path_facts: crate::path_facts::PathFactSheet::default(),
+            net_facts: Default::default(),
         };
         let p = req.user_prompt();
 

@@ -270,6 +270,7 @@ fn golden_request() -> GateRequest {
         policy: DEFAULT_POLICY.to_string(),
         posture: GatePosture::Strict,
         path_facts: crate::path_facts::PathFactSheet::default(),
+        net_facts: Default::default(),
     }
 }
 
@@ -304,6 +305,28 @@ fn golden_user_prompt_is_unchanged() {
         USER_GOLDEN,
         "the judge's user prompt changed; if that was intentional, regenerate the golden"
     );
+}
+
+/// curl-policy shadow mode: the net fact sheet is carried, not rendered. A
+/// fully populated sheet must leave both prompts byte-identical to the
+/// golden until the floor flip deliberately changes this test.
+#[test]
+fn net_facts_do_not_reach_the_prompt_in_shadow() {
+    let mut req = golden_request();
+    req.net_facts = crate::net_facts::tests::sample_sheet();
+    assert_ne!(req.net_facts, crate::net_facts::NetFactSheet::default());
+    assert_eq!(req.system_prompt(), SYSTEM_GOLDEN);
+    assert_eq!(req.user_prompt(), USER_GOLDEN);
+}
+
+/// A corpus row written before `net_facts` existed still loads, as an
+/// empty sheet.
+#[test]
+fn a_request_without_net_facts_still_deserializes() {
+    let mut json: serde_json::Value = serde_json::to_value(golden_request()).unwrap();
+    json.as_object_mut().unwrap().remove("net_facts").unwrap();
+    let back: GateRequest = serde_json::from_value(json).unwrap();
+    assert_eq!(back.net_facts, crate::net_facts::NetFactSheet::default());
 }
 
 /// Structural invariants, asserted separately from the bytes.
