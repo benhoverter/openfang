@@ -27,6 +27,7 @@ pub mod scheduler;
 pub mod secret_scrub;
 pub mod security_flags;
 pub mod serde_compat;
+pub mod shell_egress;
 pub mod taint;
 pub mod tool;
 pub mod tool_compat;

@@ -195,23 +195,30 @@ impl UploadTarget {
             .map_or(authority, |(h, _)| h)
             .trim_end_matches('.')
             .to_ascii_lowercase();
-        let shared = host == "storage.googleapis.com"
-            || host == "storage.cloud.google.com"
-            || host == "s3.amazonaws.com"
-            || ((host.starts_with("s3.") || host.starts_with("s3-"))
-                && host.ends_with(".amazonaws.com"))
-            // Backblaze B2 S3 API: s3.<region>.backblazeb2.com
-            || (host.starts_with("s3.") && host.ends_with(".backblazeb2.com"))
-            // Wasabi: s3.wasabisys.com, s3.<region>.wasabisys.com
-            || (host.starts_with("s3.") && host.ends_with(".wasabisys.com"))
-            // DigitalOcean Spaces path-style: <region>.digitaloceanspaces.com
-            // (bucket-style <bucket>.<region>.… has one more label and is
-            // owned by that bucket).
-            || host == "digitaloceanspaces.com"
-            || (host.ends_with(".digitaloceanspaces.com") && host.split('.').count() == 3);
         let bucketless = path.trim_matches('/').is_empty();
-        (shared && bucketless).then_some(host)
+        (is_shared_object_store_root(&host) && bucketless).then_some(host)
     }
+}
+
+/// Is `host` (lowercase, no port, no trailing dot) a shared, path-style
+/// object-store root, where the first path segment names the owner and
+/// anyone can create one? Shared with `[shell_egress] write_hosts`, which has
+/// no path to pin the owner and so refuses these hosts outright.
+pub(crate) fn is_shared_object_store_root(host: &str) -> bool {
+    host == "storage.googleapis.com"
+        || host == "storage.cloud.google.com"
+        || host == "s3.amazonaws.com"
+        || ((host.starts_with("s3.") || host.starts_with("s3-"))
+            && host.ends_with(".amazonaws.com"))
+        // Backblaze B2 S3 API: s3.<region>.backblazeb2.com
+        || (host.starts_with("s3.") && host.ends_with(".backblazeb2.com"))
+        // Wasabi: s3.wasabisys.com, s3.<region>.wasabisys.com
+        || (host.starts_with("s3.") && host.ends_with(".wasabisys.com"))
+        // DigitalOcean Spaces path-style: <region>.digitaloceanspaces.com
+        // (bucket-style <bucket>.<region>.… has one more label and is
+        // owned by that bucket).
+        || host == "digitaloceanspaces.com"
+        || (host.ends_with(".digitaloceanspaces.com") && host.split('.').count() == 3)
 }
 
 #[cfg(test)]

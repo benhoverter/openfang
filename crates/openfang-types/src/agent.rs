@@ -751,6 +751,11 @@ pub struct AgentManifest {
     /// [`crate::upload`].
     #[serde(default)]
     pub upload_targets: Vec<crate::upload::UploadTarget>,
+    /// Hosts this agent's shell `curl` may send data to without escalating
+    /// (`[shell_egress] write_hosts`). Absent or empty means none. A bad
+    /// entry fails the manifest load. See [`crate::shell_egress`].
+    #[serde(default)]
+    pub shell_egress: crate::shell_egress::ShellEgress,
 }
 
 /// Runtime default for `AgentManifest::max_history_messages` when the agent
@@ -896,6 +901,7 @@ impl Default for AgentManifest {
             cache_context: false,
             max_history_messages: None,
             upload_targets: Vec::new(),
+            shell_egress: Default::default(),
         }
     }
 }
@@ -1416,6 +1422,7 @@ mod tests {
             cache_context: false,
             max_history_messages: None,
             upload_targets: Vec::new(),
+            shell_egress: Default::default(),
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();

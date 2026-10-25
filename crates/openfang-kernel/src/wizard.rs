@@ -188,6 +188,7 @@ impl SetupWizard {
             cache_context: false,
             max_history_messages: None,
             upload_targets: Vec::new(),
+            shell_egress: Default::default(),
         };
 
         let skills_to_install: Vec<String> = intent

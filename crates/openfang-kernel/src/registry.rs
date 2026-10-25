@@ -514,6 +514,7 @@ mod tests {
                 cache_context: false,
                 max_history_messages: None,
                 upload_targets: Vec::new(),
+                shell_egress: Default::default(),
             },
             state: AgentState::Created,
             mode: AgentMode::default(),
