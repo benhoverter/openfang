@@ -42,7 +42,8 @@
 #   OPENFANG_DEPLOY_BRANCH expected branch (default: main)
 #
 # Rollback (manual, on failure):
-#   cp <backup-path> ~/.openfang/bin/openfang
+#   cp <backup-path> ~/.openfang/bin/openfang.tmp
+#   mv -f ~/.openfang/bin/openfang.tmp ~/.openfang/bin/openfang   (never cp in place)
 #   openfang service restart
 #
 # Exit codes:
@@ -92,7 +93,16 @@ fail()   { printf '%s  ✗ %s%s\n' "${C_RED}${C_BOLD}" "$1" "${C_RESET}"; }
 info()   { printf '%s    %s%s\n' "${C_DIM}" "$1" "${C_RESET}"; }
 
 daemon_line() { launchctl list | awk -v label="$DAEMON_LABEL" '$3 == label {print $0}' || true; }
-rollback_hint() { info "Rollback: cp $BACKUP $BIN && $BIN service restart --label $DAEMON_LABEL"; }
+rollback_hint() { info "Rollback: cp $BACKUP $BIN.tmp && mv -f $BIN.tmp $BIN && $BIN service restart --label $DAEMON_LABEL"; }
+
+# Install a binary by copy-to-temp + rename, never `cp` over the target.
+# On macOS (Apple Silicon) overwriting a signed Mach-O in place reuses its
+# inode, and the kernel's cached code signature no longer matches the new
+# bytes: the next exec is SIGKILLed ("Killed: 9"). A rename gives a new inode.
+install_bin() {
+  local src="$1" dst="$2" tmp="$2.tmp.$$"
+  cp "$src" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+}
 
 # --- Argument parsing --------------------------------------------------------
 LABEL=""
@@ -366,7 +376,13 @@ legacy_restart() {
 }
 
 restart_daemon() {
-  if "$BIN" service --help >/dev/null 2>&1; then
+  local rc=0
+  "$BIN" service --help >/dev/null 2>&1 || rc=$?
+  if (( rc > 128 )); then
+    # Killed by a signal: the binary can't run at all. Not a missing command.
+    fail "Installed binary was killed on exec (signal $((rc - 128))); not restarting with it."
+    return 1
+  elif (( rc == 0 )); then
     "$BIN" service restart --label "$DAEMON_LABEL"
   else
     warn "Installed binary has no 'service' command; using raw launchctl restart."
@@ -388,7 +404,7 @@ else
   OLD_PID=$(daemon_line | awk '{print $1}')
   info "Daemon PID before swap: ${OLD_PID:-<not running>}"
 
-  if ! cp "$BUILT" "$BIN"; then
+  if ! install_bin "$BUILT" "$BIN"; then
     fail "Failed to swap binary. Live binary unchanged."
     exit 6
   fi
@@ -397,8 +413,7 @@ else
   # The bridge isn't snapshotted: it's spawned per Claude Code turn, not a
   # long-running service. A failed copy only warns.
   if [[ $HAS_BRIDGE -eq 1 ]]; then
-    if cp "$BUILT_BRIDGE" "$BRIDGE_BIN"; then
-      chmod 755 "$BRIDGE_BIN" || true
+    if install_bin "$BUILT_BRIDGE" "$BRIDGE_BIN"; then
       ok "Bridge binary installed at $BRIDGE_BIN."
     else
       warn "Failed to install bridge binary at $BRIDGE_BIN; agents with the bridge explicitly enabled will have no tools until fixed."
@@ -409,7 +424,7 @@ else
 
   if ! restart_daemon; then
     fail "Daemon restart failed. Rolling back binary and retrying."
-    cp "$BACKUP" "$BIN" || true
+    install_bin "$BACKUP" "$BIN" || true
     restart_daemon || info "Manual recovery: $BIN service start --label $DAEMON_LABEL"
     exit 6
   fi
