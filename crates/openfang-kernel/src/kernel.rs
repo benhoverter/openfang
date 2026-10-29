@@ -11735,6 +11735,13 @@ impl KernelHandle for OpenFangKernel {
             .unwrap_or_default()
     }
 
+    fn agent_shell_egress(&self, agent_id: &str) -> openfang_types::shell_egress::ShellEgress {
+        self.resolve_agent_ref(agent_id)
+            .and_then(|id| self.registry.get(id))
+            .map(|entry| entry.manifest.shell_egress.clone())
+            .unwrap_or_default()
+    }
+
     async fn spawn_agent(
         &self,
         manifest_toml: &str,

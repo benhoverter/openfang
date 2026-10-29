@@ -356,7 +356,11 @@ fn looks_binary(text: &str) -> bool {
 
 /// Everything computable without spawning anything: resolution, stat,
 /// containment, authority.
-fn stat_fact(raw: &str, canon_ws: Option<&Path>, file_policy: Option<&FilePolicy>) -> PathFact {
+pub(crate) fn stat_fact(
+    raw: &str,
+    canon_ws: Option<&Path>,
+    file_policy: Option<&FilePolicy>,
+) -> PathFact {
     let resolved = resolve(raw, canon_ws);
 
     let mut fact = PathFact {

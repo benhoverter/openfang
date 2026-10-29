@@ -48,6 +48,7 @@ pub mod mcp;
 pub mod mcp_server;
 pub mod media_understanding;
 pub mod model_catalog;
+mod net_facts;
 pub mod operator_alert;
 pub mod path_facts;
 pub mod process_manager;

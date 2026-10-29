@@ -150,7 +150,11 @@ fn check_taint_shell_exec(command: &str) -> Option<String> {
     }
 
     // Layer 2: Heuristic patterns for injected external URLs / base64 payloads
-    let suspicious_patterns = ["curl ", "wget ", "| sh", "| bash", "base64 -d", "eval "];
+    //
+    // curl is not here: the curl floor (`crate::net_facts`) describes and
+    // rules on it instead of refusing the word. wget stays word-blocked until
+    // it has its own parser.
+    let suspicious_patterns = ["wget ", "| sh", "| bash", "base64 -d", "eval "];
     for pattern in &suspicious_patterns {
         if command.contains(pattern) {
             let mut labels = HashSet::new();
@@ -163,6 +167,55 @@ fn check_taint_shell_exec(command: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// What the curl floor asks of the caller.
+enum CurlGate {
+    /// Refuse with this message. Terminal.
+    Refuse(String),
+    /// Needs a fresh human answer for this exact call.
+    Escalate(String),
+}
+
+/// Run the curl floor for a `shell_exec` call. `None`: no curl, Full mode
+/// (which bypasses every shell check, M6), or the floor leaves it to the
+/// judge.
+fn curl_floor_gate(
+    tool_name: &str,
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    workspace_root: Option<&Path>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+) -> Option<CurlGate> {
+    if tool_name != "shell_exec"
+        || exec_policy.is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full)
+    {
+        return None;
+    }
+    let command = input.get("command").and_then(|v| v.as_str())?;
+    let egress = match (kernel, caller_agent_id) {
+        (Some(kh), Some(id)) => kh.agent_shell_egress(id),
+        _ => Default::default(),
+    };
+    let (sheet, verdict) = crate::net_facts::check(command, workspace_root, file_policy, &egress)?;
+    info!(
+        target: "openfang::curl_floor",
+        agent = caller_agent_id.unwrap_or("unknown"),
+        verdict = ?verdict,
+        net_facts = %serde_json::to_string(&sheet).unwrap_or_default(),
+        command = %command,
+        "curl floor"
+    );
+    match verdict {
+        openfang_types::net_facts::NetVerdict::Judge => None,
+        openfang_types::net_facts::NetVerdict::Escalate(why) => Some(CurlGate::Escalate(why)),
+        openfang_types::net_facts::NetVerdict::Deny(why) => Some(CurlGate::Refuse(format!(
+            "{why} Nothing was sent. This is a fixed rule, not a judgement: approval cannot \
+             override it."
+        ))),
+    }
 }
 
 /// Check if a URL should be blocked by taint tracking before network fetch.
@@ -356,6 +409,51 @@ pub async fn execute_tool(
         }
     }
 
+    // The curl floor, before any approval machinery. `Deny` is terminal: it
+    // returns here, so no judge, prompt, cache or posture ever sees it.
+    // `Escalate` demands a fresh human answer for this exact call, which the
+    // trusted/auto-approved paths cannot give, so there it refuses. Checked
+    // again in the `shell_exec` arm right before execution, through the same
+    // function, because a file can change while a prompt waits.
+    let mut curl_needs_fresh_prompt = false;
+    if let Some(refusal) = curl_floor_gate(
+        tool_name,
+        input,
+        kernel,
+        caller_agent_id,
+        workspace_root,
+        exec_policy,
+        file_policy,
+    ) {
+        match refusal {
+            CurlGate::Refuse(content) => {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content,
+                    is_error: true,
+                }
+            }
+            CurlGate::Escalate(why) => {
+                let can_prompt = kernel.is_some_and(|kh| kh.requires_approval(tool_name))
+                    && !exec_policy_bypasses_approval
+                    && auto_approved.is_none();
+                if !can_prompt {
+                    return ToolResult {
+                        tool_use_id: tool_use_id.to_string(),
+                        content: format!(
+                            "{why} This agent's curl runs without an approval prompt, so it \
+                             cannot be asked. Nothing was sent. Ask the operator to add the \
+                             host to [shell_egress] write_hosts, or to move curl to \
+                             allowed_commands."
+                        ),
+                        is_error: true,
+                    };
+                }
+                curl_needs_fresh_prompt = true;
+            }
+        }
+    }
+
     if let Some(kh) = kernel {
         if !exec_policy_bypasses_approval
             && auto_approved.is_none()
@@ -437,7 +535,10 @@ pub async fn execute_tool(
             // incidental: a gatekeeper suppression must never seed the
             // Approve-Similar cache, which blankets a whole binary for up to
             // `cache_max_uses` invocations. One judgement, one invocation.
-            let suppressed = matches!(gate_outcome, Some(crate::gatekeeper::GateOutcome::Suppress));
+            // The curl floor's Escalate is a ceiling on the judge: it may
+            // still deny, never suppress.
+            let suppressed = !curl_needs_fresh_prompt
+                && matches!(gate_outcome, Some(crate::gatekeeper::GateOutcome::Suppress));
             if suppressed {
                 debug!(
                     tool_name,
@@ -492,6 +593,14 @@ pub async fn execute_tool(
                     Some(crate::gatekeeper::GateOutcome::Escalate(note)) => Some(note.clone()),
                     _ => None,
                 };
+                let gatekeeper_note = if curl_needs_fresh_prompt {
+                    Some(match gatekeeper_note {
+                        Some(n) => format!("curl floor: escalated; {n}"),
+                        None => "curl floor: escalated".to_string(),
+                    })
+                } else {
+                    gatekeeper_note
+                };
                 // Approve-Similar cache key source: argv[0] of a shell_exec
                 // command, extracted once here where structured input still
                 // exists (never re-parsed from the mangled action_summary).
@@ -507,7 +616,11 @@ pub async fn execute_tool(
                 } else {
                     None
                 };
-                let cache_binary = raw_command.and_then(extract_cache_binary);
+                // A curl escalation is about THIS call's host and payload, so
+                // it neither reads nor seeds the Approve-Similar cache.
+                let cache_binary = raw_command
+                    .and_then(extract_cache_binary)
+                    .filter(|_| !curl_needs_fresh_prompt);
                 let command = raw_command.map(|c| {
                     c.chars()
                         .take(openfang_types::approval::MAX_COMMAND_LEN)
@@ -842,6 +955,24 @@ pub async fn execute_tool(
             let is_full_exec = exec_policy
                 .is_some_and(|p| p.mode == openfang_types::config::ExecSecurityMode::Full);
             if !is_full_exec {
+                // Second pass of the curl floor, same function, right before
+                // execution. Only `Refuse` acts here: an `Escalate` was either
+                // approved by a human above or already refused.
+                if let Some(CurlGate::Refuse(content)) = curl_floor_gate(
+                    tool_name,
+                    input,
+                    kernel,
+                    caller_agent_id,
+                    workspace_root,
+                    exec_policy,
+                    file_policy,
+                ) {
+                    return ToolResult {
+                        tool_use_id: tool_use_id.to_string(),
+                        content,
+                        is_error: true,
+                    };
+                }
                 if let Some(violation) = check_taint_shell_exec(command) {
                     return ToolResult {
                         tool_use_id: tool_use_id.to_string(),
@@ -4245,6 +4376,18 @@ async fn tool_shell_exec(
         let argv = shlex::split(command).ok_or_else(|| {
             "Command contains unmatched quotes or invalid shell syntax".to_string()
         })?;
+        // The curl floor already ruled on the agent's own argv; this only
+        // narrows (see `net_facts::inject`). Non-curl argv is unchanged.
+        let before = argv.len();
+        let argv = crate::net_facts::inject(argv);
+        if argv.len() != before {
+            // Security ruling: the audit trail records the argv that ran.
+            info!(
+                target: "openfang::curl_floor",
+                executed_argv = ?argv,
+                "curl floor: executed argv"
+            );
+        }
         if argv.is_empty() {
             return Err("Empty command after parsing".to_string());
         }
@@ -10221,6 +10364,8 @@ mod tests {
         // the whole point of the fix is that these are two channels.
         approval_note: std::sync::Mutex<Option<String>>,
         approval_summary: std::sync::Mutex<Option<String>>,
+        // curl floor: an escalation must not read or seed the cache.
+        approval_cache_binary: std::sync::Mutex<Option<String>>,
         // ANAI-153: the decision the gate should return. Defaults to Approved
         // so every pre-existing test keeps its behaviour; a test that wants to
         // exercise the negative outcomes overrides it.
@@ -10321,6 +10466,7 @@ mod tests {
                 approval_command: std::sync::Mutex::new(None),
                 approval_note: std::sync::Mutex::new(None),
                 approval_summary: std::sync::Mutex::new(None),
+                approval_cache_binary: std::sync::Mutex::new(None),
                 approval_decision: std::sync::Mutex::new(
                     openfang_types::approval::ApprovalDecision::Approved,
                 ),
@@ -12579,12 +12725,13 @@ mod tests {
             _tool_name: &str,
             action_summary: &str,
             _origin: Option<&openfang_types::approval::ApprovalOrigin>,
-            _cache_binary: Option<&str>,
+            cache_binary: Option<&str>,
             command: Option<&str>,
             gatekeeper_note: Option<&str>,
         ) -> Result<openfang_types::approval::ApprovalDecision, String> {
             self.approval_requested
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            *self.approval_cache_binary.lock().unwrap() = cache_binary.map(str::to_string);
             *self.approval_command.lock().unwrap() = command.map(str::to_string);
             *self.approval_note.lock().unwrap() = gatekeeper_note.map(str::to_string);
             *self.approval_summary.lock().unwrap() = Some(action_summary.to_string());
@@ -12956,6 +13103,96 @@ mod tests {
                 "{token}: the disposition row must join to its verdict row"
             );
         }
+    }
+
+    // ---- curl floor through execute_tool --------------------------------
+    //
+    // No test here lets curl reach the network: each one is refused, or its
+    // approval is Denied, before `tool_shell_exec` runs.
+
+    /// H-rule: refused before any approval machinery, even with a judge and a
+    /// human who would both say yes.
+    #[tokio::test]
+    async fn curl_floor_deny_is_terminal() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_gated(
+            &handle,
+            &gate_policy("curl"),
+            "curl http://127.0.0.1:4200/api",
+        )
+        .await;
+        assert!(r.is_error);
+        assert!(r.content.starts_with("curl refused:"), "{}", r.content);
+        assert!(!fake
+            .gate_consulted
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!fake
+            .approval_requested
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// E-rule: a fresh prompt, never the cache, and the judge cannot suppress.
+    #[tokio::test]
+    async fn curl_floor_escalate_forces_a_fresh_prompt() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress)
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_gated(
+            &handle,
+            &gate_policy("curl"),
+            "curl -X DELETE https://elsewhere.example/x",
+        )
+        .await;
+        assert!(r.is_error);
+        assert!(fake
+            .approval_requested
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(*fake.approval_cache_binary.lock().unwrap(), None);
+        let note = fake
+            .approval_note
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        assert!(note.starts_with("curl floor: escalated"), "{note}");
+    }
+
+    /// E-rule where nobody can be asked (curl trusted): refused, not run.
+    #[tokio::test]
+    async fn curl_floor_escalate_without_a_prompt_is_refused() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = openfang_types::config::ExecPolicy {
+            mode: openfang_types::config::ExecSecurityMode::Allowlist,
+            trusted_commands: vec!["curl".to_string()],
+            ..openfang_types::config::ExecPolicy::default()
+        };
+        let r = run_gated(
+            &handle,
+            &policy,
+            "curl -d x=1 https://elsewhere.example/hook",
+        )
+        .await;
+        assert!(r.is_error);
+        assert!(r.content.contains("cannot be asked"), "{}", r.content);
+        assert!(!fake
+            .approval_requested
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The word match is gone: a non-curl command that mentions curl runs
+    /// through the normal path, and wget is still word-blocked.
+    #[test]
+    fn the_curl_word_match_is_gone() {
+        assert!(check_taint_shell_exec("git commit -m 'fix curl handling'").is_none());
+        assert!(check_taint_shell_exec("wget https://example.com").is_some());
     }
 
     /// ANAI-240: the deterministic sheet verdict is recorded on every row.

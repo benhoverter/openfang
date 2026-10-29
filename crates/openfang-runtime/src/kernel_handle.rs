@@ -590,6 +590,13 @@ pub trait KernelHandle: Send + Sync {
         Vec::new()
     }
 
+    /// The calling agent's `[shell_egress]`. The default is an empty
+    /// `write_hosts`, which is the fail-safe: every curl upload escalates.
+    fn agent_shell_egress(&self, agent_id: &str) -> openfang_types::shell_egress::ShellEgress {
+        let _ = agent_id;
+        openfang_types::shell_egress::ShellEgress::default()
+    }
+
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
 
