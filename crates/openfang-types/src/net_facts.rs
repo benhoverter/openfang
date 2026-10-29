@@ -244,9 +244,10 @@ pub enum HostClass {
     Name,
     /// A canonical, globally routable IP literal.
     PublicIp,
-    /// Loopback, private, link-local, CGNAT, ULA, metadata, `localhost` and
-    /// `*.localhost`, `0.0.0.0` / `[::]`, after curl-style normalization of
-    /// odd IP forms.
+    /// Loopback, private, link-local, CGNAT, ULA, metadata, `0.0.0.0` /
+    /// `[::]` after curl-style normalization of odd IP forms; and the local
+    /// names `localhost`, `*.local`, `*.lan`, `*.internal`, `*.home.arpa`,
+    /// `*.ts.net` and any single-label name.
     Internal,
     /// Anything else, including IP forms we do not normalize. Never `Name`.
     Unparseable,
@@ -809,9 +810,43 @@ pub fn parse_curl_argv(
     source: NetSource,
     stat: &dyn Fn(&str) -> PathFact,
 ) -> NetFactSheet {
+    parse_inner(argv, source, stat).0
+}
+
+/// The argv indices of the tokens that start a new transfer (`--next` /
+/// `-:`), as [`parse_curl_argv`] reads them. The injector inserts at exactly
+/// these indices, so the parser and the executed argv can never disagree on
+/// where a segment ends (a `-H --next` value is not a break; a `-s:` cluster
+/// is refused as unparsed rather than split).
+pub fn curl_transfer_breaks(argv: &[String]) -> Vec<usize> {
+    parse_inner(argv, NetSource::TopLevel, &unstatted).1
+}
+
+/// A path nobody looked at. Only for [`curl_transfer_breaks`], which never
+/// reads the facts.
+fn unstatted(raw: &str) -> PathFact {
+    PathFact {
+        raw: raw.to_string(),
+        resolved: None,
+        existence: crate::path_facts::PathExistence::Unknown,
+        size_bytes: None,
+        symlink_target: None,
+        mtime_secs_ago: None,
+        git: crate::path_facts::GitFact::Unknown,
+        inside_workspace: false,
+        authority: crate::path_facts::PathAuthority::NoPolicy,
+    }
+}
+
+fn parse_inner(
+    argv: &[String],
+    source: NetSource,
+    stat: &dyn Fn(&str) -> PathFact,
+) -> (NetFactSheet, Vec<usize>) {
     let mut sheet = NetFactSheet::default();
     let mut seg = Segment::new(source, 0);
     let mut transfer: u8 = 0;
+    let mut breaks = Vec::new();
     let mut i = 1;
 
     let close = |seg: Segment, sheet: &mut NetFactSheet| {
@@ -825,6 +860,7 @@ pub fn parse_curl_argv(
     };
 
     while i < argv.len() {
+        let tok_idx = i;
         let tok = argv[i].as_str();
         i += 1;
 
@@ -844,6 +880,14 @@ pub fn parse_curl_argv(
             let mut j = 0;
             while j < chars.len() {
                 let c = chars[j];
+                if c == ':' && chars.len() > 1 {
+                    // `-s:` is a transfer break curl honours inside a
+                    // cluster. Only a lone `-:` is accepted as one, so the
+                    // injector and the parser always split in the same place.
+                    seg.unparsed = true;
+                    j += 1;
+                    continue;
+                }
                 let name = format!("-{c}");
                 match short_flag(c) {
                     Some(f) if f.takes_value() => {
@@ -900,6 +944,7 @@ pub fn parse_curl_argv(
                 Flag::Netrc | Flag::NetrcFile | Flag::Config => seg.inv.reads_config = true,
                 Flag::RemoteName => seg.remote_name = true,
                 Flag::Next => {
+                    breaks.push(tok_idx);
                     transfer = transfer.saturating_add(1);
                     let done = std::mem::replace(&mut seg, Segment::new(source, transfer));
                     close(done, &mut sheet);
@@ -970,6 +1015,16 @@ pub fn parse_curl_argv(
                         seg.unparsed = true;
                         continue;
                     };
+                    // C3: part parameters after the first `;` can read files
+                    // too (`;headers=@FILE`, `;headers=<FILE`). Only `type=`
+                    // and `filename=` are understood; anything else that
+                    // could name a file is blind.
+                    if value.split_once(';').is_some_and(|(_, params)| {
+                        params.contains(['@', '<']) || params.contains("headers")
+                    }) {
+                        seg.unparsed = true;
+                        continue;
+                    }
                     match value.strip_prefix('@').or_else(|| value.strip_prefix('<')) {
                         Some(rest) => {
                             // M3: `;type=` / `;filename=` are not part of the path.
@@ -1056,7 +1111,7 @@ pub fn parse_curl_argv(
         }
     }
     close(seg, &mut sheet);
-    sheet
+    (sheet, breaks)
 }
 
 /// Parse one URL the way curl would see it. Never stores query or fragment.
@@ -1171,12 +1226,31 @@ pub fn parse_url(raw: &str, globoff: bool) -> UrlFact {
     }
 
     fact.host = Some(host.to_string());
-    fact.host_class = if host == "localhost" || host.ends_with(".localhost") {
+    fact.host_class = if is_internal_name(host) {
         HostClass::Internal
     } else {
         HostClass::Name
     };
     fact
+}
+
+/// Names that resolve inside the box or the tailnet/LAN. These can hold
+/// publicly valid certificates (Tailscale `*.ts.net`, internal ACME), so the
+/// force-TLS argument does not cover them. A single label (`printer`) is a
+/// search-domain lookup, also local.
+fn is_internal_name(host: &str) -> bool {
+    const SUFFIXES: &[&str] = &[
+        "localhost",
+        "local",
+        "lan",
+        "internal",
+        "home.arpa",
+        "ts.net",
+    ];
+    !host.contains('.')
+        || SUFFIXES
+            .iter()
+            .any(|s| host == *s || host.ends_with(&format!(".{s}")))
 }
 
 /// curl's (and inet_aton's) IPv4 forms: 1–4 parts, each decimal, `0`-prefixed
@@ -1513,9 +1587,24 @@ pub(crate) mod tests {
             "localhost",
             "localhost.",
             "a.localhost",
+            "0x7f.1",
+            "printer",
+            "nas.local",
+            "router.lan",
+            "db.internal",
+            "box.home.arpa",
+            "laptop.tail1234.ts.net",
         ] {
             let u = parse_url(&format!("http://{host}/"), false);
             assert_eq!(u.host_class, HostClass::Internal, "{host}");
+        }
+        // Look-alikes outside those suffixes stay Name.
+        for host in ["notlocal.com", "ts.network", "internal.example.com"] {
+            assert_eq!(
+                parse_url(&format!("https://{host}/"), false).host_class,
+                HostClass::Name,
+                "{host}"
+            );
         }
         for host in [
             "[::1]",
@@ -1641,6 +1730,46 @@ pub(crate) mod tests {
         let s = parse("curl https://a.example -: https://b.example -: https://c.example -: https://d.example -: https://e.example");
         assert_eq!(s.invocations.len(), MAX_NET_INVOCATIONS);
         assert!(s.truncated);
+    }
+
+    /// C1: the parser and the injector split in the same places. `-s:` is
+    /// refused rather than split; a `--next` that is a flag's value is not a
+    /// break.
+    #[test]
+    fn transfer_breaks_match_the_parser() {
+        let argv = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(
+            curl_transfer_breaks(&argv(
+                "curl https://a.example --next https://b.example -: https://c.example"
+            )),
+            vec![2, 4]
+        );
+        assert!(curl_transfer_breaks(&argv("curl -H --next https://a.example")).is_empty());
+        assert_eq!(one("curl -H --next https://a.example").urls.len(), 1);
+        for cmd in [
+            "curl -L https://evil.example/r -s: https://example.com/",
+            "curl -L https://evil.example/r -:s https://example.com/",
+        ] {
+            assert!(parse(cmd).unparsed, "{cmd}");
+            assert!(curl_transfer_breaks(&argv(cmd)).is_empty(), "{cmd}");
+        }
+    }
+
+    /// C3: `-F` part parameters that can read a file are blind.
+    #[test]
+    fn form_part_parameters_that_read_files_are_blind() {
+        for cmd in [
+            "curl -F a=b;headers=@/etc/passwd https://a.example",
+            "curl -F a=b;headers=<hdrs.txt https://a.example",
+            "curl -F a=@ok.txt;headers=@/x https://a.example",
+            "curl -F a=@ok.txt;type=text/plain;headers=X-A:1 https://a.example",
+        ] {
+            assert!(parse(cmd).unparsed, "{cmd}");
+        }
+        assert!(
+            !parse("curl -F a=@ok.txt;type=text/plain;filename=r.txt https://a.example").unparsed
+        );
+        assert!(!parse("curl -F a=b https://a.example").unparsed);
     }
 
     /// (f) Every output-side write, and `-O` as the cwd (M4).

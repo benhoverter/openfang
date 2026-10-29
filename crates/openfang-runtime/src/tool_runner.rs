@@ -205,7 +205,7 @@ fn curl_floor_gate(
         agent = caller_agent_id.unwrap_or("unknown"),
         verdict = ?verdict,
         net_facts = %serde_json::to_string(&sheet).unwrap_or_default(),
-        command = %command,
+        command = %crate::net_facts::log_safe(command),
         "curl floor"
     );
     match verdict {
@@ -4382,9 +4382,10 @@ async fn tool_shell_exec(
         let argv = crate::net_facts::inject(argv);
         if argv.len() != before {
             // Security ruling: the audit trail records the argv that ran.
+            // Scrubbed: headers like `Authorization: Bearer …` sit in it.
             info!(
                 target: "openfang::curl_floor",
-                executed_argv = ?argv,
+                executed_argv = %crate::net_facts::log_safe(&format!("{argv:?}")),
                 "curl floor: executed argv"
             );
         }
