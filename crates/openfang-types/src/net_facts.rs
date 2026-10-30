@@ -1257,9 +1257,29 @@ fn is_internal_name(host: &str) -> bool {
             .any(|s| host == *s || host.ends_with(&format!(".{s}")))
 }
 
+/// A shell command as the judge, the approval prompt and the audit rows show
+/// it: URL userinfo redacted only when the command word is a bare program
+/// that takes URLs and runs no code (`curl`, `wget`). Every other command is
+/// shown verbatim, whatever its text looks like.
+///
+/// Security R4: no text shape is safe to hide inside an interpreter (`http:`
+/// is a Perl label, so `perl -we http://<code>@a.example` passes every shape
+/// check in [`redact_url_userinfo`]). git, ssh, psql and friends are left out
+/// on purpose: aliases, `ext::` transports and remote or inline commands can
+/// all run code. Their passwords show; a shown password beats a hidden
+/// command. Exact, case-sensitive and slash-free, like D1's readers, so
+/// `./curl` and `CURL` fall to the verbatim side.
+pub fn redact_command_userinfo(command: &str) -> std::borrow::Cow<'_, str> {
+    const URL_CONSUMERS: &[&str] = &["curl", "wget"];
+    match command.split_whitespace().next() {
+        Some(word) if URL_CONSUMERS.contains(&word) => redact_url_userinfo(command),
+        _ => std::borrow::Cow::Borrowed(command),
+    }
+}
+
 /// `text` with the userinfo of every `scheme://user:pass@host` replaced by
-/// `***`, for anything a person or a model reads: log lines, the judge's
-/// request, the approval prompt, the audit row. Never for anything that
+/// `***`. For the daemon log ([`redact_command_userinfo`] is the gate for
+/// anything the judge or the operator reads). Never for anything that
 /// decides: the floor and the gate flags read what the agent wrote.
 ///
 /// The authority ends at `/ ? #`, whitespace or a quote, so a later `@` in a
@@ -2166,5 +2186,45 @@ pub(crate) mod tests {
             !shown.contains("bob") && !shown.contains("hunter2"),
             "{shown}"
         );
+    }
+
+    /// Security R4: only a bare URL consumer is ever redacted for display.
+    #[test]
+    fn command_userinfo_redacts_only_for_url_consumers() {
+        for (input, want) in [
+            (
+                "curl https://bob:hunter2@a.example/x",
+                "curl https://***@a.example/x",
+            ),
+            (
+                "wget https://bob:hunter2@a.example/x",
+                "wget https://***@a.example/x",
+            ),
+            // Interpreters, code-running consumers, paths, other case: verbatim.
+            (
+                "perl -we http://a,b+c:d@a.example",
+                "perl -we http://a,b+c:d@a.example",
+            ),
+            (
+                "git clone https://u:tok@git.example/r",
+                "git clone https://u:tok@git.example/r",
+            ),
+            (
+                "ssh -o x=y https://u:p@h.example",
+                "ssh -o x=y https://u:p@h.example",
+            ),
+            (
+                "./curl https://u:p@a.example",
+                "./curl https://u:p@a.example",
+            ),
+            ("CURL https://u:p@a.example", "CURL https://u:p@a.example"),
+            (
+                "timeout 5 curl https://u:p@a.example",
+                "timeout 5 curl https://u:p@a.example",
+            ),
+            ("", ""),
+        ] {
+            assert_eq!(redact_command_userinfo(input), want, "{input}");
+        }
     }
 }

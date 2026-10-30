@@ -494,9 +494,9 @@ pub async fn execute_tool(
 
             // What the disposition rows below identify the command by.
             // Verbatim, same as the verdict row — a record whose dangerous
-            // tail was cut is not a record (ANAI-151). URL userinfo is the one
-            // thing removed: it is a credential, not risk context.
-            let disposition_subject = openfang_types::net_facts::redact_url_userinfo(
+            // tail was cut is not a record (ANAI-151). URL userinfo on a bare
+            // curl/wget is the one thing removed: a credential, not risk context.
+            let disposition_subject = openfang_types::net_facts::redact_command_userinfo(
                 input
                     .get("command")
                     .and_then(|v| v.as_str())
@@ -570,8 +570,14 @@ pub async fn execute_tool(
             }
 
             if !suppressed {
-                let input_str = input.to_string();
-                let input_str = openfang_types::net_facts::redact_url_userinfo(&input_str);
+                // Only a shell command's userinfo is ever hidden, and only on a
+                // URL consumer (R4); any other tool input is shown verbatim.
+                let mut shown_input = input.clone();
+                if let Some(c) = shown_input.get("command").and_then(|v| v.as_str()) {
+                    let c = openfang_types::net_facts::redact_command_userinfo(c).into_owned();
+                    shown_input["command"] = serde_json::Value::String(c);
+                }
+                let input_str = shown_input.to_string();
                 let summary = format!(
                     "{}: {}",
                     tool_name,
@@ -626,7 +632,7 @@ pub async fn execute_tool(
                     .and_then(extract_cache_binary)
                     .filter(|_| !curl_needs_fresh_prompt);
                 let command = raw_command.map(|c| {
-                    openfang_types::net_facts::redact_url_userinfo(c)
+                    openfang_types::net_facts::redact_command_userinfo(c)
                         .chars()
                         .take(openfang_types::approval::MAX_COMMAND_LEN)
                         .collect::<String>()
@@ -13470,10 +13476,12 @@ mod tests {
         );
     }
 
-    /// Security D-round: the approval prompt never shows URL userinfo, in
-    /// either the command or the summary.
+    /// Security R4: the approval prompt hides URL userinfo only on a bare
+    /// curl/wget. Any other command, here `grep`, is shown verbatim in both
+    /// the command and the summary (the redaction rule itself is tested in
+    /// types `command_userinfo_redacts_only_for_url_consumers`).
     #[tokio::test]
-    async fn test_approval_prompt_redacts_url_userinfo() {
+    async fn test_approval_prompt_shows_non_consumer_userinfo_verbatim() {
         let fake = Arc::new(
             FakeKernelHandle::new()
                 .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate),
@@ -13490,8 +13498,8 @@ mod tests {
 
         let command = fake.approval_command.lock().unwrap().clone().unwrap();
         let summary = fake.approval_summary.lock().unwrap().clone().unwrap();
-        assert_eq!(command, "grep -c x https://***@a.example/f");
-        assert!(!summary.contains("hunter2"), "{summary}");
+        assert_eq!(command, "grep -c x https://bob:hunter2@a.example/f");
+        assert!(summary.contains("bob:hunter2@a.example"), "{summary}");
     }
 
     /// The deterministic floor is a CEILING on the judge's authority. A command

@@ -415,7 +415,7 @@ pub async fn build_gate_request(
         workspace_root: workspace,
         // Display only: every flag above was computed from what the agent
         // wrote, so redacting `user:pass@` cannot launder a floor bit.
-        command: openfang_types::net_facts::redact_url_userinfo(&command).into_owned(),
+        command: openfang_types::net_facts::redact_command_userinfo(&command).into_owned(),
         bases,
         inner,
         safe_bins: policy.safe_bins.clone(),
@@ -607,7 +607,7 @@ pub async fn review(
     let raw_command = input.get("command").and_then(|v| v.as_str())?;
     // What every human- or log-facing copy below shows. The request itself is
     // built from `raw_command`.
-    let shown_command = openfang_types::net_facts::redact_url_userinfo(raw_command);
+    let shown_command = openfang_types::net_facts::redact_command_userinfo(raw_command);
 
     // ANAI-265 N2. The permissive posture's whole justification is that a
     // suppression becomes unprompted, never *unseen*. For an agent with no

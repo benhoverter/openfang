@@ -408,7 +408,7 @@ fn check_inline_script_interpreter_one(segment: &str) -> Result<(), String> {
         }
         for arg in trimmed.split_whitespace().skip(1) {
             for flag in *flags {
-                if arg.eq_ignore_ascii_case(flag) {
+                if arg.eq_ignore_ascii_case(flag) || short_flag_in_cluster(arg, flag) {
                     return Err(format!(
                         "Interpreter '{base}' invoked with inline-script flag '{flag}' \
                          — denied in Allowlist mode (inline scripts are not parseable for \
@@ -419,6 +419,22 @@ fn check_inline_script_interpreter_one(segment: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Is the one-letter `flag` (`-e`) bundled into a short-option cluster like
+/// `-we`, `-Ic` or `-pe`? Every listed interpreter accepts those (security
+/// R4). Over-matches glued values (`perl -Mfeature`, `python3 -Wdefault`
+/// hold the letter too): those are denied, which is the safe direction.
+fn short_flag_in_cluster(arg: &str, flag: &str) -> bool {
+    let Some(letter) = flag.strip_prefix('-').filter(|l| l.len() == 1) else {
+        return false;
+    };
+    arg.len() > 2
+        && arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg[1..]
+            .to_ascii_lowercase()
+            .contains(&letter.to_ascii_lowercase())
 }
 
 /// Skip the wrapper's own flags and return the slice of args starting at the
@@ -2181,6 +2197,34 @@ mod tests {
         let p = wrapper_policy();
         // python3 with a script file (no -c) is fine.
         assert!(validate_command_allowlist("python3 script.py", &p).is_ok());
+    }
+
+    /// Security R4: an inline-script flag bundled into a short cluster is
+    /// still that flag.
+    #[test]
+    fn test_bundled_inline_script_flags_denied() {
+        for cmd in [
+            "perl -we 1",
+            "perl -lne 1",
+            "perl -pE 1",
+            "python3 -Ic pass",
+            "python3 -Bc pass",
+            "node -pe 1",
+            "ruby -we 1",
+        ] {
+            let err = check_inline_script_interpreter(cmd).expect_err(cmd);
+            assert!(err.contains("inline-script flag"), "{cmd}: {err}");
+        }
+        // Clusters without the letter, long options and script files pass.
+        for cmd in [
+            "perl -w script.pl",
+            "python3 -B script.py",
+            "python3 -I script.py",
+            "node --version",
+            "ruby -w script.rb",
+        ] {
+            assert!(check_inline_script_interpreter(cmd).is_ok(), "{cmd}");
+        }
     }
 
     #[test]
