@@ -1264,6 +1264,13 @@ fn is_internal_name(host: &str) -> bool {
 ///
 /// The authority ends at `/ ? #`, whitespace or a quote, so a later `@` in a
 /// path or a second argument is not mistaken for userinfo.
+///
+/// Hiding text from the judge and the operator is worse than showing a
+/// password, so a span is redacted only when it is unambiguously userinfo:
+/// a known URL scheme starting at a token boundary, every hidden character
+/// in RFC 3986's userinfo set (minus `$ & ' ( )`), and a host[:port] after
+/// the `@`. Anything else is shown verbatim (security R1: `perl -e
+/// q://:,system(...)@a.example` must not render as `q://***@a.example`).
 pub fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains("://") || !text.contains('@') {
         return std::borrow::Cow::Borrowed(text);
@@ -1271,6 +1278,7 @@ pub fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(i) = rest.find("://") {
+        let scheme_ok = url_scheme_before(&rest[..i]);
         let (head, tail) = rest.split_at(i + 3);
         out.push_str(head);
         let end = tail
@@ -1278,16 +1286,111 @@ pub fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
             .unwrap_or(tail.len());
         let authority = &tail[..end];
         match authority.rfind('@') {
-            Some(at) => {
+            Some(at)
+                if scheme_ok
+                    && is_plain_userinfo(&authority[..at])
+                    && is_host_port(&authority[at + 1..]) =>
+            {
                 out.push_str("***");
                 out.push_str(&authority[at..]);
             }
-            None => out.push_str(authority),
+            _ => out.push_str(authority),
         }
         rest = &tail[end..];
     }
     out.push_str(rest);
     std::borrow::Cow::Owned(out)
+}
+
+/// Does `before` (the text up to a `://`) end in a known URL scheme that
+/// starts a token? `q://` (Perl quoting) or `x=foo://` inside code is not.
+fn url_scheme_before(before: &str) -> bool {
+    const SCHEMES: &[&str] = &[
+        "http",
+        "https",
+        "ftp",
+        "ftps",
+        "sftp",
+        "scp",
+        "ssh",
+        "git",
+        "ws",
+        "wss",
+        "socks4",
+        "socks4a",
+        "socks5",
+        "socks5h",
+        "smb",
+        "smbs",
+        "ldap",
+        "ldaps",
+        "imap",
+        "imaps",
+        "pop3",
+        "pop3s",
+        "smtp",
+        "smtps",
+        "rtsp",
+        "redis",
+        "rediss",
+        "postgres",
+        "postgresql",
+        "mysql",
+        "mongodb",
+        "mongodb+srv",
+        "amqp",
+        "amqps",
+    ];
+    let start = before
+        .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+        .map(|p| p + before[p..].chars().next().map_or(1, char::len_utf8))
+        .unwrap_or(0);
+    let boundary_ok = before[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '='));
+    let scheme = &before[start..];
+    boundary_ok && SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme))
+}
+
+/// RFC 3986 userinfo: unreserved, pct-encoded, sub-delims and `:`, with the
+/// shell-and-code-ish `$ & ' ( )` left out. Non-empty.
+fn is_plain_userinfo(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '.' | '_' | '~' | '%' | '!' | '*' | '+' | ',' | ';' | '=' | ':' | '-'
+                )
+        })
+}
+
+/// `host` or `host:port`, where host is a reg-name of `[A-Za-z0-9.-]` or a
+/// bracketed IPv6 literal.
+fn is_host_port(s: &str) -> bool {
+    let (host_ok, rest) = if let Some(r) = s.strip_prefix('[') {
+        let Some((v6, after)) = r.split_once(']') else {
+            return false;
+        };
+        let ok = !v6.is_empty()
+            && v6
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.'));
+        (ok, after)
+    } else {
+        let end = s.find(':').unwrap_or(s.len());
+        let h = &s[..end];
+        let ok = !h.is_empty()
+            && h.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'));
+        (ok, &s[end..])
+    };
+    let port_ok = rest.is_empty()
+        || rest
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    host_ok && port_ok
 }
 
 /// curl's (and inet_aton's) IPv4 forms: 1–4 parts, each decimal, `0`-prefixed
@@ -2018,6 +2121,40 @@ pub(crate) mod tests {
             ),
             ("git push origin main", "git push origin main"),
             ("ssh git@host", "ssh git@host"),
+            // Token-boundary `--opt=` and any-case schemes, IPv6 + port.
+            (
+                "curl --url=HTTPS://u:p@a.example:8443/x",
+                "curl --url=HTTPS://***@a.example:8443/x",
+            ),
+            (
+                "curl https://u:p%40x@[::1]:8080/",
+                "curl https://***@[::1]:8080/",
+            ),
+            // Security R1: not userinfo, so nothing may be hidden.
+            (
+                "perl -e q://:,system(pack(q{H*},q{6375726c}))@a.example",
+                "perl -e q://:,system(pack(q{H*},q{6375726c}))@a.example",
+            ),
+            // Every hidden char in the userinfo set, but `q` is no scheme.
+            (
+                "perl -e q://:,system+q:id:@a.example",
+                "perl -e q://:,system+q:id:@a.example",
+            ),
+            // Known scheme glued to code is not a token start.
+            ("x(http://u:p@a.example", "x(http://u:p@a.example"),
+            ("a.http://u:p@a.example", "a.http://u:p@a.example"),
+            // Disallowed userinfo chars, or no host after the `@`.
+            ("curl https://a(b)@h.example", "curl https://a(b)@h.example"),
+            ("curl https://a$b@h.example", "curl https://a$b@h.example"),
+            (
+                "curl https://u:p@h.example(1)",
+                "curl https://u:p@h.example(1)",
+            ),
+            (
+                "curl https://u:p@h.example:x",
+                "curl https://u:p@h.example:x",
+            ),
+            ("curl https://u:p@", "curl https://u:p@"),
         ] {
             assert_eq!(redact_url_userinfo(input), want, "{input}");
         }

@@ -17,6 +17,11 @@
 //! builds the name (`'cu' + 'rl'`, `chr()`, base64) reaches the judge.
 //! Full-mode agents (assistant-ben-jobs, assistant-pdf-worker, moderator)
 //! skip the floor entirely (M6).
+//!
+//! Display redaction (R2): only `scheme://user:pass@host` userinfo is hidden
+//! from logs, the judge and the approval prompt. Scheme-less `u:p@host`,
+//! `-x pu:pp@proxy`, and the values of `-u`, `--proxy-user` and
+//! `--oauth2-bearer` are shown as written.
 
 use std::path::Path;
 
@@ -80,6 +85,8 @@ fn only_reads(argv: &[String]) -> bool {
     // D1: a path (`./cat`) can be the agent's own program named after a
     // reader, and the allowlist matches it by basename. Only a bare name is
     // the system tool, the same reasoning as CURL_ARGV0 refusing `./curl`.
+    // R3: that holds while the sandbox PATH is the daemon's own; an agent
+    // given PATH via allowed_env / shell_env_passthrough breaks it.
     if first.contains('/') {
         return false;
     }
