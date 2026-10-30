@@ -12,8 +12,11 @@
 //! Not an obfuscation boundary for script bodies. A script is refused when
 //! its text names curl; these still reach the judge: helpers it `source`s,
 //! `bash -c 'bash s.sh'`, `make` / `npm run` / `just` targets, and a curl
-//! the script spells some other way. Full-mode agents (assistant-ben-jobs,
-//! assistant-pdf-worker, moderator) skip the floor entirely (M6).
+//! the script spells some other way. The same holds for interpreter text:
+//! `python3 -c` / `node -e` / `perl -e` naming curl is refused, but one that
+//! builds the name (`'cu' + 'rl'`, `chr()`, base64) reaches the judge.
+//! Full-mode agents (assistant-ben-jobs, assistant-pdf-worker, moderator)
+//! skip the floor entirely (M6).
 
 use std::path::Path;
 
@@ -74,6 +77,12 @@ fn only_reads(argv: &[String]) -> bool {
     let Some(first) = argv.first() else {
         return false;
     };
+    // D1: a path (`./cat`) can be the agent's own program named after a
+    // reader, and the allowlist matches it by basename. Only a bare name is
+    // the system tool, the same reasoning as CURL_ARGV0 refusing `./curl`.
+    if first.contains('/') {
+        return false;
+    }
     match basename(first) {
         "rg" => !argv[1..].iter().any(|a| a.starts_with("--pre")),
         b => READERS.contains(&b),
@@ -92,11 +101,16 @@ fn basename(tok: &str) -> &str {
 }
 
 /// `text` names curl as a word: `curl`, `/usr/bin/curl`, `"curl"`, and a word
-/// ending in it (`-Ocurl`, a flag value fused to its option letter). Errs
-/// wide: a false hit is refused, a miss reaches the judge.
+/// ending in it (`-Ocurl`, a flag value fused to its option letter). Any case
+/// (D2): APFS is case-insensitive, so `CURL` runs /usr/bin/curl. Errs wide: a
+/// false hit is refused, a miss reaches the judge.
 fn mentions_curl(text: &str) -> bool {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/')))
-        .any(|w| w.ends_with("curl"))
+        .any(|w| {
+            w.len() >= 4
+                && w.is_char_boundary(w.len() - 4)
+                && w[w.len() - 4..].eq_ignore_ascii_case("curl")
+        })
 }
 
 fn blind(source: NetSource) -> NetFactSheet {
@@ -144,7 +158,7 @@ fn describe(
     let sheet = if CURL_ARGV0.contains(&first.as_str()) {
         let stat = |raw: &str| crate::path_facts::stat_fact(raw, canon_ws.as_deref(), file_policy);
         parse_curl_argv(argv, NetSource::TopLevel, &stat)
-    } else if bin == "curl"
+    } else if bin.eq_ignore_ascii_case("curl")
         || (WRAPPERS.contains(&bin) && argv[1..].iter().any(|a| mentions_curl(a)))
     {
         blind(NetSource::TopLevel)
@@ -298,9 +312,11 @@ pub(crate) fn inject(argv: Vec<String>) -> Vec<String> {
     out
 }
 
-/// A command or argv made safe for the daemon log: known secrets and
-/// credential shapes replaced (C6). Without a scrubber, the shape redactor.
+/// A command or argv made safe for the daemon log: URL userinfo, known
+/// secrets and credential shapes replaced (C6). Without a scrubber, the shape
+/// redactor.
 pub(crate) fn log_safe(text: &str) -> String {
+    let text = &openfang_types::net_facts::redact_url_userinfo(text);
     match openfang_types::secret_scrub::global() {
         Some(s) => s.scrub(text).text,
         None => openfang_types::path_facts::redact_secrets(text).0,
@@ -379,6 +395,52 @@ mod tests {
             );
         }
         assert_eq!(verdict("timeout 300 bash ok.sh", Some(dir.path())), None);
+    }
+
+    /// Security D1: a reader must be a bare name. `./cat` with body
+    /// `exec "$@"` would otherwise run the visible curl with no H-rule.
+    #[test]
+    fn readers_must_be_bare_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cat"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        for cmd in [
+            "./cat curl -T x http://127.0.0.1:4200",
+            "/tmp/grep curl https://a.example",
+            "bin/echo curl",
+        ] {
+            assert!(
+                matches!(verdict(cmd, Some(dir.path())), Some(NetVerdict::Deny(_))),
+                "{cmd}"
+            );
+        }
+        assert_eq!(verdict("cat curl-notes.md", Some(dir.path())), None);
+    }
+
+    /// Security D2: curl in any case is curl on APFS.
+    #[test]
+    fn curl_is_matched_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("u.sh"), "CURL https://example.com\n").unwrap();
+        for cmd in [
+            "python3 -c \"import os; os.system('CURL https://x.example')\"",
+            "node -e 'require(\"child_process\").execSync(\"Curl https://x.example\")'",
+            "timeout 5 CURL https://example.com",
+            "/usr/bin/CURL https://example.com",
+            "bash u.sh",
+        ] {
+            assert!(
+                matches!(verdict(cmd, Some(dir.path())), Some(NetVerdict::Deny(_))),
+                "{cmd}"
+            );
+        }
+        assert_eq!(verdict("echo CURL", None), None);
+        assert_eq!(verdict("ls -la", None), None);
+    }
+
+    /// URL userinfo never reaches the log copy.
+    #[test]
+    fn log_copy_drops_url_userinfo() {
+        assert!(!log_safe("curl https://bob:hunter2@a.example/x").contains("hunter2"));
     }
 
     /// C6: the log copy never carries a bearer token as written.

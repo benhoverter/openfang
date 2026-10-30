@@ -494,12 +494,15 @@ pub async fn execute_tool(
 
             // What the disposition rows below identify the command by.
             // Verbatim, same as the verdict row — a record whose dangerous
-            // tail was cut is not a record (ANAI-151).
-            let disposition_subject = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or(tool_name)
-                .to_string();
+            // tail was cut is not a record (ANAI-151). URL userinfo is the one
+            // thing removed: it is a credential, not risk context.
+            let disposition_subject = openfang_types::net_facts::redact_url_userinfo(
+                input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(tool_name),
+            )
+            .into_owned();
 
             // `Deny` never prompts. The judge may only NARROW — it cannot
             // resurrect anything the allowlist wall already rejected — so a
@@ -568,6 +571,7 @@ pub async fn execute_tool(
 
             if !suppressed {
                 let input_str = input.to_string();
+                let input_str = openfang_types::net_facts::redact_url_userinfo(&input_str);
                 let summary = format!(
                     "{}: {}",
                     tool_name,
@@ -622,7 +626,8 @@ pub async fn execute_tool(
                     .and_then(extract_cache_binary)
                     .filter(|_| !curl_needs_fresh_prompt);
                 let command = raw_command.map(|c| {
-                    c.chars()
+                    openfang_types::net_facts::redact_url_userinfo(c)
+                        .chars()
                         .take(openfang_types::approval::MAX_COMMAND_LEN)
                         .collect::<String>()
                 });
@@ -13463,6 +13468,30 @@ mod tests {
             "the note must NOT be folded into the agent-controlled summary — \
              separate channels is the whole fix, got {summary:?}"
         );
+    }
+
+    /// Security D-round: the approval prompt never shows URL userinfo, in
+    /// either the command or the summary.
+    #[tokio::test]
+    async fn test_approval_prompt_redacts_url_userinfo() {
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let policy = gate_policy("grep");
+
+        let _ = run_gated(
+            &handle,
+            &policy,
+            "grep -c x https://bob:hunter2@a.example/f",
+        )
+        .await;
+
+        let command = fake.approval_command.lock().unwrap().clone().unwrap();
+        let summary = fake.approval_summary.lock().unwrap().clone().unwrap();
+        assert_eq!(command, "grep -c x https://***@a.example/f");
+        assert!(!summary.contains("hunter2"), "{summary}");
     }
 
     /// The deterministic floor is a CEILING on the judge's authority. A command

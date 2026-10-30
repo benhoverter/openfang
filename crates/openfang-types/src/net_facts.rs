@@ -1237,20 +1237,57 @@ pub fn parse_url(raw: &str, globoff: bool) -> UrlFact {
 /// Names that resolve inside the box or the tailnet/LAN. These can hold
 /// publicly valid certificates (Tailscale `*.ts.net`, internal ACME), so the
 /// force-TLS argument does not cover them. A single label (`printer`) is a
-/// search-domain lookup, also local.
+/// search-domain lookup, also local. `home` and `corp` are not delegated
+/// TLDs (ICANN name-collision list), so they only ever resolve locally.
 fn is_internal_name(host: &str) -> bool {
     const SUFFIXES: &[&str] = &[
         "localhost",
+        "localdomain",
         "local",
         "lan",
         "internal",
         "home.arpa",
+        "home",
+        "corp",
         "ts.net",
     ];
     !host.contains('.')
         || SUFFIXES
             .iter()
             .any(|s| host == *s || host.ends_with(&format!(".{s}")))
+}
+
+/// `text` with the userinfo of every `scheme://user:pass@host` replaced by
+/// `***`, for anything a person or a model reads: log lines, the judge's
+/// request, the approval prompt, the audit row. Never for anything that
+/// decides: the floor and the gate flags read what the agent wrote.
+///
+/// The authority ends at `/ ? #`, whitespace or a quote, so a later `@` in a
+/// path or a second argument is not mistaken for userinfo.
+pub fn redact_url_userinfo(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("://") || !text.contains('@') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#' | '"' | '\'') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// curl's (and inet_aton's) IPv4 forms: 1–4 parts, each decimal, `0`-prefixed
@@ -1594,12 +1631,21 @@ pub(crate) mod tests {
             "db.internal",
             "box.home.arpa",
             "laptop.tail1234.ts.net",
+            "nas.localdomain",
+            "router.home",
+            "wiki.corp",
         ] {
             let u = parse_url(&format!("http://{host}/"), false);
             assert_eq!(u.host_class, HostClass::Internal, "{host}");
         }
         // Look-alikes outside those suffixes stay Name.
-        for host in ["notlocal.com", "ts.network", "internal.example.com"] {
+        for host in [
+            "notlocal.com",
+            "ts.network",
+            "internal.example.com",
+            "home.example.com",
+            "mycorp.com",
+        ] {
             assert_eq!(
                 parse_url(&format!("https://{host}/"), false).host_class,
                 HostClass::Name,
@@ -1951,5 +1997,37 @@ pub(crate) mod tests {
             .collect();
         let s = parse_curl_argv(&argv, NetSource::TopLevel, &good);
         assert!(matches!(s.verdict(), NetVerdict::Deny(_)));
+    }
+
+    /// Security D-round: `user:pass@` never reaches a rendered copy.
+    #[test]
+    fn url_userinfo_is_redacted_for_display() {
+        for (input, want) in [
+            (
+                "curl https://bob:hunter2@a.example/x",
+                "curl https://***@a.example/x",
+            ),
+            (
+                "curl 'http://u:p@a.example:8080?x=@y' -x http://pu:pp@proxy:3128",
+                "curl 'http://***@a.example:8080?x=@y' -x http://***@proxy:3128",
+            ),
+            // An @ after the authority is path or query, not userinfo.
+            (
+                "curl https://a.example/@user",
+                "curl https://a.example/@user",
+            ),
+            ("git push origin main", "git push origin main"),
+            ("ssh git@host", "ssh git@host"),
+        ] {
+            assert_eq!(redact_url_userinfo(input), want, "{input}");
+        }
+        // The parsed facts never stored it in the first place.
+        let u = parse_url("https://bob:hunter2@a.example/x", false);
+        let shown = serde_json::to_string(&u).unwrap();
+        assert!(u.has_userinfo);
+        assert!(
+            !shown.contains("bob") && !shown.contains("hunter2"),
+            "{shown}"
+        );
     }
 }
