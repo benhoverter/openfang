@@ -817,6 +817,19 @@ pub async fn send_parsed(
         } => (stripped_text, files, skipped),
     };
 
+    // Discord can't display Markdown tables; send them as PNGs instead.
+    // Runs after marker parsing (so attach markers are already stripped) and
+    // before formatting. Covers both replies and the `channel_send` tool,
+    // which share this function.
+    let (text_to_format, attachment_blocks) = if adapter.name() == "discord" {
+        let (text, tables) = crate::table_render::render_tables(&text_to_format).await;
+        let mut blocks = attachment_blocks;
+        blocks.extend(tables);
+        (text, blocks)
+    } else {
+        (text_to_format, attachment_blocks)
+    };
+
     let formatted = if adapter.name() == "wecom" {
         formatter::format_for_wecom(&text_to_format, output_format)
     } else {
@@ -3026,6 +3039,7 @@ mod tests {
     /// [`ChannelAdapter::supports_interactive`] to exercise both branches of the
     /// degrade chokepoint (ANAI-82 Piece 1).
     struct RecordingAdapter {
+        name: &'static str,
         interactive: bool,
         received: Mutex<Vec<ChannelContent>>,
     }
@@ -3033,7 +3047,7 @@ mod tests {
     #[async_trait]
     impl ChannelAdapter for RecordingAdapter {
         fn name(&self) -> &str {
-            "recording-mock"
+            self.name
         }
         fn channel_type(&self) -> ChannelType {
             ChannelType::Custom("recording-mock".to_string())
@@ -3086,6 +3100,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_degrades_interactive_when_unsupported() {
         let adapter = RecordingAdapter {
+            name: "recording-mock",
             interactive: false,
             received: Mutex::new(Vec::new()),
         };
@@ -3112,6 +3127,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_preserves_interactive_when_supported() {
         let adapter = RecordingAdapter {
+            name: "recording-mock",
             interactive: true,
             received: Mutex::new(Vec::new()),
         };
@@ -3127,6 +3143,68 @@ mod tests {
             matches!(received[0], ChannelContent::Interactive { .. }),
             "interactive-capable adapter must receive Interactive unchanged"
         );
+    }
+
+    const TABLE_MSG: &str = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter";
+
+    /// Discord: tables become PNG attachments (when typst is installed).
+    #[tokio::test]
+    async fn send_parsed_renders_tables_for_discord() {
+        let adapter = RecordingAdapter {
+            name: "discord",
+            interactive: true,
+            received: Mutex::new(Vec::new()),
+        };
+        send_parsed(
+            &adapter,
+            &test_user(),
+            TABLE_MSG.to_string(),
+            None,
+            OutputFormat::Markdown,
+            SendOptions::default(),
+        )
+        .await;
+        let received = adapter.received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        match &received[0] {
+            ChannelContent::Multipart(parts) => {
+                assert!(
+                    matches!(&parts[0], ChannelContent::Text(t) if t.contains("Table 1") && !t.contains('|'))
+                );
+                assert!(
+                    matches!(&parts[1], ChannelContent::FileData { mime_type, .. } if mime_type == "image/png")
+                );
+            }
+            // No typst on this machine: table stays as text.
+            ChannelContent::Text(t) => assert!(t.contains("| 1 | 2 |")),
+            other => panic!("unexpected content {other:?}"),
+        }
+    }
+
+    /// Every other adapter: tables are left alone.
+    #[tokio::test]
+    async fn send_parsed_leaves_tables_for_other_channels() {
+        for name in ["telegram", "slack", "recording-mock"] {
+            let adapter = RecordingAdapter {
+                name,
+                interactive: false,
+                received: Mutex::new(Vec::new()),
+            };
+            send_parsed(
+                &adapter,
+                &test_user(),
+                TABLE_MSG.to_string(),
+                None,
+                OutputFormat::Markdown,
+                SendOptions::default(),
+            )
+            .await;
+            let received = adapter.received.lock().unwrap();
+            assert!(
+                matches!(&received[0], ChannelContent::Text(_)),
+                "{name} must not get attachments"
+            );
+        }
     }
 
     #[tokio::test]
