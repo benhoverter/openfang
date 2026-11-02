@@ -821,8 +821,14 @@ pub async fn send_parsed(
     // Runs after marker parsing (so attach markers are already stripped) and
     // before formatting. Covers both replies and the `channel_send` tool,
     // which share this function.
+    // NOTE: tables leave here as pixels. Any future outbound text scrub must
+    // run BEFORE this step, or table contents bypass it.
+    let mut pre_table_text: Option<String> = None;
     let (text_to_format, attachment_blocks) = if adapter.name() == "discord" {
         let (text, tables) = crate::table_render::render_tables(&text_to_format).await;
+        if !tables.is_empty() {
+            pre_table_text = Some(text_to_format);
+        }
         let mut blocks = attachment_blocks;
         blocks.extend(tables);
         (text, blocks)
@@ -851,10 +857,27 @@ pub async fn send_parsed(
         }
     };
 
-    let result = dispatch_content(adapter, user, content, thread_id).await;
-
-    if let Err(e) = result {
-        error!("Failed to send response: {e}");
+    // Log and drop the error inside this expression: `Box<dyn Error>` isn't
+    // Send, so no binding of it may live across the fallback's await.
+    let failed = match dispatch_content(adapter, user, content, thread_id).await {
+        Ok(()) => false,
+        Err(e) => {
+            error!("Failed to send response: {e}");
+            true
+        }
+    };
+    if failed {
+        // The tables were cut from the text before dispatch; if the upload
+        // failed (413, rejected attachment) resend them as text once rather
+        // than lose them. May duplicate prose that did get through.
+        if let Some(original) = pre_table_text {
+            let text = formatter::format_for_channel(&original, output_format);
+            if let Err(e) =
+                dispatch_content(adapter, user, ChannelContent::Text(text), thread_id).await
+            {
+                error!("Table text fallback also failed: {e}");
+            }
+        }
     }
 
     skipped
@@ -3041,6 +3064,8 @@ mod tests {
     struct RecordingAdapter {
         name: &'static str,
         interactive: bool,
+        /// Fail any send that carries attachments (simulates a 413 upload).
+        reject_files: bool,
         received: Mutex<Vec<ChannelContent>>,
     }
 
@@ -3065,6 +3090,9 @@ mod tests {
             _user: &ChannelUser,
             content: ChannelContent,
         ) -> Result<(), Box<dyn std::error::Error>> {
+            if self.reject_files && matches!(content, ChannelContent::Multipart(_)) {
+                return Err("413 Payload Too Large".into());
+            }
             self.received.lock().unwrap().push(content);
             Ok(())
         }
@@ -3102,6 +3130,7 @@ mod tests {
         let adapter = RecordingAdapter {
             name: "recording-mock",
             interactive: false,
+            reject_files: false,
             received: Mutex::new(Vec::new()),
         };
         let user = test_user();
@@ -3129,6 +3158,7 @@ mod tests {
         let adapter = RecordingAdapter {
             name: "recording-mock",
             interactive: true,
+            reject_files: false,
             received: Mutex::new(Vec::new()),
         };
         let user = test_user();
@@ -3153,6 +3183,7 @@ mod tests {
         let adapter = RecordingAdapter {
             name: "discord",
             interactive: true,
+            reject_files: false,
             received: Mutex::new(Vec::new()),
         };
         send_parsed(
@@ -3181,6 +3212,37 @@ mod tests {
         }
     }
 
+    /// A failed upload must not lose the table: it is resent as text once.
+    #[tokio::test]
+    async fn send_parsed_resends_table_text_when_upload_fails() {
+        if crate::table_render::typst_available() {
+            let adapter = RecordingAdapter {
+                name: "discord",
+                interactive: true,
+                reject_files: true,
+                received: Mutex::new(Vec::new()),
+            };
+            send_parsed(
+                &adapter,
+                &test_user(),
+                TABLE_MSG.to_string(),
+                None,
+                OutputFormat::Markdown,
+                SendOptions::default(),
+            )
+            .await;
+            let received = adapter.received.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert!(
+                matches!(&received[0], ChannelContent::Text(t) if t.contains("| 1 | 2 |")),
+                "table text must survive a failed upload, got {:?}",
+                received[0]
+            );
+        } else {
+            eprintln!("typst not installed; skipping");
+        }
+    }
+
     /// Every other adapter: tables are left alone.
     #[tokio::test]
     async fn send_parsed_leaves_tables_for_other_channels() {
@@ -3188,6 +3250,7 @@ mod tests {
             let adapter = RecordingAdapter {
                 name,
                 interactive: false,
+                reject_files: false,
                 received: Mutex::new(Vec::new()),
             };
             send_parsed(

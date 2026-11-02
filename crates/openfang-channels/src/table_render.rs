@@ -17,6 +17,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::types::ChannelContent;
@@ -26,7 +28,19 @@ const MAX_ROWS: usize = 40;
 const MAX_COLS: usize = 10;
 const MAX_CELL_CHARS: usize = 500;
 const RENDER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock budget for all tables in one message (including waiting for a
+/// render slot), so a slow typst can't hold a reply for 8 × 5 s.
+const MESSAGE_BUDGET: Duration = Duration::from_secs(12);
 const MAX_PNG_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on the estimated raster size. The input limits alone allow a
+/// ~177M-pixel image (~700 MB RGBA) that typst allocates before the
+/// timeout or the PNG-size check can stop it.
+const MAX_PIXELS: f64 = 25_000_000.0;
+/// Preferred ppi, and the fallback for tables too big at the preferred one.
+const PPI_CHOICES: [u32; 2] = [192, 144];
+/// Process-wide cap on concurrent typst renders (each can use hundreds of
+/// MB), so many agents replying with tables at once queue instead of piling up.
+static RENDER_SLOTS: Semaphore = Semaphore::const_new(2);
 /// Columns whose longest cell exceeds this many chars get a fixed width so
 /// typst wraps them; shorter columns size to content.
 const WRAP_AFTER_CHARS: usize = 36;
@@ -89,6 +103,7 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
         warn!("table_render: typst not found; sending tables as text");
         return (text.to_string(), Vec::new());
     };
+    let deadline = Instant::now() + MESSAGE_BUDGET;
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut files = Vec::new();
@@ -99,11 +114,14 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
         if files.len() >= MAX_TABLES {
             continue;
         }
-        if let Err(why) = check_limits(&f.table) {
-            warn!("table_render: table left as text: {why}");
-            continue;
-        }
-        match render_png(&typst, &f.table).await {
+        let ppi = match check_limits(&f.table).and_then(|()| pick_ppi(&f.table)) {
+            Ok(ppi) => ppi,
+            Err(why) => {
+                warn!("table_render: table left as text: {why}");
+                continue;
+            }
+        };
+        match render_limited(&typst, &f.table, ppi, deadline).await {
             Ok(png) => {
                 let n = files.len() + 1;
                 files.push(ChannelContent::FileData {
@@ -119,6 +137,24 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
     }
     out.extend(lines[cursor..].iter().map(|s| s.to_string()));
     (out.join("\n"), files)
+}
+
+/// Render under the process-wide slot limit and the message deadline.
+async fn render_limited(
+    typst: &Path,
+    table: &Table,
+    ppi: u32,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let _slot = tokio::time::timeout_at(deadline, RENDER_SLOTS.acquire())
+        .await
+        .map_err(|_| "message render budget spent waiting for a slot".to_string())?
+        .map_err(|e| format!("render slots closed: {e}"))?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err("message render budget spent".into());
+    }
+    render_png(typst, table, ppi, left.min(RENDER_TIMEOUT)).await
 }
 
 fn find_tables(lines: &[&str]) -> Vec<Found> {
@@ -275,6 +311,89 @@ fn check_limits(t: &Table) -> Result<(), String> {
     Ok(())
 }
 
+/// Deliberately pessimistic estimate of the rendered page size in points,
+/// mirroring TEMPLATE: 13pt text, 10/7pt cell insets, 14pt margin, wrapped
+/// columns `WRAP_AFTER_CHARS / 2` em wide. Overestimates char width and
+/// line count so real output stays under the cap.
+fn estimate_page_pt(t: &Table) -> (f64, f64) {
+    const FONT: f64 = 13.0;
+    const CHAR_W: f64 = 0.6 * FONT; // Helvetica averages ~0.5em; bold headers wider
+    const LINE_H: f64 = 1.3 * FONT;
+    const INSET_X: f64 = 20.0;
+    const INSET_Y: f64 = 14.0;
+    const MARGIN: f64 = 28.0;
+    let fixed_w = (WRAP_AFTER_CHARS / 2) as f64 * FONT;
+    // Fewer chars per line than fit, so the line count rounds up.
+    let chars_per_line = (fixed_w / CHAR_W).floor().max(1.0);
+
+    let widths = template_data(t)["widths"].clone();
+    let fixed: Vec<bool> = (0..t.header.len())
+        .map(|c| widths[c].as_u64().unwrap_or(0) != 0)
+        .collect();
+    let longest = |c: usize| {
+        t.rows
+            .iter()
+            .map(|r| r[c].chars().count())
+            .chain(std::iter::once(t.header[c].chars().count()))
+            .max()
+            .unwrap_or(0) as f64
+    };
+    let width: f64 = (0..t.header.len())
+        .map(|c| {
+            let content = if fixed[c] {
+                fixed_w
+            } else {
+                longest(c) * CHAR_W
+            };
+            content + INSET_X
+        })
+        .sum::<f64>()
+        + MARGIN;
+    let row_h = |row: &Vec<String>| {
+        let lines = row
+            .iter()
+            .zip(&fixed)
+            .map(|(cell, &f)| {
+                if f {
+                    (cell.chars().count() as f64 / chars_per_line)
+                        .ceil()
+                        .max(1.0)
+                } else {
+                    1.0
+                }
+            })
+            .fold(1.0, f64::max);
+        lines * LINE_H + INSET_Y
+    };
+    let height: f64 = std::iter::once(&t.header)
+        .chain(&t.rows)
+        .map(row_h)
+        .sum::<f64>()
+        + MARGIN;
+    (width, height)
+}
+
+/// Highest ppi whose estimated raster fits [`MAX_PIXELS`], or an error when
+/// even the lowest doesn't (the table then stays text).
+fn pick_ppi(t: &Table) -> Result<u32, String> {
+    let (w, h) = estimate_page_pt(t);
+    let px_at = |ppi: u32| {
+        let s = f64::from(ppi) / 72.0;
+        w * s * h * s
+    };
+    PPI_CHOICES
+        .into_iter()
+        .find(|&ppi| px_at(ppi) <= MAX_PIXELS)
+        .ok_or_else(|| {
+            let low = PPI_CHOICES[PPI_CHOICES.len() - 1];
+            format!(
+                "estimated {:.0}M pixels at {low} ppi > {:.0}M",
+                px_at(low) / 1e6,
+                MAX_PIXELS / 1e6
+            )
+        })
+}
+
 /// True when a cell reads as a number or measurement ("86 s", "-3.2%", "$5").
 fn looks_numeric(cell: &str) -> bool {
     let s = cell.trim_start_matches(['-', '+', '~', '$', '€', '£', '≈']);
@@ -334,6 +453,12 @@ fn template_data(t: &Table) -> serde_json::Value {
     })
 }
 
+/// For tests elsewhere in the crate that need a real render.
+#[cfg(test)]
+pub(crate) fn typst_available() -> bool {
+    find_typst().is_some()
+}
+
 fn find_typst() -> Option<PathBuf> {
     TYPST_CANDIDATES
         .iter()
@@ -342,6 +467,9 @@ fn find_typst() -> Option<PathBuf> {
             std::env::var_os("PATH")
                 .into_iter()
                 .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+                // An empty PATH entry splits to "" and would resolve
+                // `typst` against the daemon's cwd.
+                .filter(|d| d.is_absolute())
                 .map(|d| d.join("typst")),
         )
         .find(|p| p.is_file())
@@ -356,7 +484,12 @@ impl Drop for TempDir {
     }
 }
 
-async fn render_png(typst: &Path, table: &Table) -> Result<Vec<u8>, String> {
+async fn render_png(
+    typst: &Path,
+    table: &Table,
+    ppi: u32,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
     let dir =
         TempDir(std::env::temp_dir().join(format!("openfang-table-{}", uuid::Uuid::new_v4())));
     tokio::fs::create_dir(&dir.0)
@@ -375,16 +508,18 @@ async fn render_png(typst: &Path, table: &Table) -> Result<Vec<u8>, String> {
         .arg("compile")
         .arg("--root")
         .arg(&dir.0)
-        .args(["--format", "png", "--ppi", "192", "main.typ", "out.png"])
+        .args(["--format", "png", "--ppi"])
+        .arg(ppi.to_string())
+        .args(["main.typ", "out.png"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn typst: {e}"))?;
-    let output = tokio::time::timeout(RENDER_TIMEOUT, child.wait_with_output())
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .map_err(|_| format!("typst timed out after {}s", RENDER_TIMEOUT.as_secs()))?
+        .map_err(|_| format!("typst timed out after {:.1}s", timeout.as_secs_f64()))?
         .map_err(|e| format!("wait typst: {e}"))?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -487,6 +622,52 @@ mod tests {
         assert!(check_limits(&mk(1, 1, &"x".repeat(MAX_CELL_CHARS + 1))).is_err());
     }
 
+    fn grid(rows: usize, cols: usize, cell_chars: usize) -> Table {
+        Table {
+            header: vec!["header".into(); cols],
+            align: vec![Align::Left; cols],
+            rows: vec![vec!["x".repeat(cell_chars); cols]; rows],
+        }
+    }
+
+    #[test]
+    fn pixel_budget_picks_ppi_or_rejects() {
+        // Security's T1 case: every input limit maxed. Must stay text.
+        assert!(pick_ppi(&grid(MAX_ROWS, MAX_COLS, MAX_CELL_CHARS)).is_err());
+        // Ordinary tables render at full resolution.
+        assert_eq!(pick_ppi(&grid(2, 5, 30)), Ok(192));
+        assert_eq!(pick_ppi(&grid(MAX_ROWS, MAX_COLS, 20)), Ok(192));
+        // A wide research table with long cells drops to the lower ppi.
+        assert_eq!(pick_ppi(&grid(20, 6, 200)), Ok(144));
+    }
+
+    /// The estimate must not undershoot what typst actually draws, for both
+    /// auto-width and wrapped columns. Skips when typst isn't installed.
+    #[tokio::test]
+    async fn estimate_bounds_real_render() {
+        let Some(typst) = find_typst() else {
+            eprintln!("typst not installed; skipping");
+            return;
+        };
+        let words = |n: usize| "word ".repeat(n / 5);
+        let cases = [
+            grid(3, 4, 20),
+            Table {
+                header: vec!["name".into(), "notes".into(), "more".into()],
+                align: vec![Align::Left; 3],
+                rows: vec![vec!["Wide Mixed Case Label".into(), words(300), words(120)]; 6],
+            },
+        ];
+        for t in cases {
+            let png = render_png(&typst, &t, 72, RENDER_TIMEOUT).await.unwrap();
+            // PNG IHDR: width and height are big-endian u32s at bytes 16..24.
+            let w = u32::from_be_bytes(png[16..20].try_into().unwrap()) as f64;
+            let h = u32::from_be_bytes(png[20..24].try_into().unwrap()) as f64;
+            let (ew, eh) = estimate_page_pt(&t);
+            assert!(ew >= w && eh >= h, "estimate {ew}x{eh}pt < real {w}x{h}");
+        }
+    }
+
     #[test]
     fn auto_alignment_and_widths() {
         let t = Table {
@@ -570,10 +751,16 @@ mod tests {
             align: vec![Align::Left],
             rows: vec![],
         };
-        assert!(render_png(Path::new("/nonexistent/typst"), &t)
-            .await
-            .is_err());
+        assert!(
+            render_png(Path::new("/nonexistent/typst"), &t, 192, RENDER_TIMEOUT)
+                .await
+                .is_err()
+        );
         // A binary that exits non-zero.
-        assert!(render_png(Path::new("/usr/bin/false"), &t).await.is_err());
+        assert!(
+            render_png(Path::new("/usr/bin/false"), &t, 192, RENDER_TIMEOUT)
+                .await
+                .is_err()
+        );
     }
 }
