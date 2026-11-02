@@ -18,6 +18,7 @@ pub mod rocketchat;
 pub mod router;
 pub mod signal;
 pub mod slack;
+pub mod table_render;
 pub mod teams;
 pub mod telegram;
 pub mod twitch;
