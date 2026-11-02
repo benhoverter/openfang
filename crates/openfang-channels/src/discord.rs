@@ -1960,7 +1960,12 @@ impl ChannelAdapter for DiscordAdapter {
                 // Build the single caption string from all Text blocks.
                 let caption_str = caption_pieces.join("\n\n");
                 let caption_str = caption_str.trim();
-                let caption_opt: Option<&str> = if caption_str.is_empty() {
+                // An attachment caption is a single message, capped at
+                // DISCORD_MSG_LIMIT (the payload builder truncates). Longer
+                // text would be cut off, so it goes out first as split plain
+                // messages and the attachments follow without a caption.
+                let caption_too_long = caption_str.len() > DISCORD_MSG_LIMIT;
+                let caption_opt: Option<&str> = if caption_str.is_empty() || caption_too_long {
                     None
                 } else {
                     Some(caption_str)
@@ -1988,12 +1993,16 @@ impl ChannelAdapter for DiscordAdapter {
 
                 if attachments_resolved.is_empty() {
                     // Caption-only Multipart (all blocks were Text/unknown).
-                    if let Some(cap) = caption_opt {
-                        self.api_send_message(channel_id, cap).await?;
+                    if !caption_str.is_empty() {
+                        self.api_send_message(channel_id, caption_str).await?;
                     } else {
                         warn!("Discord Multipart: all blocks empty or unknown, nothing to send");
                     }
                     return Ok(());
+                }
+
+                if caption_too_long {
+                    self.api_send_message(channel_id, caption_str).await?;
                 }
 
                 // Chunk by both count (≤ ATTACHMENTS_PER_CHUNK) and aggregate
@@ -4167,6 +4176,76 @@ mod tests {
     }
 
     // ---- required test b: empty/whitespace caption suppressed ------------------
+
+    /// Text over DISCORD_MSG_LIMIT alongside attachments must not be
+    /// truncated into the caption: it goes out as split plain messages first,
+    /// then the attachments with no caption.
+    #[tokio::test]
+    async fn test_multipart_long_caption_sent_as_split_messages() {
+        use axum::{body::Bytes, http::HeaderMap, routing::post, Extension, Router};
+        // (content-type, body) per POST, in arrival order.
+        type Seen = Arc<TokioMutex<Vec<(String, Vec<u8>)>>>;
+        let seen: Seen = Arc::new(TokioMutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/channels/test/messages",
+                post(
+                    |Extension(store): Extension<Seen>,
+                     headers: HeaderMap,
+                     body: Bytes| async move {
+                        let ct = headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        store.lock().await.push((ct, body.to_vec()));
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .layer(Extension(seen.clone()));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let adapter = test_adapter_with_base(format!("http://{addr}"));
+        let user = make_channel_user("test");
+
+        let line = "x".repeat(99);
+        let long_text = vec![line.as_str(); 30].join("\n"); // 2999 bytes
+        let content = ChannelContent::Multipart(vec![
+            ChannelContent::Text(long_text.clone()),
+            ChannelContent::FileData {
+                data: b"\x89PNG".to_vec(),
+                filename: "table-1.png".to_string(),
+                mime_type: "image/png".to_string(),
+            },
+        ]);
+        adapter.send(&user, content).await.unwrap();
+
+        let seen = seen.lock().await;
+        let (json_posts, multipart_posts): (Vec<_>, Vec<_>) = seen
+            .iter()
+            .partition(|(ct, _)| ct.starts_with("application/json"));
+        assert_eq!(json_posts.len(), 2, "2999 bytes splits into two messages");
+        let sent: Vec<String> = json_posts
+            .iter()
+            .map(|(_, b)| {
+                let v: serde_json::Value = serde_json::from_slice(b).unwrap();
+                v["content"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(sent.join("\n"), long_text, "no text lost");
+        assert_eq!(multipart_posts.len(), 1);
+        assert!(
+            seen.last().unwrap().0.starts_with("multipart/form-data"),
+            "attachments go after the text"
+        );
+        let body = String::from_utf8_lossy(&multipart_posts[0].1);
+        assert!(body.contains("{}"), "attachment payload carries no caption");
+        assert!(!body.contains("\"content\""));
+    }
     //
     // Image URL fetches go through the SSRF guard which blocks 127.0.0.1, so
     // this test uses FileData to avoid the network requirement while still
