@@ -111,6 +111,59 @@ fn case_variants_are_hard() {
 }
 
 // ---------------------------------------------------------------------------
+// Unicode case folding (security F1)
+//
+// APFS folds Unicode case, the matchers fold ASCII only. Measured on this box:
+// `RULEſ.md` (U+017F) opens RULES.md and `gate\u{212A}eeper.md` (Kelvin sign)
+// opens gatekeeper.md. Rule: any non-ASCII name directly under the root counts
+// as naming every protected file.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn long_s_rules_spelling_is_hard() {
+    assert!(writes_fleet_rules("echo x > ~/.openfang/RULE\u{17F}.md"));
+    assert!(writes_fleet_rules("tee ~/.openfang/RULE\u{17F}.md"));
+    assert!(body_writes_fleet_rules(
+        "#!/bin/bash\necho x >> ~/.openfang/RULE\u{17F}.md\n"
+    ));
+}
+
+#[test]
+fn kelvin_gatekeeper_spelling_is_hard() {
+    let cmd = "cp ./p.md ~/.openfang/gate\u{212A}eeper.md";
+    assert!(writes_gatekeeper_policy(cmd));
+    assert!(body_writes_gatekeeper_policy(&format!(
+        "#!/bin/bash\n{cmd}\n"
+    )));
+    // The ASCII path is unchanged.
+    assert!(writes_gatekeeper_policy(
+        "cp ./p.md ~/.openfang/gatekeeper.md"
+    ));
+}
+
+/// No known fold collision for config.toml, but the rule is name-free.
+#[test]
+fn non_ascii_config_spelling_is_hard() {
+    let cmd = "tee ~/.openfang/conf\u{130}g.toml";
+    assert!(writes_runtime_config(cmd));
+    assert!(body_writes_runtime_config(&format!("#!/bin/bash\n{cmd}\n")));
+}
+
+#[test]
+fn non_ascii_root_names_are_write_only_and_root_only() {
+    // Reads are not hard (they still reach the judge as a control-plane fact).
+    assert!(!writes_fleet_rules("cat ~/.openfang/RULE\u{17F}.md"));
+    assert!(names_control_plane("cat ~/.openfang/RULE\u{17F}.md"));
+    // Below the root, a non-ASCII name is an ordinary file.
+    assert!(!writes_fleet_rules(
+        "tee ~/.openfang/workspaces/a/caf\u{e9}.md"
+    ));
+    assert!(!names_non_ascii_root_name("~/.openfang/agents/caf\u{e9}"));
+    // Outside the root entirely: not ours.
+    assert!(!writes_fleet_rules("tee ./RULE\u{17F}.md"));
+}
+
+// ---------------------------------------------------------------------------
 // Script bodies
 // ---------------------------------------------------------------------------
 

@@ -4184,9 +4184,39 @@ pub fn names_agent_config(s: &str) -> bool {
 #[must_use]
 pub fn names_runtime_config(s: &str) -> bool {
     control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Named(c) if !c.is_ascii() => true,
         RootTail::Named(c) => c.strip_prefix("config.toml").is_some_and(control_boundary),
         _ => false,
     })
+}
+
+/// True if `~/.openfang/gatekeeper.md` is named, or might be.
+///
+/// The literal test is [`GATEKEEPER_POLICY_PATH`] as a substring, unchanged
+/// from commit 6. The second arm is the non-ASCII root name rule: see
+/// [`names_non_ascii_root_name`].
+#[must_use]
+pub fn names_gatekeeper_policy(s: &str) -> bool {
+    s.contains(GATEKEEPER_POLICY_PATH) || names_non_ascii_root_name(s)
+}
+
+/// True if some first component directly under `~/.openfang/` is not plain
+/// ASCII.
+///
+/// APFS folds Unicode case, not ASCII case: `RULEſ.md` (U+017F, long s) and
+/// `gate\u{212A}eeper.md` (U+212A, Kelvin sign) open `RULES.md` and
+/// `gatekeeper.md` on this box, and on create they make a file the daemon's
+/// ASCII lookup then opens as the real one. Every matcher here lowercases
+/// with `to_ascii_lowercase`, so none of them sees that. Rather than carry a
+/// fold table, the protected-name predicates refuse any non-ASCII name at the
+/// root: no legitimate file there has one, and the rule covers every
+/// protected name without listing them. Reads are unaffected (they reach the
+/// judge through `touches_control_plane` as before).
+#[must_use]
+pub fn names_non_ascii_root_name(s: &str) -> bool {
+    control_root_tails(s)
+        .iter()
+        .any(|tail| matches!(tail, RootTail::Named(c) if !c.is_ascii()))
 }
 
 /// True if `~/.openfang/RULES.md` is named, or might be.
@@ -4194,7 +4224,8 @@ pub fn names_runtime_config(s: &str) -> bool {
 /// Matched lowercased (the tails are, and APFS is case-insensitive, so
 /// `rules.MD` is the same file). Boundary-checked like
 /// [`names_runtime_config`], so `RULES.md.bak-20261102-tables` is a backup and
-/// not the live rules.
+/// not the live rules. A non-ASCII root name counts, for the fold reason in
+/// [`names_non_ascii_root_name`].
 ///
 /// Unlike its siblings, a wildcard first component (`~/.openfang/R*`,
 /// `~/.openfang/*.md`) counts: inside a script body the shell expands it, and
@@ -4204,6 +4235,7 @@ pub fn names_runtime_config(s: &str) -> bool {
 #[must_use]
 pub fn names_fleet_rules(s: &str) -> bool {
     control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Named(c) if !c.is_ascii() => true,
         RootTail::Named(c) => c.strip_prefix("rules.md").is_some_and(control_boundary),
         RootTail::Glob => true,
         RootTail::Root => false,
@@ -7961,7 +7993,7 @@ mod fleet_rules_tests;
 /// `~/.openfang/`.
 #[must_use]
 pub fn writes_gatekeeper_policy(command: &str) -> bool {
-    writes_where(command, |s| s.contains(GATEKEEPER_POLICY_PATH))
+    writes_where(command, names_gatekeeper_policy)
 }
 
 /// ANAI-206 commit 8: a **write** at or under `~/.openfang/agents/`.
@@ -8057,7 +8089,7 @@ fn writes_where(command: &str, names: impl Fn(&str) -> bool) -> bool {
 /// judge, which is where Ben put the inside-of-a-script question.
 #[must_use]
 pub fn body_writes_gatekeeper_policy(body: &str) -> bool {
-    body_writes_where(body, &|s: &str| s.contains(GATEKEEPER_POLICY_PATH))
+    body_writes_where(body, &names_gatekeeper_policy)
 }
 
 /// [`writes_agent_config`], one level down. See

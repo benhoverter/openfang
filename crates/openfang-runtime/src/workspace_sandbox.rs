@@ -141,28 +141,75 @@ pub(crate) fn is_sensitive_home_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Files directly under the OpenFang home that steer the fleet, with the audit
+/// reason for each. `config.toml` is also on the read-and-write deny list in
+/// [`is_sensitive_openfang_path`]; it is here so the identity check below
+/// covers a hardlink to it too.
+const WRITE_PROTECTED_ROOT_FILES: &[(&str, &str)] = &[
+    // Re-read into every agent's system prompt each turn.
+    ("RULES.md", "fleet-rules"),
+    // The judge's own policy text.
+    ("gatekeeper.md", "gatekeeper-policy"),
+    ("config.toml", "config"),
+];
+
 /// Returns `Some(reason)` if `path` is an OpenFang-home file agents may read but
 /// must never write, whatever their `file_policy` grants.
 ///
-/// Today that is `RULES.md` alone: the daemon re-reads it into every agent's
-/// system prompt each turn, so a write steers the whole fleet. Several
-/// manifests grant `write` on all of `~/.openfang`, which reached it. Reads stay
-/// open — agents are told to consult the file.
+/// That is [`WRITE_PROTECTED_ROOT_FILES`]: `RULES.md`, which the daemon injects
+/// into every agent's prompt, and `gatekeeper.md`, the judge's policy. Several
+/// manifests grant `write` on all of `~/.openfang`, which reached both. Reads
+/// stay open — agents are told to consult the rules.
 ///
-/// Case-insensitive because APFS is: `rules.MD` opens the same file. Exact
-/// name, so `RULES.md.bak-*` backups stay writable. `path` must be canonical
-/// (symlinks resolved); a hardlink made elsewhere is not seen here — making one
-/// by shell names the file and trips the gate's `fleet_rules_write`.
+/// Three tests, any one refuses:
+/// 1. **Identity.** If `path` exists and is the same file (device + inode) as
+///    a protected one, under any spelling or through a hardlink made anywhere.
+/// 2. **Name, ASCII case-insensitive**, for the create case where there is no
+///    inode yet: `rules.MD`. Exact name, so `RULES.md.bak-*` stays writable.
+/// 3. **Any non-ASCII name directly under the home.** APFS folds Unicode case:
+///    `RULEſ.md` (U+017F) and `gate\u{212A}eeper.md` (Kelvin sign) open the
+///    real files, and when the real one is absent they create a file the
+///    daemon's ASCII lookup then opens. The shell half applies the same rule
+///    (`openfang_types::gatekeeper::names_non_ascii_root_name`). A name that is
+///    not UTF-8 is treated the same way.
+///
+/// `path` must be canonical (symlinks resolved).
 pub(crate) fn is_write_protected_openfang_path(path: &Path) -> Option<&'static str> {
     let home = openfang_home()?;
     let canon_home = home.canonicalize().ok()?;
+    if let Ok(candidate) = std::fs::metadata(path) {
+        for (name, reason) in WRITE_PROTECTED_ROOT_FILES {
+            if let Ok(protected) = std::fs::metadata(canon_home.join(name)) {
+                if same_inode(&candidate, &protected) {
+                    return Some(reason);
+                }
+            }
+        }
+    }
     let rel = path.strip_prefix(&canon_home).ok()?;
     let mut comps = rel.components();
-    let first = comps.next()?.as_os_str().to_str()?;
-    if comps.next().is_none() && first.eq_ignore_ascii_case("RULES.md") {
-        return Some("fleet-rules");
+    let first = comps.next()?.as_os_str();
+    if comps.next().is_some() {
+        return None;
     }
-    None
+    let Some(first) = first.to_str().filter(|s| s.is_ascii()) else {
+        return Some("non-ascii-root-name");
+    };
+    WRITE_PROTECTED_ROOT_FILES
+        .iter()
+        .find(|(name, _)| first.eq_ignore_ascii_case(name))
+        .map(|(_, reason)| *reason)
+}
+
+#[cfg(unix)]
+fn same_inode(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_inode(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// The sandbox *floor*: `..`-rejection + canonicalization + the sensitive-path
@@ -928,5 +975,107 @@ mod tests {
         let fp = whole_home_write(&h);
         assert!(resolve_with_policy("notes.md", &ws, Some(&fp), true, true).is_err());
         assert!(resolve_with_policy("notes.md", &ws, Some(&fp), false, true).is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Unicode case folding and file identity (security F1)
+    // -------------------------------------------------------------------
+
+    const LONG_S: char = '\u{017F}';
+    const KELVIN: char = '\u{212A}';
+
+    fn write_denied(h: &FakeHome, name: &str) -> Result<PathBuf, String> {
+        let fp = whole_home_write(h);
+        let abs = h.path.join(name);
+        resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), true, true)
+    }
+
+    /// On APFS `RULEſ.md` opens RULES.md (measured on this box: same inode).
+    /// Caught by identity there, by the non-ASCII rule on a case-sensitive FS.
+    #[test]
+    fn fleet_rules_long_s_spelling_is_denied_when_present() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("RULES.md"), "rules").unwrap();
+        assert!(write_denied(&h, &format!("RULE{LONG_S}.md")).is_err());
+    }
+
+    /// The create case: no inode to compare, so the name rule has to hold.
+    #[test]
+    fn fleet_rules_long_s_spelling_is_denied_when_absent() {
+        let h = FakeHome::new();
+        let e = write_denied(&h, &format!("RULE{LONG_S}.md")).unwrap_err();
+        assert!(e.contains("non-ascii-root-name"), "got: {e}");
+    }
+
+    #[test]
+    fn gatekeeper_policy_write_is_denied_and_read_allowed() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("gatekeeper.md"), "policy").unwrap();
+        let e = write_denied(&h, "gatekeeper.md").unwrap_err();
+        assert!(e.contains("gatekeeper-policy"), "got: {e}");
+        assert!(write_denied(&h, "GateKeeper.MD").is_err());
+        let fp = whole_home_write(&h);
+        let abs = h.path.join("gatekeeper.md");
+        assert!(
+            resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), false, true).is_ok()
+        );
+    }
+
+    /// Kelvin sign: measured on this box, `gate\u{212A}eeper.md` opens
+    /// gatekeeper.md, and with it absent creates a file the ASCII name opens.
+    #[test]
+    fn gatekeeper_policy_kelvin_spelling_is_denied_present_and_absent() {
+        let h = FakeHome::new();
+        let kelvin = format!("gate{KELVIN}eeper.md");
+        assert!(write_denied(&h, &kelvin).is_err(), "absent");
+        std::fs::write(h.path.join("gatekeeper.md"), "policy").unwrap();
+        assert!(write_denied(&h, &kelvin).is_err(), "present");
+    }
+
+    /// config.toml has no letter with a known APFS fold collision; the
+    /// non-ASCII rule covers it anyway, and the sensitive floor already denies
+    /// the plain name for reads and writes.
+    #[test]
+    fn runtime_config_non_ascii_spelling_is_denied() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("config.toml"), "x").unwrap();
+        assert!(write_denied(&h, "config.toml").is_err());
+        assert!(write_denied(&h, "conf\u{0130}g.toml").is_err());
+    }
+
+    /// Identity, not spelling: a hardlink anywhere is the protected file.
+    #[cfg(unix)]
+    #[test]
+    fn hardlinks_to_protected_files_are_denied_for_write() {
+        let h = FakeHome::new();
+        let ws = h.path.join("workspaces").join("a");
+        std::fs::create_dir_all(&ws).unwrap();
+        let fp = whole_home_write(&h);
+        for (name, link) in [
+            ("RULES.md", "notes.md"),
+            ("gatekeeper.md", "policy.md"),
+            ("config.toml", "c.txt"),
+        ] {
+            std::fs::write(h.path.join(name), "x").unwrap();
+            std::fs::hard_link(h.path.join(name), ws.join(link)).unwrap();
+            assert!(
+                resolve_with_policy(link, &ws, Some(&fp), true, true).is_err(),
+                "{name} via {link}"
+            );
+        }
+        // An unrelated workspace file stays writable.
+        std::fs::write(ws.join("plain.md"), "x").unwrap();
+        assert!(resolve_with_policy("plain.md", &ws, Some(&fp), true, true).is_ok());
+    }
+
+    /// The non-ASCII rule is the root only: workspaces may name files freely.
+    #[test]
+    fn non_ascii_names_below_the_root_stay_writable() {
+        let h = FakeHome::new();
+        let ws = h.path.join("workspaces").join("a");
+        std::fs::create_dir_all(&ws).unwrap();
+        let fp = whole_home_write(&h);
+        let name = format!("{LONG_S}notes-caf\u{e9}.md");
+        assert!(resolve_with_policy(&name, &ws, Some(&fp), true, true).is_ok());
     }
 }
