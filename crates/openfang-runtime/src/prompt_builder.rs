@@ -120,6 +120,10 @@ impl RecalledMemory {
 /// live file plus ~10-25% headroom. Re-measure with
 /// openfang-alpha/scripts/2026-10-18-promptfile-sizes.py before changing.
 const BUDGET_AGENTS_MD: usize = 16_000;
+/// `~/.openfang/RULES.md` — the fleet-wide operating rules, one file shared by
+/// every agent. 11.6 K on 2026-11-02; the budget leaves room for growth but is
+/// a guard, not a target: a cut here drops a rule from every agent at once.
+const BUDGET_RULES_MD: usize = 20_000;
 /// HEARTBEAT.md — autonomous checklist.
 const BUDGET_HEARTBEAT_MD: usize = 1000;
 /// BOOTSTRAP.md — first-run ritual. Was 1500 (4 cut); largest is 2.5 K.
@@ -294,6 +298,13 @@ pub struct PromptContext {
     pub is_autonomous: bool,
     /// AGENTS.md content (behavioral guidance).
     pub agents_md: Option<String>,
+    /// `~/.openfang/RULES.md` content — the shared operating rules. Read from
+    /// the OpenFang home directory, not the agent's state dir: it is one file
+    /// for the whole fleet, so an edit reaches every agent on its next turn.
+    pub rules_md: Option<String>,
+    /// The OpenFang home directory `rules_md` was read from. Used only so a
+    /// truncation marker can name the file, like `state_dir`.
+    pub home_dir: Option<String>,
     /// BOOTSTRAP.md content (first-run ritual).
     pub bootstrap_md: Option<String>,
     /// Workspace context section (project type, context files).
@@ -356,6 +367,22 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                     agents,
                     BUDGET_AGENTS_MD,
                     "AGENTS.md",
+                    Recover::FileLine(&path),
+                ));
+            }
+        }
+    }
+
+    // Section 2.6 — Fleet-wide operating rules (skip for subagents, like
+    // AGENTS.md: a subagent answers its parent, not a human).
+    if !ctx.is_subagent {
+        if let Some(ref rules) = ctx.rules_md {
+            if !rules.trim().is_empty() {
+                let path = identity_path(ctx.home_dir.as_deref(), "RULES.md");
+                sections.push(cap_section(
+                    rules.trim_end(),
+                    BUDGET_RULES_MD,
+                    "RULES.md",
                     Recover::FileLine(&path),
                 ));
             }
@@ -1475,6 +1502,52 @@ mod tests {
         };
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## Your Tools"));
+    }
+
+    const RULES: &str = "## Operating Rules (Universal)\n\n0. **Answer directly.**\n";
+
+    /// RULES.md is the fleet's shared rulebook; before this it was never read
+    /// at all, and every agent ran on a hand-copied summary that drifted.
+    #[test]
+    fn rules_md_is_injected_after_agents_md_and_before_tools() {
+        let mut ctx = basic_ctx();
+        ctx.agents_md = Some("## Agent Behavioral Guidelines\nbe good".to_string());
+        ctx.rules_md = Some(RULES.to_string());
+        let prompt = build_system_prompt(&ctx);
+        let agents_pos = prompt.find("## Agent Behavioral Guidelines").unwrap();
+        let rules_pos = prompt.find("## Operating Rules (Universal)").unwrap();
+        let tools_pos = prompt.find("## Your Tools").unwrap();
+        assert!(agents_pos < rules_pos && rules_pos < tools_pos);
+        assert!(prompt.contains("**Answer directly.**"));
+    }
+
+    #[test]
+    fn rules_md_absent_when_missing_or_blank() {
+        let mut ctx = basic_ctx();
+        assert!(!build_system_prompt(&ctx).contains("Operating Rules"));
+        ctx.rules_md = Some("  \n\t\n".to_string());
+        assert!(!build_system_prompt(&ctx).contains("Operating Rules"));
+    }
+
+    #[test]
+    fn rules_md_skipped_for_subagents() {
+        let mut ctx = basic_ctx();
+        ctx.rules_md = Some(RULES.to_string());
+        ctx.is_subagent = true;
+        assert!(!build_system_prompt(&ctx).contains("Operating Rules"));
+    }
+
+    /// An oversized RULES.md is cut visibly, pointing at the real file, never
+    /// silently (ANAI-167 / ANAI-304).
+    #[test]
+    fn oversized_rules_md_is_cut_with_a_marker_naming_the_file() {
+        let mut ctx = basic_ctx();
+        ctx.home_dir = Some("/home/of".to_string());
+        ctx.rules_md = Some(format!("{RULES}{}", "x\n".repeat(BUDGET_RULES_MD)));
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("RULES.md truncated"));
+        let expected = std::path::Path::new("/home/of").join("RULES.md");
+        assert!(prompt.contains(&expected.display().to_string()));
     }
 
     #[test]

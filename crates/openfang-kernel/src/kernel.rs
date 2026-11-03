@@ -3079,6 +3079,8 @@ impl OpenFangKernel {
                     .state_dir
                     .as_ref()
                     .and_then(|s| read_identity_file(s, "AGENTS.md")),
+                rules_md: read_identity_file(&self.config.home_dir, "RULES.md"),
+                home_dir: Some(self.config.home_dir.display().to_string()),
                 bootstrap_md: manifest
                     .state_dir
                     .as_ref()
@@ -3800,6 +3802,8 @@ impl OpenFangKernel {
                     .state_dir
                     .as_ref()
                     .and_then(|s| read_identity_file(s, "AGENTS.md")),
+                rules_md: read_identity_file(&self.config.home_dir, "RULES.md"),
+                home_dir: Some(self.config.home_dir.display().to_string()),
                 bootstrap_md: manifest
                     .state_dir
                     .as_ref()
