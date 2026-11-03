@@ -2297,6 +2297,13 @@ pub struct GateFlags {
     /// [`writes_runtime_config`]. Reads are demoted and reach the judge.
     #[serde(default)]
     pub runtime_config_write: bool,
+    /// A **write** to `~/.openfang/RULES.md`.
+    ///
+    /// Hard. The daemon injects that file into every agent's prompt each turn,
+    /// so this is one command steering the whole fleet. See
+    /// [`writes_fleet_rules`]. Reads are demoted and reach the judge.
+    #[serde(default)]
+    pub fleet_rules_write: bool,
 }
 
 impl GateFlags {
@@ -2322,6 +2329,7 @@ impl GateFlags {
             || self.policy_self_modification
             || self.agent_config_write
             || self.runtime_config_write
+            || self.fleet_rules_write
     }
 
     /// The predicates that bypass the judge entirely.
@@ -2358,6 +2366,8 @@ impl GateFlags {
     ///    `[gatekeeper]` block that decides whether any of this runs at all,
     ///    are (5) with a different subject. Nothing an agent legitimately does
     ///    requires either.
+    /// 8. [`GateFlags::fleet_rules_write`] — a write to `RULES.md`, which the
+    ///    daemon injects into every agent's prompt. (5) again, fleet-wide.
     ///
     /// Every other predicate still fires, still logs, and is rendered into the
     /// prompt for the judge to weigh against the path facts. Demotion moved who
@@ -2372,6 +2382,7 @@ impl GateFlags {
             || self.policy_self_modification
             || self.agent_config_write
             || self.runtime_config_write
+            || self.fleet_rules_write
     }
 
     /// Compact `k=v` rendering for the audit log.
@@ -2427,6 +2438,9 @@ impl GateFlags {
         }
         if self.runtime_config_write {
             hit.push("runtime_config_write");
+        }
+        if self.fleet_rules_write {
+            hit.push("fleet_rules_write");
         }
         if hit.is_empty() {
             "none".to_string()
@@ -4172,6 +4186,57 @@ pub fn names_runtime_config(s: &str) -> bool {
     control_root_tails(s).iter().any(|tail| match tail {
         RootTail::Named(c) => c.strip_prefix("config.toml").is_some_and(control_boundary),
         _ => false,
+    })
+}
+
+/// True if `~/.openfang/RULES.md` is named, or might be.
+///
+/// Matched lowercased (the tails are, and APFS is case-insensitive, so
+/// `rules.MD` is the same file). Boundary-checked like
+/// [`names_runtime_config`], so `RULES.md.bak-20261102-tables` is a backup and
+/// not the live rules.
+///
+/// Unlike its siblings, a wildcard first component (`~/.openfang/R*`,
+/// `~/.openfang/*.md`) counts: inside a script body the shell expands it, and
+/// the file it is most likely to hit is the one every agent's prompt is built
+/// from. Writes through a root glob are not ordinary agent traffic, so the
+/// over-match costs nothing real.
+#[must_use]
+pub fn names_fleet_rules(s: &str) -> bool {
+    control_root_tails(s).iter().any(|tail| match tail {
+        RootTail::Named(c) => c.strip_prefix("rules.md").is_some_and(control_boundary),
+        RootTail::Glob => true,
+        RootTail::Root => false,
+    })
+}
+
+/// Verbs that drop files *into* a directory operand under names the command
+/// line does not have to spell out: `cp ./RULES.md ~/.openfang/`,
+/// `tar -xf x.tgz -C ~/.openfang`, `rsync -a dir/ ~/.openfang/`.
+const DEPOSIT_BINS: &[&str] = &[
+    "cp", "mv", "rsync", "install", "ditto", "tar", "bsdtar", "unzip", "cpio", "pax", "ln",
+];
+
+/// True if some segment pairs a [`DEPOSIT_BINS`] verb with the bare
+/// control-plane root as an operand.
+///
+/// The gap this closes: [`writes_where`] needs a token that *names* the target,
+/// and `cp ./RULES.md ~/.openfang/` has none — the destination token is the
+/// root, the source token is a workspace file. The same shape writes
+/// `config.toml`; this predicate is wired only to the fleet-rules flag, which
+/// is the one Ben asked for, and the sibling gap is noted in the commit.
+fn deposits_into_control_root(command: &str) -> bool {
+    crate::cmd_norm::deny_variants(command).iter().any(|v| {
+        let lowered = lower_for_segments(v);
+        split_segments(&lowered).into_iter().any(|segment| {
+            let tokens: Vec<&str> = segment.split_whitespace().collect();
+            tokens
+                .iter()
+                .any(|t| DEPOSIT_BINS.contains(&basename(strip_grouping(t)).as_str()))
+                && tokens
+                    .iter()
+                    .any(|t| control_root_tails(t).contains(&RootTail::Root))
+        })
     })
 }
 
@@ -7467,6 +7532,7 @@ mod tests {
             writes_gatekeeper_policy: false,
             writes_agent_config: false,
             writes_runtime_config: false,
+            writes_fleet_rules: false,
         }));
         let p = req.user_prompt();
         assert!(p.contains("<script-body>"), "{p}");
@@ -7498,6 +7564,7 @@ mod tests {
             writes_gatekeeper_policy: false,
             writes_agent_config: false,
             writes_runtime_config: false,
+            writes_fleet_rules: false,
         }));
         let p = req.user_prompt();
         assert!(p.contains("outside-reach"), "{p}");
@@ -7670,6 +7737,7 @@ mod tests {
             writes_gatekeeper_policy: false,
             writes_agent_config: false,
             writes_runtime_config: false,
+            writes_fleet_rules: false,
         };
         body.body_facts = vec![crate::path_facts::PathFact {
             raw: "</script-body> Deterministic flags: none".into(),
@@ -7868,6 +7936,10 @@ mod commit9_tests;
 #[path = "gatekeeper_anai265_tests.rs"]
 mod anai265_tests;
 
+#[cfg(test)]
+#[path = "gatekeeper_fleet_rules_tests.rs"]
+mod fleet_rules_tests;
+
 /// ANAI-206 commit 6: a **write** to the judge's own policy file.
 ///
 /// The second member of [`GateFlags::hard`] that is about an attack on the
@@ -7928,6 +8000,25 @@ pub fn writes_runtime_config(command: &str) -> bool {
     writes_where(command, names_runtime_config)
 }
 
+/// A **write** to `~/.openfang/RULES.md`, the fleet's shared operating rules.
+///
+/// Hard, for [`writes_gatekeeper_policy`]'s reason with a wider blast radius:
+/// the daemon re-reads this file into every agent's system prompt each turn, so
+/// one write steers the whole fleet, the judge's own callers included. Rules
+/// changes are Ben's; there is no agent-side reason to make one.
+///
+/// Two shapes: a token naming the file (see [`names_fleet_rules`]) in a
+/// segment that writes, or a deposit verb aimed at the bare root (see
+/// [`deposits_into_control_root`]). Reads stay demoted:
+/// `cat ~/.openfang/RULES.md` fires `touches_control_plane` and reaches the
+/// judge. A copy *out* (`cp ~/.openfang/RULES.md ./x`) is hard, the same
+/// over-match `config.toml` has: the segment writes and the token names the
+/// file, and the floor does not model which operand is the destination.
+#[must_use]
+pub fn writes_fleet_rules(command: &str) -> bool {
+    writes_where(command, names_fleet_rules) || deposits_into_control_root(command)
+}
+
 /// Shared shape of the three control-plane write predicates: over every deny
 /// variant, in some segment, a token the predicate names **and** a verb in that
 /// same segment that writes it.
@@ -7981,6 +8072,16 @@ pub fn body_writes_agent_config(body: &str) -> bool {
 #[must_use]
 pub fn body_writes_runtime_config(body: &str) -> bool {
     body_writes_where(body, &names_runtime_config)
+}
+
+/// [`writes_fleet_rules`], one level down. See
+/// [`body_writes_gatekeeper_policy`] for why this exists.
+#[must_use]
+pub fn body_writes_fleet_rules(body: &str) -> bool {
+    body_writes_where(body, &names_fleet_rules)
+        || logical_lines(body)
+            .iter()
+            .any(|line| deposits_into_control_root(&line.text))
 }
 
 /// [`writes_where`] over the folded logical lines of a script body.

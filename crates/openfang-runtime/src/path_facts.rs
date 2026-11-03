@@ -137,6 +137,7 @@ fn read_script_body(
         writes_gatekeeper_policy: false,
         writes_agent_config: false,
         writes_runtime_config: false,
+        writes_fleet_rules: false,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
@@ -312,6 +313,9 @@ fn read_script_body(
         openfang_types::gatekeeper::body_writes_gatekeeper_policy(&text);
     body.writes_agent_config = openfang_types::gatekeeper::body_writes_agent_config(&text);
     body.writes_runtime_config = openfang_types::gatekeeper::body_writes_runtime_config(&text);
+    // RULES.md is injected into every agent's prompt each turn; a body write is
+    // the same fleet-wide steer as a command-line one.
+    body.writes_fleet_rules = openfang_types::gatekeeper::body_writes_fleet_rules(&text);
 
     // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
     //

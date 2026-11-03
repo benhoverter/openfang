@@ -549,6 +549,10 @@ pub struct ScriptBody {
     /// [`GateFlags::runtime_config_write`](crate::gatekeeper::GateFlags::runtime_config_write).
     #[serde(default)]
     pub writes_runtime_config: bool,
+    /// Some logical line of the body **writes** `~/.openfang/RULES.md`. Wired to
+    /// [`GateFlags::fleet_rules_write`](crate::gatekeeper::GateFlags::fleet_rules_write).
+    #[serde(default)]
+    pub writes_fleet_rules: bool,
 }
 
 /// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
@@ -1324,6 +1328,7 @@ mod tests {
             writes_gatekeeper_policy: false,
             writes_agent_config: false,
             writes_runtime_config: false,
+            writes_fleet_rules: false,
         }
     }
 

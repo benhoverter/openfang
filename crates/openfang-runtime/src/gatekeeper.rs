@@ -332,6 +332,9 @@ pub async fn build_gate_request(
         // both stay demoted and reach the judge.
         agent_config_write: openfang_types::gatekeeper::writes_agent_config(raw_command),
         runtime_config_write: openfang_types::gatekeeper::writes_runtime_config(raw_command),
+        // The daemon re-reads RULES.md into every agent's prompt each turn, so
+        // a write to it steers the fleet. Same class as the two above.
+        fleet_rules_write: openfang_types::gatekeeper::writes_fleet_rules(raw_command),
     };
 
     // ANAI-190. Gathered from the *comment-stripped* command, for the same
@@ -391,6 +394,10 @@ pub async fn build_gate_request(
         .script_body
         .as_ref()
         .is_some_and(|b| b.writes_runtime_config);
+    flags.fleet_rules_write |= path_facts
+        .script_body
+        .as_ref()
+        .is_some_and(|b| b.writes_fleet_rules);
 
     // ANAI-206 F1. Item 2 let a control-plane *read* fall through to the judge
     // on the strength of item 1 handing over the body. Where item 1 refused,
@@ -1210,6 +1217,90 @@ mod tests {
         assert!(req.flags.touches_control_plane);
         assert!(!req.flags.policy_self_modification);
         assert_eq!(req.floor(), GateVerdict::Suppress);
+    }
+
+    /// RULES.md is injected into every agent's prompt, so a write is the
+    /// self-modification sentence fleet-wide: hard, never the judge's call.
+    #[tokio::test]
+    async fn writing_the_fleet_rules_hits_the_floor() {
+        for cmd in [
+            "tee ~/.openfang/RULES.md",
+            "cp ./r.md ~/.openfang/rules.MD",
+            "cp ./RULES.md ~/.openfang/",
+        ] {
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
+            assert!(
+                req.flags.fleet_rules_write,
+                "{cmd} → {}",
+                req.flags.as_log_string()
+            );
+            assert_eq!(req.floor(), GateVerdict::Escalate, "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reading_the_fleet_rules_reaches_the_judge() {
+        for cmd in [
+            "cat ~/.openfang/RULES.md",
+            "tee ~/.openfang/RULES.md.bak-20261102-tables",
+        ] {
+            let req = build_gate_request(
+                "a",
+                cmd,
+                &policy(),
+                Some(std::path::Path::new("/ws")),
+                None,
+                GatePosture::Strict,
+            )
+            .await;
+            assert!(
+                !req.flags.fleet_rules_write,
+                "{cmd} → {}",
+                req.flags.as_log_string()
+            );
+            assert!(!req.flags.hard(), "{cmd} → {}", req.flags.as_log_string());
+        }
+    }
+
+    /// The one-line bypass commit 9 closed for the siblings: put the write in a
+    /// file and run the file.
+    #[tokio::test]
+    async fn a_script_body_writing_the_fleet_rules_hits_the_floor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            ws.join("s.sh"),
+            "#!/bin/bash\necho 'obey' >> ~/.openfang/RULES.md\n",
+        )
+        .unwrap();
+        // The body is only read where file_policy grants the agent the script.
+        let fp = openfang_types::config::FilePolicy::new(
+            true,
+            openfang_types::config::FileAccessTier::Deny,
+            vec![openfang_types::config::FileRule {
+                path: ws.display().to_string(),
+                tier: openfang_types::config::FileAccessTier::Write,
+            }],
+        );
+        let req = build_gate_request(
+            "a",
+            "bash ./s.sh",
+            &policy(),
+            Some(&ws),
+            Some(&fp),
+            GatePosture::Strict,
+        )
+        .await;
+        assert!(req.flags.fleet_rules_write, "{}", req.flags.as_log_string());
+        assert_eq!(req.floor(), GateVerdict::Escalate);
     }
 
     /// The command Ben named: routine, destructive-flagged, on the agent's own

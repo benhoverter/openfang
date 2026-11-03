@@ -141,10 +141,37 @@ pub(crate) fn is_sensitive_home_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Returns `Some(reason)` if `path` is an OpenFang-home file agents may read but
+/// must never write, whatever their `file_policy` grants.
+///
+/// Today that is `RULES.md` alone: the daemon re-reads it into every agent's
+/// system prompt each turn, so a write steers the whole fleet. Several
+/// manifests grant `write` on all of `~/.openfang`, which reached it. Reads stay
+/// open — agents are told to consult the file.
+///
+/// Case-insensitive because APFS is: `rules.MD` opens the same file. Exact
+/// name, so `RULES.md.bak-*` backups stay writable. `path` must be canonical
+/// (symlinks resolved); a hardlink made elsewhere is not seen here — making one
+/// by shell names the file and trips the gate's `fleet_rules_write`.
+pub(crate) fn is_write_protected_openfang_path(path: &Path) -> Option<&'static str> {
+    let home = openfang_home()?;
+    let canon_home = home.canonicalize().ok()?;
+    let rel = path.strip_prefix(&canon_home).ok()?;
+    let mut comps = rel.components();
+    let first = comps.next()?.as_os_str().to_str()?;
+    if comps.next().is_none() && first.eq_ignore_ascii_case("RULES.md") {
+        return Some("fleet-rules");
+    }
+    None
+}
+
 /// The sandbox *floor*: `..`-rejection + canonicalization + the sensitive-path
 /// deny-list. Absolute and non-overridable — no `file_policy` tier rule can
 /// widen past it. Returns the canonical candidate WITHOUT applying the
 /// workspace clamp (that is [`enforce_workspace_clamp`]'s job).
+///
+/// The write-only half of the floor, [`is_write_protected_openfang_path`],
+/// runs in [`resolve_with_policy`], the one place that knows `needs_write`.
 pub(crate) fn sandbox_floor(user_path: &str, workspace_root: &Path) -> Result<PathBuf, String> {
     let path = Path::new(user_path);
 
@@ -275,6 +302,22 @@ pub fn resolve_with_policy(
     prompt_preapproved: bool,
 ) -> Result<PathBuf, String> {
     let canon = sandbox_floor(user_path, workspace_root)?;
+    if needs_write {
+        if let Some(reason) = is_write_protected_openfang_path(&canon) {
+            tracing::warn!(
+                target: "openfang_runtime::sandbox",
+                user_path = %user_path,
+                resolved = %canon.display(),
+                reason = reason,
+                "Write denied: read-only OpenFang path"
+            );
+            return Err(format!(
+                "Access denied: path '{user_path}' resolves to a read-only \
+                 OpenFang resource ({reason}). Agents may read it but never \
+                 write it; changes to it are the operator's."
+            ));
+        }
+    }
     match file_policy {
         None => enforce_workspace_clamp(canon, workspace_root),
         Some(fp) if !fp.is_active() => enforce_workspace_clamp(canon, workspace_root),
@@ -797,5 +840,93 @@ mod tests {
         let e = assert_prevalidated(Path::new("/evil"), Some(Path::new("/a/b")));
         assert!(e.is_err());
         assert!(e.unwrap_err().contains("TOCTOU"));
+    }
+
+    // -------------------------------------------------------------------
+    // RULES.md: readable, never writable, whatever file_policy grants
+    // -------------------------------------------------------------------
+
+    /// The live case: eight manifests grant `write` on all of `~/.openfang`.
+    fn whole_home_write(h: &FakeHome) -> FilePolicy {
+        policy(
+            FileAccessTier::Deny,
+            vec![(h.path.to_str().unwrap(), FileAccessTier::Write)],
+        )
+    }
+
+    #[test]
+    fn fleet_rules_write_is_denied_under_a_whole_home_write_grant() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("RULES.md"), "rules").unwrap();
+        let fp = whole_home_write(&h);
+        let abs = h.path.join("RULES.md");
+        let e =
+            resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), true, true).unwrap_err();
+        assert!(e.contains("fleet-rules"), "got: {e}");
+        // Legacy clamp with the workspace mis-scoped to the home: same answer.
+        assert!(resolve_with_policy("RULES.md", &h.path, None, true, false).is_err());
+    }
+
+    #[test]
+    fn fleet_rules_read_is_allowed() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("RULES.md"), "rules").unwrap();
+        let fp = whole_home_write(&h);
+        let abs = h.path.join("RULES.md");
+        assert!(
+            resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), false, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn fleet_rules_case_variant_is_denied() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("RULES.md"), "rules").unwrap();
+        let fp = whole_home_write(&h);
+        let abs = h.path.join("rules.MD");
+        assert!(
+            resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), true, true).is_err()
+        );
+        assert_eq!(
+            is_write_protected_openfang_path(&h.path.join("Rules.Md")),
+            Some("fleet-rules")
+        );
+    }
+
+    /// Creating it is a write too: a missing RULES.md must not be plantable.
+    #[test]
+    fn fleet_rules_create_is_denied() {
+        let h = FakeHome::new();
+        let fp = whole_home_write(&h);
+        let abs = h.path.join("RULES.md");
+        assert!(
+            resolve_with_policy(abs.to_str().unwrap(), &h.path, Some(&fp), true, true).is_err()
+        );
+    }
+
+    #[test]
+    fn fleet_rules_backups_and_nested_names_stay_writable() {
+        let h = FakeHome::new();
+        let fp = whole_home_write(&h);
+        let bak = h.path.join("RULES.md.bak-20261102-tables");
+        assert!(resolve_with_policy(bak.to_str().unwrap(), &h.path, Some(&fp), true, true).is_ok());
+        let ws = h.path.join("workspaces").join("a");
+        std::fs::create_dir_all(&ws).unwrap();
+        let nested = ws.join("RULES.md");
+        assert!(resolve_with_policy(nested.to_str().unwrap(), &ws, Some(&fp), true, true).is_ok());
+    }
+
+    /// A symlink in the workspace pointing at RULES.md canonicalizes to it.
+    #[cfg(unix)]
+    #[test]
+    fn fleet_rules_write_through_a_symlink_is_denied() {
+        let h = FakeHome::new();
+        std::fs::write(h.path.join("RULES.md"), "rules").unwrap();
+        let ws = h.path.join("workspaces").join("a");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::os::unix::fs::symlink(h.path.join("RULES.md"), ws.join("notes.md")).unwrap();
+        let fp = whole_home_write(&h);
+        assert!(resolve_with_policy("notes.md", &ws, Some(&fp), true, true).is_err());
+        assert!(resolve_with_policy("notes.md", &ws, Some(&fp), false, true).is_ok());
     }
 }
