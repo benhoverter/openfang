@@ -114,8 +114,12 @@ const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// containing curl.
 const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
 
-/// First 4 bytes of a native executable: Mach-O 32/64 in both byte orders,
-/// Mach-O universal (fat) in both orders, ELF.
+/// Every native-executable magic: Mach-O 32/64 in both byte orders, Mach-O
+/// universal (fat) in both orders, ELF. Test corpus only: a magic this host
+/// cannot exec reaches the kernel, fails, and runs via the `/bin/sh`
+/// fallback, so skipping its scan buys no false positive and carries all the
+/// risk.
+#[cfg(test)]
 const NATIVE_MAGIC: &[[u8; 4]] = &[
     [0xfe, 0xed, 0xfa, 0xce],
     [0xce, 0xfa, 0xed, 0xfe],
@@ -126,14 +130,44 @@ const NATIVE_MAGIC: &[[u8; 4]] = &[
     [0x7f, b'E', b'L', b'F'],
 ];
 
+/// Magics this host runs natively (security H1). macOS arm64: thin 64-bit LE
+/// and fat (always big-endian on disk). Linux: ELF. Elsewhere: none.
+#[cfg(target_os = "macos")]
+const HOST_MAGIC: &[[u8; 4]] = &[[0xcf, 0xfa, 0xed, 0xfe], [0xca, 0xfe, 0xba, 0xbe]];
+#[cfg(target_os = "linux")]
+const HOST_MAGIC: &[[u8; 4]] = &[[0x7f, b'E', b'L', b'F']];
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const HOST_MAGIC: &[[u8; 4]] = &[];
+
+/// The link naming the shell behind `/bin/sh`.
+#[cfg(target_os = "macos")]
+const SH_LINK: &str = "/private/var/select/sh";
+#[cfg(not(target_os = "macos"))]
+const SH_LINK: &str = "/bin/sh";
+
 /// Bytes read to classify a file as native: the magic plus enough header to
 /// find the NUL that makes `/bin/sh` refuse it.
 const NATIVE_SNIFF_BYTES: u64 = 16;
 
-/// Is `path` a native executable that `/bin/sh` will not run as text? Reads
-/// at most [`NATIVE_SNIFF_BYTES`]. A short file or a failed read is not
-/// native, so it falls through to the text search.
+/// Does `link` name bash? The NUL-in-line-1 refusal is bash's; dash and zsh
+/// both run line 2 of a fake header (measured 2026-11-02, security H2). Not a
+/// readable link, or another shell: false, so scripts are scanned.
+fn shell_is_bash(link: &Path) -> bool {
+    std::fs::read_link(link)
+        .ok()
+        .and_then(|t| t.file_name().map(|n| n == "bash"))
+        .unwrap_or(false)
+}
+
+/// Is `path` a native executable that `/bin/sh` will not run as text? Only
+/// when `/bin/sh` is bash and the magic is one this host runs. Reads at most
+/// [`NATIVE_SNIFF_BYTES`]. A short file or a failed read is not native, so it
+/// falls through to the text search.
 fn is_native_executable(path: &Path) -> bool {
+    shell_is_bash(Path::new(SH_LINK)) && sniff_native(path, HOST_MAGIC)
+}
+
+fn sniff_native(path: &Path, magics: &[[u8; 4]]) -> bool {
     use std::io::Read;
     let mut head = Vec::new();
     if std::fs::File::open(path)
@@ -143,7 +177,7 @@ fn is_native_executable(path: &Path) -> bool {
     {
         return false;
     }
-    let magic_ok = NATIVE_MAGIC.iter().any(|m| head.starts_with(m));
+    let magic_ok = magics.iter().any(|m| head.starts_with(m));
     // bash's binary check: a NUL in the first line.
     let nul_first = head[4..]
         .iter()
@@ -578,7 +612,8 @@ mod tests {
     #[test]
     fn native_binary_is_not_scanned() {
         let dir = tempfile::tempdir().unwrap();
-        for (i, magic) in NATIVE_MAGIC.iter().enumerate() {
+        let skip = shell_is_bash(Path::new(SH_LINK));
+        for (i, magic) in HOST_MAGIC.iter().enumerate() {
             // Small and naming curl, and oversized: both used to be refused.
             let small = dir.path().join(format!("small{i}"));
             let mut body = magic.to_vec();
@@ -590,9 +625,58 @@ mod tests {
             write_exec(&big, &body);
             for p in [&small, &big] {
                 let cmd = format!("{} --version", p.display());
-                assert_eq!(verdict(&cmd, Some(dir.path())), None, "{cmd}");
+                let v = verdict(&cmd, Some(dir.path()));
+                if skip {
+                    assert_eq!(v, None, "{cmd}");
+                } else {
+                    assert!(matches!(v, Some(NetVerdict::Deny(_))), "{cmd}");
+                }
             }
         }
+    }
+
+    /// Security H1: a magic this host cannot exec is scanned like text, NUL
+    /// or not, because the kernel hands it to `/bin/sh`.
+    #[test]
+    fn foreign_magic_is_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, magic) in NATIVE_MAGIC
+            .iter()
+            .filter(|m| !HOST_MAGIC.contains(m))
+            .enumerate()
+        {
+            let p = dir.path().join(format!("foreign{i}"));
+            let mut body = magic.to_vec();
+            body.extend_from_slice(b"\0\0\0\0\ncurl https://example.com\n");
+            write_exec(&p, &body);
+            assert!(!is_native_executable(&p), "{magic:02x?}");
+            let cmd = format!("{} --version", p.display());
+            assert!(
+                matches!(verdict(&cmd, Some(dir.path())), Some(NetVerdict::Deny(_))),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// Security H2: the skip holds only when `/bin/sh` is bash. dash, zsh, a
+    /// missing link or a plain file all fail closed (scan).
+    #[test]
+    fn native_skip_requires_bash_as_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("bash", "/bin/bash", true),
+            ("dash", "/bin/dash", false),
+            ("zsh", "/bin/zsh", false),
+        ];
+        for (name, target, want) in cases {
+            let link = dir.path().join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert_eq!(shell_is_bash(&link), want, "{name}");
+        }
+        assert!(!shell_is_bash(&dir.path().join("missing")));
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        assert!(!shell_is_bash(&plain));
     }
 
     /// The reported false positive: `<abs path> --version` on a real, large
@@ -600,6 +684,11 @@ mod tests {
     #[test]
     fn absolute_path_native_binary_passes_the_floor() {
         let exe = std::env::current_exe().unwrap();
+        if !shell_is_bash(Path::new(SH_LINK)) {
+            // H2: off when /bin/sh is not bash; the binary is scanned.
+            assert!(!is_native_executable(&exe));
+            return;
+        }
         assert!(is_native_executable(&exe));
         let cmd = format!("{} --version", exe.display());
         assert_eq!(verdict(&cmd, None), None);
@@ -667,6 +756,7 @@ mod tests {
     fn fake_native_header_does_not_run_as_script() {
         let dir = tempfile::tempdir().unwrap();
         let mut ran = Vec::new();
+        let bash = shell_is_bash(Path::new(SH_LINK));
         for (i, magic) in NATIVE_MAGIC.iter().enumerate() {
             for (j, pad) in [&b""[..], &[0u8; 4][..], &b"ab\0"[..]].iter().enumerate() {
                 let marker = dir.path().join(format!("ran{i}_{j}"));
@@ -676,7 +766,8 @@ mod tests {
                 body.extend_from_slice(format!("\ntouch {}\n", marker.display()).as_bytes());
                 write_exec(&p, &body);
                 let native = is_native_executable(&p);
-                assert_eq!(native, !pad.is_empty(), "magic {i} pad {j}");
+                let want = bash && HOST_MAGIC.contains(magic) && !pad.is_empty();
+                assert_eq!(native, want, "magic {i} pad {j}");
                 let _ = std::process::Command::new(&p)
                     .current_dir(dir.path())
                     .stderr(std::process::Stdio::null())
