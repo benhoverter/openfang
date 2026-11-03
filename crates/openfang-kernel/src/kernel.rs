@@ -723,13 +723,14 @@ const MAX_IDENTITY_FILE_BYTES: usize = 1024 * 1024;
 /// called with the state directory.
 fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     let path = state_dir.join(filename);
-    // Security: ensure path stays inside the state directory
+    // Security: ensure path stays inside the state directory. If the base
+    // itself can't be canonicalized there is nothing to check against, so
+    // refuse rather than skip the check.
     match path.canonicalize() {
         Ok(canonical) => {
-            if let Ok(sd_canonical) = state_dir.canonicalize() {
-                if !canonical.starts_with(&sd_canonical) {
-                    return None; // path traversal attempt
-                }
+            let sd_canonical = state_dir.canonicalize().ok()?;
+            if !canonical.starts_with(&sd_canonical) {
+                return None; // path traversal attempt
             }
         }
         Err(_) => return None, // file doesn't exist
@@ -738,9 +739,13 @@ fn read_identity_file(state_dir: &Path, filename: &str) -> Option<String> {
     if content.trim().is_empty() {
         return None;
     }
-    // ANAI-149: advisory injection scan. Identity files are agent-writable and
-    // land verbatim in the system prompt. Warn-only by design -- self-editing
-    // is a supported capability, so nothing here drops or rewrites content.
+    // ANAI-149: advisory injection scan. Per-agent identity files are
+    // agent-writable and land verbatim in the system prompt. Warn-only by
+    // design -- self-editing them is a supported capability, so nothing here
+    // drops or rewrites content. NOT true of the shared ~/.openfang/RULES.md,
+    // which also comes through here: no agent may edit it (it steers the whole
+    // fleet), and writes to it are a hard gate. Do not cite this comment to
+    // justify agent writes to RULES.md.
     openfang_runtime::context_scan::scan_and_log(
         &openfang_runtime::context_scan::source_label(state_dir, filename),
         &content,
