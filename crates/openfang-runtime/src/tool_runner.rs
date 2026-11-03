@@ -218,6 +218,55 @@ fn curl_floor_gate(
     }
 }
 
+/// The gate's hard floor ([`GateFlags::hard`]) for a shell call, computed
+/// before the auto-approve shortcut and the Approve-Similar cache.
+///
+/// `gatekeeper::review` is the only other place the floor is computed, and it
+/// runs only for calls that are going to prompt. A call whose every base is in
+/// `safe_bins`/`trusted_commands` never got there, so `touch ~/.openfang/RULES.md`
+/// ran unchecked on the live fleet (G1 tier gap, 2026-11-03). Returns the hit
+/// flags for the log and the prompt, or `None` when the floor is clear.
+///
+/// There is no error arm to fail open on: `build_gate_request` always returns
+/// a request, an unparseable command sets `parse_failed` and an unreadable
+/// script body sets `script_body_blind`, and both are hard. A missing
+/// exec policy is judged against the default (empty) policy, which only
+/// changes the lists copied into the request, never a flag.
+///
+/// [`GateFlags::hard`]: openfang_types::gatekeeper::GateFlags::hard
+async fn shell_hard_floor(
+    tool_name: &str,
+    input: &serde_json::Value,
+    caller_agent_id: Option<&str>,
+    exec_policy: Option<&openfang_types::config::ExecPolicy>,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+) -> Option<String> {
+    if !is_shell_tool(tool_name) {
+        return None;
+    }
+    let command = input.get("command").and_then(|v| v.as_str())?;
+    let default_policy;
+    let policy = match exec_policy {
+        Some(p) => p,
+        None => {
+            default_policy = openfang_types::config::ExecPolicy::default();
+            &default_policy
+        }
+    };
+    let req = crate::gatekeeper::build_gate_request(
+        caller_agent_id.unwrap_or("unknown"),
+        command,
+        policy,
+        workspace_root,
+        file_policy,
+        // Posture picks the judge's prompt text; no flag reads it.
+        openfang_types::gatekeeper::GatePosture::Strict,
+    )
+    .await;
+    req.flags.hard().then(|| req.flags.as_log_string())
+}
+
 /// Check if a URL should be blocked by taint tracking before network fetch.
 ///
 /// Blocks URLs that appear to contain API keys, tokens, or other secrets
@@ -409,6 +458,48 @@ pub async fn execute_tool(
         }
     }
 
+    // The hard floor, before the auto-approve shortcut and before any
+    // approval-cache lookup. A hit behaves like the `allowed_commands` path
+    // already did: a fresh human prompt for this exact call, which neither
+    // reads nor seeds Approve-Similar. Where nobody can be asked, it refuses.
+    // Full mode (and allowlist `*`) never prompts and is not covered (M6).
+    let hard_floor = if exec_policy_bypasses_approval {
+        None
+    } else {
+        shell_hard_floor(
+            tool_name,
+            input,
+            caller_agent_id,
+            exec_policy,
+            workspace_root,
+            file_policy,
+        )
+        .await
+    };
+    if let Some(hit) = &hard_floor {
+        let can_prompt = kernel.is_some_and(|kh| kh.requires_approval(tool_name));
+        warn!(
+            tool_name,
+            agent = caller_agent_id.unwrap_or("unknown"),
+            flags = %hit,
+            withdrew_auto_approve = auto_approved.is_some(),
+            can_prompt,
+            "Hard floor hit: a fresh approval is required for this call"
+        );
+        if !can_prompt {
+            return ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!(
+                    "Refused: this command hits a fixed safety rule ({hit}) that needs a fresh \
+                     human approval, and this agent's {tool_name} runs without an approval \
+                     prompt, so nobody can be asked. Nothing was run."
+                ),
+                is_error: true,
+            };
+        }
+    }
+    let auto_approved = auto_approved.filter(|_| hard_floor.is_none());
+
     // The curl floor, before any approval machinery. `Deny` is terminal: it
     // returns here, so no judge, prompt, cache or posture ever sees it.
     // `Escalate` demands a fresh human answer for this exact call, which the
@@ -540,7 +631,9 @@ pub async fn execute_tool(
             // `cache_max_uses` invocations. One judgement, one invocation.
             // The curl floor's Escalate is a ceiling on the judge: it may
             // still deny, never suppress.
-            let suppressed = !curl_needs_fresh_prompt
+            // A hard-floor hit is the same ceiling, from the gate's side.
+            let fresh_prompt_only = curl_needs_fresh_prompt || hard_floor.is_some();
+            let suppressed = !fresh_prompt_only
                 && matches!(gate_outcome, Some(crate::gatekeeper::GateOutcome::Suppress));
             if suppressed {
                 debug!(
@@ -611,6 +704,11 @@ pub async fn execute_tool(
                 } else {
                     gatekeeper_note
                 };
+                let gatekeeper_note = match (&hard_floor, gatekeeper_note) {
+                    (Some(hit), Some(n)) => Some(format!("hard floor: {hit}; {n}")),
+                    (Some(hit), None) => Some(format!("hard floor: {hit}")),
+                    (None, n) => n,
+                };
                 // Approve-Similar cache key source: argv[0] of a shell_exec
                 // command, extracted once here where structured input still
                 // exists (never re-parsed from the mangled action_summary).
@@ -626,11 +724,12 @@ pub async fn execute_tool(
                 } else {
                     None
                 };
-                // A curl escalation is about THIS call's host and payload, so
-                // it neither reads nor seeds the Approve-Similar cache.
+                // A curl escalation is about THIS call's host and payload, and
+                // a hard-floor hit about THIS call's target, so neither reads
+                // nor seeds the Approve-Similar cache.
                 let cache_binary = raw_command
                     .and_then(extract_cache_binary)
-                    .filter(|_| !curl_needs_fresh_prompt);
+                    .filter(|_| !fresh_prompt_only);
                 let command = raw_command.map(|c| {
                     openfang_types::net_facts::redact_command_userinfo(c)
                         .chars()
@@ -10464,6 +10563,9 @@ mod tests {
         // ANAI-248: pretend the operator has been asked something and has not
         // answered yet.
         pending_operator_question: std::sync::atomic::AtomicBool,
+        // G1 tiers: model an agent whose tool runs without an approval prompt
+        // (`requires_approval` false), so nobody can be asked.
+        no_approval: std::sync::atomic::AtomicBool,
     }
 
     impl FakeKernelHandle {
@@ -10506,6 +10608,7 @@ mod tests {
                 context_resets: std::sync::Mutex::new(Vec::new()),
                 context_reset_fails: std::sync::atomic::AtomicBool::new(false),
                 pending_operator_question: std::sync::atomic::AtomicBool::new(false),
+                no_approval: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -12728,7 +12831,7 @@ mod tests {
         // execute_tool would fire for any tool — unless something short-circuits
         // ahead of it.
         fn requires_approval(&self, _tool_name: &str) -> bool {
-            true
+            !self.no_approval.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         async fn request_approval(
@@ -13205,6 +13308,214 @@ mod tests {
     fn the_curl_word_match_is_gone() {
         assert!(check_taint_shell_exec("git commit -m 'fix curl handling'").is_none());
         assert!(check_taint_shell_exec("wget https://example.com").is_some());
+    }
+
+    // ---- G1 tiers: the hard floor before auto-approve and the cache ------
+    //
+    // Every target lives under a temp `.openfang/`, which the floor matches
+    // exactly as it matches the real one, so nothing here can touch the live
+    // control plane even on a path that executes.
+
+    /// One policy per exec tier, every base the tests use listed in it.
+    fn tier_policy(tier: &str) -> openfang_types::config::ExecPolicy {
+        let bins: Vec<String> = ["touch", "cp", "tee", "sed", "mv", "cat"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut p = openfang_types::config::ExecPolicy {
+            mode: openfang_types::config::ExecSecurityMode::Allowlist,
+            safe_bins: Vec::new(),
+            trusted_commands: Vec::new(),
+            allowed_commands: Vec::new(),
+            ..openfang_types::config::ExecPolicy::default()
+        };
+        match tier {
+            "safe_bin" => p.safe_bins = bins,
+            "trusted" => p.trusted_commands = bins,
+            "allowed" => p.allowed_commands = bins,
+            other => panic!("unknown tier {other}"),
+        }
+        p
+    }
+
+    fn fake_control_root() -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join(".openfang");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("RULES.md"), "rules\n").unwrap();
+        let root = root.display().to_string();
+        (dir, root)
+    }
+
+    /// Every tier × every control-plane write flag: a fresh prompt, the judge
+    /// cannot suppress it, the prompt names the floor, and Approve-Similar is
+    /// neither read nor offered. Denied, so nothing runs.
+    #[tokio::test]
+    async fn hard_floor_forces_a_fresh_prompt_in_every_tier() {
+        let (_dir, root) = fake_control_root();
+        let cases = [
+            ("fleet_rules_write", format!("touch {root}/RULES.md")),
+            ("fleet_rules_write", format!("touch {root}/rules.MD")),
+            ("fleet_rules_write", format!("cp ./r.md {root}/RULES.md")),
+            ("fleet_rules_write", format!("tee {root}/RULES.md")),
+            (
+                "fleet_rules_write",
+                format!("sed -i s/a/b/ {root}/RULES.md"),
+            ),
+            ("fleet_rules_write", format!("mv ./r.md {root}/RULES.md")),
+            ("runtime_config_write", format!("touch {root}/config.toml")),
+            (
+                "policy_self_modification",
+                format!("touch {root}/gatekeeper.md"),
+            ),
+        ];
+        for tier in ["safe_bin", "trusted", "allowed"] {
+            for (flag, cmd) in &cases {
+                let fake = Arc::new(
+                    FakeKernelHandle::new()
+                        .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress)
+                        .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+                );
+                let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+                let r = run_gated(&handle, &tier_policy(tier), cmd).await;
+                let at = format!("{tier} / {flag} / {cmd}");
+                assert!(r.is_error, "{at}: denied, so must not run: {}", r.content);
+                assert!(
+                    fake.approval_requested
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "{at}: a hard hit must reach a human"
+                );
+                assert_eq!(
+                    *fake.approval_cache_binary.lock().unwrap(),
+                    None,
+                    "{at}: a hard hit must not read or seed Approve-Similar"
+                );
+                let note = fake
+                    .approval_note
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default();
+                assert!(note.starts_with("hard floor: "), "{at}: {note}");
+                assert!(note.contains(flag), "{at}: {note}");
+                assert!(
+                    !fake
+                        .gate_consulted
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    "{at}: the floor short-circuits; the judge is never billed"
+                );
+            }
+        }
+    }
+
+    /// A read stays where it was: trusted/safe reads auto-approve and run.
+    #[tokio::test]
+    async fn hard_floor_leaves_a_trusted_read_auto_approved() {
+        let (_dir, root) = fake_control_root();
+        for tier in ["safe_bin", "trusted"] {
+            let fake = Arc::new(FakeKernelHandle::new());
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let r = run_gated(&handle, &tier_policy(tier), &format!("cat {root}/RULES.md")).await;
+            assert!(!r.is_error, "{tier}: {}", r.content);
+            assert!(r.content.contains("rules"), "{tier}: {}", r.content);
+            assert!(
+                !fake
+                    .approval_requested
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "{tier}: a read must not prompt"
+            );
+        }
+    }
+
+    /// Approving a hard hit runs THIS call only. The prompt carries no cache
+    /// key, so the approval cannot seed Approve-Similar, and the next hard hit
+    /// prompts again instead of being satisfied from the cache.
+    #[tokio::test]
+    async fn hard_floor_approval_neither_seeds_nor_reads_the_cache() {
+        let (_dir, root) = fake_control_root();
+        let rules = format!("{root}/RULES.md");
+        for attempt in ["first", "second"] {
+            let fake = Arc::new(FakeKernelHandle::new());
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let r = run_gated(&handle, &tier_policy("trusted"), &format!("touch {rules}")).await;
+            assert!(
+                !r.is_error,
+                "{attempt}: approved, so it runs: {}",
+                r.content
+            );
+            assert!(
+                fake.approval_requested
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "{attempt}: every hard hit asks"
+            );
+            assert_eq!(
+                *fake.approval_cache_binary.lock().unwrap(),
+                None,
+                "{attempt}: no cache key, so no cache read and nothing to seed"
+            );
+        }
+        // Contrast: an ordinary allowed-tier command still offers the cache.
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let _ = run_gated(&handle, &tier_policy("allowed"), "touch ./plain.txt").await;
+        assert_eq!(
+            fake.approval_cache_binary.lock().unwrap().as_deref(),
+            Some("touch")
+        );
+    }
+
+    /// Nobody can be asked: refused, never run. Both shapes — a kernel whose
+    /// tool runs without approval, and no kernel at all.
+    #[tokio::test]
+    async fn hard_floor_refuses_when_nobody_can_be_asked() {
+        let (_dir, root) = fake_control_root();
+        let rules = format!("{root}/RULES.md");
+        let before = std::fs::metadata(&rules).unwrap().modified().unwrap();
+        let cmd = format!("touch -t 200001010000 {rules}");
+
+        let fake = Arc::new(FakeKernelHandle::new());
+        fake.no_approval
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_gated(&handle, &tier_policy("trusted"), &cmd).await;
+        assert!(r.is_error);
+        assert!(r.content.contains("nobody can be asked"), "{}", r.content);
+        assert!(!fake
+            .approval_requested
+            .load(std::sync::atomic::Ordering::SeqCst));
+
+        let input = serde_json::json!({ "command": cmd });
+        let policy = tier_policy("trusted");
+        let r = execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            None,
+            None,
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&policy),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(r.is_error);
+        assert!(r.content.contains("nobody can be asked"), "{}", r.content);
+
+        let after = std::fs::metadata(&rules).unwrap().modified().unwrap();
+        assert_eq!(before, after, "the refused touch must not have run");
     }
 
     /// ANAI-240: the deterministic sheet verdict is recorded on every row.
