@@ -1083,7 +1083,7 @@ mod tests {
         let deep = agents.join(format!("caf\u{e9}-{KELVIN}.toml"));
         assert!(resolve_with_policy(deep.to_str().unwrap(), &ws, Some(&fp), true, true).is_ok());
         // A non-ASCII name AT the root is refused for writes but stays readable.
-        let root_name = h.path.join(format!("caf\u{e9}.md"));
+        let root_name = h.path.join("caf\u{e9}.md");
         std::fs::write(&root_name, "x").unwrap();
         let root_str = root_name.to_str().unwrap();
         assert!(resolve_with_policy(root_str, &ws, Some(&fp), true, true).is_err());
