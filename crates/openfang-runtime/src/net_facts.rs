@@ -22,6 +22,17 @@
 //! from logs, the judge and the approval prompt. Scheme-less `u:p@host`,
 //! `-x pu:pp@proxy`, and the values of `-u`, `--proxy-user` and
 //! `--oauth2-bearer` are shown as written.
+//!
+//! Native executables: a file run directly (`/path/to/bin --version`) that
+//! looks native is not searched for curl. A magic alone is not enough: when
+//! the kernel rejects a file (fake header, foreign arch, ELF on macOS) the
+//! spawn falls back to `/bin/sh`, which runs the bytes after the header as a
+//! script (measured on this box: 4 of the 7 magics did). So "native" also
+//! needs a NUL before the first newline in the first 16 bytes, which bash
+//! (`/bin/sh` here) refuses to run as text. Real Mach-O/ELF/fat headers all
+//! have one. A binary the agent compiled itself that calls curl still
+//! reaches the judge, like any program that spells curl some other way. The
+//! same file passed to a shell (`bash x`) is still searched.
 
 use std::path::Path;
 
@@ -102,6 +113,44 @@ const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// Largest script body searched for curl; a bigger one is treated as
 /// containing curl.
 const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
+
+/// First 4 bytes of a native executable: Mach-O 32/64 in both byte orders,
+/// Mach-O universal (fat) in both orders, ELF.
+const NATIVE_MAGIC: &[[u8; 4]] = &[
+    [0xfe, 0xed, 0xfa, 0xce],
+    [0xce, 0xfa, 0xed, 0xfe],
+    [0xfe, 0xed, 0xfa, 0xcf],
+    [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe],
+    [0xbe, 0xba, 0xfe, 0xca],
+    [0x7f, b'E', b'L', b'F'],
+];
+
+/// Bytes read to classify a file as native: the magic plus enough header to
+/// find the NUL that makes `/bin/sh` refuse it.
+const NATIVE_SNIFF_BYTES: u64 = 16;
+
+/// Is `path` a native executable that `/bin/sh` will not run as text? Reads
+/// at most [`NATIVE_SNIFF_BYTES`]. A short file or a failed read is not
+/// native, so it falls through to the text search.
+fn is_native_executable(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if std::fs::File::open(path)
+        .and_then(|f| f.take(NATIVE_SNIFF_BYTES).read_to_end(&mut head))
+        .is_err()
+        || head.len() < 8
+    {
+        return false;
+    }
+    let magic_ok = NATIVE_MAGIC.iter().any(|m| head.starts_with(m));
+    // bash's binary check: a NUL in the first line.
+    let nul_first = head[4..]
+        .iter()
+        .find(|&&b| b == 0 || b == b'\n')
+        .is_some_and(|&b| b == 0);
+    magic_ok && nul_first
+}
 
 fn basename(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
@@ -201,7 +250,10 @@ fn describe(
                 blind(NetSource::ScriptBody)
             }
         }
-    } else if first.contains('/') && script_mentions_curl(first, canon_ws.as_deref()) {
+    } else if first.contains('/')
+        && !is_native_executable(&resolve(first, canon_ws.as_deref()))
+        && script_mentions_curl(first, canon_ws.as_deref())
+    {
         // `./deploy.sh`: direct execution of a script file.
         blind(NetSource::ScriptBody)
     } else {
@@ -210,14 +262,18 @@ fn describe(
     Some(sheet)
 }
 
+fn resolve(raw: &str, canon_ws: Option<&Path>) -> std::path::PathBuf {
+    match canon_ws {
+        Some(ws) if !Path::new(raw).is_absolute() => ws.join(raw),
+        _ => Path::new(raw).to_path_buf(),
+    }
+}
+
 /// Does the script at `raw` mention curl? An oversized file counts as yes;
 /// an unreadable one as no (see Known Limits in the design doc: the shell
 /// that runs it cannot read it either, or it is not a file at all).
 fn script_mentions_curl(raw: &str, canon_ws: Option<&Path>) -> bool {
-    let path = match canon_ws {
-        Some(ws) if !Path::new(raw).is_absolute() => ws.join(raw),
-        _ => Path::new(raw).to_path_buf(),
-    };
+    let path = resolve(raw, canon_ws);
     let Ok(meta) = std::fs::metadata(&path) else {
         return false;
     };
@@ -509,6 +565,131 @@ mod tests {
                 "{cmd}"
             );
         }
+    }
+
+    fn write_exec(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Alpha 2026-11-02: a native binary run directly is not searched for
+    /// curl, whatever its size or contents, for every accepted magic.
+    #[test]
+    fn native_binary_is_not_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, magic) in NATIVE_MAGIC.iter().enumerate() {
+            // Small and naming curl, and oversized: both used to be refused.
+            let small = dir.path().join(format!("small{i}"));
+            let mut body = magic.to_vec();
+            body.extend_from_slice(b"\0\0libcurl curl_easy_perform curl\n");
+            write_exec(&small, &body);
+            let big = dir.path().join(format!("big{i}"));
+            let mut body = magic.to_vec();
+            body.resize(MAX_SCRIPT_BYTES as usize + 1, 0);
+            write_exec(&big, &body);
+            for p in [&small, &big] {
+                let cmd = format!("{} --version", p.display());
+                assert_eq!(verdict(&cmd, Some(dir.path())), None, "{cmd}");
+            }
+        }
+    }
+
+    /// The reported false positive: `<abs path> --version` on a real, large
+    /// native binary. The test binary itself stands in for openfang.
+    #[test]
+    fn absolute_path_native_binary_passes_the_floor() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(is_native_executable(&exe));
+        let cmd = format!("{} --version", exe.display());
+        assert_eq!(verdict(&cmd, None), None);
+    }
+
+    /// Fail-closed for real scripts is unchanged: shebang text naming curl,
+    /// an oversized text script, and a file with native magic handed to a
+    /// shell (the shell reads it as text) are all still refused.
+    #[test]
+    fn text_script_with_curl_is_still_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        write_exec(
+            &dir.path().join("s.sh"),
+            b"#!/bin/sh\ncurl https://example.com\n",
+        );
+        let mut big = b"#!/bin/sh\n".to_vec();
+        big.resize(MAX_SCRIPT_BYTES as usize + 1, b'#');
+        write_exec(&dir.path().join("big.sh"), &big);
+        let mut disguised = NATIVE_MAGIC[3].to_vec();
+        disguised.extend_from_slice(b"\ncurl https://example.com\n");
+        write_exec(&dir.path().join("m"), &disguised);
+        // `./m`: a magic with no NUL before the newline is not native; the
+        // kernel rejects it and `/bin/sh` runs the rest.
+        for cmd in [
+            "./s.sh",
+            "./big.sh",
+            "./m",
+            "bash m",
+            "sh -e m",
+            "timeout 5 bash m",
+        ] {
+            assert!(
+                matches!(verdict(cmd, Some(dir.path())), Some(NetVerdict::Deny(_))),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// Alpha condition 1: a file under 4 bytes, or one we cannot read, does
+    /// not panic and is treated as text (not native).
+    #[test]
+    fn short_or_unreadable_file_is_text() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("e", &b""[..]),
+            ("x", &b"ls\n"[..]),
+            ("p", &[0xcf, 0xfa, 0xed][..]),
+            ("q", &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0][..]),
+        ] {
+            let p = dir.path().join(name);
+            write_exec(&p, bytes);
+            assert!(!is_native_executable(&p), "{name}");
+            assert_eq!(verdict(&format!("./{name}"), Some(dir.path())), None);
+        }
+        assert!(!is_native_executable(&dir.path().join("missing")));
+        // A directory: open succeeds on some platforms, the read fails.
+        assert!(!is_native_executable(dir.path()));
+    }
+
+    /// The skip relies on nothing classed native being runnable as a script.
+    /// Pin it on the real spawn path: for every magic, a fake header with
+    /// shell text after it is either not classed native (so it is scanned)
+    /// or does not run that text. With magic alone, 4 of 7 magics ran.
+    #[test]
+    fn fake_native_header_does_not_run_as_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ran = Vec::new();
+        for (i, magic) in NATIVE_MAGIC.iter().enumerate() {
+            for (j, pad) in [&b""[..], &[0u8; 4][..], &b"ab\0"[..]].iter().enumerate() {
+                let marker = dir.path().join(format!("ran{i}_{j}"));
+                let p = dir.path().join(format!("fake{i}_{j}"));
+                let mut body = magic.to_vec();
+                body.extend_from_slice(pad);
+                body.extend_from_slice(format!("\ntouch {}\n", marker.display()).as_bytes());
+                write_exec(&p, &body);
+                let native = is_native_executable(&p);
+                assert_eq!(native, !pad.is_empty(), "magic {i} pad {j}");
+                let _ = std::process::Command::new(&p)
+                    .current_dir(dir.path())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                if native && marker.exists() {
+                    ran.push(format!("{magic:02x?} pad {j}"));
+                }
+            }
+        }
+        assert!(
+            ran.is_empty(),
+            "classed native but ran as a script: {ran:?}"
+        );
     }
 
     #[test]
