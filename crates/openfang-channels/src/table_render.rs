@@ -368,12 +368,14 @@ fn scan(text: &str) -> Scan {
         }
         if trimmed.starts_with("```") {
             fence = Some("```");
+            pending = None;
             lines.push(line.to_string());
             i += 1;
             continue;
         }
         if trimmed.starts_with("~~~") {
             fence = Some("~~~");
+            pending = None;
             lines.push(line.to_string());
             i += 1;
             continue;
@@ -422,6 +424,11 @@ fn scan(text: &str) -> Scan {
                 }
             }
         }
+        // A tag styles only a table that follows it directly (blank lines
+        // allowed); any other text in between cancels it.
+        if !line.trim().is_empty() {
+            pending = None;
+        }
         lines.push(line.to_string());
         i += 1;
     }
@@ -457,7 +464,9 @@ fn parse_tag(line: &str) -> Option<(Mode, Option<Rgb>)> {
 
 /// Split a leading `{color}` marker off a row's first cell. Returns the
 /// color and the row line without the marker, or `(None, line)` unchanged
-/// when there's no valid marker.
+/// when there's no valid marker. The marker must be followed by a space
+/// and more text in the same cell, so a cell that is only `{red}` keeps
+/// its text.
 fn take_row_marker(line: &str) -> (Option<Rgb>, String) {
     let mut prefix = line.len() - line.trim_start().len();
     if line[prefix..].starts_with('|') {
@@ -468,7 +477,12 @@ fn take_row_marker(line: &str) -> (Option<Rgb>, String) {
     let color = rest
         .strip_prefix('{')
         .and_then(|r| r.find('}').map(|end| &r[..end]))
-        .and_then(|name| parse_color(name).map(|c| (c, name.len() + 2)));
+        .and_then(|name| parse_color(name).map(|c| (c, name.len() + 2)))
+        .filter(|&(_, used)| {
+            let after = &rest[used..];
+            let text = after.trim_start();
+            after.starts_with([' ', '\t']) && !text.is_empty() && !text.starts_with('|')
+        });
     match color {
         Some((c, used)) => (
             Some(c),
@@ -1007,7 +1021,7 @@ mod tests {
 
     #[test]
     fn row_markers_color_rows_and_are_removed() {
-        let s = scan("| a | b |\n|---|---|\n| {red} x | 1 |\n| y | 2 |\n|{#00ff00}z|3|");
+        let s = scan("| a | b |\n|---|---|\n| {red} x | 1 |\n| y | 2 |\n|{#00ff00} z|3|");
         let f = &s.found[0];
         assert_eq!(f.table.rows[0], vec!["x", "1"]);
         assert_eq!(f.table.rows[2], vec!["z", "3"]);
@@ -1026,6 +1040,34 @@ mod tests {
         assert_eq!(s.found[0].style.rows, vec![None, None, None]);
         assert_eq!(s.found[0].table.rows[0], vec!["{crimson} x"]);
         assert_eq!(s.lines.join("\n"), text);
+    }
+
+    #[test]
+    fn marker_needs_a_space_and_text_after_it() {
+        // A cell that is only a marker, or a marker glued to text, is data.
+        let text = "| a | b |\n|---|---|\n| {red} | 1 |\n|{red}| 2 |\n| {red}x | 3 |\n| {#add}  |  4 |\n| {blue}";
+        let s = scan(text);
+        assert_eq!(s.found[0].style.rows, vec![None; 5]);
+        assert_eq!(s.found[0].table.rows[0], vec!["{red}", "1"]);
+        assert_eq!(s.lines.join("\n"), text);
+        // Tab separator counts as a space.
+        let s = scan("| a |\n|---|\n| {red}\tx |");
+        assert!(s.found[0].style.rows[0].is_some());
+        assert_eq!(s.found[0].table.rows[0], vec!["x"]);
+    }
+
+    #[test]
+    fn tag_is_cancelled_by_text_before_a_table() {
+        let light = "<openfang:table mode=\"light\"/>";
+        // Blank lines between tag and table are fine.
+        let s = scan(&format!("{light}\n\n| a |\n|---|"));
+        assert_eq!(s.found[0].style.mode, Mode::Light);
+        // Prose, a fence, or a pipe line that isn't a table cancels it.
+        for between in ["some prose", "```\ncode\n```", "a | b"] {
+            let s = scan(&format!("{light}\n{between}\n| a |\n|---|"));
+            assert_eq!(s.found[0].style, Style::default(), "{between}");
+            assert!(!s.lines.iter().any(|l| l.contains("openfang:table")));
+        }
     }
 
     #[test]
