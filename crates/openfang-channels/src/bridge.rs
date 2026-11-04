@@ -823,17 +823,22 @@ pub async fn send_parsed(
     // which share this function.
     // NOTE: tables leave here as pixels. Any future outbound text scrub must
     // run BEFORE this step, or table contents bypass it.
+    // Table style markup (`<openfang:table …/>` lines, `{color}` row markers)
+    // is stripped on every path, including channels that keep tables as text.
     let mut pre_table_text: Option<String> = None;
     let (text_to_format, attachment_blocks) = if adapter.name() == "discord" {
         let (text, tables) = crate::table_render::render_tables(&text_to_format).await;
         if !tables.is_empty() {
-            pre_table_text = Some(text_to_format);
+            pre_table_text = Some(crate::table_render::strip_markup(&text_to_format));
         }
         let mut blocks = attachment_blocks;
         blocks.extend(tables);
         (text, blocks)
     } else {
-        (text_to_format, attachment_blocks)
+        (
+            crate::table_render::strip_markup(&text_to_format),
+            attachment_blocks,
+        )
     };
 
     let formatted = if adapter.name() == "wecom" {
@@ -3266,6 +3271,41 @@ mod tests {
             assert!(
                 matches!(&received[0], ChannelContent::Text(_)),
                 "{name} must not get attachments"
+            );
+        }
+    }
+
+    /// Table style markup never reaches a channel as text: not on channels
+    /// that keep tables as text, and not in Discord's failed-upload resend.
+    #[tokio::test]
+    async fn send_parsed_strips_table_style_markup() {
+        let styled = "<openfang:table mode=\"light\"/>\n| a | b |\n|---|---|\n| {red} 1 | 2 |";
+        for (name, reject_files) in [("recording-mock", false), ("discord", true)] {
+            let adapter = RecordingAdapter {
+                name,
+                interactive: false,
+                reject_files,
+                received: Mutex::new(Vec::new()),
+            };
+            send_parsed(
+                &adapter,
+                &test_user(),
+                styled.to_string(),
+                None,
+                OutputFormat::Markdown,
+                SendOptions::default(),
+            )
+            .await;
+            let received = adapter.received.lock().unwrap();
+            let text = received.iter().find_map(|c| match c {
+                ChannelContent::Text(t) => Some(t.clone()),
+                _ => None,
+            });
+            let text = text.unwrap_or_else(|| panic!("{name}: no text sent: {received:?}"));
+            assert!(text.contains("| 1 | 2 |"), "{name}: {text}");
+            assert!(
+                !text.contains("openfang:table") && !text.contains("{red}"),
+                "{name}: {text}"
             );
         }
     }

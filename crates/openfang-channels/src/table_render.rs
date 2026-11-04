@@ -13,6 +13,20 @@
 //! renders as literal text. `typst` runs with `--root` set to a fresh temp
 //! dir, a hard timeout, and `kill_on_drop`. Every failure leaves the table
 //! as text, which is the pre-existing behaviour.
+//!
+//! Styling (agent-controlled, cosmetic only):
+//! - A line `<openfang:table mode="light" header="sky_blue"/>` sets the
+//!   light/dark theme and header color for the NEXT table. The line is
+//!   always removed from the text, even when the table stays text.
+//! - A row whose first cell starts with `{red}` or `{#db4035}` gets a left
+//!   bar in that exact color and a tint of it, lightened or darkened until
+//!   the text keeps [`MIN_CONTRAST`]. The marker is removed. An unknown
+//!   `{…}` is left in the cell untouched.
+//!
+//! Colors are accepted only as a Todoist palette name or a hex code, are
+//! re-emitted by Rust as `#rrggbb`, and reach typst through data.json like
+//! the cells do. A bad value is ignored and the default is used; styling
+//! never costs the table.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,22 +63,183 @@ const WRAP_AFTER_CHARS: usize = 36;
 /// install locations before falling back to a PATH lookup.
 const TYPST_CANDIDATES: &[&str] = &["/opt/homebrew/bin/typst", "/usr/local/bin/typst"];
 
-/// Fixed template: approved mockup (Discord dark palette, zebra rows).
+/// Minimum WCAG contrast ratio between a row's text and its tint.
+const MIN_CONTRAST: f64 = 4.5;
+/// Strongest share of the source color in a row tint, before the contrast
+/// check pulls it back toward the page color.
+const MAX_TINT: f64 = 0.45;
+
+/// Todoist's API color names (developer docs, "Colors" table).
+const TODOIST_COLORS: &[(&str, u32)] = &[
+    ("berry_red", 0xB8255F),
+    ("red", 0xDC4C3E),
+    ("orange", 0xC77100),
+    ("yellow", 0xB29104),
+    ("olive_green", 0x949C31),
+    ("lime_green", 0x65A33A),
+    ("green", 0x369307),
+    ("mint_green", 0x42A393),
+    ("teal", 0x148FAD),
+    ("sky_blue", 0x319DC0),
+    ("light_blue", 0x6988A4),
+    ("blue", 0x4180FF),
+    ("grape", 0x692EC2),
+    ("violet", 0xCA3FEE),
+    ("lavender", 0xA4698C),
+    ("magenta", 0xE05095),
+    ("salmon", 0xC9766F),
+    ("charcoal", 0x808080),
+    ("grey", 0x999999),
+    ("taupe", 0x8F7A69),
+];
+
+/// Fixed template: approved mockup (zebra rows), every color from data.json.
 /// Reads all content from data.json — keep it that way (see module docs).
 const TEMPLATE: &str = r##"#let d = json("data.json")
-#set page(width: auto, height: auto, margin: 14pt, fill: rgb("#313338"))
-#set text(font: ("Helvetica Neue", "Helvetica", "Arial"), size: 13pt, fill: rgb("#dbdee1"))
+#let th = d.theme
+#set page(width: auto, height: auto, margin: 14pt, fill: rgb(th.page))
+#set text(font: ("Helvetica Neue", "Helvetica", "Arial"), size: 13pt, fill: rgb(th.text))
 #let al(a) = if a == "right" { right } else if a == "center" { center } else { left }
+#let col(c) = if c == none { none } else { rgb(c) }
 #table(
   columns: d.widths.map(w => if w == 0 { auto } else { w * 1em }),
   align: d.align.map(al),
   inset: (x: 10pt, y: 7pt),
-  stroke: (x, y) => (bottom: if y == 0 { 1.2pt + rgb("#949ba4") } else { 0.5pt + rgb("#4e5058") }),
-  fill: (x, y) => if y == 0 { rgb("#2b2d31") } else if calc.even(y) { rgb("#383a40") } else { none },
+  stroke: (x, y) => (
+    bottom: if y == 0 { 1.2pt + rgb(th.header_rule) } else { 0.5pt + rgb(th.rule) },
+    left: if x == 0 and d.bars.at(y) != none { 4pt + rgb(d.bars.at(y)) } else { none },
+  ),
+  fill: (x, y) => col(d.fills.at(y)),
   table.header(..d.header.map(h => strong[#h])),
   ..d.rows.flatten().map(c => [#c]),
 )
 "##;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rgb(u8, u8, u8);
+
+impl Rgb {
+    const fn from_u32(v: u32) -> Self {
+        Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+    }
+
+    fn hex(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
+    }
+
+    /// WCAG relative luminance.
+    fn luminance(self) -> f64 {
+        let lin = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(self.0) + 0.7152 * lin(self.1) + 0.0722 * lin(self.2)
+    }
+
+    fn contrast(self, other: Rgb) -> f64 {
+        let (a, b) = (self.luminance(), other.luminance());
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// `w` of `self` blended with `1 - w` of `base`.
+    fn mix(self, base: Rgb, w: f64) -> Rgb {
+        let m = |a: u8, b: u8| (f64::from(a) * w + f64::from(b) * (1.0 - w)).round() as u8;
+        Rgb(m(self.0, base.0), m(self.1, base.1), m(self.2, base.2))
+    }
+}
+
+/// A Todoist color name or a `#rgb` / `#rrggbb` hex code. Anything else is
+/// `None` (the caller then keeps its default).
+fn parse_color(s: &str) -> Option<Rgb> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return match hex.len() {
+            6 => Some(Rgb::from_u32(v)),
+            3 => {
+                let n = |shift: u32| ((v >> shift) & 0xF) as u8 * 17;
+                Some(Rgb(n(8), n(4), n(0)))
+            }
+            _ => None,
+        };
+    }
+    let s = s.to_ascii_lowercase();
+    TODOIST_COLORS
+        .iter()
+        .find(|(name, _)| *name == s)
+        .map(|&(_, v)| Rgb::from_u32(v))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Mode {
+    #[default]
+    Dark,
+    Light,
+}
+
+struct Theme {
+    page: Rgb,
+    text: Rgb,
+    header: Rgb,
+    stripe: Rgb,
+    header_rule: Rgb,
+    rule: Rgb,
+}
+
+impl Mode {
+    fn theme(self) -> Theme {
+        match self {
+            // Discord dark: the original palette, unchanged.
+            Mode::Dark => Theme {
+                page: Rgb::from_u32(0x313338),
+                text: Rgb::from_u32(0xdbdee1),
+                header: Rgb::from_u32(0x2b2d31),
+                stripe: Rgb::from_u32(0x383a40),
+                header_rule: Rgb::from_u32(0x949ba4),
+                rule: Rgb::from_u32(0x4e5058),
+            },
+            // Discord light.
+            Mode::Light => Theme {
+                page: Rgb::from_u32(0xffffff),
+                text: Rgb::from_u32(0x060607),
+                header: Rgb::from_u32(0xebedef),
+                stripe: Rgb::from_u32(0xf2f3f5),
+                header_rule: Rgb::from_u32(0x80848e),
+                rule: Rgb::from_u32(0xd4d7dc),
+            },
+        }
+    }
+}
+
+impl Theme {
+    /// The strongest blend of `src` into the page color (at most
+    /// [`MAX_TINT`]) that keeps the text at [`MIN_CONTRAST`]. The plain page
+    /// color always passes, so this always returns.
+    fn tint(&self, src: Rgb) -> Rgb {
+        let steps = (MAX_TINT / 0.05).round() as u32;
+        (0..=steps)
+            .rev()
+            .map(|s| src.mix(self.page, f64::from(s) * 0.05))
+            .find(|c| c.contrast(self.text) >= MIN_CONTRAST)
+            .unwrap_or(self.page)
+    }
+}
+
+/// Per-table styling from the tag line and row markers.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Style {
+    mode: Mode,
+    header: Option<Rgb>,
+    /// One entry per body row.
+    rows: Vec<Option<Rgb>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Align {
@@ -88,20 +263,34 @@ struct Found {
     start: usize,
     end: usize,
     table: Table,
+    style: Style,
+}
+
+/// The text with style markup removed, and the tables found in it. Line
+/// ranges in `found` index into `lines`.
+struct Scan {
+    lines: Vec<String>,
+    found: Vec<Found>,
+}
+
+/// Remove table style markup (tag lines, valid row markers) without
+/// rendering. For channels that send tables as text, and for the
+/// send-failure fallback.
+pub fn strip_markup(text: &str) -> String {
+    scan(text).lines.join("\n")
 }
 
 /// Replace renderable tables in `text` with marker lines and return the new
 /// text plus one PNG `FileData` per rendered table. Tables that fail any
 /// limit or fail to render stay in the text unchanged.
 pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let found = find_tables(&lines);
+    let Scan { lines, found } = scan(text);
     if found.is_empty() {
-        return (text.to_string(), Vec::new());
+        return (lines.join("\n"), Vec::new());
     }
     let Some(typst) = find_typst() else {
         warn!("table_render: typst not found; sending tables as text");
-        return (text.to_string(), Vec::new());
+        return (lines.join("\n"), Vec::new());
     };
     let deadline = Instant::now() + MESSAGE_BUDGET;
 
@@ -109,7 +298,7 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
     let mut files = Vec::new();
     let mut cursor = 0;
     for f in found {
-        out.extend(lines[cursor..f.start].iter().map(|s| s.to_string()));
+        out.extend(lines[cursor..f.start].iter().cloned());
         cursor = f.start;
         if files.len() >= MAX_TABLES {
             continue;
@@ -121,7 +310,7 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
                 continue;
             }
         };
-        match render_limited(&typst, &f.table, ppi, deadline).await {
+        match render_limited(&typst, &f.table, &f.style, ppi, deadline).await {
             Ok(png) => {
                 let n = files.len() + 1;
                 files.push(ChannelContent::FileData {
@@ -135,7 +324,7 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
             Err(why) => warn!("table_render: render failed, table left as text: {why}"),
         }
     }
-    out.extend(lines[cursor..].iter().map(|s| s.to_string()));
+    out.extend(lines[cursor..].iter().cloned());
     (out.join("\n"), files)
 }
 
@@ -143,6 +332,7 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
 async fn render_limited(
     typst: &Path,
     table: &Table,
+    style: &Style,
     ppi: u32,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
@@ -154,51 +344,77 @@ async fn render_limited(
     if left.is_zero() {
         return Err("message render budget spent".into());
     }
-    render_png(typst, table, ppi, left.min(RENDER_TIMEOUT)).await
+    render_png(typst, table, style, ppi, left.min(RENDER_TIMEOUT)).await
 }
 
-fn find_tables(lines: &[&str]) -> Vec<Found> {
+fn scan(text: &str) -> Scan {
+    let src: Vec<&str> = text.split('\n').collect();
+    let mut lines: Vec<String> = Vec::with_capacity(src.len());
     let mut found = Vec::new();
     let mut fence: Option<&str> = None;
+    // Set by a tag line; used by the next table.
+    let mut pending: Option<(Mode, Option<Rgb>)> = None;
     let mut i = 0;
-    while i < lines.len() {
-        let trimmed = lines[i].trim_start();
+    while i < src.len() {
+        let line = src[i];
+        let trimmed = line.trim_start();
         if let Some(open) = fence {
             if trimmed.starts_with(open) {
                 fence = None;
             }
+            lines.push(line.to_string());
             i += 1;
             continue;
         }
         if trimmed.starts_with("```") {
             fence = Some("```");
+            lines.push(line.to_string());
             i += 1;
             continue;
         }
         if trimmed.starts_with("~~~") {
             fence = Some("~~~");
+            lines.push(line.to_string());
             i += 1;
             continue;
         }
-        if i + 1 < lines.len() && lines[i].contains('|') {
-            let header = split_row(lines[i]);
-            if let Some(align) = parse_divider(lines[i + 1]) {
+        if let Some(tag) = parse_tag(line) {
+            pending = Some(tag);
+            i += 1;
+            continue;
+        }
+        if i + 1 < src.len() && line.contains('|') {
+            let header = split_row(line);
+            if let Some(align) = parse_divider(src[i + 1]) {
                 if align.len() == header.len() && !header.is_empty() {
+                    let start = lines.len();
+                    lines.push(line.to_string());
+                    lines.push(src[i + 1].to_string());
                     let mut j = i + 2;
                     let mut rows = Vec::new();
-                    while j < lines.len() && lines[j].contains('|') && !lines[j].trim().is_empty() {
-                        let mut row = split_row(lines[j]);
+                    let mut colors = Vec::new();
+                    while j < src.len() && src[j].contains('|') && !src[j].trim().is_empty() {
+                        let (color, row_line) = take_row_marker(src[j]);
+                        let mut row = split_row(&row_line);
                         row.resize(header.len(), String::new());
                         rows.push(row);
+                        colors.push(color);
+                        lines.push(row_line);
                         j += 1;
                     }
+                    let (mode, header_color) = pending.take().unwrap_or_default();
                     found.push(Found {
-                        start: i,
-                        end: j,
+                        start,
+                        end: lines.len(),
                         table: Table {
                             header,
                             align,
                             rows,
+                        },
+                        style: Style {
+                            mode,
+                            header: header_color,
+                            rows: colors,
                         },
                     });
                     i = j;
@@ -206,9 +422,60 @@ fn find_tables(lines: &[&str]) -> Vec<Found> {
                 }
             }
         }
+        lines.push(line.to_string());
         i += 1;
     }
-    found
+    Scan { lines, found }
+}
+
+/// Parse a whole-line `<openfang:table key="value" …/>` tag. Unknown keys
+/// and bad values are ignored; `None` means the line isn't a tag.
+fn parse_tag(line: &str) -> Option<(Mode, Option<Rgb>)> {
+    let inner = line
+        .trim()
+        .strip_prefix("<openfang:table")?
+        .strip_suffix("/>")?;
+    if inner.chars().next().is_some_and(|c| !c.is_whitespace()) {
+        return None; // e.g. `<openfang:tables/>`
+    }
+    let mut mode = Mode::default();
+    let mut header = None;
+    for part in inner.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches(|c| c == '"' || c == '\'');
+        match key {
+            "mode" if value.eq_ignore_ascii_case("light") => mode = Mode::Light,
+            "mode" if value.eq_ignore_ascii_case("dark") => mode = Mode::Dark,
+            "header" => header = parse_color(value),
+            _ => {}
+        }
+    }
+    Some((mode, header))
+}
+
+/// Split a leading `{color}` marker off a row's first cell. Returns the
+/// color and the row line without the marker, or `(None, line)` unchanged
+/// when there's no valid marker.
+fn take_row_marker(line: &str) -> (Option<Rgb>, String) {
+    let mut prefix = line.len() - line.trim_start().len();
+    if line[prefix..].starts_with('|') {
+        prefix += 1;
+    }
+    prefix += line[prefix..].len() - line[prefix..].trim_start().len();
+    let rest = &line[prefix..];
+    let color = rest
+        .strip_prefix('{')
+        .and_then(|r| r.find('}').map(|end| &r[..end]))
+        .and_then(|name| parse_color(name).map(|c| (c, name.len() + 2)));
+    match color {
+        Some((c, used)) => (
+            Some(c),
+            format!("{}{}", &line[..prefix], rest[used..].trim_start()),
+        ),
+        None => (None, line.to_string()),
+    }
 }
 
 /// Split a table row on unescaped `|`, dropping the optional outer pipes.
@@ -326,7 +593,7 @@ fn estimate_page_pt(t: &Table) -> (f64, f64) {
     // Fewer chars per line than fit, so the line count rounds up.
     let chars_per_line = (fixed_w / CHAR_W).floor().max(1.0);
 
-    let widths = template_data(t)["widths"].clone();
+    let widths = template_data(t, &Style::default())["widths"].clone();
     let fixed: Vec<bool> = (0..t.header.len())
         .map(|c| widths[c].as_u64().unwrap_or(0) != 0)
         .collect();
@@ -401,8 +668,8 @@ fn looks_numeric(cell: &str) -> bool {
 }
 
 /// Template input. Kept separate from [`Table`] so the JSON shape the
-/// template reads is explicit.
-fn template_data(t: &Table) -> serde_json::Value {
+/// template reads is explicit. Every color is emitted here as `#rrggbb`.
+fn template_data(t: &Table, style: &Style) -> serde_json::Value {
     let ncols = t.header.len();
     let align: Vec<&str> = (0..ncols)
         .map(|c| match t.align[c] {
@@ -445,11 +712,34 @@ fn template_data(t: &Table) -> serde_json::Value {
             }
         })
         .collect();
+    let theme = style.mode.theme();
+    // Index 0 is the header row, as in typst's `y`.
+    let row_color = |i: usize| style.rows.get(i).copied().flatten();
+    let fills: Vec<Option<String>> = std::iter::once(Some(
+        style.header.map_or(theme.header, |c| theme.tint(c)).hex(),
+    ))
+    .chain((0..t.rows.len()).map(|i| match row_color(i) {
+        Some(c) => Some(theme.tint(c).hex()),
+        None if (i + 1) % 2 == 0 => Some(theme.stripe.hex()),
+        None => None,
+    }))
+    .collect();
+    let bars: Vec<Option<String>> = std::iter::once(None)
+        .chain((0..t.rows.len()).map(|i| row_color(i).map(Rgb::hex)))
+        .collect();
     serde_json::json!({
         "header": t.header,
         "align": align,
         "widths": widths,
         "rows": t.rows,
+        "theme": {
+            "page": theme.page.hex(),
+            "text": theme.text.hex(),
+            "header_rule": theme.header_rule.hex(),
+            "rule": theme.rule.hex(),
+        },
+        "fills": fills,
+        "bars": bars,
     })
 }
 
@@ -487,6 +777,7 @@ impl Drop for TempDir {
 async fn render_png(
     typst: &Path,
     table: &Table,
+    style: &Style,
     ppi: u32,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
@@ -498,7 +789,7 @@ async fn render_png(
     tokio::fs::write(dir.0.join("main.typ"), TEMPLATE)
         .await
         .map_err(|e| format!("write template: {e}"))?;
-    let data = serde_json::to_vec(&template_data(table)).map_err(|e| e.to_string())?;
+    let data = serde_json::to_vec(&template_data(table, style)).map_err(|e| e.to_string())?;
     tokio::fs::write(dir.0.join("data.json"), data)
         .await
         .map_err(|e| format!("write data: {e}"))?;
@@ -543,8 +834,7 @@ mod tests {
     use super::*;
 
     fn tables(text: &str) -> Vec<Found> {
-        let lines: Vec<&str> = text.split('\n').collect();
-        find_tables(&lines)
+        scan(text).found
     }
 
     const SAMPLE: &str = "intro\n\n| version | finished | median |\n|---|:---:|---:|\n| staging | 17/21 | 86 s |\n| lower | 17/21 | 90 s |\n\noutro";
@@ -659,7 +949,9 @@ mod tests {
             },
         ];
         for t in cases {
-            let png = render_png(&typst, &t, 72, RENDER_TIMEOUT).await.unwrap();
+            let png = render_png(&typst, &t, &Style::default(), 72, RENDER_TIMEOUT)
+                .await
+                .unwrap();
             // PNG IHDR: width and height are big-endian u32s at bytes 16..24.
             let w = u32::from_be_bytes(png[16..20].try_into().unwrap()) as f64;
             let h = u32::from_be_bytes(png[20..24].try_into().unwrap()) as f64;
@@ -678,7 +970,7 @@ mod tests {
                 vec!["y".into(), "-3%".into()],
             ],
         };
-        let d = template_data(&t);
+        let d = template_data(&t, &Style::default());
         assert_eq!(d["align"], serde_json::json!(["left", "right"]));
         assert_eq!(d["widths"], serde_json::json!([WRAP_AFTER_CHARS / 2, 0]));
     }
@@ -694,9 +986,161 @@ mod tests {
             align: vec![Align::Left],
             rows: vec![vec!["$x$ ] #eval(\"1\") \"".into()]],
         };
-        let d = template_data(&t);
+        let d = template_data(&t, &Style::default());
         assert_eq!(d["header"][0], "#read(\"/etc/passwd\")");
         assert_eq!(d["rows"][0][0], "$x$ ] #eval(\"1\") \"");
+    }
+
+    #[test]
+    fn parses_colors() {
+        assert_eq!(parse_color("berry_red"), Some(Rgb(0xb8, 0x25, 0x5f)));
+        assert_eq!(parse_color("Sky_Blue"), Some(Rgb(0x31, 0x9d, 0xc0)));
+        assert_eq!(parse_color("#DB4035"), Some(Rgb(0xdb, 0x40, 0x35)));
+        assert_eq!(parse_color("#fa0"), Some(Rgb(0xff, 0xaa, 0x00)));
+        for bad in [
+            "gray", "crimson", "#12345", "#gggggg", "db4035", "", "#", "#+12",
+        ] {
+            assert_eq!(parse_color(bad), None, "{bad}");
+        }
+        assert_eq!(TODOIST_COLORS.len(), 20);
+    }
+
+    #[test]
+    fn row_markers_color_rows_and_are_removed() {
+        let s = scan("| a | b |\n|---|---|\n| {red} x | 1 |\n| y | 2 |\n|{#00ff00}z|3|");
+        let f = &s.found[0];
+        assert_eq!(f.table.rows[0], vec!["x", "1"]);
+        assert_eq!(f.table.rows[2], vec!["z", "3"]);
+        assert_eq!(
+            f.style.rows,
+            vec![Some(Rgb(0xdc, 0x4c, 0x3e)), None, Some(Rgb(0, 0xff, 0))]
+        );
+        assert_eq!(s.lines[2], "| x | 1 |");
+        assert_eq!(s.lines[4], "|z|3|");
+    }
+
+    #[test]
+    fn unknown_marker_stays_in_cell() {
+        let text = "| a |\n|---|\n| {crimson} x |\n| {json} body |\n| x {red} |";
+        let s = scan(text);
+        assert_eq!(s.found[0].style.rows, vec![None, None, None]);
+        assert_eq!(s.found[0].table.rows[0], vec!["{crimson} x"]);
+        assert_eq!(s.lines.join("\n"), text);
+    }
+
+    #[test]
+    fn tag_styles_next_table_and_is_removed() {
+        let s = scan(
+            "hi\n<openfang:table mode=\"light\" header=\"grape\"/>\n| a |\n|---|\n\n| b |\n|---|",
+        );
+        assert_eq!(s.lines[1], "| a |");
+        assert_eq!(s.found[0].style.mode, Mode::Light);
+        assert_eq!(s.found[0].style.header, Some(Rgb(0x69, 0x2e, 0xc2)));
+        // Used once: the second table gets defaults.
+        assert_eq!(s.found[1].style, Style::default());
+    }
+
+    #[test]
+    fn bad_tag_values_fall_back_to_defaults() {
+        let s =
+            scan("<openfang:table mode=\"sepia\" header='#zzz\") #eval(\"1\")' x/>\n| a |\n|---|");
+        assert_eq!(s.lines[0], "| a |");
+        assert_eq!(s.found[0].style.mode, Mode::Dark);
+        assert_eq!(s.found[0].style.header, None);
+        // Not tags: left as text.
+        for line in [
+            "<openfang:tables/>",
+            "say <openfang:table/> inline",
+            "<openfang:table>",
+        ] {
+            assert!(parse_tag(line).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn markup_in_code_fences_is_left_alone() {
+        let text = "```\n<openfang:table mode=\"light\"/>\n| {red} a |\n|---|\n```";
+        assert_eq!(strip_markup(text), text);
+    }
+
+    #[test]
+    fn strip_markup_without_markup_is_identity() {
+        assert_eq!(strip_markup(SAMPLE), SAMPLE);
+        assert_eq!(
+            strip_markup("a\n\n| x |\n|---|\n| {y} |\n"),
+            "a\n\n| x |\n|---|\n| {y} |\n"
+        );
+    }
+
+    #[test]
+    fn tints_keep_contrast_in_both_modes() {
+        for mode in [Mode::Dark, Mode::Light] {
+            let theme = mode.theme();
+            for &(name, v) in TODOIST_COLORS {
+                let tint = theme.tint(Rgb::from_u32(v));
+                assert!(
+                    tint.contrast(theme.text) >= MIN_CONTRAST,
+                    "{name} in {mode:?}"
+                );
+            }
+            // Extremes still return a passing color.
+            for c in [Rgb(255, 255, 0), Rgb(0, 0, 0), Rgb(255, 255, 255)] {
+                assert!(theme.tint(c).contrast(theme.text) >= MIN_CONTRAST);
+            }
+        }
+    }
+
+    #[test]
+    fn template_colors_are_rust_emitted_hex() {
+        let t = Table {
+            header: vec!["a".into()],
+            align: vec![Align::Left],
+            rows: vec![vec!["1".into()]; 3],
+        };
+        let style = Style {
+            mode: Mode::Light,
+            header: Some(Rgb(1, 2, 3)),
+            rows: vec![Some(Rgb(0xdc, 0x4c, 0x3e)), None],
+        };
+        let d = template_data(&t, &style);
+        assert_eq!(d["bars"], serde_json::json!([null, "#dc4c3e", null, null]));
+        // Row 2 (y = 2) keeps the stripe; row 3 has no fill.
+        assert_eq!(d["fills"][2], "#f2f3f5");
+        assert!(d["fills"][3].is_null());
+        let is_hex = |v: &serde_json::Value| {
+            let s = v.as_str().unwrap();
+            s.len() == 7 && s.starts_with('#') && s[1..].chars().all(|c| c.is_ascii_hexdigit())
+        };
+        for v in d["theme"].as_object().unwrap().values() {
+            assert!(is_hex(v));
+        }
+        for v in d["fills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(d["bars"].as_array().unwrap())
+        {
+            assert!(v.is_null() || is_hex(v));
+        }
+        // Default style reproduces the original dark palette.
+        let d = template_data(&t, &Style::default());
+        assert_eq!(d["theme"]["page"], "#313338");
+        assert_eq!(
+            d["fills"],
+            serde_json::json!(["#2b2d31", null, "#383a40", null])
+        );
+    }
+
+    #[tokio::test]
+    async fn renders_styled_table() {
+        if find_typst().is_none() {
+            eprintln!("typst not installed; skipping");
+            return;
+        }
+        let text = "<openfang:table mode=\"light\" header=\"sky_blue\"/>\n| a | b |\n|---|---|\n| {berry_red} x | 1 |\n| y | 2 |";
+        let (text, files) = render_tables(text).await;
+        assert_eq!(text, "📊 *Table 1 (image below)*");
+        assert_eq!(files.len(), 1);
     }
 
     #[tokio::test]
@@ -751,16 +1195,24 @@ mod tests {
             align: vec![Align::Left],
             rows: vec![],
         };
-        assert!(
-            render_png(Path::new("/nonexistent/typst"), &t, 192, RENDER_TIMEOUT)
-                .await
-                .is_err()
-        );
+        assert!(render_png(
+            Path::new("/nonexistent/typst"),
+            &t,
+            &Style::default(),
+            192,
+            RENDER_TIMEOUT
+        )
+        .await
+        .is_err());
         // A binary that exits non-zero.
-        assert!(
-            render_png(Path::new("/usr/bin/false"), &t, 192, RENDER_TIMEOUT)
-                .await
-                .is_err()
-        );
+        assert!(render_png(
+            Path::new("/usr/bin/false"),
+            &t,
+            &Style::default(),
+            192,
+            RENDER_TIMEOUT
+        )
+        .await
+        .is_err());
     }
 }
