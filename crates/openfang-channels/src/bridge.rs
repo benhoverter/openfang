@@ -1027,7 +1027,10 @@ async fn send_parsed_inner(
                 .await
                 {
                     Ok(()) => text_resent = true,
-                    Err(e) => error!("Text fallback after failed upload also failed: {e}"),
+                    Err(e) => error!(
+                        "Text fallback after failed upload also failed: {}",
+                        redact_urls(&e.to_string())
+                    ),
                 }
             }
         }
