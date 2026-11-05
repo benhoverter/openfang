@@ -252,19 +252,26 @@ struct ShellFloor {
 /// that; the judge reads the whole body and can. So any script whose body
 /// names the control plane goes to the judge, and so does any script whose
 /// body we could not read (fail closed: an unread body could say anything).
-/// With no script file, the command line itself is checked, which covers
-/// inline forms like `python3 -c '...'`.
+///
+/// The command line is checked in every case, because a clean script can be
+/// handed the target as an argument (`python3 w.py ~/.openfang/RULES.md`).
+/// The body check reads [`ScriptBody::names_control_plane`], which was taken
+/// before redaction: `auth_rules = ... ".openfang"` redacts to `auth_rules =`.
+/// No body at all (bare `python3 x.py`, `python3 -m pkg`, `-c '...'`) fails
+/// closed too, since nothing was read.
+///
+/// [`ScriptBody::names_control_plane`]: openfang_types::path_facts::ScriptBody::names_control_plane
 fn script_needs_judge(command: &str, sheet: &openfang_types::path_facts::PathFactSheet) -> bool {
     use openfang_types::gatekeeper::names_control_plane;
     if !openfang_types::path_facts::executes_script_like(command) {
         return false;
     }
+    if names_control_plane(command) {
+        return true;
+    }
     match &sheet.script_body {
-        Some(body) if body.status.included() => {
-            body.content.as_deref().is_none_or(names_control_plane)
-        }
-        Some(_) => true,
-        None => names_control_plane(command),
+        Some(body) if body.status.included() => body.content.is_none() || body.names_control_plane,
+        _ => true,
     }
 }
 
@@ -788,12 +795,14 @@ pub async fn execute_tool(
                 } else {
                     None
                 };
-                // A curl escalation is about THIS call's host and payload, and
-                // a hard-floor hit about THIS call's target, so neither reads
-                // nor seeds the Approve-Similar cache.
+                // A curl escalation is about THIS call's host and payload, a
+                // hard-floor hit about THIS call's target, and a routed script
+                // about THIS script's body, so none of them seeds the
+                // Approve-Similar cache. (A routed script may still be
+                // suppressed, so it is not in `fresh_prompt_only`.)
                 let cache_binary = raw_command
                     .and_then(extract_cache_binary)
-                    .filter(|_| !fresh_prompt_only);
+                    .filter(|_| !fresh_prompt_only && !floor.script_to_judge);
                 let command = raw_command.map(|c| {
                     openfang_types::net_facts::redact_command_userinfo(c)
                         .chars()
@@ -13798,6 +13807,70 @@ mod tests {
         assert!(r.is_error);
         assert!(r.content.contains("nobody can review"), "{}", r.content);
         assert!(!flag(&fake.gate_consulted));
+    }
+
+    /// Security's B1-B3 on 2ff76a7: three forms the first cut auto-approved.
+    /// Bare script name (no body read), a clean script handed the target as an
+    /// argument, and a mention hidden by redaction (`auth_*` left-hand side).
+    /// Denied, so none run; the argv case also checks its target stayed absent.
+    #[tokio::test]
+    async fn n1_bare_name_argv_and_redacted_mentions_go_to_the_judge() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        let w = ws.display();
+        std::fs::write(
+            ws.join("apply.py"),
+            "from pathlib import Path\np = Path.home() / \".openfang\" / \"RULES.md\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("w.py"),
+            "import sys\nopen(sys.argv[1], 'w').write('x')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("auth.py"),
+            "from pathlib import Path\nauth_rules = Path.home() / \".openfang\" / \"RULES.md\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(ws.join(".openfang")).unwrap();
+        let target = ws.join(".openfang").join("x");
+        let cases = [
+            "python3 apply.py".to_string(),
+            format!("python3 {w}/w.py {}", target.display()),
+            format!("python3 {w}/auth.py"),
+        ];
+        for cmd in &cases {
+            let fake = Arc::new(
+                FakeKernelHandle::new()
+                    .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+            );
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let r = run_in_ws(&handle, &ws, Some(&fp), cmd).await;
+            assert!(r.is_error, "{cmd}: denied, so must not run: {}", r.content);
+            assert!(flag(&fake.gate_consulted), "{cmd}: the judge must see it");
+        }
+        assert!(!target.exists(), "argv target must not be written");
+    }
+
+    /// An escalated routed script that a human approves must not seed the
+    /// Approve-Similar cache with its interpreter (security (a) on 2ff76a7).
+    #[tokio::test]
+    async fn n1_approved_routed_script_does_not_seed_the_cache() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("read.sh"), "echo .openfang\n").unwrap();
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Escalate)
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Approved),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let cmd = format!("sh {}/read.sh", ws.display());
+        let r = run_in_ws(&handle, &ws, Some(&fp), &cmd).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(flag(&fake.approval_requested));
+        assert_eq!(*fake.approval_cache_binary.lock().unwrap(), None);
     }
 
     /// The judge's built-in policy names the three protected files in both

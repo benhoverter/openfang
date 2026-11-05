@@ -138,6 +138,7 @@ fn read_script_body(
         writes_agent_config: false,
         writes_runtime_config: false,
         writes_fleet_rules: false,
+        names_control_plane: false,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
@@ -316,6 +317,9 @@ fn read_script_body(
     // RULES.md is injected into every agent's prompt each turn; a body write is
     // the same fleet-wide steer as a command-line one.
     body.writes_fleet_rules = openfang_types::gatekeeper::body_writes_fleet_rules(&text);
+    // N1 routing. Plaintext for the same reason: redaction blanks the rest of
+    // `auth_rules = Path.home() / ".openfang" / ...`.
+    body.names_control_plane = openfang_types::gatekeeper::names_control_plane(&text);
 
     // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
     //

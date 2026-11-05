@@ -553,6 +553,11 @@ pub struct ScriptBody {
     /// [`GateFlags::fleet_rules_write`](crate::gatekeeper::GateFlags::fleet_rules_write).
     #[serde(default)]
     pub writes_fleet_rules: bool,
+    /// The body mentions the control plane anywhere, read or write, taken on
+    /// the unredacted text. Routes a trusted-tier script run to the judge (N1);
+    /// not a floor flag.
+    #[serde(default)]
+    pub names_control_plane: bool,
 }
 
 /// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
@@ -1329,6 +1334,7 @@ mod tests {
             writes_agent_config: false,
             writes_runtime_config: false,
             writes_fleet_rules: false,
+            names_control_plane: false,
         }
     }
 
