@@ -4117,9 +4117,34 @@ pub fn names_control_plane(s: &str) -> bool {
         let tail = &rest[idx..];
         let after = &tail[CONTROL_PLANE_ROOT_BARE.len()..];
         let hit = if after.starts_with('/') {
-            !CONTROL_PLANE_BENIGN_PREFIXES
-                .iter()
-                .any(|p| tail.starts_with(p))
+            // N1 M2 (2026-11-05): a benign prefix only counts when the path
+            // stays inside it. `workspaces/me/../../RULES.md` climbs out, and a
+            // string that ends at the prefix (`".openfang/workspaces/" + x`) is
+            // a root being joined onto, so neither is benign.
+            !CONTROL_PLANE_BENIGN_PREFIXES.iter().any(|p| {
+                tail.strip_prefix(p).is_some_and(|inside| {
+                    let span = inside
+                        .split(|c: char| {
+                            c.is_whitespace()
+                                || matches!(
+                                    c,
+                                    '"' | '\''
+                                        | '`'
+                                        | '('
+                                        | ')'
+                                        | ','
+                                        | ';'
+                                        | '|'
+                                        | '&'
+                                        | '<'
+                                        | '>'
+                                )
+                        })
+                        .next()
+                        .unwrap_or("");
+                    !span.is_empty() && !span.split('/').any(|seg| seg == "..")
+                })
+            })
         } else {
             // ANAI-206 F2: the root itself. A path character after it means
             // this is a *different* name that merely starts the same way —
@@ -7943,6 +7968,26 @@ mod anai_206_f1_f2_tests {
         ));
         assert!(!names_control_plane("~/.openfang/logs/daemon.log"));
         assert!(!names_control_plane("~/.openfang/tmp/files/x.diff"));
+    }
+
+    /// N1 M2: a benign prefix stops being benign when the path climbs out of
+    /// it, or when the string ends at the prefix and gets joined onto.
+    #[test]
+    fn benign_prefix_does_not_cover_escapes() {
+        assert!(names_control_plane(
+            "~/.openfang/workspaces/me/../../RULES.md"
+        ));
+        assert!(names_control_plane("~/.openfang/logs/.."));
+        assert!(names_control_plane(
+            "p = home + \"/.openfang/workspaces/\" + \"../config.toml\""
+        ));
+        assert!(names_control_plane("cp x ~/.openfang/tmp/ y"));
+        // Still benign: stays inside, and `..` elsewhere in the text is not
+        // part of the benign path.
+        assert!(!names_control_plane(
+            "cp ../a.md ~/.openfang/workspaces/me/a.md"
+        ));
+        assert!(!names_control_plane("~/.openfang/workspaces/me/..notes.md"));
     }
 
     #[test]

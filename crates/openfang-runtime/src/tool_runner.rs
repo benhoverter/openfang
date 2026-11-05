@@ -13600,7 +13600,7 @@ mod tests {
     fn n1_policy() -> openfang_types::config::ExecPolicy {
         openfang_types::config::ExecPolicy {
             mode: openfang_types::config::ExecSecurityMode::Allowlist,
-            trusted_commands: ["python3", "node", "sh", "echo"]
+            trusted_commands: ["python3", "node", "sh", "echo", "timeout", "env"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -13809,15 +13809,16 @@ mod tests {
         assert!(!flag(&fake.gate_consulted));
     }
 
-    /// Security's B1-B3 on 2ff76a7: three forms the first cut auto-approved.
-    /// Bare script name (no body read), a clean script handed the target as an
-    /// argument, and a mention hidden by redaction (`auth_*` left-hand side).
-    /// Denied, so none run; the argv case also checks its target stayed absent.
-    #[tokio::test]
-    async fn n1_bare_name_argv_and_redacted_mentions_go_to_the_judge() {
+    /// Security's B1-B3 on 2ff76a7: forms the first cut auto-approved. Each
+    /// case is its own test (T1) so a mutation of one arm fails one test.
+    /// Denied, so none run. Returns the workspace and the argv target.
+    fn n1_b_fixtures() -> (
+        tempfile::TempDir,
+        openfang_types::config::FilePolicy,
+        PathBuf,
+    ) {
         let (dir, fp) = n1_ws();
         let ws = dir.path().canonicalize().unwrap();
-        let w = ws.display();
         std::fs::write(
             ws.join("apply.py"),
             "from pathlib import Path\np = Path.home() / \".openfang\" / \"RULES.md\"\n",
@@ -13830,27 +13831,88 @@ mod tests {
         .unwrap();
         std::fs::write(
             ws.join("auth.py"),
-            "from pathlib import Path\nauth_rules = Path.home() / \".openfang\" / \"RULES.md\"\n",
+            // No protected file name, so no hard flag fires and only the
+            // pre-redaction mention can route it (T1: proves B3 on its own).
+            // No spaces around `=`: redact_secrets keys on the last word before
+            // `=`, and `auth_dir =` leaves that word empty, so it would not
+            // redact at all and the test would prove nothing.
+            "from pathlib import Path\nauth_dir=Path.home() / \".openfang\" / \"notes\"\n",
         )
         .unwrap();
         std::fs::create_dir_all(ws.join(".openfang")).unwrap();
         let target = ws.join(".openfang").join("x");
-        let cases = [
-            "python3 apply.py".to_string(),
-            format!("python3 {w}/w.py {}", target.display()),
-            format!("python3 {w}/auth.py"),
-        ];
-        for cmd in &cases {
-            let fake = Arc::new(
-                FakeKernelHandle::new()
-                    .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
-            );
-            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
-            let r = run_in_ws(&handle, &ws, Some(&fp), cmd).await;
-            assert!(r.is_error, "{cmd}: denied, so must not run: {}", r.content);
-            assert!(flag(&fake.gate_consulted), "{cmd}: the judge must see it");
-        }
+        (dir, fp, target)
+    }
+
+    async fn assert_routed_and_denied(
+        dir: &tempfile::TempDir,
+        fp: &openfang_types::config::FilePolicy,
+        cmd: &str,
+    ) {
+        let ws = dir.path().canonicalize().unwrap();
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_in_ws(&handle, &ws, Some(fp), cmd).await;
+        assert!(r.is_error, "{cmd}: denied, so must not run: {}", r.content);
+        assert!(
+            flag(&fake.gate_consulted) || flag(&fake.approval_requested),
+            "{cmd}: must reach the judge or a human: {}",
+            r.content
+        );
+    }
+
+    /// B1: bare script name, so no body is read.
+    #[tokio::test]
+    async fn n1_bare_name_goes_to_the_judge() {
+        let (dir, fp, _) = n1_b_fixtures();
+        assert_routed_and_denied(&dir, &fp, "python3 apply.py").await;
+    }
+
+    /// B2: a clean script handed the target as an argument.
+    #[tokio::test]
+    async fn n1_argv_target_goes_to_the_judge() {
+        let (dir, fp, target) = n1_b_fixtures();
+        let w = dir.path().canonicalize().unwrap();
+        let cmd = format!("python3 {}/w.py {}", w.display(), target.display());
+        assert_routed_and_denied(&dir, &fp, &cmd).await;
         assert!(!target.exists(), "argv target must not be written");
+    }
+
+    /// B3: the mention sits on a line the redactor blanks.
+    #[tokio::test]
+    async fn n1_redacted_mention_goes_to_the_judge() {
+        let (dir, fp, _) = n1_b_fixtures();
+        let ws = dir.path().canonicalize().unwrap();
+        let cmd = format!("python3 {}/auth.py", ws.display());
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_in_ws(&handle, &ws, Some(&fp), &cmd).await;
+        assert!(r.is_error, "denied, so must not run: {}", r.content);
+        assert!(
+            flag(&fake.gate_consulted),
+            "the judge must see it: {}",
+            r.content
+        );
+    }
+
+    /// M1: wrappers and leading assignments in front of the interpreter.
+    #[tokio::test]
+    async fn n1_wrapped_interpreter_goes_to_the_judge() {
+        let (dir, fp, _) = n1_b_fixtures();
+        let w = dir.path().canonicalize().unwrap();
+        let w = w.display();
+        for cmd in [
+            format!("timeout 60 python3 {w}/apply.py"),
+            format!("env FOO=1 python3 {w}/apply.py"),
+        ] {
+            assert_routed_and_denied(&dir, &fp, &cmd).await;
+        }
     }
 
     /// An escalated routed script that a human approves must not seed the

@@ -308,11 +308,67 @@ pub const MAX_SCRIPT_BODY_BYTES: u64 = 16 * 1024;
 ///
 /// Deliberately the two-token form only — see [`script_body_target`].
 pub const SCRIPT_INTERPRETERS: &[&str] = &[
-    "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "node", "ruby", "perl",
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "ksh",
+    "python",
+    "python3",
+    "node",
+    "ruby",
+    "perl",
     // ANAI-206 F1: sourcing a script runs every line of it in the caller's own
     // shell. Strictly more powerful than `bash file`, and it was not on the
     // list, so the judge saw nothing.
-    "source", ".",
+    "source",
+    ".",
+    // N1 M1 (2026-11-05): runtimes that take a script file the same way, and
+    // package runners whose argument is code to execute.
+    "fish",
+    "bun",
+    "deno",
+    "tsx",
+    "ts-node",
+    "php",
+    "lua",
+    "osascript",
+    "npx",
+    "bunx",
+    "uvx",
+];
+
+/// Commands that run their arguments as another command. Their own flags and
+/// values (`timeout 60`, `nice -n 10`, `env FOO=1`) come before the real
+/// program. N1 M1: `timeout 60 python3 x.py` used to look like a `timeout` run.
+pub const EXEC_WRAPPERS: &[&str] = &[
+    "env",
+    "timeout",
+    "gtimeout",
+    "nice",
+    "nohup",
+    "time",
+    "command",
+    "exec",
+    "stdbuf",
+    "caffeinate",
+    "sudo",
+    "doas",
+];
+
+/// Package-manager runners: the program follows the subcommand
+/// (`uv run x.py`, `pnpm exec tsx x.ts`). N1 M1.
+pub const EXEC_RUNNERS: &[(&str, &[&str])] = &[
+    ("uv", &["run"]),
+    ("poetry", &["run"]),
+    ("pipx", &["run"]),
+    ("pdm", &["run"]),
+    ("hatch", &["run"]),
+    ("rye", &["run"]),
+    ("conda", &["run"]),
+    ("pnpm", &["exec", "dlx"]),
+    ("yarn", &["exec", "dlx", "node"]),
+    ("npm", &["exec"]),
 ];
 
 /// Suffixes that make a bare path-shaped token a script we can read.
@@ -321,13 +377,99 @@ pub const SCRIPT_INTERPRETERS: &[&str] = &[
 /// the same execution of the same file as `bash ~/.openfang/scripts/deploy.sh`,
 /// but [`script_body_target`] required an interpreter and refused it — so the
 /// most common form in this fleet was the one form the judge never saw.
-pub const SCRIPT_SUFFIXES: &[&str] = &[".sh", ".bash", ".zsh", ".py", ".rb", ".pl", ".js"];
+pub const SCRIPT_SUFFIXES: &[&str] = &[
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".py",
+    ".rb",
+    ".pl",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".ts",
+    ".mts",
+    ".cts",
+    ".tsx",
+    ".php",
+    ".lua",
+    ".applescript",
+    ".scpt",
+];
 
 /// True if `token` is named like a script file. See [`SCRIPT_SUFFIXES`].
 #[must_use]
 pub fn looks_like_script_file(token: &str) -> bool {
     let lowered = token.to_ascii_lowercase();
     SCRIPT_SUFFIXES.iter().any(|s| lowered.ends_with(s))
+}
+
+/// True if `token` names an interpreter, including versioned binaries
+/// (`python3.12`, `node22`, `ruby3.3`) and absolute paths to one.
+#[must_use]
+pub fn is_script_interpreter(token: &str) -> bool {
+    let bin = token.rsplit('/').next().unwrap_or(token);
+    if SCRIPT_INTERPRETERS.contains(&bin) {
+        return true;
+    }
+    let base = bin.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    !base.is_empty() && base != bin && SCRIPT_INTERPRETERS.contains(&base)
+}
+
+/// The command's tokens from the program that actually runs, plus whether a
+/// wrapper or runner was stepped over.
+///
+/// Drops leading `VAR=value` assignments, wrapper bins with the flags, values
+/// and assignments that follow them, and runner prefixes (`uv run`). The skip
+/// is a best effort: `timeout -s KILL 60 x` stops on `KILL`. Callers that need
+/// to fail closed check `wrapped` and scan the rest, as
+/// [`executes_script_like`] does.
+fn exec_tokens(command: &str) -> (Vec<&str>, bool) {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0;
+    let mut wrapped = false;
+    let is_assignment = |t: &str| {
+        t.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    loop {
+        while i < tokens.len() && is_assignment(tokens[i]) {
+            i += 1;
+        }
+        let Some(tok) = tokens.get(i) else { break };
+        let bin = tok.rsplit('/').next().unwrap_or(tok);
+        if EXEC_WRAPPERS.contains(&bin) {
+            wrapped = true;
+            i += 1;
+            while i < tokens.len() {
+                let t = tokens[i];
+                let duration = t
+                    .trim_end_matches(['s', 'm', 'h', 'd'])
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.');
+                if t.starts_with('-') || is_assignment(t) || (!t.is_empty() && duration) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some((_, subs)) = EXEC_RUNNERS.iter().find(|(r, _)| *r == bin) {
+            if tokens.get(i + 1).is_some_and(|s| subs.contains(s)) {
+                wrapped = true;
+                i += 2;
+                while i < tokens.len() && tokens[i].starts_with('-') {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        break;
+    }
+    (tokens[i.min(tokens.len())..].to_vec(), wrapped)
 }
 
 /// True if the command's first token *executes* something rather than reading
@@ -338,13 +480,18 @@ pub fn looks_like_script_file(token: &str) -> bool {
 /// for `cat ~/.openfang/config.toml`, where the judge can see the whole story
 /// in the command text. It is not sound for `bash $SCRIPT`, where the story is
 /// in a file we could not open. This predicate separates the two.
+///
+/// N1 M1: looks past assignments, wrappers and runners. Behind a wrapper, any
+/// interpreter or script-file token counts, because the wrapper's own
+/// arguments are not parsed exactly and a miss here skips the judge.
 #[must_use]
 pub fn executes_script_like(command: &str) -> bool {
-    let Some(first) = command.split_whitespace().next() else {
+    let (tokens, wrapped) = exec_tokens(command);
+    let runs_script = |t: &&str| is_script_interpreter(t) || looks_like_script_file(t);
+    let Some(first) = tokens.first() else {
         return false;
     };
-    let bin = first.rsplit('/').next().unwrap_or(first);
-    SCRIPT_INTERPRETERS.contains(&bin) || looks_like_script_file(bin)
+    runs_script(first) || (wrapped && tokens.iter().any(runs_script))
 }
 
 /// Substrings in an assignment's left-hand side that make its value a secret.
@@ -935,10 +1082,12 @@ pub fn script_body_target(command: &str, inner: &[String]) -> Option<String> {
     if command.contains([';', '&', '|', '\n', '`', '(', ')', '<', '>', '$']) {
         return None;
     }
-    let mut tokens = command.split_whitespace();
+    // N1 M1: start at the program that runs, past `timeout 60` / `uv run`.
+    let (tokens, _) = exec_tokens(command);
+    let mut tokens = tokens.into_iter();
     let first = tokens.next()?;
     let bin = first.rsplit('/').next().unwrap_or(first);
-    let candidate = if SCRIPT_INTERPRETERS.contains(&bin) {
+    let candidate = if is_script_interpreter(bin) {
         // ANAI-206 F1: skip interpreter flags instead of refusing on them.
         // `bash -x deploy.sh` used to return `None` here, which meant the judge
         // was handed nothing for a command that differs from the readable form
@@ -1679,5 +1828,57 @@ mod anai_206_f1_tests {
         assert!(executes_script_like("bash /home/a/*.sh"));
         assert!(executes_script_like("/home/a/deploy.sh"));
         assert!(executes_script_like("source /home/a/env.sh"));
+    }
+
+    /// N1 M1: wrappers, runners, versioned interpreters and newer suffixes.
+    #[test]
+    fn executions_behind_wrappers_and_runners_count() {
+        for cmd in [
+            "timeout 60 python3 x.py",
+            "timeout -s KILL 60 python3 x.py",
+            "env FOO=1 python3 x.py",
+            "FOO=1 python3 x.py",
+            "nice -n 10 node x.js",
+            "python3.12 x.py",
+            "/opt/homebrew/bin/python3.12 x.py",
+            "node22 x.js",
+            "uv run x.py",
+            "uv run --with rich python3 x.py",
+            "pnpm exec tsx x.ts",
+            "npx tsx x.ts",
+            "bun x.ts",
+            "deno run x.ts",
+            "./x.mjs",
+            "./x.cjs",
+            "./x.ts",
+            "osascript x.applescript",
+        ] {
+            assert!(executes_script_like(cmd), "{cmd}");
+        }
+        for cmd in [
+            "env",
+            "timeout 5 ls",
+            "uv pip list",
+            "cat x.ts",
+            "nice -n 10 ls",
+        ] {
+            assert!(!executes_script_like(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn body_target_looks_past_wrappers() {
+        assert_eq!(
+            script_body_target("timeout 60 python3 /home/a/x.py", &[]).as_deref(),
+            Some("/home/a/x.py")
+        );
+        assert_eq!(
+            script_body_target("uv run /home/a/x.py --flag", &[]).as_deref(),
+            Some("/home/a/x.py")
+        );
+        assert_eq!(
+            script_body_target("python3.12 /home/a/x.py", &[]).as_deref(),
+            Some("/home/a/x.py")
+        );
     }
 }
