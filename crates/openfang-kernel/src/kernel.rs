@@ -13363,12 +13363,14 @@ impl KernelHandle for OpenFangKernel {
         )
         .await;
 
-        // Nothing reached the reader: report it as a tool error so the agent
-        // doesn't believe the message went out.
+        // Every part failed: report it as a tool error so the agent doesn't
+        // believe the message went out. Part of a long text may still have
+        // posted, so tell the agent to look before resending.
         if report.nothing_delivered() {
             let errors: Vec<&str> = report.failures.iter().map(|f| f.error.as_str()).collect();
             return Err(format!(
-                "Message to {} via {} was not delivered: {}",
+                "Message to {} via {} was not delivered, or only partly delivered \
+                 (check the channel before resending): {}",
                 recipient,
                 channel,
                 errors.join("; ")

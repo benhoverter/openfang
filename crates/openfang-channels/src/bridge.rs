@@ -765,12 +765,46 @@ pub struct SendFailure {
 }
 
 impl SendReport {
-    /// Nothing reached the reader: every message failed with no text resent.
+    /// Every message's last attempt failed and no text was resent. This does
+    /// NOT prove the reader saw nothing: a long text whose first chunk posted,
+    /// or a caption that posted before its upload failed, still counts here.
     pub fn nothing_delivered(&self) -> bool {
         self.parts > 0
             && self.failures.len() == self.parts
             && self.failures.iter().all(|f| !f.text_resent)
     }
+}
+
+/// Adapter errors can quote the request URL, and some adapters put a
+/// credential in it: Telegram's bot token is a path segment
+/// (`/bot<TOKEN>/sendMessage`), and reqwest's Display prints the full URL.
+/// These errors now reach the agent through `channel_send`, so every URL in
+/// the text is cut to `scheme://host`, dropping userinfo, path and query.
+fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(sep) = rest.find("://") {
+        let after = &rest[sep + 3..];
+        let end = after
+            .find(|c: char| {
+                c.is_whitespace()
+                    || matches!(c, '(' | ')' | '"' | '\'' | '<' | '>' | '[' | ']' | '`')
+            })
+            .unwrap_or(after.len());
+        let url = &after[..end];
+        // Userinfo can hold '/' or '?', so drop everything up to the last
+        // '@' before looking for where the host ends.
+        let tail = url.rsplit_once('@').map_or(url, |(_, h)| h);
+        let host = &tail[..tail.find(['/', '?', '#']).unwrap_or(tail.len())];
+        out.push_str(&rest[..sep + 3]);
+        out.push_str(host);
+        if host.len() < url.len() {
+            out.push_str("/[redacted]");
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Total time one reply may spend waiting out rate limits across all of
@@ -957,7 +991,7 @@ async fn send_parsed_inner(
             Ok(()) => None,
             Err(e) => {
                 error!("Failed to send response: {e}");
-                Some(e.to_string())
+                Some(redact_urls(&e.to_string()))
             }
         };
         let Some(error) = error else { continue };
@@ -3489,7 +3523,10 @@ mod tests {
             _user: &ChannelUser,
             _content: ChannelContent,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            Err("500 Internal Server Error".into())
+            // Shaped like a reqwest error from a token-in-URL adapter.
+            Err("500 Internal Server Error for url \
+                 (https://api.telegram.org/bot123456:FAKEtokenXYZ/sendMessage)"
+                .into())
         }
         async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
@@ -3512,8 +3549,48 @@ mod tests {
         assert_eq!(report.parts, 1);
         assert_eq!(report.failures.len(), 1, "{report:?}");
         assert!(report.failures[0].error.contains("500"));
+        // The token must not reach the report, which channel_send returns
+        // to the agent.
+        assert!(
+            !report.failures[0].error.contains("FAKEtoken"),
+            "{report:?}"
+        );
+        assert!(report.failures[0]
+            .error
+            .contains("https://api.telegram.org/[redacted]"));
         assert!(!report.failures[0].text_resent);
         assert!(report.nothing_delivered());
+    }
+
+    #[test]
+    fn redact_urls_keeps_only_scheme_and_host() {
+        // Path, query and userinfo all go.
+        assert_eq!(
+            redact_urls("error for url (https://api.telegram.org/bot1:SECRET/sendMessage)"),
+            "error for url (https://api.telegram.org/[redacted])"
+        );
+        assert_eq!(
+            redact_urls("GET https://h.example/x?token=SECRET failed"),
+            "GET https://h.example/[redacted] failed"
+        );
+        assert_eq!(
+            redact_urls("to https://user:pa/ss@h.example/p"),
+            "to https://h.example/[redacted]"
+        );
+        // A bare host is left as is; several URLs and non-ASCII text survive.
+        assert_eq!(
+            redact_urls("x https://h.example y"),
+            "x https://h.example y"
+        );
+        assert_eq!(
+            redact_urls("é wss://a.example/t1 and http://b.example/t2"),
+            "é wss://a.example/[redacted] and http://b.example/[redacted]"
+        );
+        // No URL: unchanged.
+        assert_eq!(
+            redact_urls("500 Internal Server Error"),
+            "500 Internal Server Error"
+        );
     }
 
     /// A successful send reports no failures.
