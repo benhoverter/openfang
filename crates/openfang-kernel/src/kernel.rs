@@ -13351,7 +13351,7 @@ impl KernelHandle for OpenFangKernel {
         // identically to bridge reply-path responses. The workspace_root
         // (when supplied by the caller — typically the channel_send tool)
         // scopes outbound attachments to the calling agent's workspace.
-        let skipped = openfang_channels::bridge::send_parsed(
+        let report = openfang_channels::bridge::send_parsed(
             adapter.as_ref(),
             &user,
             message.to_string(),
@@ -13363,13 +13363,42 @@ impl KernelHandle for OpenFangKernel {
         )
         .await;
 
+        // Nothing reached the reader: report it as a tool error so the agent
+        // doesn't believe the message went out.
+        if report.nothing_delivered() {
+            let errors: Vec<&str> = report.failures.iter().map(|f| f.error.as_str()).collect();
+            return Err(format!(
+                "Message to {} via {} was not delivered: {}",
+                recipient,
+                channel,
+                errors.join("; ")
+            ));
+        }
+
         let mut out = format!("Message sent to {} via {}", recipient, channel);
-        if !skipped.is_empty() {
+        if !report.failures.is_empty() {
+            // Part of a split reply failed. The rest went out, so this is not
+            // an error, but the agent should know what the reader missed.
+            out.push_str(&format!(
+                "\n\nWarning: {} of {} messages failed:",
+                report.failures.len(),
+                report.parts
+            ));
+            for f in &report.failures {
+                let what = if f.text_resent {
+                    "its text was resent without the image or files"
+                } else {
+                    "lost"
+                };
+                out.push_str(&format!("\n- message {} ({}): {}", f.part, what, f.error));
+            }
+        }
+        if !report.skipped.is_empty() {
             // Surface dropped attachments so the agent can react. The
             // message body still sent; the underlying WARN log in
             // outbound_attach::parse remains the operator-facing record.
             out.push_str("\n\nSkipped attachments:");
-            for (path, reason) in &skipped {
+            for (path, reason) in &report.skipped {
                 out.push_str(&format!("\n- {}: {}", path, reason));
             }
         }

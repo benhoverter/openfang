@@ -511,7 +511,10 @@ impl DiscordAdapter {
     /// retry delay once; any other failure, or a second 429, returns `Err`
     /// at that chunk so the caller knows text was lost. Chunks already sent
     /// stay sent, and later chunks are not attempted, so the reader never
-    /// sees a gap in the middle.
+    /// sees a gap in the middle of this one message. (A reply that tables
+    /// split into several messages can still have a gap between them: see
+    /// `bridge::send_parsed`.) A wait that would overrun the reply's retry
+    /// budget is not taken; that chunk fails instead.
     async fn api_send_message(
         &self,
         channel_id: &str,
@@ -541,8 +544,16 @@ impl DiscordAdapter {
                     let header = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
                     let body_text = resp.text().await.unwrap_or_default();
                     let secs = retry_after_secs(header.as_ref(), &body_text);
+                    let wait = Duration::from_millis((secs * 1000.0) as u64);
+                    if !crate::bridge::retry_wait_fits(wait) {
+                        warn!("Discord sendMessage rate-limited; {secs:.2}s wait exceeds the reply's retry budget");
+                        return Err(format!(
+                            "Discord sendMessage rate-limited; {secs:.2}s wait exceeds the reply's retry budget"
+                        )
+                        .into());
+                    }
                     warn!("Discord sendMessage rate-limited; retrying after {secs:.2}s");
-                    tokio::time::sleep(Duration::from_millis((secs * 1000.0) as u64)).await;
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
                 let body_text = resp.text().await.unwrap_or_default();
@@ -707,10 +718,18 @@ impl DiscordAdapter {
                 let header = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
                 let body_text = resp.text().await.unwrap_or_default();
                 let retry_after_secs = retry_after_secs(header.as_ref(), &body_text);
+                let wait = Duration::from_millis((retry_after_secs * 1000.0) as u64);
+                if !crate::bridge::retry_wait_fits(wait) {
+                    warn!("Discord sendAttachments rate-limited; {retry_after_secs:.2}s wait exceeds the reply's retry budget");
+                    return Err(format!(
+                        "Discord sendAttachments rate-limited; {retry_after_secs:.2}s wait exceeds the reply's retry budget"
+                    )
+                    .into());
+                }
                 warn!(
                     "Discord sendAttachments rate-limited; retrying after {retry_after_secs:.2}s"
                 );
-                tokio::time::sleep(Duration::from_millis((retry_after_secs * 1000.0) as u64)).await;
+                tokio::time::sleep(wait).await;
                 continue;
             }
 
@@ -4888,6 +4907,39 @@ mod tests {
             .await;
         assert!(res.is_err(), "persistent 429 must surface as Err");
         assert_eq!(posts.lock().await.len(), 2, "exactly one retry");
+    }
+
+    /// A 429 whose wait would overrun the reply's retry budget is not
+    /// waited out: the send fails at once, with no retry POST.
+    #[tokio::test]
+    async fn test_text_send_429_over_reply_budget_is_err_without_wait() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let (base, posts) = spawn_text_stub(Arc::new(|n, _| {
+            if n == 0 {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    r#"{"retry_after":20.0,"global":false}"#,
+                )
+                    .into_response()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        }))
+        .await;
+        let adapter = test_adapter_with_base(base);
+        let started = std::time::Instant::now();
+        let res = crate::bridge::RETRY_DEADLINE
+            .scope(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                adapter.send(
+                    &make_channel_user("test"),
+                    ChannelContent::Text("hi".into()),
+                ),
+            )
+            .await;
+        assert!(res.is_err(), "over-budget wait must surface as Err");
+        assert_eq!(posts.lock().await.len(), 1, "no retry once over budget");
+        assert!(started.elapsed() < Duration::from_secs(5), "must not sleep");
     }
 
     /// Any other non-2xx is Err with no retry, and later chunks of a long

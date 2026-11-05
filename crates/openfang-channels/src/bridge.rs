@@ -739,6 +739,59 @@ pub struct SendOptions {
     pub workspace_root: Option<PathBuf>,
 }
 
+/// What happened to one [`send_parsed`] call.
+#[derive(Debug, Default)]
+pub struct SendReport {
+    /// `<openfang:attach .../>` directives that parsed but could not be
+    /// resolved (missing file, outside allow-roots, oversized, …):
+    /// `(directive_path, reason)` per entry.
+    pub skipped: Vec<(String, String)>,
+    /// Messages actually attempted. 1 unless tables split the reply.
+    pub parts: usize,
+    /// One entry per message that failed, in send order.
+    pub failures: Vec<SendFailure>,
+}
+
+/// One message of a reply that the adapter refused.
+#[derive(Debug)]
+pub struct SendFailure {
+    /// 1-based position of the message within the reply.
+    pub part: usize,
+    /// The adapter's error, as text.
+    pub error: String,
+    /// The message carried files and its text was resent alone, so the
+    /// reader got the words but not the image or files.
+    pub text_resent: bool,
+}
+
+impl SendReport {
+    /// Nothing reached the reader: every message failed with no text resent.
+    pub fn nothing_delivered(&self) -> bool {
+        self.parts > 0
+            && self.failures.len() == self.parts
+            && self.failures.iter().all(|f| !f.text_resent)
+    }
+}
+
+/// Total time one reply may spend waiting out rate limits across all of
+/// its messages. Each single wait is already capped at 30s; this stops a run
+/// of 429s on a split reply from holding the `channel_send` tool for minutes.
+const REPLY_RETRY_BUDGET: Duration = Duration::from_secs(60);
+
+tokio::task_local! {
+    /// Deadline for rate-limit waits during the current [`send_parsed`] call.
+    pub(crate) static RETRY_DEADLINE: tokio::time::Instant;
+}
+
+/// Whether an adapter may sleep `wait` before a rate-limit retry. Inside
+/// [`send_parsed`] the wait must end before the reply's budget runs out;
+/// elsewhere there is no reply budget and the per-wait cap is the only limit.
+pub(crate) fn retry_wait_fits(wait: Duration) -> bool {
+    RETRY_DEADLINE
+        .try_with(|deadline| tokio::time::Instant::now() + wait <= *deadline)
+        .unwrap_or(true)
+}
+
 /// Send a response, applying output formatting and optional threading.
 ///
 /// Bridge reply-path entrypoint. Delegates to [`send_parsed`] with default
@@ -770,14 +823,13 @@ async fn send_response(
 /// proactive-send path (commit 3). The `options.workspace_root`, when
 /// set, is forwarded to [`outbound_attach::parse`] as the sole allow-root,
 /// scoping attachment resolution to that agent's workspace.
-/// Returns the list of `<openfang:attach .../>` directives whose paths
-/// parsed but whose resolution failed (missing file, outside allow-roots,
-/// oversized, …) — `(directive_path, reason)` per entry. Callers that
-/// surface a tool-call result back to the agent (e.g.
-/// `kernel::send_channel_message` for the `channel_send` tool) should
-/// include this list so the agent can react to silent drops. The bridge
-/// reply-path discards it; the WARN log inside `outbound_attach::parse`
-/// remains the operator-facing record.
+/// Returns a [`SendReport`]: attach directives that could not be resolved,
+/// and any messages the adapter refused. Callers that surface a tool-call
+/// result back to the agent (e.g. `kernel::send_channel_message` for the
+/// `channel_send` tool) should pass both on so the agent can react. The
+/// bridge reply-path discards it; the logs remain the operator-facing record.
+///
+/// Rate-limit waits across the whole reply share [`REPLY_RETRY_BUDGET`].
 pub async fn send_parsed(
     adapter: &dyn ChannelAdapter,
     user: &ChannelUser,
@@ -785,7 +837,23 @@ pub async fn send_parsed(
     thread_id: Option<&str>,
     output_format: OutputFormat,
     options: SendOptions,
-) -> Vec<(String, String)> {
+) -> SendReport {
+    RETRY_DEADLINE
+        .scope(
+            tokio::time::Instant::now() + REPLY_RETRY_BUDGET,
+            send_parsed_inner(adapter, user, text, thread_id, output_format, options),
+        )
+        .await
+}
+
+async fn send_parsed_inner(
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    text: String,
+    thread_id: Option<&str>,
+    output_format: OutputFormat,
+    options: SendOptions,
+) -> SendReport {
     // Parse `<openfang:attach .../>` markers BEFORE formatting — channel
     // formatters (telegram HTML, slack mrkdwn) escape `<` and would break
     // marker detection downstream.
@@ -849,6 +917,10 @@ pub async fn send_parsed(
     let split = segments.len() > 1;
     let last = segments.len() - 1;
     let mut attachment_blocks = Some(attachment_blocks);
+    let mut report = SendReport {
+        skipped,
+        ..SendReport::default()
+    };
     // Sent strictly one after another so the messages can't arrive out of
     // order.
     for (i, seg) in segments.into_iter().enumerate() {
@@ -875,31 +947,40 @@ pub async fn send_parsed(
             1 => blocks.remove(0),
             _ => ChannelContent::Multipart(blocks),
         };
+        report.parts += 1;
+        let part = report.parts;
 
-        // Log and drop the error inside this expression: `Box<dyn Error>`
-        // isn't Send, so no binding of it may live across the fallback's
-        // await.
-        let failed = match dispatch_content(adapter, user, content, thread_id).await {
-            Ok(()) => false,
+        // Turn the error into a String inside this expression: `Box<dyn
+        // Error>` isn't Send, so no binding of it may live across the
+        // fallback's await.
+        let error = match dispatch_content(adapter, user, content, thread_id).await {
+            Ok(()) => None,
             Err(e) => {
                 error!("Failed to send response: {e}");
-                true
+                Some(e.to_string())
             }
         };
+        let Some(error) = error else { continue };
         // If a send carrying files failed (413, rejected attachment), resend
         // this segment's text once, with its table as text, rather than lose
         // both. Attach files are not retried. Earlier segments already went
-        // out and are not repeated. May duplicate this segment's prose if it
-        // got through without the file. A text-only send that failed is not
+        // out and are not repeated. A text-only send that failed is not
         // retried here: the adapter already retried it.
-        if failed && (source.is_some() || has_attach) {
+        //
+        // Known duplicate, accepted because a duplicate beats a loss: the
+        // resend can repeat prose that already posted. That happens when a
+        // long caption went out as text before its upload failed, or when
+        // the files took several uploads and the first one (carrying the
+        // caption) posted before a later one failed.
+        let mut text_resent = false;
+        if source.is_some() || has_attach {
             let text = match source {
                 Some(source) if seg.text.trim().is_empty() => source,
                 Some(source) => format!("{}\n\n{source}", seg.text),
                 None => seg.text,
             };
             if !text.trim().is_empty() {
-                if let Err(e) = dispatch_content(
+                match dispatch_content(
                     adapter,
                     user,
                     ChannelContent::Text(format(&text)),
@@ -907,13 +988,27 @@ pub async fn send_parsed(
                 )
                 .await
                 {
-                    error!("Text fallback after failed upload also failed: {e}");
+                    Ok(()) => text_resent = true,
+                    Err(e) => error!("Text fallback after failed upload also failed: {e}"),
                 }
             }
         }
+        // Later messages still go out, so the reader sees a hole where this
+        // one should be. Carrying on beats dropping the rest of the reply.
+        if !text_resent && i < last {
+            error!(
+                part,
+                "Reply message {part} was lost; later messages still sent, so the reply has a gap"
+            );
+        }
+        report.failures.push(SendFailure {
+            part,
+            error,
+            text_resent,
+        });
     }
 
-    skipped
+    report
 }
 
 /// Degrade-aware dispatch chokepoint (ANAI-82 Piece 1).
@@ -3338,7 +3433,7 @@ mod tests {
             reject_files: true,
             received: Mutex::new(Vec::new()),
         };
-        let skipped = send_parsed(
+        let report = send_parsed(
             &adapter,
             &test_user(),
             text,
@@ -3349,7 +3444,13 @@ mod tests {
             },
         )
         .await;
-        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(report.skipped.is_empty(), "{report:?}");
+        assert!(!report.failures.is_empty(), "{report:?}");
+        assert!(
+            report.failures.iter().all(|f| f.text_resent),
+            "every failed upload had its text resent: {report:?}"
+        );
+        assert!(!report.nothing_delivered());
         let received = adapter.received.lock().unwrap();
         let last = received.last().expect("something was sent");
         assert!(
@@ -3361,6 +3462,97 @@ mod tests {
             .filter(|c| matches!(c, ChannelContent::Text(t) if t.contains("after")))
             .count();
         assert_eq!(afters, 1, "text must not be sent twice: {received:?}");
+    }
+
+    /// Refuses every send, so `send_parsed` can be checked for what it
+    /// reports when nothing gets through.
+    struct RejectAllAdapter;
+
+    #[async_trait]
+    impl ChannelAdapter for RejectAllAdapter {
+        fn name(&self) -> &str {
+            "reject-all"
+        }
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Custom("reject-all".to_string())
+        }
+        async fn start(
+            &self,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = ChannelMessage> + Send>>,
+            Box<dyn std::error::Error>,
+        > {
+            Err("mock adapter does not stream".into())
+        }
+        async fn send(
+            &self,
+            _user: &ChannelUser,
+            _content: ChannelContent,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            Err("500 Internal Server Error".into())
+        }
+        async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+    }
+
+    /// A text send that fails is reported, so `channel_send` can tell the
+    /// agent instead of claiming success.
+    #[tokio::test]
+    async fn send_parsed_reports_failed_text_send() {
+        let report = send_parsed(
+            &RejectAllAdapter,
+            &test_user(),
+            "hello".to_string(),
+            None,
+            OutputFormat::Markdown,
+            SendOptions::default(),
+        )
+        .await;
+        assert_eq!(report.parts, 1);
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.failures[0].error.contains("500"));
+        assert!(!report.failures[0].text_resent);
+        assert!(report.nothing_delivered());
+    }
+
+    /// A successful send reports no failures.
+    #[tokio::test]
+    async fn send_parsed_reports_clean_send() {
+        let adapter = RecordingAdapter {
+            name: "recording-mock",
+            interactive: false,
+            reject_files: false,
+            received: Mutex::new(Vec::new()),
+        };
+        let report = send_parsed(
+            &adapter,
+            &test_user(),
+            "hello".to_string(),
+            None,
+            OutputFormat::Markdown,
+            SendOptions::default(),
+        )
+        .await;
+        assert_eq!(report.parts, 1);
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(!report.nothing_delivered());
+    }
+
+    /// Waits fit only inside the reply's deadline; outside `send_parsed`
+    /// there is no reply budget.
+    #[tokio::test]
+    async fn retry_wait_fits_respects_reply_deadline() {
+        assert!(retry_wait_fits(Duration::from_secs(3600)));
+        RETRY_DEADLINE
+            .scope(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                async {
+                    assert!(retry_wait_fits(Duration::from_secs(1)));
+                    assert!(!retry_wait_fits(Duration::from_secs(30)));
+                },
+            )
+            .await;
     }
 
     /// Every other adapter: tables are left alone.
