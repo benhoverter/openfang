@@ -821,62 +821,79 @@ pub async fn send_parsed(
     // Runs after marker parsing (so attach markers are already stripped) and
     // before formatting. Covers both replies and the `channel_send` tool,
     // which share this function.
+    // Discord shows attachments under a message's text, so the reply is split
+    // at each rendered table: one message per table, holding the text above
+    // it plus its PNG, then one for the rest. That puts each image where its
+    // table was. Attach-marker files ride on the last message, as before.
     // NOTE: tables leave here as pixels. Any future outbound text scrub must
     // run BEFORE this step, or table contents bypass it.
     // Table style markup (`<openfang:table …/>` lines, `{color}` row markers)
     // is stripped on every path, including channels that keep tables as text.
-    let mut pre_table_text: Option<String> = None;
-    let (text_to_format, attachment_blocks) = if adapter.name() == "discord" {
-        let (text, tables) = crate::table_render::render_tables(&text_to_format).await;
-        if !tables.is_empty() {
-            pre_table_text = Some(crate::table_render::strip_markup(&text_to_format));
+    let segments = if adapter.name() == "discord" {
+        crate::table_render::render_tables(&text_to_format).await
+    } else {
+        vec![crate::table_render::Segment {
+            text: crate::table_render::strip_markup(&text_to_format),
+            table: None,
+        }]
+    };
+
+    let format = |text: &str| {
+        if adapter.name() == "wecom" {
+            formatter::format_for_wecom(text, output_format)
+        } else {
+            formatter::format_for_channel(text, output_format)
         }
-        let mut blocks = attachment_blocks;
-        blocks.extend(tables);
-        (text, blocks)
-    } else {
-        (
-            crate::table_render::strip_markup(&text_to_format),
-            attachment_blocks,
-        )
     };
 
-    let formatted = if adapter.name() == "wecom" {
-        formatter::format_for_wecom(&text_to_format, output_format)
-    } else {
-        formatter::format_for_channel(&text_to_format, output_format)
-    };
-
-    let content = if attachment_blocks.is_empty() {
-        ChannelContent::Text(formatted)
-    } else {
-        let mut blocks = Vec::with_capacity(attachment_blocks.len() + 1);
+    let split = segments.len() > 1;
+    let last = segments.len() - 1;
+    let mut attachment_blocks = Some(attachment_blocks);
+    // Sent strictly one after another so the messages can't arrive out of
+    // order.
+    for (i, seg) in segments.into_iter().enumerate() {
+        let formatted = format(&seg.text);
+        let mut blocks = Vec::new();
         if !formatted.trim().is_empty() {
             blocks.push(ChannelContent::Text(formatted));
         }
-        blocks.extend(attachment_blocks);
-        if blocks.len() == 1 {
-            blocks.remove(0)
-        } else {
-            ChannelContent::Multipart(blocks)
+        let source = seg.table.map(|t| {
+            blocks.push(t.png);
+            t.source
+        });
+        if i == last {
+            blocks.extend(attachment_blocks.take().unwrap_or_default());
         }
-    };
+        let content = match blocks.len() {
+            // An empty trailing segment after a split: nothing left to say.
+            0 if split => continue,
+            // Unsplit replies keep today's behaviour, empty text included.
+            0 => ChannelContent::Text(String::new()),
+            1 => blocks.remove(0),
+            _ => ChannelContent::Multipart(blocks),
+        };
 
-    // Log and drop the error inside this expression: `Box<dyn Error>` isn't
-    // Send, so no binding of it may live across the fallback's await.
-    let failed = match dispatch_content(adapter, user, content, thread_id).await {
-        Ok(()) => false,
-        Err(e) => {
-            error!("Failed to send response: {e}");
-            true
-        }
-    };
-    if failed {
-        // The tables were cut from the text before dispatch; if the upload
-        // failed (413, rejected attachment) resend them as text once rather
-        // than lose them. May duplicate prose that did get through.
-        if let Some(original) = pre_table_text {
-            let text = formatter::format_for_channel(&original, output_format);
+        // Log and drop the error inside this expression: `Box<dyn Error>`
+        // isn't Send, so no binding of it may live across the fallback's
+        // await.
+        let failed = match dispatch_content(adapter, user, content, thread_id).await {
+            Ok(()) => false,
+            Err(e) => {
+                error!("Failed to send response: {e}");
+                true
+            }
+        };
+        // The table was cut from the text before dispatch; if the upload
+        // failed (413, rejected attachment) resend this segment with the
+        // table as text, once, rather than lose it. Earlier segments already
+        // went out and are not repeated. May duplicate this segment's prose
+        // if it got through without the file.
+        if let (true, Some(source)) = (failed, source) {
+            let text = if seg.text.trim().is_empty() {
+                format(&source)
+            } else {
+                format(&format!("{}\n\n{source}", seg.text))
+            };
             if let Err(e) =
                 dispatch_content(adapter, user, ChannelContent::Text(text), thread_id).await
             {
@@ -3095,7 +3112,12 @@ mod tests {
             _user: &ChannelUser,
             content: ChannelContent,
         ) -> Result<(), Box<dyn std::error::Error>> {
-            if self.reject_files && matches!(content, ChannelContent::Multipart(_)) {
+            if self.reject_files
+                && matches!(
+                    content,
+                    ChannelContent::Multipart(_) | ChannelContent::FileData { .. }
+                )
+            {
                 return Err("413 Payload Too Large".into());
             }
             self.received.lock().unwrap().push(content);
@@ -3182,7 +3204,9 @@ mod tests {
 
     const TABLE_MSG: &str = "before\n| a | b |\n|---|---|\n| 1 | 2 |\nafter";
 
-    /// Discord: tables become PNG attachments (when typst is installed).
+    /// Discord: each table becomes a PNG on the message holding the text
+    /// above it, and the text below follows in its own message (when typst
+    /// is installed).
     #[tokio::test]
     async fn send_parsed_renders_tables_for_discord() {
         let adapter = RecordingAdapter {
@@ -3201,23 +3225,57 @@ mod tests {
         )
         .await;
         let received = adapter.received.lock().unwrap();
-        assert_eq!(received.len(), 1);
+        if !crate::table_render::typst_available() {
+            // No typst on this machine: table stays as text, one message.
+            assert_eq!(received.len(), 1);
+            assert!(matches!(&received[0], ChannelContent::Text(t) if t.contains("| 1 | 2 |")));
+            return;
+        }
+        assert_eq!(received.len(), 2, "{received:?}");
         match &received[0] {
             ChannelContent::Multipart(parts) => {
-                assert!(
-                    matches!(&parts[0], ChannelContent::Text(t) if t.contains("Table 1") && !t.contains('|'))
-                );
+                assert_eq!(parts.len(), 2);
+                assert!(matches!(&parts[0], ChannelContent::Text(t) if t == "before"));
                 assert!(
                     matches!(&parts[1], ChannelContent::FileData { mime_type, .. } if mime_type == "image/png")
                 );
             }
-            // No typst on this machine: table stays as text.
-            ChannelContent::Text(t) => assert!(t.contains("| 1 | 2 |")),
             other => panic!("unexpected content {other:?}"),
         }
+        assert!(matches!(&received[1], ChannelContent::Text(t) if t == "after"));
     }
 
-    /// A failed upload must not lose the table: it is resent as text once.
+    /// A table at the very end: one message, no empty follow-up. Attach
+    /// files stay on the last message.
+    #[tokio::test]
+    async fn send_parsed_trailing_table_is_one_message() {
+        if !crate::table_render::typst_available() {
+            eprintln!("typst not installed; skipping");
+            return;
+        }
+        let adapter = RecordingAdapter {
+            name: "discord",
+            interactive: true,
+            reject_files: false,
+            received: Mutex::new(Vec::new()),
+        };
+        send_parsed(
+            &adapter,
+            &test_user(),
+            "intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n".to_string(),
+            None,
+            OutputFormat::Markdown,
+            SendOptions::default(),
+        )
+        .await;
+        let received = adapter.received.lock().unwrap();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert!(matches!(&received[0], ChannelContent::Multipart(p) if p.len() == 2));
+    }
+
+    /// A failed upload must not lose the table: that segment is resent with
+    /// the table as text once, and the rest of the reply still follows, in
+    /// order and without repeats.
     #[tokio::test]
     async fn send_parsed_resends_table_text_when_upload_fails() {
         if crate::table_render::typst_available() {
@@ -3237,12 +3295,14 @@ mod tests {
             )
             .await;
             let received = adapter.received.lock().unwrap();
-            assert_eq!(received.len(), 1);
+            assert_eq!(received.len(), 2, "{received:?}");
             assert!(
-                matches!(&received[0], ChannelContent::Text(t) if t.contains("| 1 | 2 |")),
+                matches!(&received[0], ChannelContent::Text(t)
+                    if t.starts_with("before") && t.contains("| 1 | 2 |") && !t.contains("after")),
                 "table text must survive a failed upload, got {:?}",
                 received[0]
             );
+            assert!(matches!(&received[1], ChannelContent::Text(t) if t == "after"));
         } else {
             eprintln!("typst not installed; skipping");
         }

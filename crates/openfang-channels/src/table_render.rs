@@ -3,9 +3,11 @@
 //!
 //! Discord shows a pipe table as raw `|` characters, which is hard to read.
 //! [`render_tables`] finds each table in an outbound message, renders it to a
-//! PNG with `typst`, and replaces the table text with a short marker line.
-//! The PNGs travel as ordinary `FileData` attachments; nothing is kept on
-//! disk afterwards (Discord stores the upload).
+//! PNG with `typst`, and splits the message at each rendered table, so the
+//! caller can post the text before a table with its PNG attached and the
+//! image lands where the table was (Discord always shows attachments under
+//! a message's text). The PNGs travel as ordinary `FileData` attachments;
+//! nothing is kept on disk afterwards (Discord stores the upload).
 //!
 //! Safety model: cell text comes from agents, so it is untrusted. It is
 //! written to `data.json` and read by a FIXED typst template via `json()`;
@@ -280,27 +282,51 @@ pub fn strip_markup(text: &str) -> String {
     scan(text).lines.join("\n")
 }
 
-/// Replace renderable tables in `text` with marker lines and return the new
-/// text plus one PNG `FileData` per rendered table. Tables that fail any
-/// limit or fail to render stay in the text unchanged.
-pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
+/// One outbound message's worth of a split reply: the text before a table,
+/// and that table's PNG. The last segment has no table.
+#[derive(Debug)]
+pub struct Segment {
+    pub text: String,
+    pub table: Option<RenderedTable>,
+}
+
+#[derive(Debug)]
+pub struct RenderedTable {
+    /// `FileData` with the PNG.
+    pub png: ChannelContent,
+    /// The table's Markdown with style markup removed, for resending as
+    /// text if the upload fails.
+    pub source: String,
+}
+
+/// Split `text` at each renderable table. Every segment but the last ends in
+/// a rendered table; the last carries the remaining text (possibly empty).
+/// Tables that fail any limit or fail to render stay in the text unchanged,
+/// so a message with nothing rendered comes back as one segment.
+pub async fn render_tables(text: &str) -> Vec<Segment> {
+    let whole = |lines: &[String]| {
+        vec![Segment {
+            text: lines.join("\n"),
+            table: None,
+        }]
+    };
     let Scan { lines, found } = scan(text);
     if found.is_empty() {
-        return (lines.join("\n"), Vec::new());
+        return whole(&lines);
     }
     let Some(typst) = find_typst() else {
         warn!("table_render: typst not found; sending tables as text");
-        return (lines.join("\n"), Vec::new());
+        return whole(&lines);
     };
     let deadline = Instant::now() + MESSAGE_BUDGET;
 
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
-    let mut files = Vec::new();
+    let mut segments = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut cursor = 0;
     for f in found {
         out.extend(lines[cursor..f.start].iter().cloned());
         cursor = f.start;
-        if files.len() >= MAX_TABLES {
+        if segments.len() >= MAX_TABLES {
             continue;
         }
         let ppi = match check_limits(&f.table).and_then(|()| pick_ppi(&f.table)) {
@@ -312,20 +338,44 @@ pub async fn render_tables(text: &str) -> (String, Vec<ChannelContent>) {
         };
         match render_limited(&typst, &f.table, &f.style, ppi, deadline).await {
             Ok(png) => {
-                let n = files.len() + 1;
-                files.push(ChannelContent::FileData {
-                    data: png,
-                    filename: format!("table-{n}.png"),
-                    mime_type: "image/png".to_string(),
+                let n = segments.len() + 1;
+                segments.push(Segment {
+                    text: trim_blank_lines(&out),
+                    table: Some(RenderedTable {
+                        png: ChannelContent::FileData {
+                            data: png,
+                            filename: format!("table-{n}.png"),
+                            mime_type: "image/png".to_string(),
+                        },
+                        source: lines[f.start..f.end].join("\n"),
+                    }),
                 });
-                out.push(format!("📊 *Table {n} (image below)*"));
+                out.clear();
                 cursor = f.end;
             }
             Err(why) => warn!("table_render: render failed, table left as text: {why}"),
         }
     }
     out.extend(lines[cursor..].iter().cloned());
-    (out.join("\n"), files)
+    let text = if segments.is_empty() {
+        out.join("\n")
+    } else {
+        trim_blank_lines(&out)
+    };
+    segments.push(Segment { text, table: None });
+    segments
+}
+
+/// Join lines, dropping blank lines at either end: the split points sit
+/// next to tables, and Markdown puts blank lines around those.
+fn trim_blank_lines(lines: &[String]) -> String {
+    let blank = |l: &&String| l.trim().is_empty();
+    let start = lines.iter().position(|l| !blank(&l)).unwrap_or(lines.len());
+    let end = lines
+        .iter()
+        .rposition(|l| !blank(&l))
+        .map_or(start, |i| i + 1);
+    lines[start..end].join("\n")
 }
 
 /// Render under the process-wide slot limit and the message deadline.
@@ -1180,16 +1230,21 @@ mod tests {
             return;
         }
         let text = "<openfang:table mode=\"light\" header=\"sky_blue\"/>\n| a | b |\n|---|---|\n| {berry_red} x | 1 |\n| y | 2 |";
-        let (text, files) = render_tables(text).await;
-        assert_eq!(text, "📊 *Table 1 (image below)*");
-        assert_eq!(files.len(), 1);
+        let segs = render_tables(text).await;
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "");
+        let table = segs[0].table.as_ref().expect("rendered");
+        assert_eq!(table.source, "| a | b |\n|---|---|\n| x | 1 |\n| y | 2 |");
+        assert_eq!(segs[1].text, "");
+        assert!(segs[1].table.is_none());
     }
 
     #[tokio::test]
     async fn no_tables_is_a_no_op() {
-        let (text, files) = render_tables("just prose | with a pipe").await;
-        assert_eq!(text, "just prose | with a pipe");
-        assert!(files.is_empty());
+        let segs = render_tables("just prose | with a pipe").await;
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "just prose | with a pipe");
+        assert!(segs[0].table.is_none());
     }
 
     /// End-to-end through the real typst binary, including hostile cells.
@@ -1202,10 +1257,12 @@ mod tests {
         }
         let hostile =
             "intro\n| a | b |\n|---|---|\n| #read(\"/etc/passwd\") | $x$ ] #eval(\"1+1\") |\nend";
-        let (text, files) = render_tables(hostile).await;
-        assert_eq!(text, "intro\n📊 *Table 1 (image below)*\nend");
-        assert_eq!(files.len(), 1);
-        match &files[0] {
+        let segs = render_tables(hostile).await;
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "intro");
+        assert_eq!(segs[1].text, "end");
+        assert!(segs[1].table.is_none());
+        match &segs[0].table.as_ref().expect("rendered").png {
             ChannelContent::FileData {
                 data,
                 filename,
@@ -1219,15 +1276,37 @@ mod tests {
         }
     }
 
+    /// Each rendered table ends a segment, so its PNG can post right after
+    /// the text above it. Blank lines at the split points are dropped.
+    #[tokio::test]
+    async fn splits_at_each_rendered_table() {
+        if find_typst().is_none() {
+            eprintln!("typst not installed; skipping");
+            return;
+        }
+        let t = "| a |\n|---|\n| 1 |";
+        let text = format!("one\n\n{t}\n\ntwo\n  indented\n\n{t}\n\nthree");
+        let segs = render_tables(&text).await;
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["one", "two\n  indented", "three"]);
+        assert!(segs[0].table.is_some() && segs[1].table.is_some());
+        assert!(segs[2].table.is_none());
+        match &segs[1].table.as_ref().unwrap().png {
+            ChannelContent::FileData { filename, .. } => assert_eq!(filename, "table-2.png"),
+            other => panic!("expected FileData, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn over_limit_table_stays_text() {
         let mut s = String::from("| a |\n|---|\n");
         for i in 0..=MAX_ROWS {
             s.push_str(&format!("| {i} |\n"));
         }
-        let (text, files) = render_tables(&s).await;
-        assert_eq!(text, s);
-        assert!(files.is_empty());
+        let segs = render_tables(&s).await;
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, s);
+        assert!(segs[0].table.is_none());
     }
 
     #[tokio::test]
