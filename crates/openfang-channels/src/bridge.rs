@@ -861,8 +861,11 @@ pub async fn send_parsed(
             blocks.push(t.png);
             t.source
         });
+        let mut has_attach = false;
         if i == last {
-            blocks.extend(attachment_blocks.take().unwrap_or_default());
+            let attach = attachment_blocks.take().unwrap_or_default();
+            has_attach = !attach.is_empty();
+            blocks.extend(attach);
         }
         let content = match blocks.len() {
             // An empty trailing segment after a split: nothing left to say.
@@ -883,21 +886,29 @@ pub async fn send_parsed(
                 true
             }
         };
-        // The table was cut from the text before dispatch; if the upload
-        // failed (413, rejected attachment) resend this segment with the
-        // table as text, once, rather than lose it. Earlier segments already
-        // went out and are not repeated. May duplicate this segment's prose
-        // if it got through without the file.
-        if let (true, Some(source)) = (failed, source) {
-            let text = if seg.text.trim().is_empty() {
-                format(&source)
-            } else {
-                format(&format!("{}\n\n{source}", seg.text))
+        // If a send carrying files failed (413, rejected attachment), resend
+        // this segment's text once, with its table as text, rather than lose
+        // both. Attach files are not retried. Earlier segments already went
+        // out and are not repeated. May duplicate this segment's prose if it
+        // got through without the file. A text-only send that failed is not
+        // retried here: the adapter already retried it.
+        if failed && (source.is_some() || has_attach) {
+            let text = match source {
+                Some(source) if seg.text.trim().is_empty() => source,
+                Some(source) => format!("{}\n\n{source}", seg.text),
+                None => seg.text,
             };
-            if let Err(e) =
-                dispatch_content(adapter, user, ChannelContent::Text(text), thread_id).await
-            {
-                error!("Table text fallback also failed: {e}");
+            if !text.trim().is_empty() {
+                if let Err(e) = dispatch_content(
+                    adapter,
+                    user,
+                    ChannelContent::Text(format(&text)),
+                    thread_id,
+                )
+                .await
+                {
+                    error!("Text fallback after failed upload also failed: {e}");
+                }
             }
         }
     }
@@ -3306,6 +3317,50 @@ mod tests {
         } else {
             eprintln!("typst not installed; skipping");
         }
+    }
+
+    /// Attach files ride on the last message. If that upload fails, the
+    /// last message's text is resent alone instead of being lost with the
+    /// files. Earlier messages are not repeated.
+    #[tokio::test]
+    async fn send_parsed_resends_last_text_when_attach_upload_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("note.txt"), b"hi").expect("write");
+        let text = if crate::table_render::typst_available() {
+            format!("{TABLE_MSG}\n<openfang:attach path=\"note.txt\"/>")
+        } else {
+            "after\n<openfang:attach path=\"note.txt\"/>".to_string()
+        };
+        let adapter = RecordingAdapter {
+            name: "discord",
+            interactive: true,
+            reject_files: true,
+            received: Mutex::new(Vec::new()),
+        };
+        let skipped = send_parsed(
+            &adapter,
+            &test_user(),
+            text,
+            None,
+            OutputFormat::Markdown,
+            SendOptions {
+                workspace_root: Some(root),
+            },
+        )
+        .await;
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let received = adapter.received.lock().unwrap();
+        let last = received.last().expect("something was sent");
+        assert!(
+            matches!(last, ChannelContent::Text(t) if t.trim() == "after"),
+            "last message's text must survive a failed attach upload, got {received:?}"
+        );
+        let afters = received
+            .iter()
+            .filter(|c| matches!(c, ChannelContent::Text(t) if t.contains("after")))
+            .count();
+        assert_eq!(afters, 1, "text must not be sent twice: {received:?}");
     }
 
     /// Every other adapter: tables are left alone.

@@ -506,6 +506,12 @@ impl DiscordAdapter {
     }
 
     /// Send a message to a Discord channel via REST API.
+    ///
+    /// Long text goes out as several messages. Each one honors a 429's
+    /// retry delay once; any other failure, or a second 429, returns `Err`
+    /// at that chunk so the caller knows text was lost. Chunks already sent
+    /// stay sent, and later chunks are not attempted, so the reader never
+    /// sees a gap in the middle.
     async fn api_send_message(
         &self,
         channel_id: &str,
@@ -516,17 +522,32 @@ impl DiscordAdapter {
 
         for chunk in chunks {
             let body = serde_json::json!({ "content": chunk });
-            let resp = self
-                .client
-                .post(&url)
-                .header("Authorization", format!("Bot {}", self.token.as_str()))
-                .json(&body)
-                .send()
-                .await?;
+            let mut attempts = 0u8;
+            loop {
+                attempts += 1;
+                let resp = self
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {}", self.token.as_str()))
+                    .json(&body)
+                    .send()
+                    .await?;
 
-            if !resp.status().is_success() {
+                let status = resp.status();
+                if status.is_success() {
+                    break;
+                }
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts == 1 {
+                    let header = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    let secs = retry_after_secs(header.as_ref(), &body_text);
+                    warn!("Discord sendMessage rate-limited; retrying after {secs:.2}s");
+                    tokio::time::sleep(Duration::from_millis((secs * 1000.0) as u64)).await;
+                    continue;
+                }
                 let body_text = resp.text().await.unwrap_or_default();
-                warn!("Discord sendMessage failed: {body_text}");
+                warn!("Discord sendMessage failed ({status}): {body_text}");
+                return Err(format!("Discord sendMessage failed ({status}): {body_text}").into());
             }
         }
         Ok(())
@@ -681,23 +702,11 @@ impl DiscordAdapter {
                 return Ok(());
             }
 
-            // Honor Retry-After once on 429. Discord puts the canonical
-            // `retry_after` in the JSON body; the HTTP header is a fallback
-            // (and is sometimes absent on per-route limits).
+            // Honor Retry-After once on 429.
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempts == 1 {
-                let header_secs = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<f64>().ok());
+                let header = resp.headers().get(reqwest::header::RETRY_AFTER).cloned();
                 let body_text = resp.text().await.unwrap_or_default();
-                let body_secs = serde_json::from_str::<serde_json::Value>(&body_text)
-                    .ok()
-                    .and_then(|v| v.get("retry_after").and_then(|r| r.as_f64()));
-                let retry_after_secs = body_secs
-                    .or(header_secs)
-                    .unwrap_or(1.0)
-                    .clamp(RETRY_AFTER_FLOOR_SECS, RETRY_AFTER_CEIL_SECS);
+                let retry_after_secs = retry_after_secs(header.as_ref(), &body_text);
                 warn!(
                     "Discord sendAttachments rate-limited; retrying after {retry_after_secs:.2}s"
                 );
@@ -2002,7 +2011,12 @@ impl ChannelAdapter for DiscordAdapter {
                 }
 
                 if caption_too_long {
-                    self.api_send_message(channel_id, caption_str).await?;
+                    // A text failure here must not stop the attachments, and
+                    // must not return Err: the bridge would then resend this
+                    // whole segment's text, repeating chunks that did post.
+                    if let Err(e) = self.api_send_message(channel_id, caption_str).await {
+                        warn!("Discord Multipart: long caption failed, sending attachments anyway: {e}");
+                    }
                 }
 
                 // Chunk by both count (≤ ATTACHMENTS_PER_CHUNK) and aggregate
@@ -2215,6 +2229,24 @@ fn chunk_attachments(
         chunks.push(current);
     }
     chunks
+}
+
+/// Seconds to wait before retrying a 429. Discord puts the canonical
+/// `retry_after` in the JSON body; the `Retry-After` header is a fallback
+/// (sometimes absent on per-route limits). Clamped so zero can't busy-loop
+/// and a huge or garbage value can't stall the send.
+fn retry_after_secs(header: Option<&reqwest::header::HeaderValue>, body: &str) -> f64 {
+    let header_secs = header
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok());
+    let body_secs = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("retry_after").and_then(|r| r.as_f64()));
+    body_secs
+        .filter(|s| s.is_finite())
+        .or(header_secs.filter(|s| s.is_finite()))
+        .unwrap_or(1.0)
+        .clamp(RETRY_AFTER_FLOOR_SECS, RETRY_AFTER_CEIL_SECS)
 }
 
 fn build_attachment_payload_json(caption: Option<&str>) -> String {
@@ -4769,6 +4801,178 @@ mod tests {
             "header-only 429 must still trigger one retry"
         );
         assert_all_attempts_carry_files(&captured, 2).await;
+    }
+
+    // ---- plain-text send: 429 retry and Err on failure -----------------------
+
+    /// Stub at `/channels/test/messages` that answers every POST via
+    /// `respond(attempt, is_multipart)` and records `is_multipart` per POST.
+    async fn spawn_text_stub(
+        respond: Arc<dyn Fn(usize, bool) -> axum::response::Response + Send + Sync + 'static>,
+    ) -> (String, Arc<TokioMutex<Vec<bool>>>) {
+        use axum::{extract::DefaultBodyLimit, http::HeaderMap, routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let posts: Arc<TokioMutex<Vec<bool>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let posts_clone = posts.clone();
+        let app = Router::new()
+            .route(
+                "/channels/test/messages",
+                post(move |headers: HeaderMap, _body: axum::body::Bytes| {
+                    let posts = posts_clone.clone();
+                    let attempt = attempt.clone();
+                    let respond = respond.clone();
+                    async move {
+                        let multipart = headers
+                            .get(axum::http::header::CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|ct| ct.starts_with("multipart/"));
+                        posts.lock().await.push(multipart);
+                        respond(attempt.fetch_add(1, Ordering::SeqCst), multipart)
+                    }
+                }),
+            )
+            .layer(DefaultBodyLimit::disable());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), posts)
+    }
+
+    fn rate_limited() -> axum::response::Response {
+        use axum::{http::StatusCode, response::IntoResponse};
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"retry_after":0.0,"global":false}"#,
+        )
+            .into_response()
+    }
+
+    /// A 429 on a text message is retried once (delay from the JSON body)
+    /// and the send succeeds.
+    #[tokio::test]
+    async fn test_text_send_429_retries_once() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let (base, posts) = spawn_text_stub(Arc::new(|n, _| {
+            if n == 0 {
+                rate_limited()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        }))
+        .await;
+        let adapter = test_adapter_with_base(base);
+        adapter
+            .send(
+                &make_channel_user("test"),
+                ChannelContent::Text("hi".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(posts.lock().await.len(), 2);
+    }
+
+    /// A second 429 is not retried again; the caller gets Err.
+    #[tokio::test]
+    async fn test_text_send_persistent_429_is_err() {
+        let (base, posts) = spawn_text_stub(Arc::new(|_, _| rate_limited())).await;
+        let adapter = test_adapter_with_base(base);
+        let res = adapter
+            .send(
+                &make_channel_user("test"),
+                ChannelContent::Text("hi".into()),
+            )
+            .await;
+        assert!(res.is_err(), "persistent 429 must surface as Err");
+        assert_eq!(posts.lock().await.len(), 2, "exactly one retry");
+    }
+
+    /// Any other non-2xx is Err with no retry, and later chunks of a long
+    /// message are not sent after a failed one.
+    #[tokio::test]
+    async fn test_text_send_failure_is_err_and_stops() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let (base, posts) = spawn_text_stub(Arc::new(|n, _| {
+            if n == 0 {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }))
+        .await;
+        let adapter = test_adapter_with_base(base);
+        let long = "word ".repeat(1200); // 6000 chars → 3 chunks
+        let res = adapter
+            .send(&make_channel_user("test"), ChannelContent::Text(long))
+            .await;
+        assert!(res.is_err());
+        assert_eq!(
+            posts.lock().await.len(),
+            2,
+            "chunk 3 must not follow a failed chunk 2"
+        );
+    }
+
+    /// A Multipart whose caption is too long goes out as text first. If that
+    /// text fails, the attachments are still sent and the send is Ok, so the
+    /// bridge doesn't resend text that may have partly posted.
+    #[tokio::test]
+    async fn test_long_caption_failure_still_sends_attachments() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let (base, posts) = spawn_text_stub(Arc::new(|_, multipart| {
+            if multipart {
+                StatusCode::OK.into_response()
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }))
+        .await;
+        let adapter = test_adapter_with_base(base);
+        let caption = "x".repeat(DISCORD_MSG_LIMIT + 10);
+        adapter
+            .send(
+                &make_channel_user("test"),
+                caption_plus_n_files(&caption, 1),
+            )
+            .await
+            .unwrap();
+        let posts = posts.lock().await;
+        assert_eq!(
+            posts.last(),
+            Some(&true),
+            "attachments must still go: {posts:?}"
+        );
+    }
+
+    #[test]
+    fn test_retry_after_secs_sources_and_bounds() {
+        use reqwest::header::HeaderValue;
+        let h = |s: &'static str| HeaderValue::from_static(s);
+        // Body wins over header.
+        assert_eq!(
+            retry_after_secs(Some(&h("9")), r#"{"retry_after":2.5}"#),
+            2.5
+        );
+        // Header is the fallback when the body has no value.
+        assert_eq!(retry_after_secs(Some(&h("3")), ""), 3.0);
+        assert_eq!(retry_after_secs(Some(&h("3")), r#"{"message":"x"}"#), 3.0);
+        // Neither: one second.
+        assert_eq!(retry_after_secs(None, ""), 1.0);
+        // Bounds: huge, infinite, NaN, zero, negative.
+        assert_eq!(
+            retry_after_secs(None, r#"{"retry_after":99999}"#),
+            RETRY_AFTER_CEIL_SECS
+        );
+        assert_eq!(retry_after_secs(Some(&h("inf")), ""), 1.0);
+        assert_eq!(retry_after_secs(Some(&h("NaN")), ""), 1.0);
+        assert_eq!(
+            retry_after_secs(None, r#"{"retry_after":0}"#),
+            RETRY_AFTER_FLOOR_SECS
+        );
+        assert_eq!(retry_after_secs(Some(&h("-5")), ""), RETRY_AFTER_FLOOR_SECS);
     }
 
     // ---- aggregate per-chunk byte cap ------------------------------------------
