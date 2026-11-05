@@ -376,15 +376,24 @@ impl SessionStore {
     /// deliberately not "leave it alone on `None`" — a boundary drawn without
     /// a slug means the agent is no longer working on the old thing, and a
     /// stale pack is worse than no pack.
+    ///
+    /// `carry` is the turn that asked for the boundary. Since ANAI-283 an
+    /// agent closes at the START of the new topic's first turn, so that turn
+    /// belongs to the new episode: it is written back as the whole canonical
+    /// history instead of being dropped with the old topic. Clearing it is
+    /// what left `assistant-teo` holding only the old topic's summary
+    /// (2026-11-04). The caller passes the slice it just appended, not a tail
+    /// count, so a failed append cannot make the re-anchor keep the wrong rows.
     pub fn reanchor_canonical(
         &self,
         agent_id: AgentId,
         prime_for: Option<&str>,
+        carry: &[Message],
     ) -> OpenFangResult<usize> {
         let mut canonical = self.load_canonical(agent_id)?;
-        let dropped = canonical.messages.len();
+        let dropped = canonical.messages.len().saturating_sub(carry.len());
         let prime_for = prime_for.map(str::to_string);
-        if dropped == 0 && canonical.prime_for == prime_for {
+        if canonical.messages.is_empty() && carry.is_empty() && canonical.prime_for == prime_for {
             // Nothing to re-anchor and nothing to prime. Return without a
             // write so a double close does not churn `updated_at` for no
             // reason. The `prime_for` half of the guard matters: a close that
@@ -392,7 +401,7 @@ impl SessionStore {
             // episode, and skipping that write would lose the pack silently.
             return Ok(0);
         }
-        canonical.messages.clear();
+        canonical.messages = carry.to_vec();
         canonical.compaction_cursor = 0;
         canonical.prime_for = prime_for;
         canonical.updated_at = Utc::now().to_rfc3339();
@@ -1026,7 +1035,7 @@ mod tests {
             )
             .unwrap();
 
-        let dropped = store.reanchor_canonical(agent_id, None).unwrap();
+        let dropped = store.reanchor_canonical(agent_id, None, &[]).unwrap();
         assert_eq!(dropped, 2);
 
         let canonical = store.load_canonical(agent_id).unwrap();
@@ -1052,8 +1061,54 @@ mod tests {
         store
             .append_canonical(agent_id, &[Message::user("one")], None)
             .unwrap();
-        assert_eq!(store.reanchor_canonical(agent_id, None).unwrap(), 1);
-        assert_eq!(store.reanchor_canonical(agent_id, None).unwrap(), 0);
+        assert_eq!(store.reanchor_canonical(agent_id, None, &[]).unwrap(), 1);
+        assert_eq!(store.reanchor_canonical(agent_id, None, &[]).unwrap(), 0);
+    }
+
+    /// 2026-11-04, `assistant-teo`: the agent closed on a topic switch at the
+    /// START of the new topic's first turn, as ANAI-283 asks. The re-anchor
+    /// then ran after that turn and dropped it with the old topic, leaving
+    /// only the old topic's summary. The asking turn must survive the
+    /// boundary as the first thing in the new episode.
+    #[test]
+    fn test_reanchor_canonical_keeps_the_asking_turn() {
+        let store = setup();
+        let agent_id = AgentId::new();
+        store
+            .store_llm_summary(
+                agent_id,
+                "earlier: the LEGO battery box",
+                vec![Message::user("9V or AA?"), Message::assistant("AA")],
+            )
+            .unwrap();
+        let asking_turn = vec![
+            Message::user("what is wave function collapse?"),
+            Message::assistant("it is ..."),
+        ];
+        store
+            .append_canonical(agent_id, &asking_turn, None)
+            .unwrap();
+
+        let dropped = store
+            .reanchor_canonical(agent_id, Some("physics"), &asking_turn)
+            .unwrap();
+        assert_eq!(dropped, 2, "only the old topic's two messages go");
+
+        let canonical = store.load_canonical(agent_id).unwrap();
+        let texts: Vec<String> = canonical
+            .messages
+            .iter()
+            .map(|m| m.content.text_content())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["what is wave function collapse?", "it is ..."],
+            "the new topic's first turn is the new episode's history"
+        );
+        assert_eq!(
+            canonical.compacted_summary.as_deref(),
+            Some("earlier: the LEGO battery box")
+        );
     }
 
     /// ANAI-247: the slug is persisted by the re-anchor and survives a
@@ -1068,7 +1123,7 @@ mod tests {
             .unwrap();
 
         store
-            .reanchor_canonical(agent_id, Some("openfang-fork"))
+            .reanchor_canonical(agent_id, Some("openfang-fork"), &[])
             .unwrap();
         assert_eq!(
             store.load_canonical(agent_id).unwrap().prime_for.as_deref(),
@@ -1078,7 +1133,7 @@ mod tests {
         // A later boundary drawn without a slug must CLEAR the old one. A
         // stale pack is worse than no pack: it briefs the agent on work it
         // has already moved off.
-        store.reanchor_canonical(agent_id, None).unwrap();
+        store.reanchor_canonical(agent_id, None, &[]).unwrap();
         assert_eq!(store.load_canonical(agent_id).unwrap().prime_for, None);
     }
 
@@ -1092,7 +1147,7 @@ mod tests {
 
         assert_eq!(
             store
-                .reanchor_canonical(agent_id, Some("openfang-fork"))
+                .reanchor_canonical(agent_id, Some("openfang-fork"), &[])
                 .unwrap(),
             0,
             "nothing verbatim to drop"
@@ -1112,7 +1167,7 @@ mod tests {
         let store = setup();
         let agent_id = AgentId::new();
         store
-            .reanchor_canonical(agent_id, Some("openfang-fork"))
+            .reanchor_canonical(agent_id, Some("openfang-fork"), &[])
             .unwrap();
 
         store

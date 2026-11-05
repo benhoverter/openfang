@@ -675,12 +675,16 @@ impl MemorySubstrate {
     /// ANAI-247: `prime_for` is recorded in the same write — `Some(slug)` to
     /// prime the next episode for that project, `None` to clear any prior
     /// priming.
+    ///
+    /// `carry` is the asking turn's messages, kept as the start of the new
+    /// episode — see [`crate::session::SessionStore::reanchor_canonical`].
     pub fn reanchor_canonical(
         &self,
         agent_id: AgentId,
         prime_for: Option<&str>,
+        carry: &[openfang_types::message::Message],
     ) -> OpenFangResult<usize> {
-        self.sessions.reanchor_canonical(agent_id, prime_for)
+        self.sessions.reanchor_canonical(agent_id, prime_for, carry)
     }
 
     /// ANAI-247: the project slug this agent is currently primed for, if any.
@@ -2009,7 +2013,9 @@ mod tests {
                 .with_scope_ref(slug),
             )
             .unwrap();
-        substrate.reanchor_canonical(agent_id, Some(slug)).unwrap();
+        substrate
+            .reanchor_canonical(agent_id, Some(slug), &[])
+            .unwrap();
     }
 
     /// The overwhelmingly common case: nobody primed anything. This runs on

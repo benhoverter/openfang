@@ -3279,8 +3279,12 @@ impl OpenFangKernel {
             match result {
                 Ok(result) => {
                     // Append new messages to canonical session for cross-channel memory
-                    if session.messages.len() > messages_before {
-                        let new_messages = session.messages[messages_before..].to_vec();
+                    let new_messages = session
+                        .messages
+                        .get(messages_before..)
+                        .map(<[_]>::to_vec)
+                        .unwrap_or_default();
+                    if !new_messages.is_empty() {
                         if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
                             warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
                         }
@@ -3290,7 +3294,7 @@ impl OpenFangKernel {
                     // that the loop has returned and this turn is in canonical
                     // memory. Doing it inside the tool would be overwritten by
                     // the loop's own `save_session_async`.
-                    kernel_clone.apply_pending_context_reset(agent_id);
+                    kernel_clone.apply_pending_context_reset(agent_id, &new_messages);
 
                     // Write JSONL session mirror and daily memory log to the
                     // agent's private state directory, not the user-facing
@@ -4027,8 +4031,12 @@ impl OpenFangKernel {
         };
 
         // Append new messages to canonical session for cross-channel memory
-        if session.messages.len() > messages_before {
-            let new_messages = session.messages[messages_before..].to_vec();
+        let new_messages = session
+            .messages
+            .get(messages_before..)
+            .map(<[_]>::to_vec)
+            .unwrap_or_default();
+        if !new_messages.is_empty() {
             if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
                 warn!("Failed to update canonical session: {e}");
             }
@@ -4036,7 +4044,7 @@ impl OpenFangKernel {
 
         // ANAI-246: honour a mid-turn `reset_context` request now that the
         // loop has returned and this turn is in canonical memory.
-        self.apply_pending_context_reset(agent_id);
+        self.apply_pending_context_reset(agent_id, &new_messages);
 
         // Write JSONL session mirror and daily memory log to the agent's
         // private state directory, not the user-facing workspace. See #1097.
@@ -4164,16 +4172,26 @@ impl OpenFangKernel {
     /// boundary is drawn. Best-effort: a failure here must not fail the turn
     /// the agent already completed, so it warns rather than propagating.
     ///
+    /// `this_turn` is the turn's own messages, from its inbound user message
+    /// on. Since ANAI-283 the close happens at the START of the new topic, so
+    /// the boundary falls *before* this turn: it is carried into the new
+    /// episode, and only what came before it is dropped.
+    ///
     /// Returns true if a reset was applied.
-    pub fn apply_pending_context_reset(&self, agent_id: AgentId) -> bool {
+    pub fn apply_pending_context_reset(
+        &self,
+        agent_id: AgentId,
+        this_turn: &[openfang_types::message::Message],
+    ) -> bool {
         let Some((_, prime_for)) = self.pending_context_resets.remove(&agent_id) else {
             return false;
         };
-        match self.reset_context_at_episode_boundary(agent_id, prime_for.as_deref()) {
+        match self.reset_context_at_episode_boundary(agent_id, prime_for.as_deref(), this_turn) {
             Ok(dropped) => {
                 info!(
                     agent_id = %agent_id,
                     canonical_messages_dropped = dropped,
+                    current_turn_messages_kept = this_turn.len(),
                     prime_for = prime_for.as_deref().unwrap_or("-"),
                     "Context reset at episode boundary (canonical re-anchored, summary kept)"
                 );
@@ -4211,6 +4229,7 @@ impl OpenFangKernel {
         &self,
         agent_id: AgentId,
         prime_for: Option<&str>,
+        carry: &[openfang_types::message::Message],
     ) -> KernelResult<usize> {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -4218,16 +4237,24 @@ impl OpenFangKernel {
 
         let _ = self.memory.delete_session(entry.session_id);
 
-        let new_session = self
+        let mut new_session = self
             .memory
             .create_session(agent_id)
             .map_err(KernelError::OpenFang)?;
+        if !carry.is_empty() {
+            // The fresh session is what the next turn loads. Seed it with the
+            // asking turn so the new topic is still in view.
+            new_session.messages = carry.to_vec();
+            self.memory
+                .save_session(&new_session)
+                .map_err(KernelError::OpenFang)?;
+        }
         self.registry
             .update_session_id(agent_id, new_session.id)
             .map_err(KernelError::OpenFang)?;
 
         self.memory
-            .reanchor_canonical(agent_id, prime_for)
+            .reanchor_canonical(agent_id, prime_for, carry)
             .map_err(KernelError::OpenFang)
     }
 
