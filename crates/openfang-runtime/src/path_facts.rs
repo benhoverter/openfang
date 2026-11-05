@@ -319,7 +319,7 @@ fn read_script_body(
     body.writes_fleet_rules = openfang_types::gatekeeper::body_writes_fleet_rules(&text);
     // N1 routing. Plaintext for the same reason: redaction blanks the rest of
     // `auth_rules = Path.home() / ".openfang" / ...`.
-    body.names_control_plane = openfang_types::gatekeeper::names_control_plane(&text);
+    body.names_control_plane = openfang_types::gatekeeper::body_names_control_plane(&text);
 
     // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
     //

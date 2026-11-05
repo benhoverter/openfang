@@ -445,11 +445,17 @@ fn exec_tokens(command: &str) -> (Vec<&str>, bool) {
             i += 1;
             while i < tokens.len() {
                 let t = tokens[i];
-                let duration = t
-                    .trim_end_matches(['s', 'm', 'h', 'd'])
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '.');
-                if t.starts_with('-') || is_assignment(t) || (!t.is_empty() && duration) {
+                // A duration starts with a digit. Without that check, trimming
+                // the unit letters turns `sh`, `ssh` or `dd` into "" and skips
+                // the program itself (security W1).
+                let duration = t.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                    && t.trim_end_matches(['s', 'm', 'h', 'd'])
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '.');
+                if is_script_interpreter(t) {
+                    break;
+                }
+                if t.starts_with('-') || is_assignment(t) || duration {
                     i += 1;
                 } else {
                     break;
@@ -1852,6 +1858,11 @@ mod anai_206_f1_tests {
             "./x.cjs",
             "./x.ts",
             "osascript x.applescript",
+            "nohup sh ./x",
+            "timeout 60 sh ./x",
+            "env sh ./w",
+            "timeout 5 sh -c true",
+            "timeout 5s bash ./x",
         ] {
             assert!(executes_script_like(cmd), "{cmd}");
         }

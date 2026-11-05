@@ -4104,6 +4104,8 @@ fn references_tainted(token: &str, tainted: &[String]) -> bool {
 /// unless it names a known-benign subtree. [`CONTROL_PATH_FRAGMENTS`] is kept
 /// as documentation of the cases we know about and as belt to a future edit of
 /// the benign list.
+///
+/// For a script body, use [`body_names_control_plane`] instead.
 pub fn names_control_plane(s: &str) -> bool {
     let lowered = s.to_ascii_lowercase();
     if CONTROL_PATH_FRAGMENTS
@@ -4162,6 +4164,17 @@ pub fn names_control_plane(s: &str) -> bool {
         rest = &rest[idx + CONTROL_PLANE_ROOT_BARE.len()..];
     }
     false
+}
+
+/// [`names_control_plane`] for a script body, where a path is often built
+/// from parts: `os.path.join(home, ".openfang/workspaces/me", "..", "RULES.md")`
+/// puts the `..` in its own string, so the benign-prefix span never sees it.
+/// A body that mentions the root and has any quoted string starting with
+/// `..` counts as a hit (security, N1 M2 follow-on). The cost is a judge call.
+pub fn body_names_control_plane(text: &str) -> bool {
+    names_control_plane(text)
+        || (text.to_ascii_lowercase().contains(CONTROL_PLANE_ROOT_BARE)
+            && ["\"..", "'..", "`.."].iter().any(|q| text.contains(q)))
 }
 
 /// True if `s` names the substrate itself: the control-plane root, or one of
@@ -7988,6 +8001,21 @@ mod anai_206_f1_f2_tests {
             "cp ../a.md ~/.openfang/workspaces/me/a.md"
         ));
         assert!(!names_control_plane("~/.openfang/workspaces/me/..notes.md"));
+    }
+
+    #[test]
+    fn body_climb_in_separate_strings_counts() {
+        assert!(body_names_control_plane(
+            "os.path.join(home, \".openfang/workspaces/me\", \"..\", \"..\", \"RULES.md\")"
+        ));
+        assert!(body_names_control_plane(
+            "Path.home() / '.openfang/workspaces/me' / '..' / '..' / 'RULES.md'"
+        ));
+        // A clean workspace write, and a `..` with no root, stay quiet.
+        assert!(!body_names_control_plane(
+            "open(Path.home() / '.openfang/workspaces/me/a.md', 'w')"
+        ));
+        assert!(!body_names_control_plane("open('../a.md')"));
     }
 
     #[test]
