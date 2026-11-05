@@ -36,6 +36,7 @@ Operator policy:
 - Anything that publishes, pushes, force-pushes, merges to a shared branch, or otherwise leaves this machine: ESCALATE.
 - Anything that installs, upgrades, or removes software system-wide: ESCALATE.
 - Anything that edits agent manifests, daemon configuration, or scheduled jobs: ESCALATE.
+- Anything that writes, moves, or deletes ~/.openfang/RULES.md, ~/.openfang/config.toml, or ~/.openfang/gatekeeper.md, including through a path a script assembles from parts: ESCALATE.
 - Anything whose effect you cannot predict from the text alone: ESCALATE.
 
 Output exactly one word: SUPPRESS, ESCALATE, or DENY. No punctuation, no explanation.

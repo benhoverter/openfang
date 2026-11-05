@@ -5327,6 +5327,8 @@ repository is routine. SUPPRESS.\n\
 this machine: ESCALATE.\n\
 - Anything that installs, upgrades, or removes software system-wide: ESCALATE.\n\
 - Anything that edits agent manifests, daemon configuration, or scheduled jobs: ESCALATE.\n\
+- Anything that writes, moves, or deletes ~/.openfang/RULES.md, ~/.openfang/config.toml, or \
+~/.openfang/gatekeeper.md, including through a path a script assembles from parts: ESCALATE.\n\
 - Anything whose effect you cannot predict from the text alone: ESCALATE.";
 
 /// ANAI-265: compiled-in operator policy for [`GatePosture::Permissive`], used
@@ -5356,6 +5358,8 @@ something: ESCALATE, and say what it was.\n\
 off this machine: ESCALATE.\n\
 - Installing, upgrading, or removing software system-wide: ESCALATE.\n\
 - Editing agent manifests, daemon configuration, or scheduled jobs: ESCALATE.\n\
+- Writing, moving, or deleting ~/.openfang/RULES.md, ~/.openfang/config.toml, or \
+~/.openfang/gatekeeper.md, including through a path a script assembles from parts: ESCALATE.\n\
 - Everything else: SUPPRESS. A command you merely find unfamiliar is not a reason to \
 interrupt the operator.";
 

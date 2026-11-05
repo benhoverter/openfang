@@ -234,6 +234,40 @@ fn curl_floor_gate(
 /// changes the lists copied into the request, never a flag.
 ///
 /// [`GateFlags::hard`]: openfang_types::gatekeeper::GateFlags::hard
+#[derive(Debug, Default)]
+struct ShellFloor {
+    /// The hard flags hit, for the log and the prompt. `None` when clear.
+    hard: Option<String>,
+    /// The call runs a script that names `.openfang`, or one we could not
+    /// read. See [`script_needs_judge`].
+    script_to_judge: bool,
+}
+
+/// True when a trusted-tier script run must go to the judge instead of being
+/// auto-approved (N1, 2026-11-05).
+///
+/// The hard floor matches protected names inside one token. A script can
+/// assemble the path at run time (`Path.home() / ".openfang" / "RULES.md"`),
+/// so no token holds it and the floor stays clear. Name matching cannot close
+/// that; the judge reads the whole body and can. So any script whose body
+/// names the control plane goes to the judge, and so does any script whose
+/// body we could not read (fail closed: an unread body could say anything).
+/// With no script file, the command line itself is checked, which covers
+/// inline forms like `python3 -c '...'`.
+fn script_needs_judge(command: &str, sheet: &openfang_types::path_facts::PathFactSheet) -> bool {
+    use openfang_types::gatekeeper::names_control_plane;
+    if !openfang_types::path_facts::executes_script_like(command) {
+        return false;
+    }
+    match &sheet.script_body {
+        Some(body) if body.status.included() => {
+            body.content.as_deref().is_none_or(names_control_plane)
+        }
+        Some(_) => true,
+        None => names_control_plane(command),
+    }
+}
+
 async fn shell_hard_floor(
     tool_name: &str,
     input: &serde_json::Value,
@@ -241,11 +275,13 @@ async fn shell_hard_floor(
     exec_policy: Option<&openfang_types::config::ExecPolicy>,
     workspace_root: Option<&Path>,
     file_policy: Option<&openfang_types::config::FilePolicy>,
-) -> Option<String> {
+) -> ShellFloor {
     if !is_shell_tool(tool_name) {
-        return None;
+        return ShellFloor::default();
     }
-    let command = input.get("command").and_then(|v| v.as_str())?;
+    let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+        return ShellFloor::default();
+    };
     let default_policy;
     let policy = match exec_policy {
         Some(p) => p,
@@ -264,7 +300,10 @@ async fn shell_hard_floor(
         openfang_types::gatekeeper::GatePosture::Strict,
     )
     .await;
-    req.flags.hard().then(|| req.flags.as_log_string())
+    ShellFloor {
+        hard: req.flags.hard().then(|| req.flags.as_log_string()),
+        script_to_judge: script_needs_judge(command, &req.path_facts),
+    }
 }
 
 /// Check if a URL should be blocked by taint tracking before network fetch.
@@ -463,8 +502,8 @@ pub async fn execute_tool(
     // already did: a fresh human prompt for this exact call, which neither
     // reads nor seeds Approve-Similar. Where nobody can be asked, it refuses.
     // Full mode (and allowlist `*`) never prompts and is not covered (M6).
-    let hard_floor = if exec_policy_bypasses_approval {
-        None
+    let floor = if exec_policy_bypasses_approval {
+        ShellFloor::default()
     } else {
         shell_hard_floor(
             tool_name,
@@ -476,6 +515,7 @@ pub async fn execute_tool(
         )
         .await
     };
+    let hard_floor = floor.hard;
     if let Some(hit) = &hard_floor {
         let can_prompt = kernel.is_some_and(|kh| kh.requires_approval(tool_name));
         warn!(
@@ -498,7 +538,30 @@ pub async fn execute_tool(
             };
         }
     }
-    let auto_approved = auto_approved.filter(|_| hard_floor.is_none());
+    // N1: a trusted script run that names `.openfang` (or that we could not
+    // read) loses auto-approve and goes to the judge, which reads the body.
+    // Unlike a hard hit, the judge may still suppress it.
+    if floor.script_to_judge && hard_floor.is_none() && auto_approved.is_some() {
+        let can_prompt = kernel.is_some_and(|kh| kh.requires_approval(tool_name));
+        warn!(
+            tool_name,
+            agent = caller_agent_id.unwrap_or("unknown"),
+            can_prompt,
+            "Trusted script names the control plane: routing to the gatekeeper"
+        );
+        if !can_prompt {
+            return ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!(
+                    "Refused: this script mentions ~/.openfang (or could not be read), so it \
+                     needs a gatekeeper review, and this agent's {tool_name} runs without an \
+                     approval prompt, so nobody can review it. Nothing was run."
+                ),
+                is_error: true,
+            };
+        }
+    }
+    let auto_approved = auto_approved.filter(|_| hard_floor.is_none() && !floor.script_to_judge);
 
     // The curl floor, before any approval machinery. `Deny` is terminal: it
     // returns here, so no judge, prompt, cache or posture ever sees it.
@@ -555,8 +618,9 @@ pub async fn execute_tool(
             // ★ ANAI-154, layer 3.5: the gatekeeper sits between the
             // Approve-Similar cache and the human prompt. Everything that
             // reaches here has already cleared the hard-deny floor and the
-            // allowlist wall, and has at least one base that comes only from
-            // `allowed_commands` — otherwise `auto_approved` would be `Some`.
+            // allowlist wall, and either has at least one base that comes only
+            // from `allowed_commands`, hit the hard floor, or is a trusted
+            // script run withdrawn by `script_needs_judge` (N1).
             //
             // The gate is inert unless the operator turned it on: the kernel's
             // impl returns `Escalate` when `[gatekeeper] enabled = false`, and
@@ -13516,6 +13580,243 @@ mod tests {
 
         let after = std::fs::metadata(&rules).unwrap().modified().unwrap();
         assert_eq!(before, after, "the refused touch must not have run");
+    }
+
+    // ---- N1: trusted script runs that name `.openfang` go to the judge -----
+    //
+    // The hard floor matches a protected name inside one token, so a script
+    // that assembles the path from parts sails through it. These pin the
+    // routing that hands such a script to the judge, which reads the body.
+
+    fn n1_policy() -> openfang_types::config::ExecPolicy {
+        openfang_types::config::ExecPolicy {
+            mode: openfang_types::config::ExecSecurityMode::Allowlist,
+            trusted_commands: ["python3", "node", "sh", "echo"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            safe_bins: Vec::new(),
+            allowed_commands: Vec::new(),
+            ..openfang_types::config::ExecPolicy::default()
+        }
+    }
+
+    /// A workspace the agent can write, so the gate is allowed to read the
+    /// script body (`read_script_body` guardrail 2).
+    fn n1_ws() -> (tempfile::TempDir, openfang_types::config::FilePolicy) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = dir.path().canonicalize().unwrap();
+        let fp = openfang_types::config::FilePolicy::new(
+            true,
+            openfang_types::config::FileAccessTier::Deny,
+            vec![openfang_types::config::FileRule {
+                path: ws.display().to_string(),
+                tier: openfang_types::config::FileAccessTier::Write,
+            }],
+        );
+        (dir, fp)
+    }
+
+    async fn run_in_ws(
+        handle: &Arc<dyn crate::kernel_handle::KernelHandle>,
+        ws: &Path,
+        fp: Option<&openfang_types::config::FilePolicy>,
+        command: &str,
+    ) -> ToolResult {
+        let input = serde_json::json!({ "command": command });
+        let policy = n1_policy();
+        execute_tool(
+            "test-id",
+            "shell_exec",
+            &input,
+            Some(handle),
+            None,
+            Some("test-agent"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(ws),
+            None,
+            Some(&policy),
+            fp,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    fn flag(b: &std::sync::atomic::AtomicBool) -> bool {
+        b.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The 2026-11-05 miss, and tools' point that the interpreter list is not
+    /// the boundary: python3, node and sh scripts all lose auto-approve and
+    /// reach the judge. Denied, so none run.
+    ///
+    /// Every script here only ever names a `.openfang` under the temp dir,
+    /// never `$HOME`, so a regression that lets one run cannot touch the live
+    /// control plane. (A mutation run on 2026-11-05 proved this matters.)
+    #[tokio::test]
+    async fn n1_trusted_script_naming_openfang_goes_to_the_judge() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        let w = ws.display();
+        std::fs::write(
+            ws.join("apply.py"),
+            "from pathlib import Path\np = Path.home() / \".openfang\" / \"RULES.md\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("apply.js"),
+            format!("const p = '{w}' + '/.openfang/' + 'RU' + 'LES.md';\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("apply.sh"),
+            format!("d=\"{w}/.openfang\"\nmkdir -p \"$d\"\necho > \"$d/RU\"LES.md\n"),
+        )
+        .unwrap();
+        let cases = [
+            format!("python3 {w}/apply.py"),
+            format!("node {w}/apply.js"),
+            format!("sh {w}/apply.sh"),
+        ];
+        for cmd in &cases {
+            let fake = Arc::new(
+                FakeKernelHandle::new()
+                    .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+            );
+            let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+            let r = run_in_ws(&handle, &ws, Some(&fp), cmd).await;
+            assert!(r.is_error, "{cmd}: denied, so must not run: {}", r.content);
+            assert!(
+                flag(&fake.gate_consulted),
+                "{cmd}: the judge must see it: {}",
+                r.content
+            );
+            assert!(
+                flag(&fake.approval_requested),
+                "{cmd}: escalates to a human"
+            );
+        }
+
+        // Inline, no script file: already a hard hit (`script_body_blind`), so
+        // it skips the judge and goes straight to a fresh prompt. Stricter
+        // than N1's routing, and pinned here so the two do not drift apart.
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_in_ws(&handle, &ws, Some(&fp), "sh -c 'echo ~/.openfang/x'").await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(flag(&fake.approval_requested));
+        let note = fake
+            .approval_note
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        assert!(note.starts_with("hard floor: "), "{note}");
+    }
+
+    /// Unlike a hard hit, the judge may still wave a routed script through.
+    #[tokio::test]
+    async fn n1_judge_may_suppress_a_routed_script() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("read.sh"), "echo .openfang\n").unwrap();
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_gate_verdict(openfang_types::gatekeeper::GateVerdict::Suppress),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let cmd = format!("sh {}/read.sh", ws.display());
+        let r = run_in_ws(&handle, &ws, Some(&fp), &cmd).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains(".openfang"), "{}", r.content);
+        assert!(flag(&fake.gate_consulted));
+        assert!(!flag(&fake.approval_requested));
+    }
+
+    /// A script that never mentions `.openfang` keeps the fast path.
+    #[tokio::test]
+    async fn n1_clean_trusted_script_stays_auto_approved() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("clean.sh"), "echo clean\n").unwrap();
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let cmd = format!("sh {}/clean.sh", ws.display());
+        let r = run_in_ws(&handle, &ws, Some(&fp), &cmd).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("clean"), "{}", r.content);
+        assert!(!flag(&fake.gate_consulted));
+        assert!(!flag(&fake.approval_requested));
+    }
+
+    /// Fail closed: a body the gate may not read could say anything.
+    #[tokio::test]
+    async fn n1_unreadable_script_goes_to_the_judge() {
+        let (dir, _fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("clean.sh"), "echo clean\n").unwrap();
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        // No file_policy, so the path is outside reach and the body unread.
+        let cmd = format!("sh {}/clean.sh", ws.display());
+        let r = run_in_ws(&handle, &ws, None, &cmd).await;
+        assert!(r.is_error, "{}", r.content);
+        assert!(flag(&fake.gate_consulted));
+    }
+
+    /// Nobody can be asked: refused, never run.
+    #[tokio::test]
+    async fn n1_refuses_when_nobody_can_review() {
+        let (dir, fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        let target = ws.join(".openfang");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(
+            ws.join("touch.sh"),
+            format!("touch \"{}\"/x\n", target.display()),
+        )
+        .unwrap();
+        let fake = Arc::new(FakeKernelHandle::new());
+        fake.no_approval
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let cmd = format!("sh {}/touch.sh", ws.display());
+        let r = run_in_ws(&handle, &ws, Some(&fp), &cmd).await;
+        assert!(r.is_error);
+        assert!(r.content.contains("nobody can review"), "{}", r.content);
+        assert!(!flag(&fake.gate_consulted));
+    }
+
+    /// The judge's built-in policy names the three protected files in both
+    /// postures, so a permissive judge escalates an assembled-path write.
+    #[test]
+    fn n1_builtin_policies_escalate_protected_file_writes() {
+        for p in [
+            openfang_types::gatekeeper::DEFAULT_POLICY,
+            openfang_types::gatekeeper::DEFAULT_POLICY_PERMISSIVE,
+        ] {
+            for name in [
+                "~/.openfang/RULES.md",
+                "~/.openfang/config.toml",
+                "~/.openfang/gatekeeper.md",
+            ] {
+                assert!(p.contains(name), "{name}");
+            }
+            assert!(p.contains("assembles from parts"));
+        }
     }
 
     /// ANAI-240: the deterministic sheet verdict is recorded on every row.
