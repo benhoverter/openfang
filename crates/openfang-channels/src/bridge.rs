@@ -780,6 +780,8 @@ impl SendReport {
 /// (`/bot<TOKEN>/sendMessage`), and reqwest's Display prints the full URL.
 /// These errors now reach the agent through `channel_send`, so every URL in
 /// the text is cut to `scheme://host`, dropping userinfo, path and query.
+/// Only URLs with a `scheme://` are caught; a scheme-less URL passes through,
+/// and the tool-result SecretScrubber is the second layer for that case.
 fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -990,8 +992,10 @@ async fn send_parsed_inner(
         let error = match dispatch_content(adapter, user, content, thread_id).await {
             Ok(()) => None,
             Err(e) => {
-                error!("Failed to send response: {e}");
-                Some(redact_urls(&e.to_string()))
+                // Redacted in the log too: agents with whole-home read can read it.
+                let redacted = redact_urls(&e.to_string());
+                error!("Failed to send response: {redacted}");
+                Some(redacted)
             }
         };
         let Some(error) = error else { continue };
