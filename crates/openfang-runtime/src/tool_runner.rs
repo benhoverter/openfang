@@ -309,7 +309,13 @@ async fn shell_hard_floor(
     .await;
     ShellFloor {
         hard: req.flags.hard().then(|| req.flags.as_log_string()),
-        script_to_judge: script_needs_judge(command, &req.path_facts),
+        // An agent's `trusted_invocations` entry skips only the judge step;
+        // `hard` above is computed regardless.
+        script_to_judge: script_needs_judge(command, &req.path_facts)
+            && !openfang_types::path_facts::matches_trusted_invocation(
+                command,
+                &policy.trusted_invocations,
+            ),
     }
 }
 
@@ -13933,6 +13939,58 @@ mod tests {
         assert!(!r.is_error, "{}", r.content);
         assert!(flag(&fake.approval_requested));
         assert_eq!(*fake.approval_cache_binary.lock().unwrap(), None);
+    }
+
+    // ---- trusted_invocations: a listed command skips the judge only -------
+
+    /// The unreadable script that `n1_unreadable_script_goes_to_the_judge`
+    /// routes, now listed for the agent: it runs with no judge and no prompt.
+    #[tokio::test]
+    async fn trusted_invocation_skips_the_judge() {
+        let (dir, _fp) = n1_ws();
+        let ws = dir.path().canonicalize().unwrap();
+        std::fs::write(ws.join("clean.sh"), "echo clean\n").unwrap();
+        let cmd = format!("sh {}/clean.sh", ws.display());
+        let policy = openfang_types::config::ExecPolicy {
+            trusted_invocations: vec![cmd.clone()],
+            ..n1_policy()
+        };
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_gated(&handle, &policy, &cmd).await;
+        assert!(!r.is_error, "{}", r.content);
+        assert!(r.content.contains("clean"), "{}", r.content);
+        assert!(
+            !flag(&fake.gate_consulted),
+            "a listed command skips the judge"
+        );
+        assert!(!flag(&fake.approval_requested));
+    }
+
+    /// A listed command that hits the hard floor still needs a fresh prompt.
+    #[tokio::test]
+    async fn trusted_invocation_does_not_lift_the_hard_floor() {
+        let (_dir, root) = fake_control_root();
+        let cmd = format!("touch {root}/RULES.md");
+        let policy = openfang_types::config::ExecPolicy {
+            trusted_invocations: vec![cmd.clone()],
+            ..tier_policy("trusted")
+        };
+        let fake = Arc::new(
+            FakeKernelHandle::new()
+                .with_approval_decision(openfang_types::approval::ApprovalDecision::Denied),
+        );
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let r = run_gated(&handle, &policy, &cmd).await;
+        assert!(r.is_error, "denied, so must not run: {}", r.content);
+        assert!(flag(&fake.approval_requested));
+        let note = fake
+            .approval_note
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        assert!(note.starts_with("hard floor: "), "{note}");
     }
 
     /// The judge's built-in policy names the three protected files in both

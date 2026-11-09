@@ -500,6 +500,67 @@ pub fn executes_script_like(command: &str) -> bool {
     runs_script(first) || (wrapped && tokens.iter().any(runs_script))
 }
 
+/// Launcher options that can sit between the program and the entry's next
+/// word: `(program, flags with no value, flags that take one value)`. An
+/// option not listed here means no match, so an unknown `npx` flag (`-c`,
+/// `--package`, `--call`) goes to the judge as before.
+const LAUNCHER_OPTIONS: &[(&str, &[&str], &[&str])] = &[(
+    "npx",
+    &["-y", "--yes", "--no", "-q", "--quiet"],
+    &["--prefix"],
+)];
+
+/// Characters that make whitespace splitting unreliable or chain a second
+/// command. A command or entry containing any of them never matches.
+const INVOCATION_UNSAFE_CHARS: &[char] = &[
+    ';', '|', '&', '<', '>', '`', '$', '(', ')', '\'', '"', '\\', '\n', '\r', '*', '?', '[', '{',
+];
+
+/// True when `command` starts with one of `entries` (`trusted_invocations` in
+/// an agent's `[exec_policy]`), compared word by word.
+///
+/// An entry is a program followed by the words that must come next, for
+/// example `npx wrangler deploy`. The command matches when its first word is
+/// exactly that program (a bare name, so `./npx` or `/tmp/npx` never match),
+/// any options after it are known launcher options (see
+/// [`LAUNCHER_OPTIONS`]), and the entry's remaining words follow in order.
+/// Anything after that is free. Fails closed: entries with fewer than two
+/// words, a path as the program, or shell syntax are ignored, and so are
+/// commands with leading assignments, wrappers or shell syntax.
+#[must_use]
+pub fn matches_trusted_invocation(command: &str, entries: &[String]) -> bool {
+    if command.contains(INVOCATION_UNSAFE_CHARS) {
+        return false;
+    }
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    entries.iter().any(|entry| {
+        if entry.contains(INVOCATION_UNSAFE_CHARS) {
+            return false;
+        }
+        let words: Vec<&str> = entry.split_whitespace().collect();
+        let [program, rest @ ..] = words.as_slice() else {
+            return false;
+        };
+        if rest.is_empty() || program.contains('/') || tokens.first() != Some(program) {
+            return false;
+        }
+        let mut i = 1;
+        if let Some((_, flags, valued)) = LAUNCHER_OPTIONS.iter().find(|(p, ..)| p == program) {
+            while let Some(t) = tokens.get(i).filter(|t| t.starts_with('-')) {
+                let name = t.split_once('=').map_or(*t, |(n, _)| n);
+                if flags.contains(t) {
+                    i += 1;
+                } else if valued.contains(&name) {
+                    i += if t.contains('=') { 1 } else { 2 };
+                } else {
+                    return false;
+                }
+            }
+        }
+        tokens.len() >= i + rest.len() && tokens[i..i + rest.len()] == *rest
+    })
+}
+
 /// Substrings in an assignment's left-hand side that make its value a secret.
 pub const SECRET_KEY_HINTS: &[&str] = &[
     "secret",
@@ -1891,5 +1952,98 @@ mod anai_206_f1_tests {
             script_body_target("python3.12 /home/a/x.py", &[]).as_deref(),
             Some("/home/a/x.py")
         );
+    }
+
+    fn invocations() -> Vec<String> {
+        ["npx wrangler deployments", "npx wrangler deploy"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn trusted_invocation_matches_bens_deploy_command() {
+        let cmd = "npx --prefix /Users/rlyeh/GitHub/Repos/kimiya/ACTIVE-design-a/web wrangler \
+                   deployments status --env staging -c \
+                   /Users/rlyeh/GitHub/Repos/kimiya/ACTIVE-design-a/worker/wrangler.toml";
+        assert!(matches_trusted_invocation(cmd, &invocations()));
+        assert!(matches_trusted_invocation(
+            "npx wrangler deploy",
+            &invocations()
+        ));
+        assert!(matches_trusted_invocation(
+            "npx -y --prefix=/w wrangler deploy --env staging",
+            &invocations()
+        ));
+    }
+
+    #[test]
+    fn trusted_invocation_rejects_other_subcommands() {
+        for cmd in [
+            "npx wrangler delete",
+            "npx wrangler",
+            "npx wrangler deployer",
+            "npx wranglerx deploy",
+            "npx --prefix /w wrangler d1 execute db",
+        ] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn trusted_invocation_rejects_unknown_launcher_option() {
+        for cmd in [
+            "npx -c wrangler deploy",
+            "npx --package evil wrangler deploy",
+            "npx --call x wrangler deploy",
+            "npx --prefix",
+        ] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn trusted_invocation_requires_bare_program() {
+        for cmd in [
+            "./npx wrangler deploy",
+            "/tmp/npx wrangler deploy",
+            "FOO=1 npx wrangler deploy",
+            "timeout 60 npx wrangler deploy",
+        ] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd}");
+        }
+        let path_entry = vec!["/usr/bin/npx wrangler deploy".to_string()];
+        assert!(!matches_trusted_invocation(
+            "/usr/bin/npx wrangler deploy",
+            &path_entry
+        ));
+    }
+
+    #[test]
+    fn trusted_invocation_rejects_shell_syntax() {
+        for cmd in [
+            "npx wrangler deploy; rm -rf x",
+            "npx wrangler deploy && curl x",
+            "npx wrangler deploy | sh",
+            "npx wrangler deploy $(id)",
+            "npx wrangler deploy `id`",
+            "npx wrangler deploy > out",
+            "npx wrangler deploy\nrm x",
+            "npx \"wrangler\" deploy",
+        ] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_invocation_ignores_malformed_entries() {
+        for entry in ["npx", "", "npx wrangler deploy; rm", "npx $X deploy"] {
+            let entries = vec![entry.to_string()];
+            assert!(
+                !matches_trusted_invocation("npx wrangler deploy", &entries),
+                "{entry:?}"
+            );
+            assert!(!matches_trusted_invocation("npx", &entries), "{entry:?}");
+        }
     }
 }

@@ -177,6 +177,7 @@ struct ExecPolicyShadow {
     safe_bins: Option<Vec<String>>,
     allowed_commands: Option<Vec<String>>,
     trusted_commands: Option<Vec<String>>,
+    trusted_invocations: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     max_output_bytes: Option<usize>,
     no_output_timeout_secs: Option<u64>,
@@ -192,6 +193,7 @@ impl ExecPolicyShadow {
             safe_bins: self.safe_bins.unwrap_or_default(),
             allowed_commands: self.allowed_commands.unwrap_or_default(),
             trusted_commands: self.trusted_commands.unwrap_or_default(),
+            trusted_invocations: self.trusted_invocations.unwrap_or_default(),
             timeout_secs: self.timeout_secs.unwrap_or(d.timeout_secs),
             max_output_bytes: self.max_output_bytes.unwrap_or(d.max_output_bytes),
             no_output_timeout_secs: self

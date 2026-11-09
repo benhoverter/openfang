@@ -1435,6 +1435,25 @@ pub struct ExecPolicy {
     /// is about scope (fleet-wide vs per-agent), not trust level.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub trusted_commands: Vec<String>,
+    /// Per-agent command prefixes that skip the gatekeeper judge, matched
+    /// word by word (see [`crate::path_facts::matches_trusted_invocation`]).
+    /// Example: `["npx wrangler deploy", "npx wrangler deployments"]`.
+    ///
+    /// Only for commands that are already auto-approved through
+    /// `trusted_commands` or `safe_bins` but would be sent to the judge
+    /// because they run code the gate cannot read (`npx` runs a package).
+    /// A match skips that judge review and nothing else: the hard floor
+    /// still runs first, so a matching command that writes RULES.md or
+    /// `config.toml` still prompts a human.
+    ///
+    /// A listed command is not vouched for. `npx wrangler deploy` runs
+    /// whatever `wrangler.toml` and the build step tell it to; the entry only
+    /// says the judge need not read it first.
+    ///
+    /// Agent-only, like `trusted_commands`: ignored in the global
+    /// `config.toml`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub trusted_invocations: Vec<String>,
     /// Max execution timeout in seconds. Default: 30.
     pub timeout_secs: u64,
     /// Max output size in bytes. Default: 100KB.
@@ -1486,6 +1505,7 @@ impl Default for ExecPolicy {
             .collect(),
             allowed_commands: Vec::new(),
             trusted_commands: Vec::new(),
+            trusted_invocations: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 100 * 1024,
             no_output_timeout_secs: default_no_output_timeout(),
@@ -1541,6 +1561,7 @@ impl ExecPolicy {
                 self.allowed_commands.clone()
             },
             trusted_commands: self.trusted_commands.clone(),
+            trusted_invocations: self.trusted_invocations.clone(),
             timeout_secs: self.timeout_secs,
             max_output_bytes: self.max_output_bytes,
             no_output_timeout_secs: self.no_output_timeout_secs,
@@ -1563,6 +1584,7 @@ impl ExecPolicy {
         match manifest_override {
             None => ExecPolicy {
                 trusted_commands: Vec::new(),
+                trusted_invocations: Vec::new(),
                 ..global.clone()
             },
             Some(ov) => ov.merged_over(global),
@@ -1574,7 +1596,7 @@ impl ExecPolicy {
     /// `config.toml`. Callers warn; the field is ignored either way.
     #[must_use]
     pub fn declares_misplaced_trusted_commands(&self) -> bool {
-        !self.trusted_commands.is_empty()
+        !self.trusted_commands.is_empty() || !self.trusted_invocations.is_empty()
     }
 }
 
@@ -6493,6 +6515,27 @@ shell_env_passthrough = ["*"]
         };
         let eff = ExecPolicy::resolve_over_global(&global, Some(ov));
         assert_eq!(eff.trusted_commands, vec!["cargo".to_string()]);
+    }
+
+    #[test]
+    fn exec_policy_trusted_invocations_are_agent_only() {
+        let global = ExecPolicy {
+            trusted_invocations: vec!["npx wrangler deploy".to_string()],
+            ..exec_global()
+        };
+        let eff = ExecPolicy::resolve_over_global(&global, None);
+        assert!(eff.trusted_invocations.is_empty());
+        assert!(global.declares_misplaced_trusted_commands());
+
+        let ov = ExecPolicy {
+            trusted_invocations: vec!["npx wrangler deployments".to_string()],
+            ..ExecPolicy::default()
+        };
+        let eff = ExecPolicy::resolve_over_global(&global, Some(ov));
+        assert_eq!(
+            eff.trusted_invocations,
+            vec!["npx wrangler deployments".to_string()]
+        );
     }
 
     #[test]
