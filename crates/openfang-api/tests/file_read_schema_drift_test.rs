@@ -316,3 +316,50 @@ fn file_upload_is_privileged_and_workspace_scoped() {
         "file_upload"
     ));
 }
+
+#[test]
+fn both_tool_surfaces_serve_the_same_video_digest_tool() {
+    let runtime = openfang_runtime::tool_runner::builtin_tool_definitions()
+        .into_iter()
+        .find(|d| d.name == "video_digest")
+        .expect("the runtime defines video_digest");
+    let bridge = openfang_mcp_bridge::built_in_tools()
+        .into_iter()
+        .find(|t| t.name == "video_digest")
+        .expect("the bridge advertises video_digest");
+
+    assert_eq!(
+        openfang_mcp_bridge::VIDEO_DIGEST_DESCRIPTION,
+        openfang_runtime::video_digest::DESCRIPTION,
+        "the bridge's video_digest description has drifted from the runtime's"
+    );
+    assert_eq!(
+        runtime.description,
+        openfang_runtime::video_digest::DESCRIPTION
+    );
+    assert_eq!(
+        runtime.input_schema,
+        openfang_runtime::video_digest::input_schema()
+    );
+    assert_eq!(
+        serde_json::to_value(&*bridge.input_schema).unwrap(),
+        runtime.input_schema,
+        "the bridge's hand-copied video_digest schema has drifted from the runtime's"
+    );
+}
+
+/// video_digest spawns ffmpeg/whisper and writes files: dispatchable,
+/// workspace-scoped, privileged (a manifest has to name it), never read-only,
+/// reserved against MCP shadowing, and not a file_read companion.
+#[test]
+fn video_digest_is_privileged_and_workspace_scoped() {
+    assert!(openfang_api::bridge_ipc::ALLOWED_TOOLS.contains(&"video_digest"));
+    assert!(openfang_mcp_bridge::PRIVILEGED_DEFAULT_DENY.contains(&"video_digest"));
+    assert!(
+        !openfang_mcp_bridge::DEFAULT_ALLOWED.contains(&"video_digest"),
+        "video_digest must never be reachable from the no-env-var fallback"
+    );
+    assert!(openfang_runtime::tool_runner::FS_SANDBOXED_TOOLS.contains(&"video_digest"));
+    assert!(!openfang_types::turn::READ_ONLY_TOOLS.contains(&"video_digest"));
+    assert!(openfang_runtime::mcp::RESERVED_BUILTIN_NAMES.contains(&"video_digest"));
+}

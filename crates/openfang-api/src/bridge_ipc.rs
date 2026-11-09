@@ -124,6 +124,8 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     // Privileged-deny (sends workspace bytes off the machine); inert without
     // `[[upload_targets]]` in the caller's manifest.
     "file_upload",
+    // Privileged-deny: spawns ffmpeg/whisper and writes into the workspace.
+    "video_digest",
 ];
 
 /// Subset of [`ALLOWED_TOOLS`] that operates on the agent's workspace

@@ -46,6 +46,8 @@ pub const FS_SANDBOXED_TOOLS: &[&str] = &[
     "file_convert",
     // Reads a workspace file to send it; the path is file_read's.
     "file_upload",
+    // Reads its input like file_read and writes only inside the workspace.
+    "video_digest",
 ];
 
 /// Check if a tool name refers to a shell execution tool.
@@ -1080,6 +1082,18 @@ pub async fn execute_tool(
             .await
         }
 
+        // Local video/audio digest (ffmpeg + whisper.cpp). The input path is
+        // file_read's (pre-pass + prevalidation); outputs stay in the workspace.
+        "video_digest" => {
+            tool_video_digest(
+                input,
+                workspace_root,
+                file_policy,
+                prevalidated_path.as_deref(),
+            )
+            .await
+        }
+
         // Web tools (upgraded: multi-provider search, SSRF-protected fetch)
         "web_fetch" => {
             // Taint check: block URLs containing secrets/PII from being exfiltrated
@@ -1631,6 +1645,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             name: "file_upload".to_string(),
             description: FILE_UPLOAD_DESCRIPTION.to_string(),
             input_schema: file_upload_input_schema(),
+        },
+        ToolDefinition {
+            name: "video_digest".to_string(),
+            description: crate::video_digest::DESCRIPTION.to_string(),
+            input_schema: crate::video_digest::input_schema(),
         },
         ToolDefinition {
             name: "create_directory".to_string(),
@@ -2585,7 +2604,9 @@ fn fs_tool_single_path<'a>(
     input: &'a serde_json::Value,
 ) -> Option<(bool, &'a str)> {
     let needs_write = match tool_name {
-        "file_read" | "file_list" | "file_grep" | "image_read" | "file_upload" => false,
+        "file_read" | "file_list" | "file_grep" | "image_read" | "file_upload" | "video_digest" => {
+            false
+        }
         "file_write" | "create_directory" => true,
         _ => return None,
     };
@@ -3037,6 +3058,29 @@ async fn tool_file_upload(
     let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
     crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
     crate::file_upload::run(input, raw_path, &resolved, targets, caller_agent_id).await
+}
+
+/// `video_digest`: the input path is `file_read`'s, unchanged (same resolver,
+/// read tier, pre-pass and prevalidation). The output folder is resolved inside
+/// [`crate::video_digest::tool`], clamped to the workspace.
+async fn tool_video_digest(
+    input: &serde_json::Value,
+    workspace_root: Option<&Path>,
+    file_policy: Option<&openfang_types::config::FilePolicy>,
+    prevalidated: Option<&Path>,
+) -> Result<String, String> {
+    let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
+    if workspace_root.is_none() {
+        // resolve_file_path skips the sandbox floor without a workspace; refuse
+        // before resolving rather than after.
+        return Err(crate::video_digest::err_envelope(
+            "NO_WORKSPACE",
+            "video_digest writes into the caller's workspace, and this call has none",
+        ));
+    }
+    let resolved = resolve_file_path(raw_path, workspace_root, file_policy, false)?;
+    crate::workspace_sandbox::assert_prevalidated(&resolved, prevalidated)?;
+    crate::video_digest::tool(input, &resolved, workspace_root, file_policy).await
 }
 
 async fn tool_file_read(
@@ -16526,6 +16570,31 @@ mod image_read_tests {
             assert!(res.is_err(), "image_read must refuse {path} too");
             assert!(images.is_empty(), "{path}: deposited an image on refusal");
         }
+    }
+
+    /// video_digest reaches exactly the inputs file_read reaches, and refuses
+    /// outright with no workspace.
+    #[tokio::test]
+    async fn video_digest_input_is_file_reads_and_needs_a_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = elsewhere.path().join("clip.mp4");
+        std::fs::write(&foreign, b"x").unwrap();
+        let foreign = foreign.to_string_lossy().into_owned();
+        for path in [foreign.as_str(), "../clip.mp4"] {
+            let res = tool_video_digest(
+                &serde_json::json!({ "path": path }),
+                Some(workspace.path()),
+                None,
+                None,
+            )
+            .await;
+            assert!(res.is_err(), "video_digest must refuse {path}");
+        }
+        let res = tool_video_digest(&serde_json::json!({ "path": foreign }), None, None, None)
+            .await
+            .unwrap_err();
+        assert!(res.contains("NO_WORKSPACE"), "{res}");
     }
 
     /// End to end through `execute_tool`: the dispatch arm exists, the

@@ -1110,7 +1110,9 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" | "agent_activate" => "Agents",
 
-        "image_describe" | "image_generate" | "audio_transcribe" | "tts_speak" => "Media",
+        "image_describe" | "image_generate" | "audio_transcribe" | "tts_speak" | "video_digest" => {
+            "Media"
+        }
 
         "docker_exec" | "docker_build" | "docker_run" => "Docker",
 
@@ -1198,6 +1200,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "image_generate" => "generate an image from a prompt",
         "audio_transcribe" => "transcribe audio to text",
         "tts_speak" => "convert text to speech",
+        "video_digest" => {
+            "turn a video into stills, a contact sheet, a transcript and audio facts you can read"
+        }
 
         // Docker
         "docker_exec" => "run a command in a container",

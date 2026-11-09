@@ -69,6 +69,7 @@ pub mod tool_policy;
 pub mod tool_runner;
 pub mod tts;
 pub mod turn_context;
+pub mod video_digest;
 pub mod web_cache;
 pub mod web_content;
 pub mod web_fetch;
