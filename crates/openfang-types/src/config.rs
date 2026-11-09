@@ -1449,6 +1449,13 @@ pub struct ExecPolicy {
     /// A listed command is not vouched for. `npx wrangler deploy` runs
     /// whatever `wrangler.toml` and the build step tell it to; the entry only
     /// says the judge need not read it first.
+    /// In practice an entry lets this agent run code it wrote, with no judge,
+    /// whenever it can write the working directory, the `--prefix` tree or
+    /// the config the command reads. A command line that names `~/.openfang`
+    /// still goes to the judge.
+    ///
+    /// Entries whose program is an interpreter or script file (`python3
+    /// build.py`, `sh x.sh`) are ignored; only launchers such as `npx` count.
     ///
     /// Agent-only, like `trusted_commands`: ignored in the global
     /// `config.toml`.

@@ -527,14 +527,24 @@ const INVOCATION_UNSAFE_CHARS: &[char] = &[
 /// Anything after that is free. Fails closed: entries with fewer than two
 /// words, a path as the program, or shell syntax are ignored, and so are
 /// commands with leading assignments, wrappers or shell syntax.
+///
+/// An entry whose program is an interpreter or a script file (`python3 x.py`,
+/// `sh build.sh`) is ignored too, unless the program is a listed launcher
+/// such as `npx`. Such an entry would name a script the agent can rewrite,
+/// so one config line would switch off the N1 body check for that agent.
+/// Non-ASCII whitespace in the command or entry means no match, since the
+/// shell layer (shlex) does not split on it.
 #[must_use]
 pub fn matches_trusted_invocation(command: &str, entries: &[String]) -> bool {
-    if command.contains(INVOCATION_UNSAFE_CHARS) {
+    let unsafe_text = |s: &str| {
+        s.contains(INVOCATION_UNSAFE_CHARS) || s.chars().any(|c| c.is_whitespace() && !c.is_ascii())
+    };
+    if unsafe_text(command) {
         return false;
     }
     let tokens: Vec<&str> = command.split_whitespace().collect();
     entries.iter().any(|entry| {
-        if entry.contains(INVOCATION_UNSAFE_CHARS) {
+        if unsafe_text(entry) {
             return false;
         }
         let words: Vec<&str> = entry.split_whitespace().collect();
@@ -544,14 +554,23 @@ pub fn matches_trusted_invocation(command: &str, entries: &[String]) -> bool {
         if rest.is_empty() || program.contains('/') || tokens.first() != Some(program) {
             return false;
         }
+        let launcher = LAUNCHER_OPTIONS.iter().find(|(p, ..)| p == program);
+        if launcher.is_none() && (is_script_interpreter(program) || looks_like_script_file(program))
+        {
+            return false;
+        }
         let mut i = 1;
-        if let Some((_, flags, valued)) = LAUNCHER_OPTIONS.iter().find(|(p, ..)| p == program) {
+        if let Some((_, flags, valued)) = launcher {
             while let Some(t) = tokens.get(i).filter(|t| t.starts_with('-')) {
                 let name = t.split_once('=').map_or(*t, |(n, _)| n);
-                if flags.contains(t) {
+                if flags.contains(t) || (valued.contains(&name) && t.contains('=')) {
                     i += 1;
-                } else if valued.contains(&name) {
-                    i += if t.contains('=') { 1 } else { 2 };
+                } else if valued.contains(t)
+                    && tokens.get(i + 1).is_some_and(|v| !v.starts_with('-'))
+                {
+                    // `--prefix --package=evil` must not read the flag as the
+                    // prefix value (security T2).
+                    i += 2;
                 } else {
                     return false;
                 }
@@ -1997,9 +2016,39 @@ mod anai_206_f1_tests {
             "npx --package evil wrangler deploy",
             "npx --call x wrangler deploy",
             "npx --prefix",
+            "npx --prefix --package=evil wrangler deploy",
+            "npx --prefix -y wrangler deploy",
         ] {
             assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd}");
         }
+    }
+
+    /// Security T3: an interpreter or script-file entry would switch off N1.
+    #[test]
+    fn trusted_invocation_ignores_interpreter_entries() {
+        for (entry, cmd) in [
+            ("python3 build.py", "python3 build.py"),
+            ("sh build.sh", "sh build.sh"),
+            ("node x.js", "node x.js"),
+            ("python3.12 -m pkg", "python3.12 -m pkg"),
+            ("deploy.sh staging", "deploy.sh staging"),
+        ] {
+            let entries = vec![entry.to_string()];
+            assert!(!matches_trusted_invocation(cmd, &entries), "{entry}");
+        }
+        // A non-interpreter program still works.
+        let entries = vec!["touch a".to_string()];
+        assert!(matches_trusted_invocation("touch a b", &entries));
+    }
+
+    /// Security (3): shlex does not split on non-ASCII spaces.
+    #[test]
+    fn trusted_invocation_rejects_non_ascii_whitespace() {
+        for cmd in ["npx wrangler\u{a0}deploy", "npx\u{3000}wrangler deploy"] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd:?}");
+        }
+        let entries = vec!["npx wrangler\u{a0}deploy".to_string()];
+        assert!(!matches_trusted_invocation("npx wrangler deploy", &entries));
     }
 
     #[test]

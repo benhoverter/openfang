@@ -310,12 +310,16 @@ async fn shell_hard_floor(
     ShellFloor {
         hard: req.flags.hard().then(|| req.flags.as_log_string()),
         // An agent's `trusted_invocations` entry skips only the judge step;
-        // `hard` above is computed regardless.
+        // `hard` above is computed regardless. The entry vouches for "the
+        // gate can't read the launched package", never for a command line
+        // that names the control plane (`wrangler deploy --outdir
+        // ~/.openfang/agents/x`), so that arm still routes (security T1).
         script_to_judge: script_needs_judge(command, &req.path_facts)
-            && !openfang_types::path_facts::matches_trusted_invocation(
-                command,
-                &policy.trusted_invocations,
-            ),
+            && (openfang_types::gatekeeper::names_control_plane(command)
+                || !openfang_types::path_facts::matches_trusted_invocation(
+                    command,
+                    &policy.trusted_invocations,
+                )),
     }
 }
 
@@ -13943,28 +13947,44 @@ mod tests {
 
     // ---- trusted_invocations: a listed command skips the judge only -------
 
-    /// The unreadable script that `n1_unreadable_script_goes_to_the_judge`
-    /// routes, now listed for the agent: it runs with no judge and no prompt.
+    async fn npx_floor(cmd: &str, listed: bool) -> ShellFloor {
+        let mut policy = n1_policy();
+        policy.trusted_commands.push("npx".to_string());
+        if listed {
+            policy.trusted_invocations = vec!["npx wrangler deploy".to_string()];
+        }
+        shell_hard_floor(
+            "shell_exec",
+            &serde_json::json!({ "command": cmd }),
+            None,
+            Some(&policy),
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// npx runs a package the gate can't read, so it routes to the judge;
+    /// a listed entry lifts exactly that.
     #[tokio::test]
     async fn trusted_invocation_skips_the_judge() {
-        let (dir, _fp) = n1_ws();
-        let ws = dir.path().canonicalize().unwrap();
-        std::fs::write(ws.join("clean.sh"), "echo clean\n").unwrap();
-        let cmd = format!("sh {}/clean.sh", ws.display());
-        let policy = openfang_types::config::ExecPolicy {
-            trusted_invocations: vec![cmd.clone()],
-            ..n1_policy()
-        };
-        let fake = Arc::new(FakeKernelHandle::new());
-        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
-        let r = run_gated(&handle, &policy, &cmd).await;
-        assert!(!r.is_error, "{}", r.content);
-        assert!(r.content.contains("clean"), "{}", r.content);
+        let cmd = "npx --prefix /w wrangler deploy --env staging";
         assert!(
-            !flag(&fake.gate_consulted),
-            "a listed command skips the judge"
+            npx_floor(cmd, false).await.script_to_judge,
+            "unlisted routes"
         );
-        assert!(!flag(&fake.approval_requested));
+        let floor = npx_floor(cmd, true).await;
+        assert!(!floor.script_to_judge, "a listed command skips the judge");
+        assert!(floor.hard.is_none());
+    }
+
+    /// Security T1: a listed command whose trailing arguments name the
+    /// control plane still goes to the judge.
+    #[tokio::test]
+    async fn trusted_invocation_naming_the_control_plane_still_routes() {
+        let (_dir, root) = fake_control_root();
+        let cmd = format!("npx wrangler deploy --outdir {root}/agents/x");
+        assert!(npx_floor(&cmd, true).await.script_to_judge, "{cmd}");
     }
 
     /// A listed command that hits the hard floor still needs a fresh prompt.
