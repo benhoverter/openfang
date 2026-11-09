@@ -534,6 +534,11 @@ const INVOCATION_UNSAFE_CHARS: &[char] = &[
 /// so one config line would switch off the N1 body check for that agent.
 /// Non-ASCII whitespace in the command or entry means no match, since the
 /// shell layer (shlex) does not split on it.
+///
+/// A command with a `..` path segment in any word never matches (security X1).
+/// Agent cwds sit under `~/.openfang/workspaces/<agent>`, so
+/// `--outdir ../../agents/x` reaches the control plane without spelling
+/// `.openfang`, and the hard floor only resolves targets of named writers.
 #[must_use]
 pub fn matches_trusted_invocation(command: &str, entries: &[String]) -> bool {
     let unsafe_text = |s: &str| {
@@ -543,6 +548,10 @@ pub fn matches_trusted_invocation(command: &str, entries: &[String]) -> bool {
         return false;
     }
     let tokens: Vec<&str> = command.split_whitespace().collect();
+    let climbs = |t: &&str| t.split(['/', '=', ',', ':']).any(|seg| seg == "..");
+    if tokens.iter().any(climbs) {
+        return false;
+    }
     entries.iter().any(|entry| {
         if unsafe_text(entry) {
             return false;
@@ -2049,6 +2058,24 @@ mod anai_206_f1_tests {
         }
         let entries = vec!["npx wrangler\u{a0}deploy".to_string()];
         assert!(!matches_trusted_invocation("npx wrangler deploy", &entries));
+    }
+
+    #[test]
+    fn trusted_invocation_rejects_relative_climb() {
+        for cmd in [
+            "npx wrangler deploy --outdir ../../agents/kimiya-alpha",
+            "npx wrangler deploy --outdir=../../agents/kimiya-alpha",
+            "npx wrangler deploy -c ..",
+            "npx --prefix ../.. wrangler deploy",
+            "npx --prefix=web/../../x wrangler deploy",
+        ] {
+            assert!(!matches_trusted_invocation(cmd, &invocations()), "{cmd}");
+        }
+        // A dotted name that is not a `..` segment still matches.
+        assert!(matches_trusted_invocation(
+            "npx wrangler deploy -c web/..config/wrangler.toml",
+            &invocations()
+        ));
     }
 
     #[test]
