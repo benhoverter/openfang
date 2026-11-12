@@ -1300,6 +1300,20 @@ pub fn script_body_target(command: &str, inner: &[String]) -> Option<String> {
     Some(candidate.to_string())
 }
 
+/// The interpreter that runs [`script_body_target`]'s file, by its bare name
+/// (`python3.12`, `node`), or `None` when the file runs directly.
+///
+/// The language of a script is decided by what runs it, not what it is
+/// called: `python3 ./notes.txt` is Python. The link walk keys on this so an
+/// odd file name cannot switch off import following.
+#[must_use]
+pub fn script_body_interpreter(command: &str) -> Option<String> {
+    let (tokens, _) = exec_tokens(command);
+    let first = tokens.first()?;
+    let bin = first.rsplit('/').next().unwrap_or(first);
+    is_script_interpreter(bin).then(|| bin.to_string())
+}
+
 /// Guardrail 6. Replace secret-shaped spans before the body reaches a model.
 ///
 /// Two rules, both crude on purpose. This is not a secret scanner and does not
@@ -1380,6 +1394,22 @@ fn looks_secret(token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_body_interpreter_names_it_past_wrappers_and_none_for_direct_runs() {
+        let interp = script_body_interpreter;
+        assert_eq!(interp("python3 ./notes.txt").as_deref(), Some("python3"));
+        assert_eq!(
+            interp("timeout 60 /usr/bin/node x.js").as_deref(),
+            Some("node")
+        );
+        assert_eq!(
+            interp("FOO=1 uv run python3.12 x").as_deref(),
+            Some("python3.12")
+        );
+        assert_eq!(interp("./deploy.sh"), None);
+        assert_eq!(interp("ls -la"), None);
+    }
 
     fn fact(existence: PathExistence, git: GitFact, inside: bool, auth: PathAuthority) -> PathFact {
         PathFact {

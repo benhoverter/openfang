@@ -33,9 +33,10 @@ use std::time::Duration;
 
 use openfang_types::config::{FileAccessTier, FilePolicy};
 use openfang_types::path_facts::{
-    extract_body_path_tokens, extract_path_tokens, redact_secrets, script_body_target, GitFact,
-    PathAuthority, PathExistence, PathFact, PathFactSheet, ScriptBody, ScriptBodyStatus,
-    MAX_BODY_PATH_FACTS, MAX_PATH_FACTS, MAX_SCANNED_BODY_BYTES, MAX_SCRIPT_BODY_BYTES,
+    extract_body_path_tokens, extract_path_tokens, redact_secrets, script_body_interpreter,
+    script_body_target, GitFact, PathAuthority, PathExistence, PathFact, PathFactSheet, ScriptBody,
+    ScriptBodyStatus, MAX_BODY_PATH_FACTS, MAX_PATH_FACTS, MAX_SCANNED_BODY_BYTES,
+    MAX_SCRIPT_BODY_BYTES,
 };
 
 /// Total wall-clock budget for *all* git queries behind one gate decision.
@@ -86,7 +87,16 @@ pub async fn gather(
     // their flags fold into the entry's. Before the body-path phase below so
     // a blind walk is already recorded when the sheet is rendered.
     if let Some((body, _, Some((real, text)))) = script_body.as_mut() {
-        crate::script_links::walk(body, real, text, canon_ws.as_deref(), file_policy).await;
+        let interpreter = script_body_interpreter(command);
+        crate::script_links::walk(
+            body,
+            real,
+            text,
+            interpreter.as_deref(),
+            canon_ws.as_deref(),
+            file_policy,
+        )
+        .await;
     }
 
     // ANAI-206 item 3, second phase: stat the paths the body named.
@@ -177,7 +187,7 @@ fn read_script_body(
     // *unredacted* text. Redaction can blank a line that names a control path
     // (`auth_rules = Path.home() / ".openfang"` redacts to `auth_rules =`), and
     // a scan of the redacted form would then miss exactly what it looks for.
-    let scan = BodyScan::of(&text, &real);
+    let scan = BodyScan::of(&text);
     scan.apply(&mut body);
 
     // Oversize scan (2026-11-11). Past the judge's cap the body is still read
@@ -373,16 +383,18 @@ pub(crate) struct BodyScan {
     writes_runtime_config: bool,
     writes_fleet_rules: bool,
     names_control_plane: bool,
-    /// S1: a Python coding cookie naming a codec other than UTF-8, ASCII or
-    /// Latin-1. `# coding: utf-7` lets the source spell `.openfang` in a form
-    /// no plaintext scan sees, so it counts as a control-plane mention.
+    /// S1: a coding cookie naming a codec other than UTF-8, ASCII or Latin-1.
+    /// `# coding: utf-7` lets the source spell `.openfang` in a form no
+    /// plaintext scan sees, so it counts as a control-plane mention. Checked on
+    /// every file whatever its name: `python3 ./notes.txt` honours the cookie
+    /// too, and a false hit costs one judge call.
     odd_encoding: bool,
 }
 
 impl BodyScan {
-    pub(crate) fn of(text: &str, path: &Path) -> Self {
+    pub(crate) fn of(text: &str) -> Self {
         use openfang_types::gatekeeper as g;
-        let odd_encoding = is_python(path, text) && odd_coding_cookie(text);
+        let odd_encoding = odd_coding_cookie(text);
         Self {
             writes_control_plane: g::body_writes_control_plane(text),
             destroys_substrate: g::body_destroys_substrate(text),
@@ -467,24 +479,17 @@ impl BodyScan {
     }
 }
 
-fn is_python(path: &Path, text: &str) -> bool {
-    path.extension().is_some_and(|e| e == "py")
-        || text
-            .lines()
-            .next()
-            .is_some_and(|l| l.starts_with("#!") && l.contains("python"))
-}
-
-/// PEP 263: a comment on line 1 or 2 matching `coding[:=]\s*([-\w.]+)`.
+/// PEP 263: a comment on line 1 or 2 matching `.*?coding[:=]\s*([-\w.]+)`.
+/// The lazy `.*?` means the first `coding` *followed by `:` or `=`* wins, not
+/// the first `coding` (security L1: `# coding utf8, coding: utf-7`).
 fn odd_coding_cookie(text: &str) -> bool {
     for line in text.lines().take(2) {
         let Some(hash) = line.find('#') else { continue };
         let comment = &line[hash..];
-        let Some(at) = comment.find("coding") else {
-            continue;
-        };
-        let rest = &comment[at + "coding".len()..];
-        let Some(rest) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) else {
+        let Some(rest) = comment.match_indices("coding").find_map(|(at, _)| {
+            let rest = &comment[at + "coding".len()..];
+            rest.strip_prefix(':').or_else(|| rest.strip_prefix('='))
+        }) else {
             continue;
         };
         let codec: String = rest
@@ -1366,6 +1371,28 @@ mod tests {
         assert!(odd.script_body.unwrap().needs_judge());
         let fine = gather("python3 ./ok.py", &[], Some(&ws), Some(&policy)).await;
         assert!(!fine.script_body.unwrap().needs_judge());
+    }
+
+    /// S1 follow-up: the cookie counts whatever the file is called, because
+    /// `python3 ./notes.txt` honours it.
+    #[tokio::test]
+    async fn an_odd_coding_cookie_counts_in_a_file_not_named_py() {
+        let ws = tempdir("body-utf7-txt");
+        std::fs::write(ws.join("notes.txt"), "# coding: utf-7\nprint(1)\n").unwrap();
+        let policy = policy_over(&ws, FileAccessTier::Write);
+        let sheet = gather("python3 ./notes.txt", &[], Some(&ws), Some(&policy)).await;
+        assert!(sheet.script_body.unwrap().needs_judge());
+    }
+
+    /// Security L1: Python takes the first `coding` followed by `:`/`=`.
+    #[test]
+    fn a_cookie_after_a_bare_coding_word_is_still_read() {
+        assert!(odd_coding_cookie("# coding utf8, coding: utf-7\n"));
+        assert!(odd_coding_cookie(
+            "#!/usr/bin/env python3\n# encoding=utf-7\n"
+        ));
+        assert!(!odd_coding_cookie("# coding utf8, coding: utf-8\n"));
+        assert!(!odd_coding_cookie("# no cookie here\nx = 1\n"));
     }
 
     #[tokio::test]

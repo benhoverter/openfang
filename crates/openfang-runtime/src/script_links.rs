@@ -97,6 +97,27 @@ fn lang_of(path: &Path, text: &str) -> Lang {
     }
 }
 
+/// The language an interpreter runs its file as, whatever the file is called
+/// (`python3 ./notes.txt` is Python). `None` for launchers like `npx`, whose
+/// argument is not the file's language.
+fn lang_of_interpreter(bin: &str) -> Option<Lang> {
+    let base = bin.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    match if base.is_empty() { bin } else { base } {
+        "python" => Some(Lang::Python),
+        "node" | "bun" | "deno" | "tsx" | "ts-node" => Some(Lang::Js),
+        "bash" | "sh" | "zsh" | "dash" | "ksh" | "source" | "." => Some(Lang::Shell),
+        _ => None,
+    }
+}
+
+/// Words of a command string, split on whitespace and on the shell operators
+/// that can be glued to a name: `python3 w.py;rm x`, `w.py>log`,
+/// `cd sub&&python3 w.py` (security W2).
+fn command_words(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')'))
+        .filter(|w| !w.is_empty())
+}
+
 /// One file the walk has read.
 struct Node {
     path: PathBuf,
@@ -127,11 +148,24 @@ pub(crate) async fn walk(
     body: &mut ScriptBody,
     entry: &Path,
     entry_text: &str,
+    interpreter: Option<&str>,
     canon_ws: Option<&Path>,
     file_policy: Option<&FilePolicy>,
 ) {
     let mut hits: Vec<String> = Vec::new();
-    let result = walk_inner(body, &mut hits, entry, entry_text, canon_ws, file_policy).await;
+    let entry_lang = interpreter
+        .and_then(lang_of_interpreter)
+        .unwrap_or_else(|| lang_of(entry, entry_text));
+    let result = walk_inner(
+        body,
+        &mut hits,
+        entry,
+        entry_text,
+        entry_lang,
+        canon_ws,
+        file_policy,
+    )
+    .await;
     if let Err(reason) = result {
         body.links_blind = Some(reason);
     }
@@ -153,6 +187,7 @@ async fn walk_inner(
     hits: &mut Vec<String>,
     entry: &Path,
     entry_text: &str,
+    entry_lang: Lang,
     canon_ws: Option<&Path>,
     file_policy: Option<&FilePolicy>,
 ) -> Result<(), String> {
@@ -164,7 +199,7 @@ async fn walk_inner(
     let mut level = vec![Node {
         path: entry.to_path_buf(),
         text: entry_text.to_string(),
-        lang: lang_of(entry, entry_text),
+        lang: entry_lang,
         depth: 0,
         py_root: dir_of(entry),
         cwd: canon_ws.map(Path::to_path_buf),
@@ -212,7 +247,7 @@ async fn walk_inner(
             if bytes > MAX_BYTES {
                 return Err(format!("linked files exceed {MAX_BYTES} bytes"));
             }
-            let scan = BodyScan::of(&text, &real);
+            let scan = BodyScan::of(&text);
             scan.apply(body);
             if let Some(h) = scan.excerpt(&real, &text) {
                 hits.push(h);
@@ -271,7 +306,7 @@ impl Finder {
             // single-string forms (os.system("python3 w.py"),
             // execSync('node w.js')) are followed.
             for (_, lit) in string_literals(&node.text) {
-                for w in lit.split_whitespace() {
+                for w in command_words(&lit) {
                     for p in run_target(&unquote(w), &dir, node.cwd.as_deref()) {
                         out.push(Link {
                             path: p,
@@ -716,7 +751,7 @@ fn shell_links(node: &Node, dir: &Path, out: &mut Vec<Link>) -> Result<(), Strin
                 }
                 _ => {}
             }
-            for w in &words {
+            for w in words.iter().flat_map(|w| command_words(w)) {
                 for p in run_target(&unquote(w), dir, cwd.as_deref()) {
                     out.push(Link {
                         path: p,
@@ -910,6 +945,67 @@ mod tests {
         let b = body(&d, &p, "python3 sub/main.py").await;
         assert_eq!(b.linked.len(), 2, "{b:?}");
         assert!(b.needs_judge());
+    }
+
+    /// Security W2: a shell operator glued to the name does not hide it.
+    #[tokio::test]
+    async fn a_sibling_with_a_glued_operator_is_followed() {
+        for (name, call) in [
+            ("w2-semi", "os.system(\"python3 w.py;rm x\")"),
+            ("w2-redir", "os.system(\"python3 w.py>log\")"),
+            ("w2-and", "os.system(\"cd .&&python3 w.py\")"),
+            ("w2-pipe", "os.system(\"python3 w.py|tee o\")"),
+        ] {
+            let (d, p) = ws(name);
+            put(&d, "main.py", &format!("import os\n{call}\n"));
+            put(&d, "w.py", &format!("import os\n{MENTION}"));
+            let b = body(&d, &p, "python3 ./main.py").await;
+            assert_eq!(b.linked.len(), 1, "{call}: {b:?}");
+            assert!(b.needs_judge(), "{call}");
+        }
+    }
+
+    /// W2, shell arm: `./w.sh>log` inside a shell script.
+    #[tokio::test]
+    async fn a_shell_word_with_a_glued_redirect_is_followed() {
+        let (d, p) = ws("w2-shell");
+        put(&d, "run.sh", "./w.sh>log\n");
+        put(&d, "w.sh", "rm -rf ~/.openfang/agents/\n");
+        let b = body(&d, &p, "bash ./run.sh").await;
+        assert!(b.destroys_substrate, "{b:?}");
+    }
+
+    /// The interpreter decides the language, not the file name: an import
+    /// in `notes.txt` run by python3 is still followed.
+    #[tokio::test]
+    async fn the_interpreter_sets_the_language_of_an_oddly_named_entry() {
+        let (d, p) = ws("lang-interp");
+        put(&d, "notes.txt", "import helper\n");
+        put(&d, "helper.py", MENTION);
+        let b = body(&d, &p, "python3 ./notes.txt").await;
+        assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+
+        let (d, p) = ws("lang-interp-js");
+        put(&d, "notes.txt", "const h = require('./helper')\n");
+        put(
+            &d,
+            "helper.js",
+            "module.exports = '~/.openfang/config.toml'\n",
+        );
+        let b = body(&d, &p, "node ./notes.txt").await;
+        assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    #[test]
+    fn interpreter_names_map_to_languages() {
+        assert_eq!(lang_of_interpreter("python3.12"), Some(Lang::Python));
+        assert_eq!(lang_of_interpreter("node22"), Some(Lang::Js));
+        assert_eq!(lang_of_interpreter("bash"), Some(Lang::Shell));
+        assert_eq!(lang_of_interpreter("."), Some(Lang::Shell));
+        assert_eq!(lang_of_interpreter("npx"), None);
+        assert_eq!(lang_of_interpreter("ruby"), None);
     }
 
     #[tokio::test]
