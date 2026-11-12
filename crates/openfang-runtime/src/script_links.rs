@@ -64,7 +64,7 @@ const JS_EXTS: &[&str] = &[
 ];
 const PY_COMPILED: &[&str] = &["pyc", "pyo", "so", "dylib", "pyd"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Lang {
     Python,
     Js,
@@ -134,6 +134,16 @@ fn runner_lang(word: &str) -> Option<Lang> {
     lang_of_interpreter(bin)
 }
 
+/// Interpreter flags whose value is the next word (security L3):
+/// `python3 -X utf8 w`, `python3 -W ignore w`, `bash -o pipefail w`.
+fn takes_value(lang: Lang, flag: &str) -> bool {
+    match lang {
+        Lang::Python => matches!(flag, "-X" | "-W" | "-Q"),
+        Lang::Shell => matches!(flag, "-o" | "-O" | "+o" | "+O"),
+        Lang::Js | Lang::Other => false,
+    }
+}
+
 /// R1 edges out of a stream of command words. A word after an interpreter
 /// (`python3 -u x`, flags skipped) is followed whatever its name and takes
 /// that interpreter's language (security F1); any other word is followed
@@ -145,8 +155,14 @@ fn run_links<'a>(
     out: &mut Vec<Link>,
 ) {
     let mut runner: Option<Lang> = None;
+    let mut flag_value = false;
     for w in words {
         let w = unquote(w);
+        if flag_value {
+            // A flag's value is not the file, and keeps the runner live.
+            flag_value = false;
+            continue;
+        }
         for path in run_target(&w, runner.is_some(), dir, cwd) {
             out.push(Link {
                 path,
@@ -155,7 +171,9 @@ fn run_links<'a>(
                 lang: runner,
             });
         }
-        if !(runner.is_some() && w.starts_with('-')) {
+        if let Some(l) = runner.filter(|_| w.starts_with('-') || w.starts_with('+')) {
+            flag_value = takes_value(l, &w);
+        } else {
             runner = runner_lang(&w);
         }
     }
@@ -238,8 +256,21 @@ async fn walk_inner(
 ) -> Result<(), String> {
     let dir_of = |p: &Path| p.parent().map(Path::to_path_buf).unwrap_or_default();
     let mut finder = Finder::default();
-    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-    visited.insert(canonical(entry));
+    // A file is walked once per language it can run as (security G1): the
+    // first link to reach it must not decide that for every later one.
+    // `followed` de-duplicates links before a read, `walked` de-duplicates
+    // the walks after it, `files` counts distinct files for the cap.
+    let mut followed: BTreeSet<(PathBuf, Option<Lang>)> = BTreeSet::new();
+    let mut walked: BTreeSet<(PathBuf, Lang)> = BTreeSet::new();
+    let mut files: BTreeSet<PathBuf> = BTreeSet::new();
+    let canon_entry = canonical(entry);
+    followed.insert((canon_entry.clone(), Some(entry_lang)));
+    if lang_of(entry, entry_text) == entry_lang {
+        // A plain link back to the entry would walk it the same way again.
+        followed.insert((canon_entry.clone(), None));
+    }
+    walked.insert((canon_entry.clone(), entry_lang));
+    files.insert(canon_entry.clone());
     let mut bytes: u64 = 0;
     let mut level = vec![Node {
         path: entry.to_path_buf(),
@@ -256,7 +287,8 @@ async fn walk_inner(
             for link in finder.links(node)? {
                 // De-duplicate before any cap counts (R5b): a cycle or a
                 // diamond is not more files.
-                if !visited.insert(canonical(&link.path)) {
+                let key = canonical(&link.path);
+                if !followed.insert((key.clone(), link.lang)) {
                     continue;
                 }
                 let depth = node.depth + 1;
@@ -266,7 +298,8 @@ async fn walk_inner(
                         link.path.display()
                     ));
                 }
-                if visited.len() - 1 > MAX_FILES {
+                files.insert(key);
+                if files.len() - 1 > MAX_FILES {
                     return Err(format!("links reach more than {MAX_FILES} files"));
                 }
                 fresh.push((link, depth));
@@ -294,18 +327,38 @@ async fn walk_inner(
             }
             let scan = BodyScan::of(&text);
             scan.apply(body);
-            if let Some(h) = scan.excerpt(&real, &text) {
-                hits.push(h);
+            let shown = real.display().to_string();
+            let key = canonical(&real);
+            if key != canon_entry && !body.linked.contains(&shown) {
+                if let Some(h) = scan.excerpt(&real, &text) {
+                    hits.push(h);
+                }
+                body.linked.push(shown);
             }
-            body.linked.push(real.display().to_string());
-            next.push(Node {
-                lang: link.lang.unwrap_or_else(|| lang_of(&real, &text)),
-                py_root: link.py_root.unwrap_or_else(|| dir_of(&real)),
-                cwd: link.cwd,
-                path: real,
-                text,
-                depth,
-            });
+            // The runner's language and the file's own (suffix/shebang) can
+            // differ: a planted "python3" literal before "./w.sh" must not
+            // hide w.sh's shell lines (G1). Walk each language not yet walked.
+            let own = lang_of(&real, &text);
+            // Later links that would only repeat these walks skip the read.
+            followed.insert((key.clone(), None));
+            followed.insert((key.clone(), Some(own)));
+            let mut langs = vec![link.lang.unwrap_or(own)];
+            if link.lang.is_some_and(|l| l != own) {
+                langs.push(own);
+            }
+            for lang in langs {
+                if !walked.insert((key.clone(), lang)) {
+                    continue;
+                }
+                next.push(Node {
+                    lang,
+                    py_root: link.py_root.clone().unwrap_or_else(|| dir_of(&real)),
+                    cwd: link.cwd.clone(),
+                    path: real.clone(),
+                    text: text.clone(),
+                    depth,
+                });
+            }
         }
         level = next;
     }
@@ -1079,6 +1132,57 @@ mod tests {
         let b = body(&d, &p, "python3 ./main.py").await;
         assert_eq!(b.linked.len(), 1, "{b:?}");
         assert!(b.needs_judge());
+    }
+
+    /// G1: a file named first without a runner, then with one, is still
+    /// walked in the runner's language.
+    #[tokio::test]
+    async fn a_runner_link_after_a_plain_link_still_sets_the_language() {
+        let (d, p) = ws("g1-cat-then-bash");
+        put(
+            &d,
+            "main.py",
+            "import os\nos.system(\"cat w.py; bash w.py\")\n",
+        );
+        put(&d, "w.py", "./inner.sh\n");
+        put(&d, "inner.sh", "rm -rf ~/.openfang/agents/\n");
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert!(b.linked.iter().any(|l| l.ends_with("inner.sh")), "{b:?}");
+        assert_eq!(b.linked.len(), 2, "w.py is listed once: {b:?}");
+        assert!(b.destroys_substrate, "{b:?}");
+    }
+
+    /// G1: a planted "python3" literal must not hide a shell file's lines.
+    #[tokio::test]
+    async fn a_planted_runner_literal_does_not_hide_the_files_own_language() {
+        let (d, p) = ws("g1-planted");
+        put(
+            &d,
+            "main.py",
+            "X = \"python3\"\nimport subprocess\nsubprocess.run([\"./w.sh\"])\n",
+        );
+        put(&d, "w.sh", "#!/bin/bash\nsource ./lib.sh\n");
+        put(&d, "lib.sh", MENTION);
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert!(b.linked.iter().any(|l| l.ends_with("lib.sh")), "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    /// L3: a flag that takes a value keeps the runner for the next word.
+    #[tokio::test]
+    async fn a_value_flag_does_not_drop_the_runner() {
+        for (name, cmd) in [
+            ("l3-py-x", "python3 -X utf8 notes.txt"),
+            ("l3-py-w", "python3 -W ignore notes.txt"),
+            ("l3-sh-o", "bash -o pipefail notes.txt"),
+        ] {
+            let (d, p) = ws(name);
+            put(&d, "main.py", &format!("import os\nos.system(\"{cmd}\")\n"));
+            put(&d, "notes.txt", MENTION);
+            let b = body(&d, &p, "python3 ./main.py").await;
+            assert_eq!(b.linked.len(), 1, "{cmd}: {b:?}");
+            assert!(b.needs_judge(), "{cmd}");
+        }
     }
 
     /// F1 negative: a data file named next to no interpreter stays unread.
