@@ -35,7 +35,7 @@ use openfang_types::config::{FileAccessTier, FilePolicy};
 use openfang_types::path_facts::{
     extract_body_path_tokens, extract_path_tokens, redact_secrets, script_body_target, GitFact,
     PathAuthority, PathExistence, PathFact, PathFactSheet, ScriptBody, ScriptBodyStatus,
-    MAX_BODY_PATH_FACTS, MAX_PATH_FACTS, MAX_SCRIPT_BODY_BYTES,
+    MAX_BODY_PATH_FACTS, MAX_PATH_FACTS, MAX_SCANNED_BODY_BYTES, MAX_SCRIPT_BODY_BYTES,
 };
 
 /// Total wall-clock budget for *all* git queries behind one gate decision.
@@ -81,20 +81,28 @@ pub async fn gather(
     let mut script_body = script_body_target(command, inner)
         .map(|raw| read_script_body(&raw, &facts, canon_ws.as_deref(), file_policy));
 
+    // Oversize scan, the import walk: local files the script imports, sources
+    // or runs by a literal path get the same guardrails and predicates, and
+    // their flags fold into the entry's. Before the body-path phase below so
+    // a blind walk is already recorded when the sheet is rendered.
+    if let Some((body, _, Some((real, text)))) = script_body.as_mut() {
+        crate::script_links::walk(body, real, text, canon_ws.as_deref(), file_policy).await;
+    }
+
     // ANAI-206 item 3, second phase: stat the paths the body named.
     //
     // A second git pass rather than one, because the body cannot be read until
     // the script's own facts exist and the two phases therefore cannot be
     // merged. It carries its own budget for the same reason the first one does:
     // a slow repository costs a `GitFact::Unknown`, never the latency ceiling.
-    if let Some((body, tokens)) = script_body.as_mut() {
+    if let Some((body, tokens, _)) = script_body.as_mut() {
         body.body_facts = tokens
             .iter()
             .map(|raw| stat_fact(raw, canon_ws.as_deref(), file_policy))
             .collect();
         annotate_git(&mut body.body_facts, canon_ws.as_deref()).await;
     }
-    let script_body = script_body.map(|(body, _)| body);
+    let script_body = script_body.map(|(body, _, _)| body);
 
     PathFactSheet {
         facts,
@@ -120,7 +128,7 @@ fn read_script_body(
     facts: &[PathFact],
     canon_ws: Option<&Path>,
     file_policy: Option<&FilePolicy>,
-) -> (ScriptBody, Vec<String>) {
+) -> (ScriptBody, Vec<String>, Option<(PathBuf, String)>) {
     let mut body = ScriptBody {
         raw: raw.to_string(),
         resolved: None,
@@ -139,12 +147,15 @@ fn read_script_body(
         writes_runtime_config: false,
         writes_fleet_rules: false,
         names_control_plane: false,
+        linked: Vec::new(),
+        links_blind: None,
+        scan_hits: None,
     };
 
     // No fact means the token was dropped by `MAX_PATH_FACTS` truncation or
     // failed to resolve. Either way we have nothing to check reach against.
     let Some(fact) = facts.iter().find(|f| f.raw == raw) else {
-        return (body, Vec::new());
+        return (body, Vec::new(), None);
     };
     body.resolved = fact.resolved.clone();
     // Recorded, not decided on: guardrail 3 refuses `Ignored` and `Unknown`
@@ -154,13 +165,74 @@ fn read_script_body(
     // repository, and it is the directory item 1 exists to serve.
     body.git = fact.git;
 
+    let (real, text) = match read_guarded(fact, canon_ws, file_policy) {
+        Ok(read) => read,
+        Err(status) => {
+            body.status = status;
+            return (body, Vec::new(), None);
+        }
+    };
+
+    // ANAI-206 item 3, commits 6 and 9, and N1: every body predicate, on the
+    // *unredacted* text. Redaction can blank a line that names a control path
+    // (`auth_rules = Path.home() / ".openfang"` redacts to `auth_rules =`), and
+    // a scan of the redacted form would then miss exactly what it looks for.
+    let scan = BodyScan::of(&text, &real);
+    scan.apply(&mut body);
+
+    // Oversize scan (2026-11-11). Past the judge's cap the body is still read
+    // whole and every predicate above ran over it; only the content stays out
+    // of the prompt. The judge gets the lines that hit instead (S2).
+    if text.len() as u64 > MAX_SCRIPT_BODY_BYTES {
+        body.status = ScriptBodyStatus::Scanned;
+        body.scan_hits = scan.excerpt(&real, &text);
+        return (body, Vec::new(), Some((real, text)));
+    }
+
+    // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
+    //
+    // `extract_body_path_tokens` used to read the unredacted text, and
+    // `PathFact::render` prints `resolved.unwrap_or(&self.raw)`. So
+    // `API_TOKEN=/Users/x/.ssh/deploy_key_abc123` was redacted *inside* the
+    // `<script-body>` fence and printed in full as a path fact *outside* it,
+    // where the facts block deliberately is not redacted. `looks_secret` cannot
+    // catch it on the way out either: it excludes any token containing `/`,
+    // which is every path.
+    //
+    // Extract twice rather than redacting the rendered block, which would eat
+    // the ordinary paths the map exists for. The two predicates above keep
+    // reading plaintext on purpose — redaction can blank a line that names a
+    // control path — and only the rendered map moves behind the redactor.
+    let (redacted, redactions) = redact_secrets(&text);
+    let (tokens, unresolved) = extract_body_path_tokens(&redacted);
+    body.body_truncated = tokens.len() > MAX_BODY_PATH_FACTS;
+    body.body_unresolved = unresolved;
+    let tokens: Vec<String> = tokens.into_iter().take(MAX_BODY_PATH_FACTS).collect();
+    body.content = Some(redacted);
+    body.redactions = redactions;
+    body.status = ScriptBodyStatus::Included;
+    (body, tokens, Some((real, text)))
+}
+
+/// Guardrails 2 through 5 for one file: reach, the real parent's reach, git,
+/// identity at `open`, size, and text. Shared by the script a command runs and
+/// by every local file it imports or runs ([`crate::script_links`]), so a
+/// linked file is never held to a lower bar than the entry.
+///
+/// Returns the parent-canonicalized path the bytes came from and the
+/// unredacted text, or the refusal. Never reads past
+/// [`MAX_SCANNED_BODY_BYTES`].
+pub(crate) fn read_guarded(
+    fact: &PathFact,
+    canon_ws: Option<&Path>,
+    file_policy: Option<&FilePolicy>,
+) -> Result<(PathBuf, String), ScriptBodyStatus> {
     // Guardrail 2, first and unconditional. `Prompt` is excluded because the
     // operator already said they want to be asked about this path, and
     // `NoPolicy` because outside `file_policy` there is no reach to be inside
     // of — the ANAI-190 rule, unchanged.
     if !matches!(fact.authority, PathAuthority::Read | PathAuthority::Write) {
-        body.status = ScriptBodyStatus::OutsideReach;
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::OutsideReach);
     }
 
     // Guardrail 2b — ANAI-206 commit 9, G3.
@@ -191,26 +263,23 @@ fn read_script_body(
     // than being laundered into its target's authority here.
     let Some(real) = canonical_parent_path(fact.resolved.as_deref()) else {
         // No parent, or a parent that does not exist. Nothing to read.
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     };
     if !matches!(
         authority_for(&real, canon_ws, file_policy),
         PathAuthority::Read | PathAuthority::Write
     ) {
-        body.status = ScriptBodyStatus::OutsideReach;
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::OutsideReach);
     }
 
     // Guardrail 3. `Unknown` is a refusal, not a pass: the git budget expiring
     // under fleet load must not launder an ignored file into a readable one.
     match fact.git {
         GitFact::Ignored => {
-            body.status = ScriptBodyStatus::Ignored;
-            return (body, Vec::new());
+            return Err(ScriptBodyStatus::Ignored);
         }
         GitFact::Unknown => {
-            body.status = ScriptBodyStatus::GitUnknown;
-            return (body, Vec::new());
+            return Err(ScriptBodyStatus::GitUnknown);
         }
         _ => {}
     }
@@ -219,14 +288,13 @@ fn read_script_body(
     // the no-traversal invariant: a symlinked leaf is `Symlink`, never `File`,
     // and lands in `Unreadable` without being opened.
     if fact.existence != PathExistence::File {
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     }
 
     // Guardrail 4, on the stat first so an oversized file is never read into
     // memory at all.
-    if fact.size_bytes.unwrap_or(u64::MAX) > MAX_SCRIPT_BODY_BYTES {
-        body.status = ScriptBodyStatus::TooLarge;
-        return (body, Vec::new());
+    if fact.size_bytes.unwrap_or(u64::MAX) > MAX_SCANNED_BODY_BYTES {
+        return Err(ScriptBodyStatus::TooLarge);
     }
 
     // Guardrail 4b — ANAI-206 F8, the TOCTOU the security review found.
@@ -252,98 +320,195 @@ fn read_script_body(
         .custom_flags(libc::O_NOFOLLOW)
         .open(&real)
     else {
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     };
     let Ok(meta) = file.metadata() else {
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     };
     // `fstat` on the open handle. A directory or a device that replaced the
     // file between the two is not a script.
     if !meta.is_file() {
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     }
-    if meta.len() > MAX_SCRIPT_BODY_BYTES {
-        body.status = ScriptBodyStatus::TooLarge;
-        return (body, Vec::new());
+    if meta.len() > MAX_SCANNED_BODY_BYTES {
+        return Err(ScriptBodyStatus::TooLarge);
     }
     let mut bytes: Vec<u8> = Vec::new();
     if file
         .by_ref()
-        .take(MAX_SCRIPT_BODY_BYTES + 1)
+        .take(MAX_SCANNED_BODY_BYTES + 1)
         .read_to_end(&mut bytes)
         .is_err()
     {
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Unreadable);
     }
     // ...and again on what we actually got, because a file can grow between
     // the `fstat` and the last byte read.
-    if bytes.len() as u64 > MAX_SCRIPT_BODY_BYTES {
-        body.status = ScriptBodyStatus::TooLarge;
-        return (body, Vec::new());
+    if bytes.len() as u64 > MAX_SCANNED_BODY_BYTES {
+        return Err(ScriptBodyStatus::TooLarge);
     }
 
     // Guardrail 5.
     let Ok(text) = String::from_utf8(bytes) else {
-        body.status = ScriptBodyStatus::Binary;
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Binary);
     };
     if looks_binary(&text) {
-        body.status = ScriptBodyStatus::Binary;
-        return (body, Vec::new());
+        return Err(ScriptBodyStatus::Binary);
     }
 
-    // ANAI-206 item 3, first phase. Both of these read the *unredacted* text,
-    // for the reason in this function's doc comment: redaction can blank a line
-    // that names a control path, and a scan of the redacted form would then
-    // miss exactly what it is looking for.
-    body.writes_control_plane = openfang_types::gatekeeper::body_writes_control_plane(&text);
-    // ANAI-206 commit 6. `writes_control_plane` is now a fact the judge weighs,
-    // so the hard case has to be named separately: a recursive removal of the
-    // substrate on line 40 of the file this command runs bypasses the judge for
-    // exactly the same reason it does on the command line.
-    body.destroys_substrate = openfang_types::gatekeeper::body_destroys_substrate(&text);
-    // ANAI-265. Same argument, one class down: a datastore deletion inside the
-    // body bypasses the command-line predicate by being in a file.
-    body.destroys_datastore = openfang_types::gatekeeper::body_destroys_datastore(&text);
-    // ANAI-206 commit 9, C6-3. The other three hard flags, which commit 6 and
-    // commit 8 both left scoped to the command line. A hard flag that stops at
-    // the command line has a one-line bypass — put the line in a file and run
-    // the file — and commit 6 had already rejected that argument for
-    // `substrate_destruction` by adding the predicate above it.
-    body.writes_gatekeeper_policy =
-        openfang_types::gatekeeper::body_writes_gatekeeper_policy(&text);
-    body.writes_agent_config = openfang_types::gatekeeper::body_writes_agent_config(&text);
-    body.writes_runtime_config = openfang_types::gatekeeper::body_writes_runtime_config(&text);
-    // RULES.md is injected into every agent's prompt each turn; a body write is
-    // the same fleet-wide steer as a command-line one.
-    body.writes_fleet_rules = openfang_types::gatekeeper::body_writes_fleet_rules(&text);
-    // N1 routing. Plaintext for the same reason: redaction blanks the rest of
-    // `auth_rules = Path.home() / ".openfang" / ...`.
-    body.names_control_plane = openfang_types::gatekeeper::body_names_control_plane(&text);
+    Ok((real, text))
+}
 
-    // Guardrail 6, and it now runs *before* extraction — ANAI-206 F9.
-    //
-    // `extract_body_path_tokens` used to read the unredacted text, and
-    // `PathFact::render` prints `resolved.unwrap_or(&self.raw)`. So
-    // `API_TOKEN=/Users/x/.ssh/deploy_key_abc123` was redacted *inside* the
-    // `<script-body>` fence and printed in full as a path fact *outside* it,
-    // where the facts block deliberately is not redacted. `looks_secret` cannot
-    // catch it on the way out either: it excludes any token containing `/`,
-    // which is every path.
-    //
-    // Extract twice rather than redacting the rendered block, which would eat
-    // the ordinary paths the map exists for. The two predicates above keep
-    // reading plaintext on purpose — redaction can blank a line that names a
-    // control path — and only the rendered map moves behind the redactor.
-    let (redacted, redactions) = redact_secrets(&text);
-    let (tokens, unresolved) = extract_body_path_tokens(&redacted);
-    body.body_truncated = tokens.len() > MAX_BODY_PATH_FACTS;
-    body.body_unresolved = unresolved;
-    let tokens: Vec<String> = tokens.into_iter().take(MAX_BODY_PATH_FACTS).collect();
-    body.content = Some(redacted);
-    body.redactions = redactions;
-    body.status = ScriptBodyStatus::Included;
-    (body, tokens)
+/// Every body predicate the gate runs, over one file's unredacted text.
+///
+/// One place, so the entry script and each file it links are scanned by the
+/// same list; a predicate added later cannot be wired to one and not the other.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct BodyScan {
+    writes_control_plane: bool,
+    destroys_substrate: bool,
+    destroys_datastore: bool,
+    writes_gatekeeper_policy: bool,
+    writes_agent_config: bool,
+    writes_runtime_config: bool,
+    writes_fleet_rules: bool,
+    names_control_plane: bool,
+    /// S1: a Python coding cookie naming a codec other than UTF-8, ASCII or
+    /// Latin-1. `# coding: utf-7` lets the source spell `.openfang` in a form
+    /// no plaintext scan sees, so it counts as a control-plane mention.
+    odd_encoding: bool,
+}
+
+impl BodyScan {
+    pub(crate) fn of(text: &str, path: &Path) -> Self {
+        use openfang_types::gatekeeper as g;
+        let odd_encoding = is_python(path, text) && odd_coding_cookie(text);
+        Self {
+            writes_control_plane: g::body_writes_control_plane(text),
+            destroys_substrate: g::body_destroys_substrate(text),
+            destroys_datastore: g::body_destroys_datastore(text),
+            writes_gatekeeper_policy: g::body_writes_gatekeeper_policy(text),
+            writes_agent_config: g::body_writes_agent_config(text),
+            writes_runtime_config: g::body_writes_runtime_config(text),
+            writes_fleet_rules: g::body_writes_fleet_rules(text),
+            names_control_plane: g::body_names_control_plane(text) || odd_encoding,
+            odd_encoding,
+        }
+    }
+
+    /// OR into `body`. Never clears a flag: a linked file can only add.
+    pub(crate) fn apply(&self, body: &mut ScriptBody) {
+        body.writes_control_plane |= self.writes_control_plane;
+        body.destroys_substrate |= self.destroys_substrate;
+        body.destroys_datastore |= self.destroys_datastore;
+        body.writes_gatekeeper_policy |= self.writes_gatekeeper_policy;
+        body.writes_agent_config |= self.writes_agent_config;
+        body.writes_runtime_config |= self.writes_runtime_config;
+        body.writes_fleet_rules |= self.writes_fleet_rules;
+        body.names_control_plane |= self.names_control_plane;
+    }
+
+    fn hit_names(&self) -> Vec<&'static str> {
+        [
+            (self.destroys_substrate, "substrate_destruction"),
+            (self.destroys_datastore, "datastore_destruction"),
+            (self.writes_gatekeeper_policy, "policy_self_modification"),
+            (self.writes_agent_config, "agent_config_write"),
+            (self.writes_runtime_config, "runtime_config_write"),
+            (self.writes_fleet_rules, "fleet_rules_write"),
+            (self.writes_control_plane, "writes_control_plane"),
+            (self.odd_encoding, "odd_source_encoding"),
+            (self.names_control_plane, "names_control_plane"),
+        ]
+        .into_iter()
+        .filter_map(|(hit, name)| hit.then_some(name))
+        .collect()
+    }
+
+    /// S2: what the judge sees for a file it cannot be shown. The predicates
+    /// that hit, then each line naming the control plane with three lines of
+    /// context either side, redacted. `None` when nothing hit.
+    pub(crate) fn excerpt(&self, path: &Path, text: &str) -> Option<String> {
+        let names = self.hit_names();
+        if names.is_empty() {
+            return None;
+        }
+        const CONTEXT: usize = 3;
+        const MAX_LINES: usize = 60;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut keep = vec![false; lines.len()];
+        for (i, line) in lines.iter().enumerate() {
+            let cookie = self.odd_encoding && i < 2 && line.contains("coding");
+            if cookie || openfang_types::gatekeeper::names_control_plane(line) {
+                let lo = i.saturating_sub(CONTEXT);
+                let hi = (i + CONTEXT).min(lines.len().saturating_sub(1));
+                keep[lo..=hi].iter_mut().for_each(|k| *k = true);
+            }
+        }
+        let mut out = format!("# {} — hit: {}\n", path.display(), names.join(", "));
+        let mut shown = 0;
+        let mut last: Option<usize> = None;
+        for (i, line) in lines.iter().enumerate().filter(|(i, _)| keep[*i]) {
+            if shown == MAX_LINES {
+                out.push_str("  [...more matching lines not shown]\n");
+                break;
+            }
+            if last.is_some_and(|l| l + 1 != i) {
+                out.push_str("  ...\n");
+            }
+            out.push_str(&format!("  {:>5}: {line}\n", i + 1));
+            shown += 1;
+            last = Some(i);
+        }
+        if shown == 0 {
+            out.push_str("  (the hit spans lines; no single line names the control plane)\n");
+        }
+        Some(redact_secrets(&out).0)
+    }
+}
+
+fn is_python(path: &Path, text: &str) -> bool {
+    path.extension().is_some_and(|e| e == "py")
+        || text
+            .lines()
+            .next()
+            .is_some_and(|l| l.starts_with("#!") && l.contains("python"))
+}
+
+/// PEP 263: a comment on line 1 or 2 matching `coding[:=]\s*([-\w.]+)`.
+fn odd_coding_cookie(text: &str) -> bool {
+    for line in text.lines().take(2) {
+        let Some(hash) = line.find('#') else { continue };
+        let comment = &line[hash..];
+        let Some(at) = comment.find("coding") else {
+            continue;
+        };
+        let rest = &comment[at + "coding".len()..];
+        let Some(rest) = rest.strip_prefix(':').or_else(|| rest.strip_prefix('=')) else {
+            continue;
+        };
+        let codec: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .collect::<String>()
+            .to_ascii_lowercase()
+            .replace('_', "-");
+        return !matches!(
+            codec.as_str(),
+            "utf-8"
+                | "utf8"
+                | "ascii"
+                | "us-ascii"
+                | "latin-1"
+                | "latin1"
+                | "iso-8859-1"
+                | "iso8859-1"
+                | "l1"
+                | "utf-8-sig"
+        );
+    }
+    false
 }
 
 /// True when text carries control bytes in a shape no script has.
@@ -428,7 +593,7 @@ pub(crate) fn stat_fact(
 /// root, because that is `shell_exec`'s working directory. `..` is folded
 /// lexically rather than by `canonicalize`, so a path whose leaf is a symlink —
 /// or does not exist yet — still resolves.
-fn resolve(raw: &str, canon_ws: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn resolve(raw: &str, canon_ws: Option<&Path>) -> Option<PathBuf> {
     let expanded: PathBuf = if raw == "~" {
         home_dir()?
     } else if let Some(rest) = raw.strip_prefix("~/") {
@@ -555,7 +720,7 @@ fn authority_for(
 /// repositories, or none. Paths sharing a root are batched into one pair of
 /// queries. Paths with no root above them get `NoRepo`, which is a real answer
 /// and not a synonym for `Untracked`.
-async fn annotate_git(facts: &mut [PathFact], canon_ws: Option<&Path>) {
+pub(crate) async fn annotate_git(facts: &mut [PathFact], canon_ws: Option<&Path>) {
     let mut by_root: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     let mut no_repo: Vec<usize> = Vec::new();
     for (i, fact) in facts.iter().enumerate() {
@@ -1116,14 +1281,14 @@ mod tests {
         );
     }
 
-    /// Over the cap the body is refused, not truncated: the interesting line
-    /// goes at byte 17000 and a truncated read would show the judge a
-    /// perfectly ordinary first 16KB.
+    /// Over the judge's cap the body is scanned whole, never truncated: the
+    /// interesting line goes at byte 17000 and every predicate still sees it.
+    /// The content stays out of the prompt.
     #[tokio::test]
-    async fn an_oversized_script_is_refused_rather_than_truncated() {
+    async fn an_oversized_script_is_scanned_whole_not_shown() {
         let ws = tempdir("body-large");
         let mut script = "echo padding\n".repeat(2000);
-        script.push_str("rm -rf /\n");
+        script.push_str("rm -rf ~/.openfang/agents/\n");
         assert!(script.len() as u64 > MAX_SCRIPT_BODY_BYTES);
         std::fs::write(ws.join("big.sh"), &script).unwrap();
 
@@ -1134,9 +1299,73 @@ mod tests {
             Some(&policy_over(&ws, FileAccessTier::Write)),
         )
         .await;
+        assert!(!sheet.suppress_eligible());
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Scanned);
+        assert!(body.content.is_none());
+        assert!(body.destroys_substrate, "hard flag computed past 16 KiB");
+        assert!(body.names_control_plane);
+        assert!(body.needs_judge());
+        let hits = body.scan_hits.as_deref().expect("S2 excerpt");
+        assert!(hits.contains("substrate_destruction"), "{hits}");
+        assert!(hits.contains("rm -rf ~/.openfang/agents/"), "{hits}");
+    }
+
+    /// A clean oversize script is the case Erik's survey builder hit: read
+    /// whole, nothing found, no judge.
+    #[tokio::test]
+    async fn a_clean_oversized_script_skips_the_judge() {
+        let ws = tempdir("body-large-clean");
+        let script = "print('<p>survey</p>')\n".repeat(2000);
+        assert!(script.len() as u64 > MAX_SCRIPT_BODY_BYTES);
+        std::fs::write(ws.join("build.py"), &script).unwrap();
+
+        let sheet = gather(
+            "python3 ./build.py",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
+        let body = sheet.script_body.expect("script body");
+        assert_eq!(body.status, ScriptBodyStatus::Scanned);
+        assert!(body.scan_hits.is_none());
+        assert!(!body.needs_judge(), "{body:?}");
+    }
+
+    /// Past the scan cap it is still refused rather than truncated.
+    #[tokio::test]
+    async fn a_script_past_the_scan_cap_is_refused() {
+        let ws = tempdir("body-huge");
+        let script = "echo padding\n".repeat(90_000);
+        assert!(script.len() as u64 > MAX_SCANNED_BODY_BYTES);
+        std::fs::write(ws.join("huge.sh"), &script).unwrap();
+
+        let sheet = gather(
+            "bash ./huge.sh",
+            &[],
+            Some(&ws),
+            Some(&policy_over(&ws, FileAccessTier::Write)),
+        )
+        .await;
         let body = sheet.script_body.expect("script body");
         assert_eq!(body.status, ScriptBodyStatus::TooLarge);
         assert!(body.content.is_none());
+        assert!(body.needs_judge());
+    }
+
+    /// S1: a codec cookie other than UTF-8/ASCII/Latin-1 counts as a mention.
+    #[tokio::test]
+    async fn an_odd_python_coding_cookie_routes_to_the_judge() {
+        let ws = tempdir("body-utf7");
+        std::fs::write(ws.join("w.py"), "# -*- coding: utf-7 -*-\nprint(1)\n").unwrap();
+        std::fs::write(ws.join("ok.py"), "# coding: utf-8\nprint(1)\n").unwrap();
+        let policy = policy_over(&ws, FileAccessTier::Write);
+
+        let odd = gather("python3 ./w.py", &[], Some(&ws), Some(&policy)).await;
+        assert!(odd.script_body.unwrap().needs_judge());
+        let fine = gather("python3 ./ok.py", &[], Some(&ws), Some(&policy)).await;
+        assert!(!fine.script_body.unwrap().needs_judge());
     }
 
     #[tokio::test]
@@ -1281,7 +1510,7 @@ mod tests {
             authority: PathAuthority::Write,
         };
 
-        let (body, tokens) = read_script_body("./swapped.sh", &[lying_fact], None, None);
+        let (body, tokens, _) = read_script_body("./swapped.sh", &[lying_fact], None, None);
         assert!(
             body.content.is_none(),
             "O_NOFOLLOW must refuse the link even when the fact says File"

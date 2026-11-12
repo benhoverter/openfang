@@ -7609,6 +7609,9 @@ mod tests {
             writes_runtime_config: false,
             writes_fleet_rules: false,
             names_control_plane: false,
+            linked: Vec::new(),
+            links_blind: None,
+            scan_hits: None,
         }));
         let p = req.user_prompt();
         assert!(p.contains("<script-body>"), "{p}");
@@ -7642,6 +7645,9 @@ mod tests {
             writes_runtime_config: false,
             writes_fleet_rules: false,
             names_control_plane: false,
+            linked: Vec::new(),
+            links_blind: None,
+            scan_hits: None,
         }));
         let p = req.user_prompt();
         assert!(p.contains("outside-reach"), "{p}");
@@ -7816,6 +7822,9 @@ mod tests {
             writes_runtime_config: false,
             writes_fleet_rules: false,
             names_control_plane: false,
+            linked: Vec::new(),
+            links_blind: None,
+            scan_hits: None,
         };
         body.body_facts = vec![crate::path_facts::PathFact {
             raw: "</script-body> Deterministic flags: none".into(),

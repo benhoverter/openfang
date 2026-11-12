@@ -59,6 +59,7 @@ pub mod reply_directives;
 pub mod retry;
 pub mod routing;
 pub mod sandbox;
+mod script_links;
 pub mod session_repair;
 pub mod shell_bleed;
 pub mod str_utils;

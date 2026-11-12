@@ -259,8 +259,11 @@ struct ShellFloor {
 /// before redaction: `auth_rules = ... ".openfang"` redacts to `auth_rules =`.
 /// No body at all (bare `python3 x.py`, `python3 -m pkg`, `-c '...'`) fails
 /// closed too, since nothing was read.
+/// A body too large to show but scanned whole, and the local files it imports
+/// or runs, are held to the same test ([`ScriptBody::needs_judge`]).
 ///
 /// [`ScriptBody::names_control_plane`]: openfang_types::path_facts::ScriptBody::names_control_plane
+/// [`ScriptBody::needs_judge`]: openfang_types::path_facts::ScriptBody::needs_judge
 fn script_needs_judge(command: &str, sheet: &openfang_types::path_facts::PathFactSheet) -> bool {
     use openfang_types::gatekeeper::names_control_plane;
     if !openfang_types::path_facts::executes_script_like(command) {
@@ -269,10 +272,10 @@ fn script_needs_judge(command: &str, sheet: &openfang_types::path_facts::PathFac
     if names_control_plane(command) {
         return true;
     }
-    match &sheet.script_body {
-        Some(body) if body.status.included() => body.content.is_none() || body.names_control_plane,
-        _ => true,
-    }
+    sheet
+        .script_body
+        .as_ref()
+        .is_none_or(|body| body.needs_judge())
 }
 
 async fn shell_hard_floor(

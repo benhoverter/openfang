@@ -408,14 +408,15 @@ pub async fn build_gate_request(
     //
     // Computed on `command` (comment-stripped) for the same reason the path
     // facts are: a path behind a `#` is not a path the shell will act on.
+    // A scanned body counts as read: every hard body flag above was computed
+    // over all of it, and its control-plane mention routes to the judge
+    // through `script_needs_judge` rather than escalating by rule.
     flags.script_body_blind = openfang_types::path_facts::executes_script_like(&command)
         && openfang_types::gatekeeper::names_control_plane(&command)
-        && !path_facts.script_body.as_ref().is_some_and(|b| {
-            matches!(
-                b.status,
-                openfang_types::path_facts::ScriptBodyStatus::Included
-            )
-        });
+        && !path_facts
+            .script_body
+            .as_ref()
+            .is_some_and(|b| b.status.read_whole());
 
     GateRequest {
         agent_name: agent_id.to_string(),

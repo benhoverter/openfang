@@ -304,6 +304,17 @@ impl PathFact {
 /// escalate.
 pub const MAX_SCRIPT_BODY_BYTES: u64 = 16 * 1024;
 
+/// Hard cap on a script the gate will *scan* without showing it to the judge.
+///
+/// Between [`MAX_SCRIPT_BODY_BYTES`] and this, a body is read in full and every
+/// predicate an included body gets is run over it, but no content goes into
+/// the judge prompt ([`ScriptBodyStatus::Scanned`]). A clean included body
+/// already skips the judge, so a clean scanned one may too; size changes how
+/// much room there is to hide something, not the trust model (security,
+/// 2026-11-11). Over this, [`ScriptBodyStatus::TooLarge`] and fail closed.
+/// Also the per-file cap for files a script imports or runs.
+pub const MAX_SCANNED_BODY_BYTES: u64 = 1024 * 1024;
+
 /// Interpreters whose first non-flag argument is a script file to execute.
 ///
 /// Deliberately the two-token form only — see [`script_body_target`].
@@ -641,7 +652,12 @@ pub enum ScriptBodyStatus {
     Ignored,
     /// The git axis did not answer in budget, so "not ignored" is unproven.
     GitUnknown,
-    /// Larger than [`MAX_SCRIPT_BODY_BYTES`].
+    /// Larger than [`MAX_SCRIPT_BODY_BYTES`] but within
+    /// [`MAX_SCANNED_BODY_BYTES`]: read in full and run through every predicate
+    /// an included body gets, but not shown to the judge. Not a refusal for
+    /// routing purposes — see [`ScriptBodyStatus::read_whole`].
+    Scanned,
+    /// Larger than [`MAX_SCANNED_BODY_BYTES`].
     TooLarge,
     /// Not valid UTF-8, or carrying control bytes in a shape no script has.
     Binary,
@@ -658,6 +674,7 @@ impl ScriptBodyStatus {
             Self::OutsideReach => "outside-reach",
             Self::Ignored => "git-ignored",
             Self::GitUnknown => "git-unknown",
+            Self::Scanned => "scanned",
             Self::TooLarge => "too-large",
             Self::Binary => "binary",
             Self::Unreadable => "unreadable",
@@ -667,6 +684,14 @@ impl ScriptBodyStatus {
     #[must_use]
     pub fn included(self) -> bool {
         matches!(self, Self::Included)
+    }
+
+    /// Every byte was read and every body predicate ran, whether or not the
+    /// content reached the judge. The bar for treating the body's flags as
+    /// complete.
+    #[must_use]
+    pub fn read_whole(self) -> bool {
+        matches!(self, Self::Included | Self::Scanned)
     }
 }
 
@@ -800,6 +825,22 @@ pub struct ScriptBody {
     /// not a floor flag.
     #[serde(default)]
     pub names_control_plane: bool,
+    /// Local files this script imports, sources or runs by a literal path, that
+    /// the gate followed and scanned with the same predicates. Their flags are
+    /// already OR'd into the ones above. Resolved paths, for the audit row.
+    #[serde(default)]
+    pub linked: Vec<String>,
+    /// Why the walk over [`linked`](Self::linked) could not finish: a linked
+    /// file the gate could not read, a non-literal `source`, a compiled
+    /// module, or a depth, count or byte cap. `Some` routes to the judge;
+    /// the walk never truncates silently.
+    #[serde(default)]
+    pub links_blind: Option<String>,
+    /// For a body the judge cannot see (scanned, or a linked file): which
+    /// predicates hit and the matching lines with three lines of context,
+    /// redacted. So the judge is not escalating blind.
+    #[serde(default)]
+    pub scan_hits: Option<String>,
 }
 
 /// `serde` default for [`ScriptBody::git`]: unknown, never a benign answer.
@@ -808,6 +849,19 @@ fn git_unknown() -> GitFact {
 }
 
 impl ScriptBody {
+    /// A trusted-tier run of this body must go to the judge (N1): the body or
+    /// something it links names the control plane, the link walk could not
+    /// finish, or a body marked included has no content.
+    #[must_use]
+    pub fn needs_judge(&self) -> bool {
+        if !self.status.read_whole() {
+            return true;
+        }
+        (self.status.included() && self.content.is_none())
+            || self.names_control_plane
+            || self.links_blind.is_some()
+    }
+
     /// The block that goes inside the judge's `<script-body>` fence.
     ///
     /// A refusal renders as a stated refusal, not as an empty span: "we could
@@ -815,7 +869,7 @@ impl ScriptBody {
     #[must_use]
     pub fn render(&self) -> String {
         let name = self.resolved.as_deref().unwrap_or(&self.raw);
-        match (&self.content, self.status) {
+        let mut out = match (&self.content, self.status) {
             (Some(text), ScriptBodyStatus::Included) => {
                 let mut out = format!("# {name}\n");
                 if self.redactions > 0 {
@@ -827,12 +881,34 @@ impl ScriptBody {
                 out.push_str(text);
                 out
             }
+            (_, ScriptBodyStatus::Scanned) => format!(
+                "(not shown: {name} — scanned. It is too large to show, so the daemon \
+                 searched all of it for control-plane names and protected writes \
+                 instead.)"
+            ),
             _ => format!(
                 "(not read: {} — {}. You are blind to what this command executes.)",
                 name,
                 self.status.as_token()
             ),
+        };
+        if !self.linked.is_empty() {
+            out.push_str(&format!(
+                "\n(also scanned, not shown: {} local file(s) this script imports or runs)",
+                self.linked.len()
+            ));
         }
+        if let Some(reason) = &self.links_blind {
+            out.push_str(&format!(
+                "\n(could not check a file this script imports or runs: {reason}. You are \
+                 blind to that file.)"
+            ));
+        }
+        if let Some(hits) = &self.scan_hits {
+            out.push_str("\n(matching lines from unshown files:)\n");
+            out.push_str(hits);
+        }
+        out
     }
 
     /// ANAI-206 item 3: the daemon's map of what the script touches.
@@ -932,6 +1008,7 @@ impl PathFactSheet {
                 || body.destroys_datastore
                 || body.body_truncated
                 || body.body_unresolved
+                || body.links_blind.is_some()
                 // ANAI-206 F3. `all()` over an empty vec is vacuously true, so
                 // a body whose every operand is a bare word — `cd
                 // ~/.openfang/agents` then `rm -rf openfang-alpha`, where
@@ -991,6 +1068,15 @@ impl PathFactSheet {
             // `~/.openfang/scripts/` answers `no-repo`, and there the guardrail
             // is inert.
             token.push_str(&format!(" script_git={}", body.git.as_token()));
+            if !body.linked.is_empty() {
+                token.push_str(&format!(" linked={}", body.linked.len()));
+            }
+            if body.links_blind.is_some() {
+                token.push_str(" links_blind");
+            }
+            if body.status == ScriptBodyStatus::Scanned && body.names_control_plane {
+                token.push_str(" scan_hit");
+            }
             if body.status.included() {
                 token.push_str(&format!(" body_n={}", body.body_facts.len()));
                 if body.body_truncated {
@@ -1579,6 +1665,9 @@ mod tests {
             writes_runtime_config: false,
             writes_fleet_rules: false,
             names_control_plane: false,
+            linked: Vec::new(),
+            links_blind: None,
+            scan_hits: None,
         }
     }
 
