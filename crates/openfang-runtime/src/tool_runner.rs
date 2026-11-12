@@ -7131,6 +7131,18 @@ async fn tool_channel_send(
 
     let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
 
+    // Pace every progress post, media included (`[progress_updates]
+    // min_interval_secs`). Reserved right before each send, after the call
+    // has validated, so a bad call doesn't burn the slot. A throttled post
+    // returns Ok so the agent keeps working instead of retrying or stopping
+    // to report a failure.
+    let throttled = || -> Option<String> {
+        if !is_progress {
+            return None;
+        }
+        progress_throttled_note(caller_agent_id?, &dest_route)
+    };
+
     // Check for media content (image_url, file_url, or file_path)
     let image_url = input["image_url"].as_str().filter(|s| !s.is_empty());
     let file_url = input["file_url"].as_str().filter(|s| !s.is_empty());
@@ -7145,6 +7157,9 @@ async fn tool_channel_send(
 
     if let Some(url) = image_url {
         let caption = attributed_caption(input["message"].as_str());
+        if let Some(note) = throttled() {
+            return Ok(note);
+        }
         return kh
             .send_channel_media(
                 &channel,
@@ -7161,6 +7176,9 @@ async fn tool_channel_send(
     if let Some(url) = file_url {
         let caption = attributed_caption(input["message"].as_str());
         let filename = input["filename"].as_str();
+        if let Some(note) = throttled() {
+            return Ok(note);
+        }
         return kh
             .send_channel_media(
                 &channel,
@@ -7224,6 +7242,9 @@ async fn tool_channel_send(
             _ => "application/octet-stream",
         };
 
+        if let Some(note) = throttled() {
+            return Ok(note);
+        }
         return kh
             .send_channel_file_data(&channel, recipient, data, &filename, mime_type, thread_id)
             .await;
@@ -7276,37 +7297,35 @@ async fn tool_channel_send(
     };
     let final_message = synthesize_attach_directives(&final_message, attachments_raw)?;
 
-    // Pace text-only progress posts (`[progress_updates] min_interval_secs`).
-    // A throttled post returns Ok so the agent keeps working instead of
-    // retrying or stopping to report a failure.
-    let throttle_key = format!("{}|{dest_route}", caller_agent_id.unwrap_or(""));
-    if is_progress && !has_attachments {
-        let interval =
-            std::time::Duration::from_secs(openfang_types::progress_updates::min_interval_secs());
-        if let Some(wait) = progress_throttle().wait_left(&throttle_key, interval) {
-            return Ok(format!(
-                "NOT posted: progress updates are limited to one per {}s per channel \
-                 ({}s left). Do not retry this message. Keep working; include it in \
-                 your next update or your final reply.",
-                interval.as_secs(),
-                wait.as_secs().max(1)
-            ));
-        }
+    if let Some(note) = throttled() {
+        return Ok(note);
     }
+    kh.send_channel_message(
+        &channel,
+        recipient,
+        &final_message,
+        thread_id,
+        workspace_root,
+    )
+    .await
+}
 
-    let sent = kh
-        .send_channel_message(
-            &channel,
-            recipient,
-            &final_message,
-            thread_id,
-            workspace_root,
-        )
-        .await?;
-    if is_progress && !has_attachments {
-        progress_throttle().mark(&throttle_key);
-    }
-    Ok(sent)
+/// Reserve this agent's progress slot for `dest_route`. `None` means post
+/// now (the slot is taken as of this call); `Some` is the note to return
+/// instead. Caller-less sends aren't throttled: there is no agent to pace.
+fn progress_throttled_note(caller: &str, dest_route: &str) -> Option<String> {
+    let interval =
+        std::time::Duration::from_secs(openfang_types::progress_updates::min_interval_secs());
+    let wait = progress_throttle()
+        .try_reserve(&format!("{caller}|{dest_route}"), interval)
+        .err()?;
+    Some(format!(
+        "NOT posted: progress updates are limited to one per {}s per channel \
+         ({}s left). Do not retry this message. Keep working; include it in \
+         your next update or your final reply.",
+        interval.as_secs(),
+        wait.as_secs().max(1)
+    ))
 }
 
 /// Choose where a recipient-less `channel_send` goes. The wake route beats
@@ -7329,7 +7348,7 @@ fn pick_progress_route(
         .map(|(ch, rcpt)| (ch.to_lowercase(), rcpt.to_string()))
 }
 
-/// Last successful progress post per `"<agent>|<channel>:<recipient>"`.
+/// Last reserved progress post per `"<agent>|<channel>:<recipient>"`.
 struct ProgressThrottle {
     last: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
@@ -7341,22 +7360,25 @@ impl ProgressThrottle {
         }
     }
 
-    /// Time still to wait before `key` may post again, or `None` if it may
-    /// post now. A zero interval never throttles.
-    fn wait_left(&self, key: &str, interval: std::time::Duration) -> Option<std::time::Duration> {
+    /// Check and take the slot in one step, so two concurrent posts can't
+    /// both pass. `Ok` means post now; `Err` is the time still to wait. A
+    /// zero interval never throttles.
+    fn try_reserve(
+        &self,
+        key: &str,
+        interval: std::time::Duration,
+    ) -> Result<(), std::time::Duration> {
         if interval.is_zero() {
-            return None;
+            return Ok(());
         }
-        let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let elapsed = last.get(key)?.elapsed();
-        (elapsed < interval).then(|| interval - elapsed)
-    }
-
-    fn mark(&self, key: &str) {
-        self.last
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.to_string(), std::time::Instant::now());
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(elapsed) = last.get(key).map(|t| t.elapsed()) {
+            if elapsed < interval {
+                return Err(interval - elapsed);
+            }
+        }
+        last.insert(key.to_string(), std::time::Instant::now());
+        Ok(())
     }
 }
 
@@ -7408,34 +7430,59 @@ mod progress_update_tests {
     fn throttle_blocks_inside_the_interval_only() {
         let t = ProgressThrottle::new();
         let iv = Duration::from_secs(60);
-        assert!(t.wait_left("a|discord:1", iv).is_none(), "first post goes");
-        t.mark("a|discord:1");
+        assert!(t.try_reserve("a|discord:1", iv).is_ok(), "first post goes");
         assert!(
-            t.wait_left("a|discord:1", iv).is_some(),
+            t.try_reserve("a|discord:1", iv).is_err(),
             "second post waits"
         );
         assert!(
-            t.wait_left("a|discord:2", iv).is_none(),
+            t.try_reserve("a|discord:2", iv).is_ok(),
             "other channel is separate"
         );
         assert!(
-            t.wait_left("b|discord:1", iv).is_none(),
+            t.try_reserve("b|discord:1", iv).is_ok(),
             "other agent is separate"
         );
         assert!(
-            t.wait_left("a|discord:1", Duration::ZERO).is_none(),
+            t.try_reserve("a|discord:1", Duration::ZERO).is_ok(),
             "zero interval disables the limit"
         );
+    }
+
+    /// L2: check-and-take is one step, so concurrent posts in one window
+    /// can't both get through.
+    #[test]
+    fn concurrent_reservations_let_exactly_one_post_through() {
+        let t = std::sync::Arc::new(ProgressThrottle::new());
+        let iv = Duration::from_secs(60);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (t, b) = (t.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    t.try_reserve("a|discord:1", iv).is_ok()
+                })
+            })
+            .collect();
+        let passed = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(passed, 1);
     }
 
     #[test]
     fn throttle_reopens_after_the_interval() {
         let t = ProgressThrottle::new();
-        t.mark("a|discord:1");
+        assert!(t
+            .try_reserve("a|discord:1", Duration::from_secs(60))
+            .is_ok());
         std::thread::sleep(Duration::from_millis(20));
         assert!(t
-            .wait_left("a|discord:1", Duration::from_millis(10))
-            .is_none());
+            .try_reserve("a|discord:1", Duration::from_millis(10))
+            .is_ok());
     }
 }
 
@@ -9482,6 +9529,43 @@ mod tests {
         assert!(out.starts_with("NOT posted"), "{out}");
         assert!(out.contains("Do not retry"), "{out}");
         assert_eq!(fake.channel_sends.lock().unwrap().len(), 1);
+    }
+
+    /// L1: media progress posts share the same slot as text ones. The fake
+    /// has no media send, so reaching it would be an Err; a throttle note is Ok.
+    #[tokio::test]
+    async fn media_progress_post_inside_the_interval_is_held_back() {
+        let fake = progress_fake("pu-media", Some("discord:222"), Some("discord:111"));
+        send_as(&fake, "pu-media", serde_json::json!({"message": "one"}))
+            .await
+            .unwrap();
+        for media in [
+            serde_json::json!({"image_url": "https://x/y.png"}),
+            serde_json::json!({"file_url": "https://x/y.pdf"}),
+        ] {
+            let out = send_as(&fake, "pu-media", media)
+                .await
+                .expect("a throttled media post must not be an error");
+            assert!(out.starts_with("NOT posted"), "{out}");
+        }
+    }
+
+    /// L3: a send with no calling agent has no one to pace, so it isn't throttled.
+    #[tokio::test]
+    async fn caller_less_sends_are_not_throttled() {
+        let fake = Arc::new(FakeKernelHandle::new());
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        for _ in 0..2 {
+            tool_channel_send(
+                &serde_json::json!({"channel": "discord", "message": "x"}),
+                Some(&handle),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(fake.channel_sends.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

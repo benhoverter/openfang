@@ -350,12 +350,11 @@ pub struct OpenFangKernel {
     /// `agent_reply_async` already holds via `require_kernel` — so the native
     /// (in-process) and subprocess (IPC) drivers read it identically.
     ///
-    /// Keyed by `AgentId`. Race-free because `wake_turn_locks` (ANAI-197) holds
-    /// the mint -> turn -> cleanup span in one per-agent critical section, so an
-    /// agent has at most one live right at any instant and a concurrent wake for
-    /// the same target blocks *before* minting rather than clobbering.
-    /// (Superseded the ANAI-125 TODO, which relied on `agent_msg_locks` — a lock
-    /// acquired downstream of the mint, and therefore too late to protect it.)
+    /// Keyed by `AgentId`. Race-free because `wake_turn_locks` (ANAI-197)
+    /// serializes wakes for one target, and `WakeTurnScope` mints only after
+    /// the woken turn also holds `agent_msg_locks` and clears before releasing
+    /// it. So a concurrent wake blocks before minting, and a channel or cron
+    /// turn for the same agent can never see (or consume) a waiting wake's right.
     ///
     /// The correlation the right carries is the inbound wake's task id; that is
     /// the durable id ANAI-201's outstanding-correlation rows key on.
@@ -369,7 +368,8 @@ pub struct OpenFangKernel {
     /// turn. Unlike `reply_rights` it is not consumed by a reply and is set
     /// for reply-woken turns too, so a recipient-less `channel_send` posts to
     /// the chain's channel for the whole turn, and a nested
-    /// `agent_send_async` passes the route down the chain. Removed at turn end.
+    /// `agent_send_async` passes the route down the chain. Set and cleared by
+    /// `WakeTurnScope`, inside the woken turn's `agent_msg_locks` span only.
     /// A registry rather than a task-local because bridge tool calls run on
     /// another task.
     wake_routes: dashmap::DashMap<AgentId, String>,
@@ -948,6 +948,72 @@ struct CompactionBasis {
     /// The system prompt the gate measured with — built, not raw, on both turn
     /// paths.
     system_prompt: String,
+}
+
+/// What a woken turn installs into the per-agent registries (`reply_rights`,
+/// `wake_routes`) once it owns the agent's turn lock.
+struct WakeMint {
+    is_reply: bool,
+    sender: String,
+    task_id: String,
+    surface_to: Option<String>,
+    /// Set when the scope ends: `true` if the reply-right was never consumed.
+    debt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Holds a woken turn's reply-right and route for exactly as long as the turn
+/// owns `agent_msg_locks`.
+///
+/// Installing them any earlier (under `wake_turn_locks` alone) let a channel
+/// or cron turn that already held the msg lock see the waiting wake's state:
+/// its recipient-less `channel_send` posted into the waker's channel, and it
+/// could consume a reply-right meant for a turn that had not started yet.
+/// Declared after the msg-lock guard, so it drops first, including when the
+/// ANAI-201 deadline drops the turn future.
+struct WakeTurnScope<'k> {
+    kernel: &'k OpenFangKernel,
+    agent: AgentId,
+    debt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<'k> WakeTurnScope<'k> {
+    /// Caller must hold `agent_msg_locks` for `agent`.
+    fn install(kernel: &'k OpenFangKernel, agent: AgentId, mint: WakeMint) -> Self {
+        if mint.is_reply {
+            kernel.reply_rights.remove(&agent);
+        } else {
+            kernel.reply_rights.insert(
+                agent,
+                openfang_runtime::tool_runner::ReplyRight::new(
+                    mint.sender,
+                    mint.task_id,
+                    mint.surface_to.clone(),
+                ),
+            );
+        }
+        match mint.surface_to {
+            Some(route) => {
+                kernel.wake_routes.insert(agent, route);
+            }
+            None => {
+                kernel.wake_routes.remove(&agent);
+            }
+        }
+        Self {
+            kernel,
+            agent,
+            debt: mint.debt,
+        }
+    }
+}
+
+impl Drop for WakeTurnScope<'_> {
+    fn drop(&mut self) {
+        let unconsumed = self.kernel.reply_rights.remove(&self.agent).is_some();
+        self.kernel.wake_routes.remove(&self.agent);
+        self.debt
+            .store(unconsumed, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl OpenFangKernel {
@@ -2712,6 +2778,37 @@ impl OpenFangKernel {
         turn_policy: TurnPolicy,
         trigger: TurnTrigger,
     ) -> KernelResult<AgentLoopResult> {
+        self.send_message_turn(
+            agent_id,
+            message,
+            kernel_handle,
+            content_blocks,
+            sender_id,
+            sender_name,
+            origin,
+            turn_policy,
+            trigger,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::send_message_with_handle_and_blocks`] plus an optional wake
+    /// mint, installed only after the turn lock is held (see [`WakeTurnScope`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn send_message_turn(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+        content_blocks: Option<Vec<openfang_types::message::ContentBlock>>,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
+        origin: Option<openfang_types::approval::ApprovalOrigin>,
+        turn_policy: TurnPolicy,
+        trigger: TurnTrigger,
+        wake: Option<WakeMint>,
+    ) -> KernelResult<AgentLoopResult> {
         // Acquire per-agent lock to serialize concurrent messages for the same agent.
         // This prevents session corruption when multiple messages arrive in quick
         // succession (e.g. rapid voice messages via Telegram). Messages for different
@@ -2722,6 +2819,9 @@ impl OpenFangKernel {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
+        // After `_guard`, so it drops (and clears the registries) before the
+        // lock is released.
+        let _wake_scope = wake.map(|w| WakeTurnScope::install(self, agent_id, w));
 
         // Enforce quota before running the agent loop
         self.scheduler
@@ -7226,7 +7326,14 @@ impl OpenFangKernel {
         // reply wake (leg 4 is minted no reply-right, so a directive there would
         // instruct the initiator to call a tool guaranteed to fail closed).
         let turn_message = envelope.turn_prompt(&task_id);
-        let send_fut = self.send_message_with_handle_and_blocks(
+        // ANAI-122/123 + progress routes: the reply-right and the wake route
+        // are minted INSIDE the turn lock by `WakeTurnScope`, not here. Minting
+        // here (under `_wake_guard` only) exposed them to whatever channel or
+        // cron turn already held `agent_msg_locks` for this agent. `debt`
+        // starts true for an origination wake: if the turn never reaches the
+        // lock (deadline elapsed while queued), the sender is still owed.
+        let debt = Arc::new(std::sync::atomic::AtomicBool::new(!envelope.is_reply));
+        let send_fut = self.send_message_turn(
             target_id,
             &turn_message,
             handle,
@@ -7242,6 +7349,13 @@ impl OpenFangKernel {
             // the step-1 comment promised.
             TurnPolicy::woken(),
             envelope.trigger,
+            Some(WakeMint {
+                is_reply: envelope.is_reply,
+                sender: envelope.sender.clone(),
+                task_id: task_id.clone(),
+                surface_to: envelope.surface_to.clone(),
+                debt: debt.clone(),
+            }),
         );
         // ANAI-110: scope the inbound wake lineage into task-local context for
         // the whole woken turn, so a nested `agent_send_async` extends the REAL
@@ -7266,33 +7380,10 @@ impl OpenFangKernel {
         // `envelope.sender`) and is consumed by the first `agent_reply_async`
         // call; a second reply this turn finds nothing.
         //
-        // Keying by agent_id is race-free because `_wake_guard` above holds the
-        // mint/consume/cleanup span in one per-agent critical section (ANAI-197).
-        // The pre-ANAI-197 comment credited `agent_msg_locks` for this; that lock
-        // is acquired downstream of this mint and so never protected it.
-        if envelope.is_reply {
-            self.reply_rights.remove(&target_id);
-        } else {
-            self.reply_rights.insert(
-                target_id,
-                openfang_runtime::tool_runner::ReplyRight::new(
-                    envelope.sender.clone(),
-                    task_id.clone(),
-                    // ANAI-123: bake the inbound surfacing route into the token
-                    // so the callee's one-shot reply inherits it without ever
-                    // seeing or choosing a target/route.
-                    envelope.surface_to.clone(),
-                ),
-            );
-        }
-        match envelope.surface_to.clone() {
-            Some(route) => {
-                self.wake_routes.insert(target_id, route);
-            }
-            None => {
-                self.wake_routes.remove(&target_id);
-            }
-        }
+        // Keying by agent_id is race-free because `_wake_guard` above
+        // serializes wakes for this target (ANAI-197) and `WakeTurnScope`
+        // confines the mint to the span that also owns `agent_msg_locks`, so
+        // non-woken turns for the same agent cannot see it either.
         // The lineage task-local still wraps the in-process send future: it is
         // read only by in-process `resolve_wake_base_lineage`, never across the
         // IPC boundary, so it correctly stays a task-local. The reply-right no
@@ -7331,17 +7422,15 @@ impl OpenFangKernel {
         )
         .await;
 
-        // Cleanup (belt-and-suspenders): drop any reply-right that survived the
-        // turn UNUSED, so a stale token cannot leak into a later
-        // reply-woken/terminal turn for the same agent. Consume-on-read already
-        // removes a USED right; this covers the never-replied path. Safe under
-        // `agent_msg_locks` (one woken turn per agent at a time).
+        // Cleanup: `WakeTurnScope` dropped any reply-right that survived the
+        // turn UNUSED (and the wake route) before the turn lock released, so a
+        // stale token cannot leak into a later turn for the same agent.
         //
-        // ANAI-199: the return value is now load-bearing, not incidental. `Some`
-        // means the token was NEVER consumed — the turn ran (or failed) without
-        // the callee ever calling `agent_reply_async`, so the sender's debt is
-        // still outstanding and the daemon must pay it. `None` means the callee
-        // already answered; synthesizing anything here would double-reply.
+        // ANAI-199: `debt` is load-bearing. `true` means the token was NEVER
+        // consumed — the turn ran (or failed, or never got the lock) without
+        // the callee calling `agent_reply_async`, so the sender's debt is
+        // still outstanding and the daemon must pay it. `false` means the
+        // callee already answered; synthesizing anything would double-reply.
         //
         // ANAI-201: read BEFORE the timeout branch below, so an ABORT obeys the
         // same rule. A callee that replied and then hung has no outstanding
@@ -7349,8 +7438,7 @@ impl OpenFangKernel {
         // answer. Reading here also means the token is dropped on the abort
         // path too — the aborted turn is over, and a surviving token would be a
         // live grant to answer a correlation the kernel has already closed.
-        let debt_outstanding = self.reply_rights.remove(&target_id).is_some();
-        self.wake_routes.remove(&target_id);
+        let debt_outstanding = debt.load(std::sync::atomic::Ordering::SeqCst);
 
         let result = match timed {
             Ok(r) => r,
@@ -16917,6 +17005,149 @@ system_prompt = "You are a test agent."
             kernel.reply_rights.is_empty(),
             "no reply-right may survive turn end"
         );
+
+        kernel.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // Progress updates P1: a wake's route and reply-right exist only while the
+    // woken turn owns `agent_msg_locks`
+    // -----------------------------------------------------------------------
+
+    fn p1_kernel(tag: &str) -> (tempfile::TempDir, std::sync::Arc<OpenFangKernel>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join(tag);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        let kernel =
+            std::sync::Arc::new(OpenFangKernel::boot_with_config(config).expect("kernel boots"));
+        (tmp, kernel)
+    }
+
+    fn p1_mint(is_reply: bool, route: &str) -> (WakeMint, Arc<std::sync::atomic::AtomicBool>) {
+        let debt = Arc::new(std::sync::atomic::AtomicBool::new(!is_reply));
+        (
+            WakeMint {
+                is_reply,
+                sender: "waker".into(),
+                task_id: "corr-p1".into(),
+                surface_to: Some(route.into()),
+                debt: debt.clone(),
+            },
+            debt,
+        )
+    }
+
+    /// Security's P1 case: X is mid-turn with its own human (holds the msg
+    /// lock). A wake for X with a foreign route arrives. Until the woken turn
+    /// owns the lock, X's live turn must see no wake route and no reply-right,
+    /// or its recipient-less `channel_send` posts into the waker's channel.
+    #[tokio::test]
+    async fn wake_state_is_not_visible_while_another_turn_holds_the_msg_lock() {
+        let (_tmp, kernel) = p1_kernel("openfang-p1-lock");
+        let x: AgentId = AgentId(uuid::Uuid::new_v4());
+
+        let msg_lock = kernel
+            .agent_msg_locks
+            .entry(x)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let channel_turn = msg_lock.lock().await;
+
+        let (mint, debt) = p1_mint(false, "discord:waker-channel");
+        let k = kernel.clone();
+        let woken = tokio::spawn(async move {
+            k.send_message_turn(
+                x,
+                "wake",
+                None,
+                None,
+                Some("waker".into()),
+                None,
+                None,
+                TurnPolicy::woken(),
+                TurnTrigger::User,
+                Some(mint),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            kernel.wake_routes.get(&x).is_none(),
+            "a waiting wake's route leaked into the turn that holds the msg lock"
+        );
+        assert!(
+            kernel.reply_rights.get(&x).is_none(),
+            "a waiting wake's reply-right is consumable by the turn that holds the msg lock"
+        );
+
+        drop(channel_turn);
+        // X is not registered, so the woken turn fails right after minting;
+        // what matters is that the scope cleaned up and recorded the debt.
+        let _ = woken.await.expect("woken turn task completes");
+        assert!(
+            kernel.wake_routes.get(&x).is_none(),
+            "route outlived the turn"
+        );
+        assert!(
+            kernel.reply_rights.get(&x).is_none(),
+            "right outlived the turn"
+        );
+        assert!(
+            debt.load(std::sync::atomic::Ordering::SeqCst),
+            "an unconsumed reply-right must leave the sender's debt outstanding"
+        );
+
+        kernel.shutdown();
+    }
+
+    /// The scope's set/clear contract: visible while held, gone after, and the
+    /// debt reflects whether the turn consumed its right.
+    #[tokio::test]
+    async fn wake_turn_scope_sets_clears_and_records_debt() {
+        let (_tmp, kernel) = p1_kernel("openfang-p1-scope");
+        let x: AgentId = AgentId(uuid::Uuid::new_v4());
+
+        // Origination wake, callee answers: no debt.
+        let (mint, debt) = p1_mint(false, "discord:a");
+        {
+            let _scope = WakeTurnScope::install(&kernel, x, mint);
+            assert_eq!(
+                kernel.wake_routes.get(&x).map(|r| r.clone()).as_deref(),
+                Some("discord:a")
+            );
+            assert!(kernel.reply_rights.remove(&x).is_some(), "right minted");
+        }
+        assert!(kernel.wake_routes.get(&x).is_none());
+        assert!(!debt.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Origination wake, callee never answers: debt outstanding.
+        let (mint, debt) = p1_mint(false, "discord:b");
+        drop(WakeTurnScope::install(&kernel, x, mint));
+        assert!(kernel.reply_rights.get(&x).is_none());
+        assert!(debt.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Reply wake: route set, no right minted (a stale one is cleared).
+        kernel.reply_rights.insert(
+            x,
+            openfang_runtime::tool_runner::ReplyRight::new("stale", "corr-stale", None),
+        );
+        let (mint, debt) = p1_mint(true, "discord:c");
+        {
+            let _scope = WakeTurnScope::install(&kernel, x, mint);
+            assert!(
+                kernel.reply_rights.get(&x).is_none(),
+                "reply wakes stay terminal"
+            );
+            assert!(kernel.wake_routes.get(&x).is_some());
+        }
+        assert!(kernel.wake_routes.get(&x).is_none());
+        assert!(!debt.load(std::sync::atomic::Ordering::SeqCst));
 
         kernel.shutdown();
     }
