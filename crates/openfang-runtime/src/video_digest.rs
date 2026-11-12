@@ -65,10 +65,10 @@ pub const SILENCE_NOISE_DB: i32 = -35;
 const STILL_MAX_WIDTH: u32 = 1280;
 const SHEET_TILE_WIDTH: u32 = 320;
 const SHEET_COLS: u32 = 5;
-const WORK_DIR: &str = ".work";
 /// Written into every output folder this tool fills. A non-empty folder is
-/// only cleaned when it carries this marker (or a prior `digest.md`), so an
-/// agent cannot point the tool at an unrelated folder and lose its `frames/`.
+/// only cleaned when it carries this marker, so an agent cannot point the
+/// tool at an unrelated folder (one that merely holds a `digest.md`, say) and
+/// lose its `frames/`.
 const MARKER_FILE: &str = ".video_digest";
 /// Plain files this tool writes into the output folder (besides `frames/`).
 const OUTPUT_FILES: [&str; 6] = [
@@ -473,7 +473,14 @@ fn defang(text: &str) -> String {
 fn clean_label(name: &str) -> String {
     let flat: String = name
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        // U+2028/U+2029 are not Cc, but models read them as line breaks.
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     defang(&flat)
 }
@@ -490,14 +497,38 @@ fn write_new(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
         .write_all(bytes.as_ref())
 }
 
+/// Scratch space for the child processes. ffmpeg and whisper-cli open their
+/// outputs with O_TRUNC and follow symlinks, so they must never write under a
+/// name an agent can predict or reach: a fresh 0700 folder in the system temp
+/// dir with a random name, removed on drop (success, error, or the deadline
+/// dropping the future). Results reach the output folder only through `place`.
+struct WorkDir(PathBuf);
+
+impl WorkDir {
+    fn new() -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path =
+            std::env::temp_dir().join(format!("openfang-vd-{}", uuid::Uuid::new_v4().simple()));
+        // Non-recursive: an existing entry at the random name is an error, not reused.
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Refuse a folder this tool did not fill, then clear our own names and
-/// create fresh `.work` and `frames`. Errors are full envelopes.
+/// create a fresh `frames`. Errors are full envelopes.
 fn prepare_out_dir(out: &Path) -> Result<(), String> {
     let entries: Vec<std::ffi::OsString> = std::fs::read_dir(out)
         .map_err(|e| err_envelope("DIGEST_FAILED", &format!("cannot list output folder: {e}")))?
         .filter_map(|e| e.ok().map(|e| e.file_name()))
         .collect();
-    let ours = entries.iter().any(|n| n == MARKER_FILE || n == "digest.md");
+    let ours = entries.iter().any(|n| n == MARKER_FILE);
     if !entries.is_empty() && !ours {
         return Err(err_envelope(
             "BAD_OUTPUT_DIR",
@@ -505,9 +536,7 @@ fn prepare_out_dir(out: &Path) -> Result<(), String> {
              pick an empty or new folder so nothing of yours is overwritten",
         ));
     }
-    let work = out.join(WORK_DIR);
     let frames_dir = out.join("frames");
-    let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&frames_dir);
     for f in OUTPUT_FILES {
         let _ = std::fs::remove_file(out.join(f));
@@ -517,8 +546,7 @@ fn prepare_out_dir(out: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         r => r,
     };
-    made.and_then(|_| std::fs::create_dir(&work))
-        .and_then(|_| std::fs::create_dir(&frames_dir))
+    made.and_then(|_| std::fs::create_dir(&frames_dir))
         .map_err(|e| {
             err_envelope(
                 "DIGEST_FAILED",
@@ -527,11 +555,21 @@ fn prepare_out_dir(out: &Path) -> Result<(), String> {
         })
 }
 
-/// Move a single image ffmpeg wrote into `.work` to its final name. rename
-/// replaces whatever sits at the target, a symlink included, without following it.
-fn place(work: &Path, out: &Path, name: &str) -> Result<(), String> {
-    std::fs::rename(work.join(name), out.join(name))
-        .map_err(|e| err_envelope("DIGEST_FAILED", &format!("could not move {name}: {e}")))
+/// Move a file a child wrote in the work dir to its final place. rename
+/// replaces whatever sits at the target, a symlink included, without following
+/// it. If the temp dir sits on another volume, copy with `write_new` instead:
+/// the target was just cleaned, so an existing entry there is tampering.
+fn place(src: &Path, dst: &Path) -> Result<(), String> {
+    let moved = match std::fs::rename(src, dst) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            std::fs::read(src).and_then(|b| write_new(dst, b))
+        }
+        r => r,
+    };
+    moved.map_err(|e| {
+        let name = dst.file_name().unwrap_or_default().to_string_lossy();
+        err_envelope("DIGEST_FAILED", &format!("could not move {name}: {e}"))
+    })
 }
 
 fn timeline(f: &DigestFacts) -> String {
@@ -715,7 +753,6 @@ pub async fn run(r: &Resolved, params: &Params) -> String {
     };
     with_deadline(
         Duration::from_secs(WALL_CLOCK_SECS),
-        &r.out_dir,
         &r.out_display,
         run_inner(r, params),
     )
@@ -723,33 +760,28 @@ pub async fn run(r: &Resolved, params: &Params) -> String {
 }
 
 /// Dropping `fut` on the deadline drops every in-flight child, and
-/// `kill_on_drop` kills it.
+/// `kill_on_drop` kills it; it also drops the `WorkDir`, which removes it.
 async fn with_deadline(
     limit: Duration,
-    out_dir: &Path,
     out_display: &str,
     fut: impl std::future::Future<Output = String>,
 ) -> String {
     match tokio::time::timeout(limit, fut).await {
         Ok(s) => s,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(out_dir.join(WORK_DIR));
-            err_envelope(
-                "TIMEOUT",
-                &format!(
-                    "video_digest passed its {}s limit and was stopped. \
-                     Files already in {out_display} may be incomplete.",
-                    limit.as_secs()
-                ),
-            )
-        }
+        Err(_) => err_envelope(
+            "TIMEOUT",
+            &format!(
+                "video_digest passed its {}s limit and was stopped. \
+                 Files already in {out_display} may be incomplete.",
+                limit.as_secs()
+            ),
+        ),
     }
 }
 
 async fn run_inner(r: &Resolved, p: &Params) -> String {
     let input = r.input.to_string_lossy().into_owned();
     let out = &r.out_dir;
-    let work = out.join(WORK_DIR);
     let frames_dir = out.join("frames");
 
     // 1. Probe. Refuse long files before decoding anything.
@@ -791,6 +823,16 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
     if let Err(e) = prepare_out_dir(out) {
         return e;
     }
+    let work_guard = match WorkDir::new() {
+        Ok(w) => w,
+        Err(e) => {
+            return err_envelope(
+                "DIGEST_FAILED",
+                &format!("could not create a work folder: {e}"),
+            )
+        }
+    };
+    let work = work_guard.0.clone();
 
     // 2. Stills.
     let mut frames: Vec<(String, f64)> = Vec::new();
@@ -868,21 +910,21 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                 Ok(c) => return child_failed("ffmpeg (contact sheet)", &c),
                 Err(e) => return err_envelope("DIGEST_FAILED", &e),
             }
-            if let Err(e) = place(&work, out, "contact_sheet.jpg") {
+            if let Err(e) = place(
+                &work.join("contact_sheet.jpg"),
+                &out.join("contact_sheet.jpg"),
+            ) {
                 return e;
             }
         }
         for i in 0..n {
             let t = times.get(i).copied().unwrap_or(0.0);
             let name = frame_file_name(i, t);
-            if let Err(e) = std::fs::rename(
-                work.join(format!("{:03}.jpg", i + 1)),
-                frames_dir.join(&name),
+            if let Err(e) = place(
+                &work.join(format!("{:03}.jpg", i + 1)),
+                &frames_dir.join(&name),
             ) {
-                return err_envelope(
-                    "DIGEST_FAILED",
-                    &format!("could not move still {}: {e}", i + 1),
-                );
+                return e;
             }
             frames.push((name, t));
         }
@@ -938,7 +980,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             Ok(c) => return child_failed("ffmpeg (waveform)", &c),
             Err(e) => return err_envelope("DIGEST_FAILED", &e),
         }
-        if let Err(e) = place(&work, out, "waveform.png") {
+        if let Err(e) = place(&work.join("waveform.png"), &out.join("waveform.png")) {
             return e;
         }
 
@@ -1042,7 +1084,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
     if let Err(e) = write_new(&out.join("digest.md"), md) {
         return err_envelope("DIGEST_FAILED", &format!("could not write digest.md: {e}"));
     }
-    let _ = std::fs::remove_dir_all(&work);
+    drop(work_guard);
 
     let rel = |name: &str| format!("{}/{}", r.out_display.trim_end_matches('/'), name);
     let mut files = serde_json::Map::new();
@@ -1518,7 +1560,7 @@ mod tests {
         let marker = tmp.path().join("marker");
         let script = format!("sleep 3; /usr/bin/touch '{}'", marker.display());
         let started = std::time::Instant::now();
-        let s = with_deadline(Duration::from_millis(500), tmp.path(), "d", async {
+        let s = with_deadline(Duration::from_millis(500), "d", async {
             let _ = run_child("/bin/sh", &["-c".into(), script], tmp.path()).await;
             "finished".to_string()
         })
@@ -1682,15 +1724,21 @@ mod tests {
         ] {
             assert!(out.join(f).is_file(), "{f} missing");
         }
-        assert!(!out.join(WORK_DIR).exists(), "work dir left behind");
+        assert!(!out.join(".work").exists(), "work dir under out/");
         let audio: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out.join("audio.json")).unwrap()).unwrap();
         assert!(!audio["silences"].as_array().unwrap().is_empty(), "{audio}");
         assert!(out.join(MARKER_FILE).is_file());
-        // A second run into the same folder cleans it and succeeds.
+        // A second run into the same folder cleans it and succeeds, and never
+        // writes through a link planted where the old fixed work names were.
+        let victim = tmp.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        std::fs::create_dir(out.join(".work")).unwrap();
+        std::os::unix::fs::symlink(&victim, out.join(".work/whisper.json")).unwrap();
         let env: serde_json::Value =
             serde_json::from_str(&run_inner(&r, &parse_params(&json!({})).unwrap()).await).unwrap();
         assert_eq!(env["ok"], true, "second run: {env}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
     }
 
     /// Needs Homebrew ffprobe. On a dev host without it this FAILS rather than
@@ -1777,6 +1825,12 @@ mod tests {
     }
 
     #[test]
+    fn file_name_line_and_paragraph_separators_are_flattened() {
+        let s = clean_label("a\u{2028}# b\u{2029}c\u{85}d");
+        assert_eq!(s, "a # b c d");
+    }
+
+    #[test]
     fn output_dir_with_pattern_characters_is_refused() {
         let ws = tempfile::tempdir().unwrap();
         let src = Path::new("/x/a.mp4");
@@ -1797,7 +1851,7 @@ mod tests {
         assert!(e.contains("BAD_OUTPUT_DIR"), "{e}");
         assert!(d.path().join("frames/mine.jpg").is_file());
         assert!(d.path().join("waveform.png").is_file());
-        assert!(!d.path().join(WORK_DIR).exists());
+        assert!(!d.path().join(MARKER_FILE).exists());
     }
 
     #[test]
@@ -1805,8 +1859,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         prepare_out_dir(d.path()).unwrap();
         assert!(d.path().join(MARKER_FILE).is_file());
-        assert!(d.path().join(WORK_DIR).is_dir());
         assert!(d.path().join("frames").is_dir());
+        assert!(!d.path().join(".work").exists());
     }
 
     #[test]
@@ -1816,17 +1870,59 @@ mod tests {
         prepare_out_dir(d.path()).unwrap();
         std::fs::write(d.path().join("frames/old.jpg"), b"x").unwrap();
         std::fs::write(d.path().join("waveform.png"), b"x").unwrap();
-        std::fs::remove_dir_all(d.path().join(WORK_DIR)).unwrap();
         prepare_out_dir(d.path()).unwrap();
         assert!(!d.path().join("frames/old.jpg").exists());
         assert!(!d.path().join("waveform.png").exists());
+    }
 
-        // digest.md only: a folder from before the marker existed.
+    #[test]
+    fn folder_with_only_a_digest_md_is_refused() {
+        // "digest.md" is a common name; without our marker the folder is not ours.
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("digest.md"), b"x").unwrap();
+        std::fs::write(d.path().join("digest.md"), b"notes").unwrap();
         std::fs::create_dir(d.path().join("frames")).unwrap();
+        std::fs::write(d.path().join("frames/mine.jpg"), b"keep").unwrap();
+        let e = prepare_out_dir(d.path()).unwrap_err();
+        assert!(e.contains("BAD_OUTPUT_DIR"), "{e}");
+        assert!(d.path().join("digest.md").is_file());
+        assert!(d.path().join("frames/mine.jpg").is_file());
+    }
+
+    #[test]
+    fn work_dir_is_private_random_and_outside_the_output_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let out = tempfile::tempdir().unwrap();
+        prepare_out_dir(out.path()).unwrap();
+        let a = WorkDir::new().unwrap();
+        let b = WorkDir::new().unwrap();
+        assert_ne!(a.0, b.0);
+        assert!(!a.0.starts_with(out.path()));
+        assert!(a.0.starts_with(std::env::temp_dir()));
+        let mode = std::fs::metadata(&a.0).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let path = a.0.clone();
+        std::fs::write(path.join("whisper.json"), b"{}").unwrap();
+        drop(a);
+        assert!(!path.exists(), "work dir survived drop");
+    }
+
+    #[test]
+    fn link_planted_at_the_old_work_name_is_never_touched() {
+        let d = tempfile::tempdir().unwrap();
         prepare_out_dir(d.path()).unwrap();
-        assert!(!d.path().join("digest.md").exists());
+        let victim = d.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+        std::fs::create_dir(d.path().join(".work")).unwrap();
+        let link = d.path().join(".work/whisper.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        prepare_out_dir(d.path()).unwrap();
+        let w = WorkDir::new().unwrap();
+        assert!(!w.0.starts_with(d.path()));
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
     }
 
     #[test]
@@ -1844,13 +1940,12 @@ mod tests {
     #[test]
     fn place_replaces_a_planted_symlink_without_following_it() {
         let d = tempfile::tempdir().unwrap();
-        let work = d.path().join(WORK_DIR);
-        std::fs::create_dir(&work).unwrap();
-        std::fs::write(work.join("waveform.png"), b"png").unwrap();
+        let work = WorkDir::new().unwrap();
+        std::fs::write(work.0.join("waveform.png"), b"png").unwrap();
         let victim = d.path().join("victim.txt");
         std::fs::write(&victim, b"original").unwrap();
         std::os::unix::fs::symlink(&victim, d.path().join("waveform.png")).unwrap();
-        place(&work, d.path(), "waveform.png").unwrap();
+        place(&work.0.join("waveform.png"), &d.path().join("waveform.png")).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"original");
         let meta = std::fs::symlink_metadata(d.path().join("waveform.png")).unwrap();
         assert!(meta.is_file());
