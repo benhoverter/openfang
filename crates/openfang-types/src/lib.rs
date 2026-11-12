@@ -24,6 +24,7 @@ pub mod model_catalog;
 pub mod net_facts;
 pub mod path_facts;
 pub mod paths;
+pub mod progress_updates;
 pub mod scheduler;
 pub mod secret_scrub;
 pub mod security_flags;

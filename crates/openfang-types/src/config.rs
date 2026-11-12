@@ -1909,6 +1909,10 @@ pub struct KernelConfig {
     /// `agent_send_async`, ANAI-201).
     #[serde(default)]
     pub async_reply: AsyncReplyConfig,
+    /// Rate limit on recipient-less `channel_send` progress posts
+    /// (`[progress_updates]`).
+    #[serde(default)]
+    pub progress_updates: ProgressUpdatesConfig,
     /// `file_convert` spawn-timeout policy (`[convert]`, ANAI-286). Operator
     /// policy; the per-recipe value lives next to the recipe in
     /// `convert/recipes.toml`.
@@ -2155,6 +2159,27 @@ impl Default for AsyncReplyConfig {
             default_timeout_secs: crate::async_reply::DEFAULT_TIMEOUT_SECS,
             min_timeout_secs: crate::async_reply::MIN_TIMEOUT_SECS,
             max_timeout_secs: crate::async_reply::MAX_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// `[progress_updates]`: fleet-wide pacing for progress posts.
+///
+/// Applies to `channel_send` calls that leave out the recipient, which is the
+/// form RULES.md tells agents to use for progress. Explicit-recipient sends
+/// are deliberate deliveries and are never throttled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProgressUpdatesConfig {
+    /// Minimum seconds between two progress posts by the same agent to the
+    /// same channel. Default: 60. `0` turns the limit off.
+    pub min_interval_secs: u64,
+}
+
+impl Default for ProgressUpdatesConfig {
+    fn default() -> Self {
+        Self {
+            min_interval_secs: crate::progress_updates::DEFAULT_MIN_INTERVAL_SECS,
         }
     }
 }
@@ -2423,6 +2448,7 @@ impl Default for KernelConfig {
             watchdog: WatchdogConfig::default(),
             agent_wake: AgentWakeConfig::default(),
             async_reply: AsyncReplyConfig::default(),
+            progress_updates: ProgressUpdatesConfig::default(),
             convert: ConvertConfig::default(),
             skills: HashMap::new(),
             turn_context: TurnContextConfig::default(),

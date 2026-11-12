@@ -1266,7 +1266,7 @@ pub async fn execute_tool(
         "cron_cancel" => tool_cron_cancel(input, kernel).await,
 
         // Channel send tool (proactive outbound messaging)
-        "channel_send" => tool_channel_send(input, kernel, workspace_root).await,
+        "channel_send" => tool_channel_send(input, kernel, workspace_root, caller_agent_id).await,
 
         // Persistent process tools
         "process_start" => {
@@ -2313,12 +2313,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use `attachments` to send one or more local files alongside the message (workspace-relative paths preferred). Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media on a configured channel (discord, email, telegram, slack, etc). For a progress update, pass only `message`: leave out `channel` and `recipient` and the daemon posts it where your current work belongs (the channel of the agent that asked you for this work, otherwise your own channel), labels it with your name when it isn't your channel, and limits progress posts to one per channel per minute. To reach a specific person or place, pass both `channel` and `recipient`. For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use `attachments` to send one or more local files alongside the message (workspace-relative paths preferred). Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
+                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord'). Required with `recipient`; omit for progress updates." },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, channel ID, etc.). Omit for progress updates; the daemon picks the channel." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
                     "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
@@ -2332,7 +2332,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
-                "required": ["channel", "recipient"]
+                "required": []
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
@@ -5036,6 +5036,11 @@ async fn tool_agent_send_async(
     // still resolves to `None`, preserving a pure fire-and-forget wake. The
     // route rides the round-trip identically to an explicit one from here on.
     let surface_to = surface_to.or_else(|| {
+        // Inside a woken turn, pass the inbound route down the chain so every
+        // hop's progress and replies land where the chain started.
+        if let Some(route) = kh.wake_route(sender) {
+            return Some(route);
+        }
         let sender_name = agents.iter().find(|a| a.id == sender).map(|a| a.name.as_str())?;
         let route = kh.channel_binding_route(sender_name)?;
         info!(
@@ -7054,12 +7059,13 @@ async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
     workspace_root: Option<&Path>,
+    caller_agent_id: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
-    let channel = input["channel"]
+    let channel_hint = input["channel"]
         .as_str()
-        .ok_or("Missing 'channel' parameter")?
+        .unwrap_or("")
         .trim()
         .to_lowercase();
     let recipient_input = input["recipient"]
@@ -7067,22 +7073,61 @@ async fn tool_channel_send(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    // If recipient is empty, resolve from channel's default_chat_id config.
-    let recipient = if recipient_input.is_empty() {
-        let default_id = kh.get_channel_default_recipient(&channel).await;
-        match default_id {
-            Some(id) => id,
+    // A recipient-less send is a progress post. The daemon picks where it
+    // goes: the route of the wake this turn belongs to, else the caller's home
+    // channel, else the channel's configured default_chat_id. An explicit
+    // recipient always wins and is never throttled or attributed.
+    let is_progress = recipient_input.is_empty();
+    let own_route = caller_agent_id.and_then(|c| kh.channel_binding_route(c));
+    let wake_route = caller_agent_id.and_then(|c| kh.wake_route(c));
+    let (channel, recipient) = if !is_progress {
+        if channel_hint.is_empty() {
+            return Err("Missing 'channel' parameter (required with 'recipient')".to_string());
+        }
+        (channel_hint, recipient_input)
+    } else if let Some(found) =
+        pick_progress_route(&channel_hint, wake_route.as_deref(), own_route.as_deref())
+    {
+        found
+    } else {
+        if channel_hint.is_empty() {
+            return Err(
+                "No channel to post to: this agent has no home channel and this turn \
+                 has no caller's channel. Pass 'channel' and 'recipient' explicitly."
+                    .to_string(),
+            );
+        }
+        match kh.get_channel_default_recipient(&channel_hint).await {
+            Some(id) => (channel_hint, id),
             None => {
                 return Err(format!(
-                "Missing 'recipient' parameter. Set default_chat_id in [channels.{channel}] config \
-                 or pass recipient explicitly."
-            ))
+                    "Missing 'recipient' parameter. Set default_chat_id in \
+                     [channels.{channel_hint}] config or pass recipient explicitly."
+                ))
             }
         }
-    } else {
-        recipient_input
     };
     let recipient = recipient.as_str();
+    let dest_route = format!("{channel}:{recipient}");
+
+    // Attribution: a post that lands in the calling chain's channel rather
+    // than the sender's own carries the sender's real name, stamped here so
+    // the model can neither forget nor forge it.
+    let attribution = if wake_route.as_deref() == Some(dest_route.as_str())
+        && own_route.as_deref() != Some(dest_route.as_str())
+    {
+        caller_agent_id.map(|c| {
+            let name = kh
+                .list_agents()
+                .into_iter()
+                .find(|a| a.id == c)
+                .map(|a| a.name)
+                .unwrap_or_else(|| c.to_string());
+            format!("[from {name}] ")
+        })
+    } else {
+        None
+    };
 
     let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
 
@@ -7090,20 +7135,41 @@ async fn tool_channel_send(
     let image_url = input["image_url"].as_str().filter(|s| !s.is_empty());
     let file_url = input["file_url"].as_str().filter(|s| !s.is_empty());
     let file_path = input["file_path"].as_str().filter(|s| !s.is_empty());
+    let attributed_caption = |raw: Option<&str>| -> Option<String> {
+        match (&attribution, raw.filter(|s| !s.is_empty())) {
+            (Some(a), Some(m)) => Some(format!("{a}{m}")),
+            (Some(a), None) => Some(a.trim_end().to_string()),
+            (None, m) => m.map(str::to_string),
+        }
+    };
 
     if let Some(url) = image_url {
-        let caption = input["message"].as_str().filter(|s| !s.is_empty());
+        let caption = attributed_caption(input["message"].as_str());
         return kh
-            .send_channel_media(&channel, recipient, "image", url, caption, None, thread_id)
+            .send_channel_media(
+                &channel,
+                recipient,
+                "image",
+                url,
+                caption.as_deref(),
+                None,
+                thread_id,
+            )
             .await;
     }
 
     if let Some(url) = file_url {
-        let caption = input["message"].as_str().filter(|s| !s.is_empty());
+        let caption = attributed_caption(input["message"].as_str());
         let filename = input["filename"].as_str();
         return kh
             .send_channel_media(
-                &channel, recipient, "file", url, caption, filename, thread_id,
+                &channel,
+                recipient,
+                "file",
+                url,
+                caption.as_deref(),
+                filename,
+                thread_id,
             )
             .await;
     }
@@ -7203,16 +7269,174 @@ async fn tool_channel_send(
         message_raw.to_string()
     };
 
+    let final_message = match &attribution {
+        // Email bodies start with a `Subject:` header; a prefix would break it.
+        Some(a) if channel != "email" => format!("{a}{final_message}"),
+        _ => final_message,
+    };
     let final_message = synthesize_attach_directives(&final_message, attachments_raw)?;
 
-    kh.send_channel_message(
-        &channel,
-        recipient,
-        &final_message,
-        thread_id,
-        workspace_root,
-    )
-    .await
+    // Pace text-only progress posts (`[progress_updates] min_interval_secs`).
+    // A throttled post returns Ok so the agent keeps working instead of
+    // retrying or stopping to report a failure.
+    let throttle_key = format!("{}|{dest_route}", caller_agent_id.unwrap_or(""));
+    if is_progress && !has_attachments {
+        let interval =
+            std::time::Duration::from_secs(openfang_types::progress_updates::min_interval_secs());
+        if let Some(wait) = progress_throttle().wait_left(&throttle_key, interval) {
+            return Ok(format!(
+                "NOT posted: progress updates are limited to one per {}s per channel \
+                 ({}s left). Do not retry this message. Keep working; include it in \
+                 your next update or your final reply.",
+                interval.as_secs(),
+                wait.as_secs().max(1)
+            ));
+        }
+    }
+
+    let sent = kh
+        .send_channel_message(
+            &channel,
+            recipient,
+            &final_message,
+            thread_id,
+            workspace_root,
+        )
+        .await?;
+    if is_progress && !has_attachments {
+        progress_throttle().mark(&throttle_key);
+    }
+    Ok(sent)
+}
+
+/// Choose where a recipient-less `channel_send` goes. The wake route beats
+/// the agent's own home channel. A non-empty `channel_hint` only accepts a
+/// route on that channel adapter. Routes are `"<channel>:<recipient>"`.
+fn pick_progress_route(
+    channel_hint: &str,
+    wake_route: Option<&str>,
+    own_route: Option<&str>,
+) -> Option<(String, String)> {
+    [wake_route, own_route]
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.split_once(':'))
+        .find(|(ch, rcpt)| {
+            !ch.is_empty()
+                && !rcpt.is_empty()
+                && (channel_hint.is_empty() || ch.eq_ignore_ascii_case(channel_hint))
+        })
+        .map(|(ch, rcpt)| (ch.to_lowercase(), rcpt.to_string()))
+}
+
+/// Last successful progress post per `"<agent>|<channel>:<recipient>"`.
+struct ProgressThrottle {
+    last: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl ProgressThrottle {
+    fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Time still to wait before `key` may post again, or `None` if it may
+    /// post now. A zero interval never throttles.
+    fn wait_left(&self, key: &str, interval: std::time::Duration) -> Option<std::time::Duration> {
+        if interval.is_zero() {
+            return None;
+        }
+        let last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = last.get(key)?.elapsed();
+        (elapsed < interval).then(|| interval - elapsed)
+    }
+
+    fn mark(&self, key: &str) {
+        self.last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), std::time::Instant::now());
+    }
+}
+
+fn progress_throttle() -> &'static ProgressThrottle {
+    static T: std::sync::OnceLock<ProgressThrottle> = std::sync::OnceLock::new();
+    T.get_or_init(ProgressThrottle::new)
+}
+
+#[cfg(test)]
+mod progress_update_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const WAKE: &str = "discord:111";
+    const OWN: &str = "discord:222";
+
+    #[test]
+    fn wake_route_beats_home_channel() {
+        assert_eq!(
+            pick_progress_route("", Some(WAKE), Some(OWN)),
+            Some(("discord".into(), "111".into()))
+        );
+    }
+
+    #[test]
+    fn home_channel_used_on_an_origin_turn() {
+        assert_eq!(
+            pick_progress_route("", None, Some(OWN)),
+            Some(("discord".into(), "222".into()))
+        );
+    }
+
+    #[test]
+    fn channel_hint_skips_routes_on_other_adapters() {
+        assert_eq!(
+            pick_progress_route("slack", Some(WAKE), Some("slack:C9")),
+            Some(("slack".into(), "C9".into()))
+        );
+        assert_eq!(pick_progress_route("email", Some(WAKE), Some(OWN)), None);
+    }
+
+    #[test]
+    fn malformed_routes_are_ignored() {
+        assert_eq!(pick_progress_route("", Some("nocolon"), Some(":x")), None);
+        assert_eq!(pick_progress_route("", None, None), None);
+    }
+
+    #[test]
+    fn throttle_blocks_inside_the_interval_only() {
+        let t = ProgressThrottle::new();
+        let iv = Duration::from_secs(60);
+        assert!(t.wait_left("a|discord:1", iv).is_none(), "first post goes");
+        t.mark("a|discord:1");
+        assert!(
+            t.wait_left("a|discord:1", iv).is_some(),
+            "second post waits"
+        );
+        assert!(
+            t.wait_left("a|discord:2", iv).is_none(),
+            "other channel is separate"
+        );
+        assert!(
+            t.wait_left("b|discord:1", iv).is_none(),
+            "other agent is separate"
+        );
+        assert!(
+            t.wait_left("a|discord:1", Duration::ZERO).is_none(),
+            "zero interval disables the limit"
+        );
+    }
+
+    #[test]
+    fn throttle_reopens_after_the_interval() {
+        let t = ProgressThrottle::new();
+        t.mark("a|discord:1");
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(t
+            .wait_left("a|discord:1", Duration::from_millis(10))
+            .is_none());
+    }
 }
 
 /// Prepend synthesized `<openfang:attach path="…"/>` directives from an
@@ -9165,6 +9389,157 @@ mod tests {
         );
     }
 
+    // --- Progress updates: recipient-less channel_send routing ---
+
+    fn progress_fake(caller: &str, own: Option<&str>, wake: Option<&str>) -> Arc<FakeKernelHandle> {
+        let fake = FakeKernelHandle::new().with_opaque_agent(caller);
+        if let Some(r) = own {
+            fake.own_routes
+                .lock()
+                .unwrap()
+                .insert(caller.into(), r.into());
+        }
+        if let Some(r) = wake {
+            fake.wake_routes
+                .lock()
+                .unwrap()
+                .insert(caller.into(), r.into());
+        }
+        Arc::new(fake)
+    }
+
+    async fn send_as(
+        fake: &Arc<FakeKernelHandle>,
+        caller: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        tool_channel_send(&input, Some(&handle), None, Some(caller)).await
+    }
+
+    #[tokio::test]
+    async fn progress_post_goes_home_unlabelled_on_an_origin_turn() {
+        let fake = progress_fake("pu-home", Some("discord:222"), None);
+        send_as(
+            &fake,
+            "pu-home",
+            serde_json::json!({"message": "step 1 done"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.channel_sends.lock().unwrap()[0],
+            ("discord".into(), "222".into(), "step 1 done".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_post_goes_to_the_callers_channel_with_a_label() {
+        let fake = progress_fake("pu-callee", Some("discord:222"), Some("discord:111"));
+        send_as(
+            &fake,
+            "pu-callee",
+            serde_json::json!({"message": "halfway"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fake.channel_sends.lock().unwrap()[0],
+            (
+                "discord".into(),
+                "111".into(),
+                "[from pu-callee] halfway".into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_recipient_is_unchanged_and_never_throttled() {
+        let fake = progress_fake("pu-explicit", Some("discord:222"), Some("discord:111"));
+        for _ in 0..3 {
+            send_as(
+                &fake,
+                "pu-explicit",
+                serde_json::json!({"channel": "discord", "recipient": "999", "message": "hi"}),
+            )
+            .await
+            .unwrap();
+        }
+        let sends = fake.channel_sends.lock().unwrap();
+        assert_eq!(sends.len(), 3);
+        assert_eq!(sends[0], ("discord".into(), "999".into(), "hi".into()));
+    }
+
+    #[tokio::test]
+    async fn second_progress_post_inside_the_interval_is_held_back_as_ok() {
+        let fake = progress_fake("pu-throttle", Some("discord:222"), None);
+        send_as(&fake, "pu-throttle", serde_json::json!({"message": "one"}))
+            .await
+            .unwrap();
+        let out = send_as(&fake, "pu-throttle", serde_json::json!({"message": "two"}))
+            .await
+            .expect("a throttled post must not be an error");
+        assert!(out.starts_with("NOT posted"), "{out}");
+        assert!(out.contains("Do not retry"), "{out}");
+        assert_eq!(fake.channel_sends.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_route_falls_back_to_config_default_then_errors() {
+        let fake = progress_fake("pu-unbound", None, None);
+        send_as(
+            &fake,
+            "pu-unbound",
+            serde_json::json!({"channel": "discord", "message": "x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.channel_sends.lock().unwrap()[0].1, "config-default");
+        let err = send_as(&fake, "pu-unbound", serde_json::json!({"message": "y"}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("No channel to post to"), "{err}");
+        let err = send_as(
+            &fake,
+            "pu-unbound",
+            serde_json::json!({"recipient": "9", "message": "z"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("Missing 'channel'"), "{err}");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn nested_wake_passes_the_inbound_route_down_the_chain() {
+        let _guard = WAKE_EMIT_TEST_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        reset_wake_emit_window();
+        let fake = FakeKernelHandle::new()
+            .with_opaque_agent("pu-b")
+            .with_opaque_agent("pu-c");
+        fake.own_routes
+            .lock()
+            .unwrap()
+            .insert("pu-b".into(), "discord:222".into());
+        fake.wake_routes
+            .lock()
+            .unwrap()
+            .insert("pu-b".into(), "discord:111".into());
+        let fake = Arc::new(fake);
+        let handle: Arc<dyn crate::kernel_handle::KernelHandle> = fake.clone();
+        let input = serde_json::json!({"agent_id": "pu-c", "message": "do the thing"});
+        tool_agent_send_async(&input, Some(&handle), Some("pu-b"))
+            .await
+            .unwrap();
+        let env = openfang_types::wake::WakeEnvelope::from_payload(
+            &fake.wake_payloads.lock().unwrap()[0],
+        )
+        .unwrap();
+        assert_eq!(env.surface_to.as_deref(), Some("discord:111"));
+    }
+
     // Reaches the process-global emit window, so it must serialize against the
     // tests that deliberately saturate it — otherwise a satisfied pre-flight
     // fails on the CEILING error and reads as a pre-flight bug. Held across the
@@ -10652,6 +11027,13 @@ mod tests {
         // G1 tiers: model an agent whose tool runs without an approval prompt
         // (`requires_approval` false), so nobody can be asked.
         no_approval: std::sync::atomic::AtomicBool,
+        // Progress updates: per-agent home route, per-agent inbound wake
+        // route, every channel_send delivered (channel, recipient, body), and
+        // every wake payload enqueued.
+        own_routes: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        wake_routes: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        channel_sends: std::sync::Mutex<Vec<(String, String, String)>>,
+        wake_payloads: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl FakeKernelHandle {
@@ -10695,6 +11077,10 @@ mod tests {
                 context_reset_fails: std::sync::atomic::AtomicBool::new(false),
                 pending_operator_question: std::sync::atomic::AtomicBool::new(false),
                 no_approval: std::sync::atomic::AtomicBool::new(false),
+                own_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                wake_routes: std::sync::Mutex::new(std::collections::HashMap::new()),
+                channel_sends: std::sync::Mutex::new(Vec::new()),
+                wake_payloads: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -12840,8 +13226,9 @@ mod tests {
             description: &str,
             assigned_to: Option<&str>,
             _created_by: Option<&str>,
-            _payload: &[u8],
+            payload: &[u8],
         ) -> Result<String, String> {
+            self.wake_payloads.lock().unwrap().push(payload.to_vec());
             self.wake_posts.lock().unwrap().push((
                 assigned_to.unwrap_or("").to_string(),
                 description.to_string(),
@@ -12852,6 +13239,30 @@ mod tests {
         // consume-on-read `DashMap::remove`.
         fn take_reply_right(&self, agent_id: &str) -> Option<ReplyRight> {
             self.reply_rights.lock().unwrap().remove(agent_id)
+        }
+        fn channel_binding_route(&self, agent_name: &str) -> Option<String> {
+            self.own_routes.lock().unwrap().get(agent_name).cloned()
+        }
+        fn wake_route(&self, agent_id: &str) -> Option<String> {
+            self.wake_routes.lock().unwrap().get(agent_id).cloned()
+        }
+        async fn get_channel_default_recipient(&self, channel: &str) -> Option<String> {
+            (channel == "discord").then(|| "config-default".to_string())
+        }
+        async fn send_channel_message(
+            &self,
+            channel: &str,
+            recipient: &str,
+            message: &str,
+            _thread_id: Option<&str>,
+            _workspace_root: Option<&std::path::Path>,
+        ) -> Result<String, String> {
+            self.channel_sends.lock().unwrap().push((
+                channel.to_string(),
+                recipient.to_string(),
+                message.to_string(),
+            ));
+            Ok("sent".to_string())
         }
         async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
             Ok(None)

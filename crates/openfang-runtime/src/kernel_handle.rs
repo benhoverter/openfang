@@ -524,6 +524,16 @@ pub trait KernelHandle: Send + Sync {
         None
     }
 
+    /// The `surface_to` route of the wake that started this agent's current
+    /// turn (`"<channel>:<recipient>"`), or `None` on an origin turn or a wake
+    /// that carried no route. Not consumed by reading, and still set after the
+    /// agent replies. Used to send recipient-less `channel_send` posts, and
+    /// nested wakes, to the channel where the chain started.
+    fn wake_route(&self, agent_id: &str) -> Option<String> {
+        let _ = agent_id;
+        None
+    }
+
     /// ANAI-125: resolve `agent_name`'s channel binding into a `surface_to`
     /// route (`"<channel>:<recipient>"`) so an async wake that omits an
     /// explicit route can default to the ORIGINATOR's own home channel — the

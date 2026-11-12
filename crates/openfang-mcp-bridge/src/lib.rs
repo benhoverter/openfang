@@ -490,8 +490,14 @@ pub fn built_in_tools() -> Vec<Tool> {
         ),
         Tool::new(
             "channel_send",
-            "Send a message to a user on a configured channel (email, telegram, slack, \
-             discord, etc). For email: recipient is the email address; optionally set \
+            "Send a message on a configured channel (discord, email, telegram, slack, \
+             etc). For a progress update, pass only `message`: leave out `channel` and \
+             `recipient` and the daemon posts it where your current work belongs (the \
+             channel of the agent that asked you for this work, otherwise your own \
+             channel), labels it with your name when it isn't your channel, and limits \
+             progress posts to one per channel per minute. To reach a specific person \
+             or place, pass both `channel` and `recipient`. For email: recipient is the \
+             email address; optionally set \
              subject. Use thread_id to reply in a specific thread/topic. Use \
              `attachments` (array of file paths, workspace-relative preferred) to \
              attach files alongside the message; paths resolve against the agent \
@@ -500,8 +506,8 @@ pub fn built_in_tools() -> Vec<Tool> {
             obj(json!({
                 "type": "object",
                 "properties": {
-                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
+                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord'). Required with `recipient`; omit for progress updates." },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, channel ID, etc.). Omit for progress updates; the daemon picks the channel." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send" },
                     "attachments": {
@@ -511,7 +517,7 @@ pub fn built_in_tools() -> Vec<Tool> {
                     },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in" }
                 },
-                "required": ["channel", "recipient"]
+                "required": []
             })),
         ),
         // Mirrors `openfang_runtime::tool_runner` → `agent_send`. Kept in

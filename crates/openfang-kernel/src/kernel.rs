@@ -365,6 +365,14 @@ pub struct OpenFangKernel {
     /// (cleanup, so a stale token cannot leak into a later reply-woken/terminal
     /// turn). A reply-woken turn inserts nothing, so the tool fail-closes.
     reply_rights: dashmap::DashMap<AgentId, openfang_runtime::tool_runner::ReplyRight>,
+    /// The inbound wake's `surface_to` route for each agent's current woken
+    /// turn. Unlike `reply_rights` it is not consumed by a reply and is set
+    /// for reply-woken turns too, so a recipient-less `channel_send` posts to
+    /// the chain's channel for the whole turn, and a nested
+    /// `agent_send_async` passes the route down the chain. Removed at turn end.
+    /// A registry rather than a task-local because bridge tool calls run on
+    /// another task.
+    wake_routes: dashmap::DashMap<AgentId, String>,
     /// Per-agent stash of the active run's [`ApprovalOrigin`] (Piece 3, ANAI-82).
     /// The bridge-IPC tool-call path runs on a separate task with no handle to
     /// the run's origin stack, so it resolves a push target by looking up the
@@ -1692,6 +1700,7 @@ impl OpenFangKernel {
             compacting: dashmap::DashSet::new(),
             wake_turn_locks: dashmap::DashMap::new(),
             reply_rights: dashmap::DashMap::new(),
+            wake_routes: dashmap::DashMap::new(),
             active_run_origins: dashmap::DashMap::new(),
             approval_prompt_coords: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
@@ -6247,6 +6256,9 @@ impl OpenFangKernel {
                 max_timeout_secs: self.config.async_reply.max_timeout_secs,
             },
         );
+        openfang_types::progress_updates::install_min_interval_secs(
+            self.config.progress_updates.min_interval_secs,
+        );
 
         // Start heartbeat monitor for agent health checking
         self.start_heartbeat_monitor();
@@ -7273,6 +7285,14 @@ impl OpenFangKernel {
                 ),
             );
         }
+        match envelope.surface_to.clone() {
+            Some(route) => {
+                self.wake_routes.insert(target_id, route);
+            }
+            None => {
+                self.wake_routes.remove(&target_id);
+            }
+        }
         // The lineage task-local still wraps the in-process send future: it is
         // read only by in-process `resolve_wake_base_lineage`, never across the
         // IPC boundary, so it correctly stays a task-local. The reply-right no
@@ -7330,6 +7350,7 @@ impl OpenFangKernel {
         // path too — the aborted turn is over, and a surviving token would be a
         // live grant to answer a correlation the kernel has already closed.
         let debt_outstanding = self.reply_rights.remove(&target_id).is_some();
+        self.wake_routes.remove(&target_id);
 
         let result = match timed {
             Ok(r) => r,
@@ -11706,6 +11727,11 @@ impl KernelHandle for OpenFangKernel {
         self.reply_rights
             .get(&id)
             .map(|right| right.reply_to().to_string())
+    }
+
+    fn wake_route(&self, agent_id: &str) -> Option<String> {
+        let id: AgentId = agent_id.parse().ok()?;
+        self.wake_routes.get(&id).map(|r| r.clone())
     }
 
     /// ANAI-125: expose the originator's own channel binding as a `surface_to`
