@@ -100,6 +100,9 @@ fn lang_of(path: &Path, text: &str) -> Lang {
 /// The language an interpreter runs its file as, whatever the file is called
 /// (`python3 ./notes.txt` is Python). `None` for launchers like `npx`, whose
 /// argument is not the file's language.
+///
+/// Not recognised yet: `pypy`/`pypy3`, `pythonw` and `python3-dbg` map to
+/// `None`, so their files fall back to the extension or shebang (security F3).
 fn lang_of_interpreter(bin: &str) -> Option<Lang> {
     let base = bin.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     match if base.is_empty() { bin } else { base } {
@@ -112,10 +115,50 @@ fn lang_of_interpreter(bin: &str) -> Option<Lang> {
 
 /// Words of a command string, split on whitespace and on the shell operators
 /// that can be glued to a name: `python3 w.py;rm x`, `w.py>log`,
-/// `cd sub&&python3 w.py` (security W2).
+/// `cd sub&&python3 w.py` (security W2), and backticks (F2).
 fn command_words(s: &str) -> impl Iterator<Item = &str> {
-    s.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')'))
-        .filter(|w| !w.is_empty())
+    s.split(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '`')
+    })
+    .filter(|w| !w.is_empty())
+}
+
+/// The language a word starts a file in, when the word is an interpreter
+/// (bare or by path). `source` and `.` are excluded: shell handles them
+/// itself, and a stray "." literal elsewhere is not a runner.
+fn runner_lang(word: &str) -> Option<Lang> {
+    let bin = word.rsplit('/').next().unwrap_or(word);
+    if matches!(bin, "." | "source") {
+        return None;
+    }
+    lang_of_interpreter(bin)
+}
+
+/// R1 edges out of a stream of command words. A word after an interpreter
+/// (`python3 -u x`, flags skipped) is followed whatever its name and takes
+/// that interpreter's language (security F1); any other word is followed
+/// only when it has a script suffix.
+fn run_links<'a>(
+    words: impl Iterator<Item = &'a str>,
+    dir: &Path,
+    cwd: Option<&Path>,
+    out: &mut Vec<Link>,
+) {
+    let mut runner: Option<Lang> = None;
+    for w in words {
+        let w = unquote(w);
+        for path in run_target(&w, runner.is_some(), dir, cwd) {
+            out.push(Link {
+                path,
+                py_root: None,
+                cwd: cwd.map(Path::to_path_buf),
+                lang: runner,
+            });
+        }
+        if !(runner.is_some() && w.starts_with('-')) {
+            runner = runner_lang(&w);
+        }
+    }
 }
 
 /// One file the walk has read.
@@ -139,6 +182,8 @@ struct Link {
     /// when it is run (its own directory becomes `sys.path[0]`).
     py_root: Option<PathBuf>,
     cwd: Option<PathBuf>,
+    /// The language of the interpreter that runs it, when one was named.
+    lang: Option<Lang>,
 }
 
 /// Walk the links out of `entry`, folding every linked file's flags into
@@ -254,7 +299,7 @@ async fn walk_inner(
             }
             body.linked.push(real.display().to_string());
             next.push(Node {
-                lang: lang_of(&real, &text),
+                lang: link.lang.unwrap_or_else(|| lang_of(&real, &text)),
                 py_root: link.py_root.unwrap_or_else(|| dir_of(&real)),
                 cwd: link.cwd,
                 path: real,
@@ -304,18 +349,16 @@ impl Finder {
             // R1. Shell does this per word, with its tracked cwd. Other
             // languages split each literal into words too, so the
             // single-string forms (os.system("python3 w.py"),
-            // execSync('node w.js')) are followed.
-            for (_, lit) in string_literals(&node.text) {
-                for w in command_words(&lit) {
-                    for p in run_target(&unquote(w), &dir, node.cwd.as_deref()) {
-                        out.push(Link {
-                            path: p,
-                            py_root: None,
-                            cwd: node.cwd.clone(),
-                        });
-                    }
-                }
-            }
+            // execSync('node w.js')) are followed. Words run on across
+            // literals so the list form (["python3", "notes.txt"]) sees its
+            // interpreter.
+            let lits = string_literals(&node.text);
+            run_links(
+                lits.iter().flat_map(|(_, l)| command_words(l)),
+                &dir,
+                node.cwd.as_deref(),
+                &mut out,
+            );
         }
         Ok(out)
     }
@@ -345,6 +388,7 @@ impl Finder {
                 path,
                 py_root: Some(node.py_root.clone()),
                 cwd: node.cwd.clone(),
+                lang: None,
             }));
         }
         Ok(())
@@ -442,13 +486,15 @@ impl Finder {
 /// R1: every existing script file a literal names, against the script's
 /// directory AND the working directory. All candidates, not the first: a
 /// subprocess resolves against cwd, so a clean decoy in the script dir must
-/// not hide the file that actually runs.
-fn run_target(lit: &str, dir: &Path, cwd: Option<&Path>) -> Vec<PathBuf> {
+/// not hide the file that actually runs. `after_runner` drops the suffix
+/// requirement: whatever follows `python3` is run, whatever it is called.
+fn run_target(lit: &str, after_runner: bool, dir: &Path, cwd: Option<&Path>) -> Vec<PathBuf> {
     if lit.len() > 4096
+        || lit.is_empty()
         || lit
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '$' | '`' | '{' | '*'))
-        || !SCRIPT_SUFFIXES.iter().any(|s| lit.ends_with(s))
+        || !(after_runner || SCRIPT_SUFFIXES.iter().any(|s| lit.ends_with(s)))
     {
         return Vec::new();
     }
@@ -583,6 +629,7 @@ fn js_links(node: &Node, dir: &Path, out: &mut Vec<Link>) -> Result<(), String> 
             path,
             py_root: None,
             cwd: node.cwd.clone(),
+            lang: None,
         });
     }
     Ok(())
@@ -747,19 +794,17 @@ fn shell_links(node: &Node, dir: &Path, out: &mut Vec<Link>) -> Result<(), Strin
                         path,
                         py_root: None,
                         cwd: cwd.clone(),
+                        lang: Some(Lang::Shell),
                     });
                 }
                 _ => {}
             }
-            for w in words.iter().flat_map(|w| command_words(w)) {
-                for p in run_target(&unquote(w), dir, cwd.as_deref()) {
-                    out.push(Link {
-                        path: p,
-                        py_root: None,
-                        cwd: cwd.clone(),
-                    });
-                }
-            }
+            run_links(
+                words.iter().flat_map(|w| command_words(w)),
+                dir,
+                cwd.as_deref(),
+                out,
+            );
         }
     }
     Ok(())
@@ -1006,6 +1051,68 @@ mod tests {
         assert_eq!(lang_of_interpreter("."), Some(Lang::Shell));
         assert_eq!(lang_of_interpreter("npx"), None);
         assert_eq!(lang_of_interpreter("ruby"), None);
+    }
+
+    /// F1: a run file takes the language of the word that runs it.
+    /// `bash w.py` is shell, so its `./inner.sh` run line is followed.
+    #[tokio::test]
+    async fn a_linked_file_takes_the_language_of_its_runner() {
+        let (d, p) = ws("f1-runner-lang");
+        put(&d, "main.py", "import os\nos.system(\"bash w.py\")\n");
+        put(&d, "w.py", "./inner.sh\n");
+        put(&d, "inner.sh", "rm -rf ~/.openfang/agents/\n");
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert!(b.linked.iter().any(|l| l.ends_with("inner.sh")), "{b:?}");
+        assert!(b.destroys_substrate, "{b:?}");
+    }
+
+    /// F1: after an interpreter word, a file is followed whatever its name.
+    #[tokio::test]
+    async fn a_file_with_no_script_suffix_run_by_an_interpreter_is_followed() {
+        let (d, p) = ws("f1-any-name");
+        put(
+            &d,
+            "main.py",
+            "import subprocess\nsubprocess.run([\"python3\", \"-u\",\n    \"notes.txt\"])\n",
+        );
+        put(&d, "notes.txt", MENTION);
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    /// F1 negative: a data file named next to no interpreter stays unread.
+    #[tokio::test]
+    async fn a_data_file_not_after_an_interpreter_is_not_followed() {
+        let (d, p) = ws("f1-data");
+        put(&d, "main.py", "open(\"notes.txt\").read()\n");
+        put(&d, "notes.txt", "plain data\n");
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert!(b.linked.is_empty(), "{b:?}");
+    }
+
+    /// F2: backticks inside a string split like the other operators.
+    #[tokio::test]
+    async fn a_backticked_run_inside_a_string_is_followed() {
+        let (d, p) = ws("f2-backtick");
+        put(
+            &d,
+            "main.py",
+            "import os\nos.system(\"echo `python3 w.py`\")\n",
+        );
+        put(&d, "w.py", &format!("import os\n{MENTION}"));
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    #[test]
+    fn runner_words_name_their_language() {
+        assert_eq!(runner_lang("/usr/bin/python3"), Some(Lang::Python));
+        assert_eq!(runner_lang("bash"), Some(Lang::Shell));
+        assert_eq!(runner_lang("."), None);
+        assert_eq!(runner_lang("source"), None);
+        assert_eq!(runner_lang("`python3"), None);
     }
 
     #[tokio::test]
