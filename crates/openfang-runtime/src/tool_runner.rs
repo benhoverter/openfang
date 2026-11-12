@@ -7112,7 +7112,9 @@ async fn tool_channel_send(
 
     // Attribution: a post that lands in the calling chain's channel rather
     // than the sender's own carries the sender's real name, stamped here so
-    // the model can neither forget nor forge it.
+    // the model can neither forget nor forge it. A code span rather than
+    // bold: it reads as a tag in Discord and renders the same in Slack,
+    // where `**` would show as literal stars.
     let attribution = if wake_route.as_deref() == Some(dest_route.as_str())
         && own_route.as_deref() != Some(dest_route.as_str())
     {
@@ -7123,7 +7125,7 @@ async fn tool_channel_send(
                 .find(|a| a.id == c)
                 .map(|a| a.name)
                 .unwrap_or_else(|| c.to_string());
-            format!("[from {name}] ")
+            format!("`{name}` ")
         })
     } else {
         None
@@ -9492,11 +9494,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fake.channel_sends.lock().unwrap()[0],
-            (
-                "discord".into(),
-                "111".into(),
-                "[from pu-callee] halfway".into()
-            )
+            ("discord".into(), "111".into(), "`pu-callee` halfway".into())
         );
     }
 
