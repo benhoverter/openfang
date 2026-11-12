@@ -266,14 +266,19 @@ impl Finder {
             Lang::Other => {}
         }
         if node.lang != Lang::Shell {
-            // R1. Shell does this per word, with its tracked cwd.
+            // R1. Shell does this per word, with its tracked cwd. Other
+            // languages split each literal into words too, so the
+            // single-string forms (os.system("python3 w.py"),
+            // execSync('node w.js')) are followed.
             for (_, lit) in string_literals(&node.text) {
-                if let Some(p) = run_target(&lit, &dir, node.cwd.as_deref()) {
-                    out.push(Link {
-                        path: p,
-                        py_root: None,
-                        cwd: node.cwd.clone(),
-                    });
+                for w in lit.split_whitespace() {
+                    for p in run_target(&unquote(w), &dir, node.cwd.as_deref()) {
+                        out.push(Link {
+                            path: p,
+                            py_root: None,
+                            cwd: node.cwd.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -399,22 +404,27 @@ impl Finder {
     }
 }
 
-/// R1: a literal that names an existing script file, against the script's
-/// directory and then the working directory.
-fn run_target(lit: &str, dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+/// R1: every existing script file a literal names, against the script's
+/// directory AND the working directory. All candidates, not the first: a
+/// subprocess resolves against cwd, so a clean decoy in the script dir must
+/// not hide the file that actually runs.
+fn run_target(lit: &str, dir: &Path, cwd: Option<&Path>) -> Vec<PathBuf> {
     if lit.len() > 4096
         || lit
             .chars()
             .any(|c| c.is_whitespace() || matches!(c, '$' | '`' | '{' | '*'))
         || !SCRIPT_SUFFIXES.iter().any(|s| lit.ends_with(s))
     {
-        return None;
+        return Vec::new();
     }
-    [Some(dir), cwd]
+    let mut found: Vec<PathBuf> = [Some(dir), cwd]
         .into_iter()
         .flatten()
         .filter_map(|base| resolve(lit, Some(base)))
-        .find(|p| exists(p))
+        .filter(|p| exists(p))
+        .collect();
+    found.dedup_by(|a, b| canonical(a) == canonical(b));
+    found
 }
 
 // -- Python import statements ---------------------------------------------
@@ -707,7 +717,7 @@ fn shell_links(node: &Node, dir: &Path, out: &mut Vec<Link>) -> Result<(), Strin
                 _ => {}
             }
             for w in &words {
-                if let Some(p) = run_target(&unquote(w), dir, cwd.as_deref()) {
+                for p in run_target(&unquote(w), dir, cwd.as_deref()) {
                     out.push(Link {
                         path: p,
                         py_root: None,
@@ -857,6 +867,48 @@ mod tests {
         put(&d, "w.py", &format!("import os\n{MENTION}"));
         let b = body(&d, &p, "python3 ./main.py").await;
         assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    /// B1: the single-string form, split into words.
+    #[tokio::test]
+    async fn a_sibling_run_by_os_system_string_is_followed() {
+        let (d, p) = ws("b1-os-system");
+        put(&d, "main.py", "import os\nos.system(\"python3 w.py\")\n");
+        put(&d, "w.py", &format!("import os\n{MENTION}"));
+        let b = body(&d, &p, "python3 ./main.py").await;
+        assert_eq!(b.linked.len(), 1, "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    /// B1, JS arm.
+    #[tokio::test]
+    async fn a_sibling_run_by_exec_sync_string_is_followed() {
+        let (d, p) = ws("b1-exec-sync");
+        put(
+            &d,
+            "main.js",
+            "const { execSync } = require('child_process');\nexecSync('node ./w.mjs');\n",
+        );
+        put(&d, "w.mjs", "import fs from 'fs';\nfs.writeFileSync(process.env.HOME + '/.openfang/RULES.md', '');\n");
+        let b = body(&d, &p, "node ./main.js").await;
+        assert!(b.linked.iter().any(|l| l.ends_with("w.mjs")), "{b:?}");
+        assert!(b.needs_judge());
+    }
+
+    /// B2: a clean decoy next to the script must not hide the cwd file.
+    #[tokio::test]
+    async fn a_clean_decoy_in_the_script_dir_does_not_hide_the_cwd_target() {
+        let (d, p) = ws("b2-decoy");
+        put(
+            &d,
+            "sub/main.py",
+            "import subprocess\nsubprocess.run(['python3', 'w.py'])\n",
+        );
+        put(&d, "sub/w.py", "print('clean')\n");
+        put(&d, "w.py", &format!("import os\n{MENTION}"));
+        let b = body(&d, &p, "python3 sub/main.py").await;
+        assert_eq!(b.linked.len(), 2, "{b:?}");
         assert!(b.needs_judge());
     }
 
