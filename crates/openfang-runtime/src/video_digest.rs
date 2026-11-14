@@ -521,6 +521,47 @@ impl Drop for WorkDir {
     }
 }
 
+/// Every agent runs as the same user, so the work dir's 0700 does not stop a
+/// shell-capable agent from planting a link in it mid-run. Anything we take
+/// out of it must be a regular file we can see without following a link.
+fn tampered(path: &Path) -> std::io::Error {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("{name} in the work folder is not a regular file (link or special file planted mid-run?)"),
+    )
+}
+
+fn require_regular(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(tampered(path))
+    }
+}
+
+/// Read a file a child wrote in the work dir. O_NOFOLLOW refuses a link in the
+/// final component without a check-then-open race; O_NONBLOCK keeps a planted
+/// FIFO from hanging the open; the fstat refuses anything but a regular file.
+fn read_work_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ELOOP) => tampered(path),
+            _ => e,
+        })?;
+    if !f.metadata()?.is_file() {
+        return Err(tampered(path));
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Refuse a folder this tool did not fill, then clear our own names and
 /// create a fresh `frames`. Errors are full envelopes.
 fn prepare_out_dir(out: &Path) -> Result<(), String> {
@@ -559,13 +600,21 @@ fn prepare_out_dir(out: &Path) -> Result<(), String> {
 /// replaces whatever sits at the target, a symlink included, without following
 /// it. If the temp dir sits on another volume, copy with `write_new` instead:
 /// the target was just cleaned, so an existing entry there is tampering.
+/// rename moves a link as a link, so the source must be a regular file; the
+/// recheck after the move closes the gap between that check and the rename.
 fn place(src: &Path, dst: &Path) -> Result<(), String> {
-    let moved = match std::fs::rename(src, dst) {
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            std::fs::read(src).and_then(|b| write_new(dst, b))
-        }
-        r => r,
-    };
+    let moved = require_regular(src)
+        .and_then(|_| match std::fs::rename(src, dst) {
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                read_work_file(src).and_then(|b| write_new(dst, b))
+            }
+            r => r,
+        })
+        .and_then(|_| {
+            require_regular(dst).inspect_err(|_| {
+                let _ = std::fs::remove_file(dst);
+            })
+        });
     moved.map_err(|e| {
         let name = dst.file_name().unwrap_or_default().to_string_lossy();
         err_envelope("DIGEST_FAILED", &format!("could not move {name}: {e}"))
@@ -1033,7 +1082,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             if !c.ok {
                 return child_failed("whisper-cli", &c);
             }
-            let raw = match std::fs::read(stem.with_extension("json")) {
+            let raw = match read_work_file(&stem.with_extension("json")) {
                 Ok(b) => b,
                 Err(e) => {
                     return err_envelope("DIGEST_FAILED", &format!("whisper wrote no JSON: {e}"))
@@ -1949,5 +1998,48 @@ mod tests {
         assert_eq!(std::fs::read(&victim).unwrap(), b"original");
         let meta = std::fs::symlink_metadata(d.path().join("waveform.png")).unwrap();
         assert!(meta.is_file());
+    }
+
+    #[test]
+    fn place_refuses_a_link_planted_in_the_work_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let work = WorkDir::new().unwrap();
+        let victim = d.path().join("victim.txt");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::os::unix::fs::symlink(&victim, work.0.join("waveform.png")).unwrap();
+        let e = place(&work.0.join("waveform.png"), &d.path().join("waveform.png")).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        assert!(std::fs::symlink_metadata(d.path().join("waveform.png")).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn whisper_read_back_refuses_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let work = WorkDir::new().unwrap();
+        let victim = d.path().join("victim.json");
+        std::fs::write(&victim, br#"{"secret":1}"#).unwrap();
+        let link = work.0.join("whisper.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        let e = read_work_file(&link).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn whisper_read_back_refuses_a_fifo_without_hanging() {
+        use std::os::unix::ffi::OsStrExt;
+        let work = WorkDir::new().unwrap();
+        let fifo = work.0.join("whisper.json");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let e = read_work_file(&fifo).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn read_work_file_reads_a_regular_file() {
+        let work = WorkDir::new().unwrap();
+        std::fs::write(work.0.join("whisper.json"), b"{}").unwrap();
+        assert_eq!(read_work_file(&work.0.join("whisper.json")).unwrap(), b"{}");
     }
 }
