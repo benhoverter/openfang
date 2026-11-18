@@ -16,6 +16,11 @@
 //!   `MISSING_DEP` before anything spawns. Children get argv arrays (never a
 //!   shell), a cleared env ([`crate::subprocess_sandbox::sandbox_command`]) and
 //!   `kill_on_drop`, and the whole call runs under one wall-clock deadline.
+//! - Every child also runs under `sandbox-exec` ([`SANDBOX_PROFILE`]): no
+//!   network, and writes only inside a private per-run work folder. A
+//!   compromised decoder can still read files, but cannot send them anywhere
+//!   or write outside that folder. Without `sandbox-exec` the tool refuses
+//!   with `MISSING_DEP` rather than run unsandboxed.
 //! - ffmpeg is parsing untrusted media. Playlist-style demuxers (hls, concat,
 //!   image2 patterns, tee, lavfi) can make it open other local files or the
 //!   network, so every ffmpeg/ffprobe read of the agent's file is pinned to
@@ -34,8 +39,9 @@
 //!   comment tags) is never read: the probe asks only for duration, format name,
 //!   stream kinds and picture size.
 //!
-//! Known limits: macOS/Homebrew paths only, and ffmpeg's decoders themselves are
-//! trusted (a decoder memory bug is out of scope here, as it is for any viewer).
+//! Known limits: macOS/Homebrew paths only. Reads are not sandboxed (see
+//! [`SANDBOX_PROFILE`]). An agent with a shell could still swap the output
+//! folder or its `frames/` for a link mid-run.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -45,8 +51,26 @@ use std::time::Duration;
 pub const FFMPEG: &str = "/opt/homebrew/bin/ffmpeg";
 pub const FFPROBE: &str = "/opt/homebrew/bin/ffprobe";
 pub const WHISPER_CLI: &str = "/opt/homebrew/bin/whisper-cli";
+/// Every child runs under this, with [`SANDBOX_PROFILE`].
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Model path relative to the OpenFang home directory.
 pub const WHISPER_MODEL_REL: &str = "models/whisper/ggml-large-v3-turbo-q5_0.bin";
+
+/// Seatbelt profile for every ffmpeg / ffprobe / whisper-cli run. A decoder
+/// bug in ffmpeg is code execution as the daemon's user, so the children get
+/// no network and may write only inside the run's private work folder
+/// (`WORK`, passed with `-D` so the path is never spliced into the profile
+/// text). Seatbelt checks the resolved path, so a link planted in the work
+/// folder that points elsewhere is refused too. Reads stay open: locking them
+/// down means listing every dylib, Metal and model path the children touch,
+/// and that list breaks with OS and Homebrew updates. The demuxer and protocol
+/// whitelists are what keep ffmpeg from opening other files.
+pub const SANDBOX_PROFILE: &str = "(version 1)
+(allow default)
+(deny network*)
+(deny file-write*)
+(allow file-write* (subpath (param \"WORK\")))
+(allow file-write-data (literal \"/dev/null\"))";
 
 /// Demuxers ffmpeg may use on the agent's file. Plain containers only: no
 /// playlist, concat, image-sequence, device or filter-graph sources.
@@ -511,7 +535,15 @@ impl WorkDir {
             std::env::temp_dir().join(format!("openfang-vd-{}", uuid::Uuid::new_v4().simple()));
         // Non-recursive: an existing entry at the random name is an error, not reused.
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self(path))
+        // The sandbox rule matches the resolved path (/var is a link to
+        // /private/var on macOS), so keep the canonical form.
+        match std::fs::canonicalize(&path) {
+            Ok(real) => Ok(Self(real)),
+            Err(e) => {
+                let _ = std::fs::remove_dir(&path);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -523,7 +555,9 @@ impl Drop for WorkDir {
 
 /// Every agent runs as the same user, so the work dir's 0700 does not stop a
 /// shell-capable agent from planting a link in it mid-run. Anything we take
-/// out of it must be a regular file we can see without following a link.
+/// out of it must be a regular file we can see without following a link, and
+/// with one name only: a hard link is a regular file, but its bytes belong to
+/// some other file.
 fn tampered(path: &Path) -> std::io::Error {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     std::io::Error::new(
@@ -532,8 +566,13 @@ fn tampered(path: &Path) -> std::io::Error {
     )
 }
 
+fn sole_regular(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.file_type().is_file() && m.nlink() == 1
+}
+
 fn require_regular(path: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(path)?.file_type().is_file() {
+    if sole_regular(&std::fs::symlink_metadata(path)?) {
         Ok(())
     } else {
         Err(tampered(path))
@@ -554,7 +593,7 @@ fn read_work_file(path: &Path) -> std::io::Result<Vec<u8>> {
             Some(libc::ELOOP) => tampered(path),
             _ => e,
         })?;
-    if !f.metadata()?.is_file() {
+    if !sole_regular(&f.metadata()?) {
         return Err(tampered(path));
     }
     let mut buf = Vec::new();
@@ -734,10 +773,26 @@ struct ChildOut {
     stderr: String,
 }
 
-async fn run_child(program: &str, args: &[String], cwd: &Path) -> Result<ChildOut, String> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    cmd.current_dir(cwd);
+/// argv for running `program` under [`SANDBOX_PROFILE`] with `work` as the
+/// only writable folder.
+fn sandboxed_argv(work: &Path, program: &str, args: &[String]) -> Vec<String> {
+    let mut v = vec![
+        "-D".to_string(),
+        format!("WORK={}", work.display()),
+        "-p".into(),
+        SANDBOX_PROFILE.into(),
+        program.into(),
+    ];
+    v.extend(args.iter().cloned());
+    v
+}
+
+/// Run one child under the sandbox. `work` must be a [`WorkDir`] path (already
+/// canonical); it is also the child's cwd.
+async fn run_child(program: &str, args: &[String], work: &Path) -> Result<ChildOut, String> {
+    let mut cmd = tokio::process::Command::new(SANDBOX_EXEC);
+    cmd.args(sandboxed_argv(work, program, args));
+    cmd.current_dir(work);
     crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
     cmd.stdin(std::process::Stdio::null());
     // The outer deadline drops this future; the child must die with it.
@@ -777,7 +832,8 @@ pub struct Resolved {
 /// Every external dependency, checked before any spawn.
 pub fn missing_deps(model: &Path) -> Vec<String> {
     let mut missing = Vec::new();
-    for b in [FFMPEG, FFPROBE, WHISPER_CLI] {
+    // No sandbox-exec means MISSING_DEP, never an unsandboxed run.
+    for b in [FFMPEG, FFPROBE, WHISPER_CLI, SANDBOX_EXEC] {
         if !Path::new(b).is_file() {
             missing.push(b.to_string());
         }
@@ -833,8 +889,21 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
     let out = &r.out_dir;
     let frames_dir = out.join("frames");
 
+    // Every child runs sandboxed with this as its only writable folder, the
+    // probe included.
+    let work_guard = match WorkDir::new() {
+        Ok(w) => w,
+        Err(e) => {
+            return err_envelope(
+                "DIGEST_FAILED",
+                &format!("could not create a work folder: {e}"),
+            )
+        }
+    };
+    let work = work_guard.0.clone();
+
     // 1. Probe. Refuse long files before decoding anything.
-    let probe_out = match run_child(FFPROBE, &probe_args(&input), out).await {
+    let probe_out = match run_child(FFPROBE, &probe_args(&input), &work).await {
         Ok(c) if c.ok => c,
         Ok(c) => {
             return err_envelope(
@@ -872,16 +941,6 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
     if let Err(e) = prepare_out_dir(out) {
         return e;
     }
-    let work_guard = match WorkDir::new() {
-        Ok(w) => w,
-        Err(e) => {
-            return err_envelope(
-                "DIGEST_FAILED",
-                &format!("could not create a work folder: {e}"),
-            )
-        }
-    };
-    let work = work_guard.0.clone();
 
     // 2. Stills.
     let mut frames: Vec<(String, f64)> = Vec::new();
@@ -907,7 +966,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             .map(String::from),
         );
         args.push(work.join("%03d.jpg").to_string_lossy().into_owned());
-        let c = match run_child(FFMPEG, &args, out).await {
+        let c = match run_child(FFMPEG, &args, &work).await {
             Ok(c) => c,
             Err(e) => return err_envelope("DIGEST_FAILED", &e),
         };
@@ -954,7 +1013,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                     .into_owned(),
             ])
             .collect();
-            match run_child(FFMPEG, &args, out).await {
+            match run_child(FFMPEG, &args, &work).await {
                 Ok(c) if c.ok => {}
                 Ok(c) => return child_failed("ffmpeg (contact sheet)", &c),
                 Err(e) => return err_envelope("DIGEST_FAILED", &e),
@@ -997,7 +1056,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             "null".into(),
             "-".into(),
         ]);
-        match run_child(FFMPEG, &args, out).await {
+        match run_child(FFMPEG, &args, &work).await {
             Ok(c) if c.ok => {
                 loudness = Some(parse_ebur128_summary(&c.stderr));
                 silences = parse_silences(&c.stderr);
@@ -1024,7 +1083,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             "1".into(),
             work.join("waveform.png").to_string_lossy().into_owned(),
         ]);
-        match run_child(FFMPEG, &args, out).await {
+        match run_child(FFMPEG, &args, &work).await {
             Ok(c) if c.ok => {}
             Ok(c) => return child_failed("ffmpeg (waveform)", &c),
             Err(e) => return err_envelope("DIGEST_FAILED", &e),
@@ -1057,7 +1116,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                 .map(String::from),
             );
             args.push(wav.to_string_lossy().into_owned());
-            match run_child(FFMPEG, &args, out).await {
+            match run_child(FFMPEG, &args, &work).await {
                 Ok(c) if c.ok => {}
                 Ok(c) => return child_failed("ffmpeg (audio extract)", &c),
                 Err(e) => return err_envelope("DIGEST_FAILED", &e),
@@ -1075,7 +1134,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                 stem.to_string_lossy().into_owned(),
                 "-np".into(),
             ];
-            let c = match run_child(WHISPER_CLI, &args, out).await {
+            let c = match run_child(WHISPER_CLI, &args, &work).await {
                 Ok(c) => c,
                 Err(e) => return err_envelope("DIGEST_FAILED", &e),
             };
@@ -1603,14 +1662,17 @@ mod tests {
         assert_eq!(env["error"]["code"], "BUSY", "{env}");
     }
 
+    // macOS only: children run under sandbox-exec. The marker lives in a real
+    // WorkDir so the sandbox would let the child write it if it survived.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn deadline_kills_the_child() {
-        let tmp = tempfile::tempdir().unwrap();
-        let marker = tmp.path().join("marker");
+        let work = WorkDir::new().unwrap();
+        let marker = work.0.join("marker");
         let script = format!("sleep 3; /usr/bin/touch '{}'", marker.display());
         let started = std::time::Instant::now();
         let s = with_deadline(Duration::from_millis(500), "d", async {
-            let _ = run_child("/bin/sh", &["-c".into(), script], tmp.path()).await;
+            let _ = run_child("/bin/sh", &["-c".into(), script], &work.0).await;
             "finished".to_string()
         })
         .await;
@@ -1946,7 +2008,11 @@ mod tests {
         let b = WorkDir::new().unwrap();
         assert_ne!(a.0, b.0);
         assert!(!a.0.starts_with(out.path()));
-        assert!(a.0.starts_with(std::env::temp_dir()));
+        // Canonical, so the sandbox's subpath rule matches what the kernel sees.
+        assert!(a
+            .0
+            .starts_with(std::fs::canonicalize(std::env::temp_dir()).unwrap()));
+        assert_eq!(std::fs::canonicalize(&a.0).unwrap(), a.0);
         let mode = std::fs::metadata(&a.0).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         let path = a.0.clone();
@@ -2041,5 +2107,129 @@ mod tests {
         let work = WorkDir::new().unwrap();
         std::fs::write(work.0.join("whisper.json"), b"{}").unwrap();
         assert_eq!(read_work_file(&work.0.join("whisper.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn whisper_read_back_refuses_a_hard_link() {
+        let d = tempfile::tempdir().unwrap();
+        let work = WorkDir::new().unwrap();
+        let victim = d.path().join("victim.json");
+        std::fs::write(&victim, br#"{"secret":1}"#).unwrap();
+        let link = work.0.join("whisper.json");
+        if std::fs::hard_link(&victim, &link).is_err() {
+            // $TMPDIR on another volume: a cross-volume hard link cannot exist.
+            return;
+        }
+        let e = read_work_file(&link).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
+    }
+
+    #[test]
+    fn place_refuses_a_hard_link_planted_in_the_work_dir() {
+        let work = WorkDir::new().unwrap();
+        // Victim on the same volume as the work dir, so the link can be made.
+        let victim_dir = tempfile::tempdir().unwrap();
+        let victim = victim_dir.path().join("victim.txt");
+        std::fs::write(&victim, b"secret").unwrap();
+        let src = work.0.join("waveform.png");
+        if std::fs::hard_link(&victim, &src).is_err() {
+            return;
+        }
+        let out = tempfile::tempdir().unwrap();
+        let e = place(&src, &out.path().join("waveform.png")).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
+        assert!(std::fs::symlink_metadata(out.path().join("waveform.png")).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn sandboxed_argv_passes_work_as_a_param_and_the_program_last() {
+        let argv = sandboxed_argv(
+            Path::new("/private/tmp/w \"x\")"),
+            FFMPEG,
+            &["-i".into(), "/a.mp4".into()],
+        );
+        assert_eq!(argv[0], "-D");
+        // The path rides in -D, never inside the profile text, so quotes in it
+        // cannot change the rules.
+        assert_eq!(argv[1], "WORK=/private/tmp/w \"x\")");
+        assert_eq!(argv[2], "-p");
+        assert_eq!(argv[3], SANDBOX_PROFILE);
+        assert_eq!(&argv[4..], [FFMPEG, "-i", "/a.mp4"]);
+        assert!(SANDBOX_PROFILE.contains("(deny network*)"));
+        assert!(SANDBOX_PROFILE.contains("(deny file-write*)"));
+        assert!(!SANDBOX_PROFILE.contains("/private"), "no paths baked in");
+    }
+
+    #[test]
+    fn missing_sandbox_exec_is_a_missing_dep() {
+        let listed = missing_deps(Path::new("/nonexistent/model.bin"));
+        assert_eq!(
+            listed.contains(&SANDBOX_EXEC.to_string()),
+            !Path::new(SANDBOX_EXEC).is_file()
+        );
+    }
+
+    /// The tool is macOS only and never runs a child unsandboxed. If Apple
+    /// ever drops sandbox-exec, this fails on every Mac build, loudly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_exec_is_present() {
+        assert!(
+            Path::new(SANDBOX_EXEC).is_file(),
+            "{SANDBOX_EXEC} is gone: video_digest will refuse every call with MISSING_DEP"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn sh_in_sandbox(work: &WorkDir, script: &str) -> ChildOut {
+        run_child("/bin/sh", &["-c".into(), script.into()], &work.0)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_allows_writes_only_inside_the_work_dir() {
+        let work = WorkDir::new().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"original").unwrap();
+
+        let c = sh_in_sandbox(&work, "echo ok > inside.txt").await;
+        assert!(c.ok, "write inside the work dir refused: {}", c.stderr);
+        assert!(work.0.join("inside.txt").is_file());
+
+        let c = sh_in_sandbox(
+            &work,
+            &format!("echo x > '{}/new.txt'", outside.path().display()),
+        )
+        .await;
+        assert!(!c.ok, "write outside the work dir was allowed");
+        assert!(!outside.path().join("new.txt").exists());
+
+        // A link planted in the work dir: Seatbelt checks the resolved path.
+        std::os::unix::fs::symlink(&victim, work.0.join("whisper.json")).unwrap();
+        let c = sh_in_sandbox(&work, "echo attacker > whisper.json").await;
+        assert!(!c.ok, "write through a planted link was allowed");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_blocks_network_even_to_localhost() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let probe = format!("/usr/bin/nc -z -G 2 127.0.0.1 {port}");
+        // Control: the same command unsandboxed connects, so a refusal below
+        // is the sandbox and not a broken probe.
+        let ctl = std::process::Command::new("/bin/sh")
+            .args(["-c", &probe])
+            .status()
+            .unwrap();
+        assert!(ctl.success(), "control connection failed; probe is broken");
+        let work = WorkDir::new().unwrap();
+        let c = sh_in_sandbox(&work, &probe).await;
+        assert!(!c.ok, "network connect allowed inside the sandbox");
     }
 }
