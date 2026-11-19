@@ -17,10 +17,12 @@
 //!   shell), a cleared env ([`crate::subprocess_sandbox::sandbox_command`]) and
 //!   `kill_on_drop`, and the whole call runs under one wall-clock deadline.
 //! - Every child also runs under `sandbox-exec` ([`SANDBOX_PROFILE`]): no
-//!   network, and writes only inside a private per-run work folder. A
-//!   compromised decoder can still read files, but cannot send them anywhere
-//!   or write outside that folder. Without `sandbox-exec` the tool refuses
-//!   with `MISSING_DEP` rather than run unsandboxed.
+//!   network, writes only inside a private per-run work folder, and no way to
+//!   start any other program (no exec, no LaunchServices opens, no Apple
+//!   events). A compromised decoder can still read files, but cannot send them
+//!   anywhere, write outside that folder, or hand work to an unsandboxed
+//!   process. Without `sandbox-exec` the tool refuses with `MISSING_DEP`
+//!   rather than run unsandboxed.
 //! - ffmpeg is parsing untrusted media. Playlist-style demuxers (hls, concat,
 //!   image2 patterns, tee, lavfi) can make it open other local files or the
 //!   network, so every ffmpeg/ffprobe read of the agent's file is pinned to
@@ -40,8 +42,13 @@
 //!   stream kinds and picture size.
 //!
 //! Known limits: macOS/Homebrew paths only. Reads are not sandboxed (see
-//! [`SANDBOX_PROFILE`]). An agent with a shell could still swap the output
-//! folder or its `frames/` for a link mid-run.
+//! [`SANDBOX_PROFILE`]), so a compromised decoder could copy any file the user
+//! can read into its outputs, and from there into the agent's workspace. An
+//! agent with a shell could still swap the output folder or its `frames/` for
+//! a link mid-run, or hard-link a victim file into the work folder under one
+//! of ffmpeg's output names (Seatbelt allows it: the link's path is inside
+//! the work folder); both need the run's random folder name and a shell
+//! command the gate sees.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -61,7 +68,17 @@ pub const WHISPER_MODEL_REL: &str = "models/whisper/ggml-large-v3-turbo-q5_0.bin
 /// no network and may write only inside the run's private work folder
 /// (`WORK`, passed with `-D` so the path is never spliced into the profile
 /// text). Seatbelt checks the resolved path, so a link planted in the work
-/// folder that points elsewhere is refused too. Reads stay open: locking them
+/// folder that points elsewhere is refused too.
+///
+/// With `(allow default)` the child could otherwise start other programs, or
+/// ask LaunchServices / another app (Apple events) to open something, and
+/// that work would run outside the sandbox. So exec is limited to `PROG`
+/// (the canonical path of the one binary being run, also passed with `-D`),
+/// and LaunchServices opens and Apple events are denied. The launchservicesd
+/// lookup is denied by name only: Metal needs other mach lookups, so mach is
+/// not blanket-denied.
+///
+/// Reads stay open: locking them
 /// down means listing every dylib, Metal and model path the children touch,
 /// and that list breaks with OS and Homebrew updates. The demuxer and protocol
 /// whitelists are what keep ffmpeg from opening other files.
@@ -70,7 +87,12 @@ pub const SANDBOX_PROFILE: &str = "(version 1)
 (deny network*)
 (deny file-write*)
 (allow file-write* (subpath (param \"WORK\")))
-(allow file-write-data (literal \"/dev/null\"))";
+(allow file-write-data (literal \"/dev/null\"))
+(deny process-exec)
+(allow process-exec (literal (param \"PROG\")))
+(deny lsopen)
+(deny appleevent-send)
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\"))";
 
 /// Demuxers ffmpeg may use on the agent's file. Plain containers only: no
 /// playlist, concat, image-sequence, device or filter-graph sources.
@@ -774,14 +796,18 @@ struct ChildOut {
 }
 
 /// argv for running `program` under [`SANDBOX_PROFILE`] with `work` as the
-/// only writable folder.
-fn sandboxed_argv(work: &Path, program: &str, args: &[String]) -> Vec<String> {
+/// only writable folder and `program` as the only executable. `program` must
+/// be canonical: Seatbelt's exec check sees the resolved path, so a Homebrew
+/// `bin/` link would not match (it fails closed: exec refused).
+fn sandboxed_argv(work: &Path, program: &Path, args: &[String]) -> Vec<String> {
     let mut v = vec![
         "-D".to_string(),
         format!("WORK={}", work.display()),
+        "-D".into(),
+        format!("PROG={}", program.display()),
         "-p".into(),
         SANDBOX_PROFILE.into(),
-        program.into(),
+        program.display().to_string(),
     ];
     v.extend(args.iter().cloned());
     v
@@ -790,8 +816,10 @@ fn sandboxed_argv(work: &Path, program: &str, args: &[String]) -> Vec<String> {
 /// Run one child under the sandbox. `work` must be a [`WorkDir`] path (already
 /// canonical); it is also the child's cwd.
 async fn run_child(program: &str, args: &[String], work: &Path) -> Result<ChildOut, String> {
+    let prog =
+        std::fs::canonicalize(program).map_err(|e| format!("failed to resolve {program}: {e}"))?;
     let mut cmd = tokio::process::Command::new(SANDBOX_EXEC);
-    cmd.args(sandboxed_argv(work, program, args));
+    cmd.args(sandboxed_argv(work, &prog, args));
     cmd.current_dir(work);
     crate::subprocess_sandbox::sandbox_command(&mut cmd, &[]);
     cmd.stdin(std::process::Stdio::null());
@@ -1669,10 +1697,30 @@ mod tests {
     async fn deadline_kills_the_child() {
         let work = WorkDir::new().unwrap();
         let marker = work.0.join("marker");
-        let script = format!("sleep 3; /usr/bin/touch '{}'", marker.display());
+        // Bash builtins only (exec of sleep/touch is refused in the sandbox):
+        // `read -t` on a FIFO opened read-write waits the full 3 s.
+        let fifo = work.0.join("wait.fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let script = format!(
+            "read -t 3 <> '{}'; echo x > '{}'",
+            fifo.display(),
+            marker.display()
+        );
+        // Control: with no deadline the script does write the marker, so its
+        // absence below means the child died.
+        let ctl = run_child("/bin/bash", &["-c".into(), script.clone()], &work.0)
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "control never wrote the marker: {}",
+            ctl.stderr
+        );
+        std::fs::remove_file(&marker).unwrap();
         let started = std::time::Instant::now();
         let s = with_deadline(Duration::from_millis(500), "d", async {
-            let _ = run_child("/bin/sh", &["-c".into(), script], &work.0).await;
+            let _ = run_child("/bin/bash", &["-c".into(), script], &work.0).await;
             "finished".to_string()
         })
         .await;
@@ -2146,18 +2194,27 @@ mod tests {
     fn sandboxed_argv_passes_work_as_a_param_and_the_program_last() {
         let argv = sandboxed_argv(
             Path::new("/private/tmp/w \"x\")"),
-            FFMPEG,
+            Path::new("/opt/homebrew/Cellar/ffmpeg/8/bin/ffmpeg"),
             &["-i".into(), "/a.mp4".into()],
         );
         assert_eq!(argv[0], "-D");
         // The path rides in -D, never inside the profile text, so quotes in it
         // cannot change the rules.
         assert_eq!(argv[1], "WORK=/private/tmp/w \"x\")");
-        assert_eq!(argv[2], "-p");
-        assert_eq!(argv[3], SANDBOX_PROFILE);
-        assert_eq!(&argv[4..], [FFMPEG, "-i", "/a.mp4"]);
+        assert_eq!(argv[2], "-D");
+        // The exec allowance names exactly the binary that is run.
+        assert_eq!(argv[3], "PROG=/opt/homebrew/Cellar/ffmpeg/8/bin/ffmpeg");
+        assert_eq!(argv[4], "-p");
+        assert_eq!(argv[5], SANDBOX_PROFILE);
+        assert_eq!(
+            &argv[6..],
+            ["/opt/homebrew/Cellar/ffmpeg/8/bin/ffmpeg", "-i", "/a.mp4"]
+        );
         assert!(SANDBOX_PROFILE.contains("(deny network*)"));
         assert!(SANDBOX_PROFILE.contains("(deny file-write*)"));
+        assert!(SANDBOX_PROFILE.contains("(deny process-exec)"));
+        assert!(SANDBOX_PROFILE.contains("(deny lsopen)"));
+        assert!(SANDBOX_PROFILE.contains("(deny appleevent-send)"));
         assert!(!SANDBOX_PROFILE.contains("/private"), "no paths baked in");
     }
 
@@ -2181,9 +2238,11 @@ mod tests {
         );
     }
 
+    /// `/bin/sh` on macOS re-execs bash, which the exec rule refuses, so the
+    /// live tests drive bash directly and stick to builtins.
     #[cfg(target_os = "macos")]
     async fn sh_in_sandbox(work: &WorkDir, script: &str) -> ChildOut {
-        run_child("/bin/sh", &["-c".into(), script.into()], &work.0)
+        run_child("/bin/bash", &["-c".into(), script.into()], &work.0)
             .await
             .unwrap()
     }
@@ -2220,10 +2279,12 @@ mod tests {
     async fn sandbox_blocks_network_even_to_localhost() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let probe = format!("/usr/bin/nc -z -G 2 127.0.0.1 {port}");
+        // A bash builtin, not nc: exec of nc is refused in the sandbox, which
+        // would pass this test without touching the network rule.
+        let probe = format!("echo hi > /dev/tcp/127.0.0.1/{port}");
         // Control: the same command unsandboxed connects, so a refusal below
         // is the sandbox and not a broken probe.
-        let ctl = std::process::Command::new("/bin/sh")
+        let ctl = std::process::Command::new("/bin/bash")
             .args(["-c", &probe])
             .status()
             .unwrap();
@@ -2231,5 +2292,53 @@ mod tests {
         let work = WorkDir::new().unwrap();
         let c = sh_in_sandbox(&work, &probe).await;
         assert!(!c.ok, "network connect allowed inside the sandbox");
+        assert!(c.stderr.contains("Operation not permitted"), "{}", c.stderr);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_refuses_exec_of_any_other_program() {
+        let work = WorkDir::new().unwrap();
+        // Control: the allowed program itself runs.
+        let c = run_child("/usr/bin/true", &[], &work.0).await.unwrap();
+        assert!(c.ok, "PROG itself refused: {}", c.stderr);
+        // A child starting anything else is refused.
+        let c = sh_in_sandbox(&work, "/usr/bin/true").await;
+        assert!(!c.ok, "exec of a second program was allowed");
+        assert!(c.stderr.contains("Operation not permitted"), "{}", c.stderr);
+    }
+
+    /// LaunchServices opens run outside the sandbox, so they are the escape
+    /// that matters. `open` is the allowed PROG here, so only the lsopen /
+    /// launchservicesd rules stand in the way. -54 is LaunchServices'
+    /// permission error, which tells a refusal apart from a missing app.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_refuses_launchservices_open() {
+        let work = WorkDir::new().unwrap();
+        let c = run_child(
+            "/usr/bin/open",
+            &["-g".into(), "-j".into(), "-a".into(), "TextEdit".into()],
+            &work.0,
+        )
+        .await
+        .unwrap();
+        assert!(!c.ok, "LaunchServices open was allowed");
+        assert!(c.stderr.contains("-54"), "{}", c.stderr);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn run_child_resolves_links_to_the_real_binary() {
+        // /opt/homebrew/bin/* are links into the Cellar; the exec rule only
+        // matches the resolved path, so run_child must resolve it.
+        if !Path::new(FFMPEG).is_file() {
+            return;
+        }
+        let work = WorkDir::new().unwrap();
+        let c = run_child(FFMPEG, &["-hide_banner".into(), "-version".into()], &work.0)
+            .await
+            .unwrap();
+        assert!(c.ok, "ffmpeg via its bin/ link refused: {}", c.stderr);
     }
 }
