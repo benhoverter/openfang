@@ -78,6 +78,16 @@ pub const WHISPER_MODEL_REL: &str = "models/whisper/ggml-large-v3-turbo-q5_0.bin
 /// lookup is denied by name only: Metal needs other mach lookups, so mach is
 /// not blanket-denied.
 ///
+/// The pasteboard lookup is denied too: with the network off and reads open,
+/// the clipboard is the obvious channel left for moving data out. The Apple
+/// events lookup is a second layer behind `appleevent-send`.
+///
+/// This is a denylist on top of `(allow default)`: it can't prove that no
+/// other XPC service will start work for the child. Closing that fully means
+/// deny-default mach with an allowlist, which breaks as easily as locking
+/// reads, so it stays an accepted limit alongside open reads. All of this
+/// assumes code execution inside the decoder in the first place.
+///
 /// Reads stay open: locking them
 /// down means listing every dylib, Metal and model path the children touch,
 /// and that list breaks with OS and Homebrew updates. The demuxer and protocol
@@ -92,7 +102,9 @@ pub const SANDBOX_PROFILE: &str = "(version 1)
 (allow process-exec (literal (param \"PROG\")))
 (deny lsopen)
 (deny appleevent-send)
-(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\"))";
+(deny mach-lookup (global-name \"com.apple.coreservices.launchservicesd\"))
+(deny mach-lookup (global-name \"com.apple.coreservices.appleevents\"))
+(deny mach-lookup (global-name \"com.apple.pasteboard.1\"))";
 
 /// Demuxers ffmpeg may use on the agent's file. Plain containers only: no
 /// playlist, concat, image-sequence, device or filter-graph sources.
@@ -2215,6 +2227,8 @@ mod tests {
         assert!(SANDBOX_PROFILE.contains("(deny process-exec)"));
         assert!(SANDBOX_PROFILE.contains("(deny lsopen)"));
         assert!(SANDBOX_PROFILE.contains("(deny appleevent-send)"));
+        assert!(SANDBOX_PROFILE.contains("\"com.apple.pasteboard.1\""));
+        assert!(SANDBOX_PROFILE.contains("\"com.apple.coreservices.appleevents\""));
         assert!(!SANDBOX_PROFILE.contains("/private"), "no paths baked in");
     }
 
@@ -2327,12 +2341,36 @@ mod tests {
         assert!(c.stderr.contains("-54"), "{}", c.stderr);
     }
 
+    /// Reads the clipboard (never writes it, so the test can't clobber it).
+    /// Control first: unsandboxed pbpaste works, so a failure below is the
+    /// pasteboard rule.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn sandbox_refuses_the_pasteboard() {
+        let ctl = std::process::Command::new("/usr/bin/pbpaste")
+            .output()
+            .unwrap();
+        assert!(
+            ctl.status.success(),
+            "control pbpaste failed; probe is broken"
+        );
+        let work = WorkDir::new().unwrap();
+        let c = run_child("/usr/bin/pbpaste", &[], &work.0).await.unwrap();
+        assert!(!c.ok, "pasteboard lookup was allowed: {}", c.stderr);
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn run_child_resolves_links_to_the_real_binary() {
         // /opt/homebrew/bin/* are links into the Cellar; the exec rule only
-        // matches the resolved path, so run_child must resolve it.
+        // matches the resolved path, so run_child must resolve it. Fails on a
+        // dev host without ffmpeg (only CI skips), like the ffprobe test.
         if !Path::new(FFMPEG).is_file() {
+            assert!(
+                std::env::var_os("CI").is_some(),
+                "{FFMPEG} is not installed, so this test cannot guard the resolve step"
+            );
+            eprintln!("skipping under CI: {FFMPEG} not installed");
             return;
         }
         let work = WorkDir::new().unwrap();
