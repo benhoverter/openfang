@@ -75,6 +75,7 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
                     // every agent). Bad entries are logged at ERROR and dropped;
                     // survivors are passed through to typed deserialization.
                     lenient_extract_bindings(&mut root_value);
+                    lenient_extract_prompt_budgets(&mut root_value);
 
                     match root_value.try_into::<KernelConfig>() {
                         Ok(config) => {
@@ -337,6 +338,48 @@ fn lenient_extract_bindings(root_value: &mut toml::Value) {
     }
 
     tbl.insert("bindings".to_string(), toml::Value::Array(survivors));
+}
+
+/// Lenient pre-pass over `[context.prompt_budgets]` (GAP-012, same shape as
+/// [`lenient_extract_bindings`]).
+///
+/// These are hand-edited numbers, and a wrong TYPE (`"6000"`, `6000.0`, `-1`)
+/// would otherwise fail typed deserialization of the whole config and drop
+/// bindings, exec policy and approvals to defaults. Each field that isn't a
+/// non-negative integer is logged at ERROR and removed, so that field keeps
+/// its compiled default and everything else loads. A `prompt_budgets` that
+/// isn't a table at all is removed whole. Range checks stay in
+/// `PromptBudgetsConfig::effective`; unknown keys pass through untouched.
+fn lenient_extract_prompt_budgets(root_value: &mut toml::Value) {
+    let Some(toml::Value::Table(context)) = root_value.get_mut("context") else {
+        return;
+    };
+    let budgets = match context.get_mut("prompt_budgets") {
+        None => return,
+        Some(toml::Value::Table(t)) => t,
+        Some(other) => {
+            tracing::error!(
+                "[context.prompt_budgets] must be a table, got {}; \
+                 ignoring it and keeping every compiled default",
+                other.type_str()
+            );
+            context.remove("prompt_budgets");
+            return;
+        }
+    };
+    let bad: Vec<String> = budgets
+        .iter()
+        .filter(|(_, v)| !matches!(v, toml::Value::Integer(i) if *i >= 0))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in bad {
+        if let Some(v) = budgets.remove(&key) {
+            tracing::error!(
+                "Refusing prompt budget, keeping the compiled default: \
+                 [context.prompt_budgets] {key} = {v} is not a whole number"
+            );
+        }
+    }
 }
 
 /// Get the default config file path.
@@ -768,5 +811,68 @@ match_rule = {{ channel = "discord", channel_id = "2" }}
 
         let config = load_config(Some(&root));
         assert_eq!(config.log_level, "trace");
+    }
+
+    /// A wrong-typed budget drops only that field; the rest of the config,
+    /// bindings included, still loads.
+    #[test]
+    fn test_lenient_prompt_budgets_bad_type_drops_only_that_field() {
+        use openfang_types::config::PromptBudgetsConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+log_level = "debug"
+
+[context.prompt_budgets]
+user_md = "6000"
+rules_md = 20000.0
+soul_md = -1
+agents_md = 20000
+
+[[bindings]]
+agent = "good"
+match_rule = {{ channel = "discord", channel_id = "1" }}
+"#
+        )
+        .unwrap();
+        drop(f);
+
+        let config = load_config(Some(&path));
+        assert_eq!(config.log_level, "debug", "rest of config must load");
+        assert_eq!(config.bindings.len(), 1, "bindings must survive");
+        let b = config.context.prompt_budgets;
+        let d = PromptBudgetsConfig::DEFAULT;
+        assert_eq!(b.user_md, d.user_md);
+        assert_eq!(b.rules_md, d.rules_md);
+        assert_eq!(b.soul_md, d.soul_md);
+        assert_eq!(b.agents_md, 20_000, "the good field is kept");
+    }
+
+    #[test]
+    fn test_lenient_prompt_budgets_non_table_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"
+log_level = "debug"
+
+[context]
+prompt_budgets = 6000
+"#
+        )
+        .unwrap();
+        drop(f);
+
+        let config = load_config(Some(&path));
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(
+            config.context.prompt_budgets,
+            openfang_types::config::PromptBudgetsConfig::DEFAULT
+        );
     }
 }

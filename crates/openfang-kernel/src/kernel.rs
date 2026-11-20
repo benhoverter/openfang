@@ -6220,6 +6220,12 @@ impl OpenFangKernel {
             for e in budgets.errors() {
                 error!("Refusing prompt budget, keeping the compiled default: {e}");
             }
+            for (name, v, d) in budgets.lowered() {
+                warn!(
+                    "[context.prompt_budgets] {name} = {v} is below its default {d}; \
+                     that section is cut sooner for every agent"
+                );
+            }
             let overrides = budgets.overrides();
             if !overrides.is_empty() {
                 info!(

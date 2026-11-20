@@ -215,7 +215,7 @@ impl PromptBudgetsConfig {
     /// Smallest accepted cap per field: half the compiled default, so a cap
     /// can be tightened but not set low enough to gut a section. `rules_md`
     /// cannot go below its default at all: a cut there drops operating rules
-    /// from every agent at once, and RULES.md already sits near 14 K.
+    /// from every agent at once.
     pub const MINIMUM: Self = Self {
         agents_md: Self::DEFAULT.agents_md / 2,
         rules_md: Self::DEFAULT.rules_md,
@@ -272,12 +272,19 @@ impl PromptBudgetsConfig {
             .into_iter()
             .filter(|(_, v, _, m)| !Self::in_range(*v, *m))
             .map(|(name, v, d, m)| {
-                format!(
-                    "[context.prompt_budgets] {name} = {v} is outside {}..={}; \
-                     keeping the default {d}",
-                    m,
-                    Self::MAX
-                )
+                if v < m && m == d {
+                    format!(
+                        "[context.prompt_budgets] {name} = {v} cannot be lowered below \
+                         its default {d}; keeping the default {d}"
+                    )
+                } else {
+                    format!(
+                        "[context.prompt_budgets] {name} = {v} is outside {}..={}; \
+                         keeping the default {d}",
+                        m,
+                        Self::MAX
+                    )
+                }
             })
             .collect()
     }
@@ -289,6 +296,17 @@ impl PromptBudgetsConfig {
             .into_iter()
             .filter(|(_, v, d, _)| v != d)
             .map(|(name, v, _, _)| (name, v))
+            .collect()
+    }
+
+    /// Effective fields set below their compiled default, as
+    /// `(name, value, default)`, so boot can log a cut louder than a raise.
+    pub fn lowered(&self) -> Vec<(&'static str, usize, usize)> {
+        self.effective()
+            .fields()
+            .into_iter()
+            .filter(|(_, v, d, _)| v < d)
+            .map(|(name, v, d, _)| (name, v, d))
             .collect()
     }
 
@@ -6430,13 +6448,30 @@ mod tests {
             ..PromptBudgetsConfig::DEFAULT
         };
         assert_eq!(lowered.effective().rules_md, d);
-        assert_eq!(lowered.errors().len(), 1);
+        let errs = lowered.errors();
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].contains("rules_md = 19999 cannot be lowered below its default 20000"),
+            "{errs:?}"
+        );
         let raised = PromptBudgetsConfig {
             rules_md: d + 1,
             ..PromptBudgetsConfig::DEFAULT
         };
         assert_eq!(raised.effective().rules_md, d + 1);
         assert!(raised.errors().is_empty());
+    }
+
+    #[test]
+    fn lowered_lists_only_accepted_cuts_below_the_default() {
+        let b = PromptBudgetsConfig {
+            user_md: 2_000,                                    // accepted cut
+            soul_md: PromptBudgetsConfig::MINIMUM.soul_md - 1, // refused, default live
+            agents_md: 20_000,                                 // raise, not a cut
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(b.lowered(), vec![("user_md", 2_000, 3_000)]);
+        assert!(PromptBudgetsConfig::DEFAULT.lowered().is_empty());
     }
 
     #[test]
