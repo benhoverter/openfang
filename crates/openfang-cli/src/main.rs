@@ -2550,14 +2550,14 @@ decay_rate = 0.05
         }
 
         // --- Check 4: Port availability ---
-        // Read api_listen from config (default: 127.0.0.1:4200)
+        // Read api_listen the way the daemon does (includes, [api] migration,
+        // lenient pre-passes), so a field the daemon drops can't hide the port.
         let api_listen = {
             let cfg_path = openfang_dir.join("config.toml");
             if cfg_path.exists() {
-                std::fs::read_to_string(&cfg_path)
+                openfang_kernel::config::load_config_checked(&cfg_path)
                     .ok()
-                    .and_then(|s| toml::from_str::<openfang_types::config::KernelConfig>(&s).ok())
-                    .map(|c| c.api_listen)
+                    .map(|r| r.config.api_listen)
                     .unwrap_or_else(|| "127.0.0.1:4200".to_string())
             } else {
                 "127.0.0.1:4200".to_string()
@@ -2869,94 +2869,140 @@ decay_rate = 0.05
                 println!("\n  Config Validation:");
             }
             let config_content = std::fs::read_to_string(&config_path).unwrap_or_default();
-            match toml::from_str::<openfang_types::config::KernelConfig>(&config_content) {
+            // Strict first: it catches every mistake. If it fails, ask the
+            // daemon's own loader what it would do, so we report "the daemon
+            // drops X and runs" apart from "the daemon falls back to defaults".
+            let loaded = match toml::from_str::<openfang_types::config::KernelConfig>(
+                &config_content,
+            ) {
                 Ok(cfg) => {
                     if !json {
                         ui::check_ok("Config deserializes into KernelConfig");
                     }
                     checks.push(serde_json::json!({"check": "config_deser", "status": "ok"}));
-
-                    // Check exec policy
-                    let mode = format!("{:?}", cfg.exec_policy.mode);
-                    let safe_bins_count = cfg.exec_policy.safe_bins.len();
-                    if !json {
-                        ui::check_ok(&format!(
-                            "Exec policy: mode={mode}, safe_bins={safe_bins_count}"
-                        ));
-                    }
-                    checks.push(serde_json::json!({"check": "exec_policy", "status": "ok", "mode": mode, "safe_bins": safe_bins_count}));
-
-                    // Check includes
-                    if !cfg.include.is_empty() {
-                        let mut include_ok = true;
-                        for inc in &cfg.include {
-                            let inc_path = openfang_dir.join(inc);
-                            if inc_path.exists() {
-                                if !json {
-                                    ui::check_ok(&format!("Include file: {inc}"));
-                                }
-                            } else if repair {
-                                if !json {
-                                    ui::check_warn(&format!("Include file missing: {inc}"));
-                                }
-                                include_ok = false;
-                            } else {
-                                if !json {
-                                    ui::check_fail(&format!("Include file not found: {inc}"));
-                                }
-                                include_ok = false;
-                                all_ok = false;
-                            }
-                        }
-                        checks.push(serde_json::json!({"check": "config_includes", "status": if include_ok { "ok" } else { "fail" }, "count": cfg.include.len()}));
-                    }
-
-                    // Check MCP server configs
-                    if !cfg.mcp_servers.is_empty() {
-                        let mcp_count = cfg.mcp_servers.len();
-                        if !json {
-                            ui::check_ok(&format!("MCP servers configured: {mcp_count}"));
-                        }
-                        for server in &cfg.mcp_servers {
-                            // Validate transport config
-                            match &server.transport {
-                                openfang_types::config::McpTransportEntry::Stdio {
-                                    command,
-                                    ..
-                                } => {
-                                    if command.is_empty() {
-                                        if !json {
-                                            ui::check_warn(&format!(
-                                                "MCP server '{}' has empty command",
-                                                server.name
-                                            ));
-                                        }
-                                        checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
-                                    }
-                                }
-                                openfang_types::config::McpTransportEntry::Sse { url }
-                                | openfang_types::config::McpTransportEntry::Http { url } => {
-                                    if url.is_empty() {
-                                        if !json {
-                                            ui::check_warn(&format!(
-                                                "MCP server '{}' has empty URL",
-                                                server.name
-                                            ));
-                                        }
-                                        checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
+                    Some(cfg)
+                }
+                Err(strict_err) => {
+                    match openfang_kernel::config::load_config_checked(&config_path) {
+                        Ok(report) => {
+                            if !json {
+                                ui::check_warn(&format!("Strict parse failed: {strict_err}"));
+                                if report.dropped.is_empty() {
+                                    ui::check_warn(
+                                        "The daemon loads it after includes and the [api] migration",
+                                    );
+                                } else {
+                                    ui::check_warn("The daemon loads the rest and drops these:");
+                                    for d in &report.dropped {
+                                        ui::check_warn(&format!("  dropped: {d}"));
                                     }
                                 }
                             }
+                            checks.push(serde_json::json!({
+                                "check": "config_deser",
+                                "status": "warn",
+                                "error": strict_err.to_string(),
+                                "daemon_loads": true,
+                                "dropped": report.dropped,
+                            }));
+                            Some(report.config)
                         }
-                        checks.push(serde_json::json!({"check": "mcp_servers", "status": "ok", "count": mcp_count}));
+                        Err(load_err) => {
+                            if !json {
+                                ui::check_fail(&format!(
+                                    "Config fails KernelConfig deserialization: {strict_err}"
+                                ));
+                                ui::check_fail(&format!(
+                                    "The daemon can't load it either and will run on DEFAULTS \
+                                     (no bindings, default exec policy): {load_err}"
+                                ));
+                            }
+                            checks.push(serde_json::json!({
+                                "check": "config_deser",
+                                "status": "fail",
+                                "error": strict_err.to_string(),
+                                "daemon_loads": false,
+                                "daemon_error": load_err,
+                            }));
+                            all_ok = false;
+                            None
+                        }
                     }
                 }
-                Err(e) => {
-                    if !json {
-                        ui::check_fail(&format!("Config fails KernelConfig deserialization: {e}"));
+            };
+            if let Some(cfg) = loaded {
+                // Check exec policy
+                let mode = format!("{:?}", cfg.exec_policy.mode);
+                let safe_bins_count = cfg.exec_policy.safe_bins.len();
+                if !json {
+                    ui::check_ok(&format!(
+                        "Exec policy: mode={mode}, safe_bins={safe_bins_count}"
+                    ));
+                }
+                checks.push(serde_json::json!({"check": "exec_policy", "status": "ok", "mode": mode, "safe_bins": safe_bins_count}));
+
+                // Check includes
+                if !cfg.include.is_empty() {
+                    let mut include_ok = true;
+                    for inc in &cfg.include {
+                        let inc_path = openfang_dir.join(inc);
+                        if inc_path.exists() {
+                            if !json {
+                                ui::check_ok(&format!("Include file: {inc}"));
+                            }
+                        } else if repair {
+                            if !json {
+                                ui::check_warn(&format!("Include file missing: {inc}"));
+                            }
+                            include_ok = false;
+                        } else {
+                            if !json {
+                                ui::check_fail(&format!("Include file not found: {inc}"));
+                            }
+                            include_ok = false;
+                            all_ok = false;
+                        }
                     }
-                    checks.push(serde_json::json!({"check": "config_deser", "status": "fail", "error": e.to_string()}));
-                    all_ok = false;
+                    checks.push(serde_json::json!({"check": "config_includes", "status": if include_ok { "ok" } else { "fail" }, "count": cfg.include.len()}));
+                }
+
+                // Check MCP server configs
+                if !cfg.mcp_servers.is_empty() {
+                    let mcp_count = cfg.mcp_servers.len();
+                    if !json {
+                        ui::check_ok(&format!("MCP servers configured: {mcp_count}"));
+                    }
+                    for server in &cfg.mcp_servers {
+                        // Validate transport config
+                        match &server.transport {
+                            openfang_types::config::McpTransportEntry::Stdio {
+                                command, ..
+                            } => {
+                                if command.is_empty() {
+                                    if !json {
+                                        ui::check_warn(&format!(
+                                            "MCP server '{}' has empty command",
+                                            server.name
+                                        ));
+                                    }
+                                    checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
+                                }
+                            }
+                            openfang_types::config::McpTransportEntry::Sse { url }
+                            | openfang_types::config::McpTransportEntry::Http { url } => {
+                                if url.is_empty() {
+                                    if !json {
+                                        ui::check_warn(&format!(
+                                            "MCP server '{}' has empty URL",
+                                            server.name
+                                        ));
+                                    }
+                                    checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
+                                }
+                            }
+                        }
+                    }
+                    checks.push(serde_json::json!({"check": "mcp_servers", "status": "ok", "count": mcp_count}));
                 }
             }
         }

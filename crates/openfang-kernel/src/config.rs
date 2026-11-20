@@ -11,6 +11,16 @@ use tracing::info;
 /// Maximum include nesting depth.
 const MAX_INCLUDE_DEPTH: u32 = 10;
 
+/// What the daemon's loader made of a config file: the config it will run
+/// with, plus a line for every binding, field or include it had to drop to
+/// get there. `openfang doctor` reports `dropped`, so it can describe what the
+/// daemon will actually do rather than only what a strict parse thinks.
+#[derive(Debug)]
+pub struct ConfigLoadReport {
+    pub config: KernelConfig,
+    pub dropped: Vec<String>,
+}
+
 /// Load kernel configuration from a TOML file, with defaults.
 ///
 /// If the config contains an `include` field, included files are loaded
@@ -20,108 +30,104 @@ pub fn load_config(path: Option<&Path>) -> KernelConfig {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(default_config_path);
 
-    if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                Ok(mut root_value) => {
-                    // Process includes before deserializing
-                    let config_dir = config_path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .to_path_buf();
-                    let mut visited = HashSet::new();
-                    if let Ok(canonical) = std::fs::canonicalize(&config_path) {
-                        visited.insert(canonical);
-                    } else {
-                        visited.insert(config_path.clone());
-                    }
-
-                    if let Err(e) =
-                        resolve_config_includes(&mut root_value, &config_dir, &mut visited, 0)
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "Config include resolution failed, using root config only"
-                        );
-                    }
-
-                    // Remove the `include` field before deserializing to avoid confusion
-                    if let toml::Value::Table(ref mut tbl) = root_value {
-                        tbl.remove("include");
-                    }
-
-                    // Migrate misplaced api_key/api_listen from [api] section to root level.
-                    // The old config schema incorrectly grouped these under [api], so many
-                    // users have them in the wrong place. Move them up if not already at root.
-                    if let toml::Value::Table(ref mut tbl) = root_value {
-                        if let Some(toml::Value::Table(api_section)) = tbl.get("api").cloned() {
-                            for key in &["api_key", "api_listen", "log_level"] {
-                                if !tbl.contains_key(*key) {
-                                    if let Some(val) = api_section.get(*key) {
-                                        tracing::info!(
-                                            key,
-                                            "Migrating misplaced config field from [api] to root level"
-                                        );
-                                        tbl.insert(key.to_string(), val.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // GAP-012 (Tier 1): pre-validate the [[bindings]] array so a
-                    // single malformed entry doesn't poison the whole config and
-                    // force a fall-back to defaults (which would silently unbind
-                    // every agent). Bad entries are logged at ERROR and dropped;
-                    // survivors are passed through to typed deserialization.
-                    lenient_extract_bindings(&mut root_value);
-                    lenient_extract_prompt_budgets(&mut root_value);
-
-                    match root_value.try_into::<KernelConfig>() {
-                        Ok(config) => {
-                            info!(path = %config_path.display(), "Loaded configuration");
-                            return config;
-                        }
-                        Err(e) => {
-                            // TODO(GAP-012-Tier-2): this fallback still silently
-                            // swaps the user's intent for `KernelConfig::default()`
-                            // on any non-binding deserialization failure. Tier 1
-                            // closes the binding-shape footgun; Tier 2 should
-                            // surface remaining failures via a health endpoint
-                            // and/or stderr banner so the silent-default path
-                            // can't hide a broken config.
-                            tracing::warn!(
-                                error = %e,
-                                path = %config_path.display(),
-                                "Failed to deserialize merged config, using defaults"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        path = %config_path.display(),
-                        "Failed to parse config, using defaults"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %config_path.display(),
-                    "Failed to read config file, using defaults"
-                );
-            }
-        }
-    } else {
+    if !config_path.exists() {
         info!(
             path = %config_path.display(),
             "Config file not found, using defaults"
         );
+        return KernelConfig::default();
     }
 
-    KernelConfig::default()
+    match load_config_checked(&config_path) {
+        Ok(report) => {
+            info!(path = %config_path.display(), "Loaded configuration");
+            report.config
+        }
+        Err(e) => {
+            // TODO(GAP-012-Tier-2): this fallback still silently swaps the
+            // user's intent for `KernelConfig::default()` on any failure the
+            // lenient pre-passes don't absorb. Tier 2 should surface it via a
+            // health endpoint and/or stderr banner. `openfang doctor` reports
+            // it today through `load_config_checked`.
+            tracing::warn!(
+                error = %e,
+                path = %config_path.display(),
+                "Failed to load config, using defaults"
+            );
+            KernelConfig::default()
+        }
+    }
+}
+
+/// The daemon's config load, without the fall-back to defaults: includes,
+/// the `[api]` migration and the GAP-012 lenient pre-passes, then typed
+/// deserialization. `Err` is exactly the case where [`load_config`] would run
+/// on `KernelConfig::default()`.
+pub fn load_config_checked(config_path: &Path) -> Result<ConfigLoadReport, String> {
+    let contents =
+        std::fs::read_to_string(config_path).map_err(|e| format!("cannot read file: {e}"))?;
+    let mut root_value =
+        toml::from_str::<toml::Value>(&contents).map_err(|e| format!("not valid TOML: {e}"))?;
+    let mut dropped = Vec::new();
+
+    // Process includes before deserializing
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let mut visited = HashSet::new();
+    if let Ok(canonical) = std::fs::canonicalize(config_path) {
+        visited.insert(canonical);
+    } else {
+        visited.insert(config_path.to_path_buf());
+    }
+
+    if let Err(e) = resolve_config_includes(&mut root_value, &config_dir, &mut visited, 0) {
+        tracing::warn!(
+            error = %e,
+            "Config include resolution failed, using root config only"
+        );
+        dropped.push(format!(
+            "includes: resolution failed ({e}); using the root config only"
+        ));
+    }
+
+    // Remove the `include` field before deserializing to avoid confusion
+    if let toml::Value::Table(ref mut tbl) = root_value {
+        tbl.remove("include");
+    }
+
+    // Migrate misplaced api_key/api_listen from [api] section to root level.
+    // The old config schema incorrectly grouped these under [api], so many
+    // users have them in the wrong place. Move them up if not already at root.
+    if let toml::Value::Table(ref mut tbl) = root_value {
+        if let Some(toml::Value::Table(api_section)) = tbl.get("api").cloned() {
+            for key in &["api_key", "api_listen", "log_level"] {
+                if !tbl.contains_key(*key) {
+                    if let Some(val) = api_section.get(*key) {
+                        tracing::info!(
+                            key,
+                            "Migrating misplaced config field from [api] to root level"
+                        );
+                        tbl.insert(key.to_string(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // GAP-012 (Tier 1): pre-validate the [[bindings]] array and the prompt
+    // budgets so a single malformed entry doesn't poison the whole config and
+    // force a fall-back to defaults (which would silently unbind every
+    // agent). Bad entries are logged at ERROR and dropped; survivors are
+    // passed through to typed deserialization.
+    dropped.extend(lenient_extract_bindings(&mut root_value));
+    dropped.extend(lenient_extract_prompt_budgets(&mut root_value));
+
+    let config = root_value
+        .try_into::<KernelConfig>()
+        .map_err(|e| format!("does not deserialize into KernelConfig: {e}"))?;
+    Ok(ConfigLoadReport { config, dropped })
 }
 
 /// Resolve config includes by deep-merging included files into the root value.
@@ -278,12 +284,13 @@ pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
 /// level; only the all-or-nothing behavior is relaxed.
 ///
 /// No-op if `root_value` is not a table or has no `bindings` array.
-fn lenient_extract_bindings(root_value: &mut toml::Value) {
+/// Returns one line per dropped binding.
+fn lenient_extract_bindings(root_value: &mut toml::Value) -> Vec<String> {
     use openfang_types::config::AgentBinding;
 
     let tbl = match root_value {
         toml::Value::Table(t) => t,
-        _ => return,
+        _ => return Vec::new(),
     };
 
     // Replace the array in place if (and only if) `bindings` is present
@@ -291,17 +298,16 @@ fn lenient_extract_bindings(root_value: &mut toml::Value) {
     // so the typed deserializer can produce its own targeted error.
     let original = match tbl.get("bindings") {
         Some(toml::Value::Array(arr)) => arr.clone(),
-        _ => return,
+        _ => return Vec::new(),
     };
 
     let mut survivors: Vec<toml::Value> = Vec::with_capacity(original.len());
-    let mut dropped = 0usize;
+    let mut dropped: Vec<String> = Vec::new();
 
     for (idx, entry) in original.into_iter().enumerate() {
         match entry.clone().try_into::<AgentBinding>() {
             Ok(_) => survivors.push(entry),
             Err(e) => {
-                dropped += 1;
                 // Lazy: only allocate the agent-name fallback string when we
                 // actually need it for an error log. The happy path skips this.
                 let agent_name = entry
@@ -320,24 +326,26 @@ fn lenient_extract_bindings(root_value: &mut toml::Value) {
                     agent_name,
                     e
                 );
+                dropped.push(format!("binding #{idx} (agent='{agent_name}'): {e}"));
             }
         }
     }
 
-    if dropped > 0 {
+    if !dropped.is_empty() {
         // Per-entry ERRORs above carry the root cause; this summary is a
         // grep-friendly one-liner, so WARN keeps ERROR == per-binding cause.
         tracing::warn!(
-            dropped,
+            dropped = dropped.len(),
             survivors = survivors.len(),
             "Dropped {} malformed binding(s); {} binding(s) will load. \
              See preceding ERROR lines for per-binding details.",
-            dropped,
+            dropped.len(),
             survivors.len()
         );
     }
 
     tbl.insert("bindings".to_string(), toml::Value::Array(survivors));
+    dropped
 }
 
 /// Lenient pre-pass over `[context.prompt_budgets]` (GAP-012, same shape as
@@ -350,21 +358,26 @@ fn lenient_extract_bindings(root_value: &mut toml::Value) {
 /// its compiled default and everything else loads. A `prompt_budgets` that
 /// isn't a table at all is removed whole. Range checks stay in
 /// `PromptBudgetsConfig::effective`; unknown keys pass through untouched.
-fn lenient_extract_prompt_budgets(root_value: &mut toml::Value) {
+/// Returns one line per dropped field (or one for a non-table section).
+fn lenient_extract_prompt_budgets(root_value: &mut toml::Value) -> Vec<String> {
     let Some(toml::Value::Table(context)) = root_value.get_mut("context") else {
-        return;
+        return Vec::new();
     };
     let budgets = match context.get_mut("prompt_budgets") {
-        None => return,
+        None => return Vec::new(),
         Some(toml::Value::Table(t)) => t,
         Some(other) => {
+            let msg = format!(
+                "[context.prompt_budgets] must be a table, got {}; every budget keeps its default",
+                other.type_str()
+            );
             tracing::error!(
                 "[context.prompt_budgets] must be a table, got {}; \
                  ignoring it and keeping every compiled default",
                 other.type_str()
             );
             context.remove("prompt_budgets");
-            return;
+            return vec![msg];
         }
     };
     let bad: Vec<String> = budgets
@@ -372,14 +385,19 @@ fn lenient_extract_prompt_budgets(root_value: &mut toml::Value) {
         .filter(|(_, v)| !matches!(v, toml::Value::Integer(i) if *i >= 0))
         .map(|(k, _)| k.clone())
         .collect();
+    let mut dropped = Vec::new();
     for key in bad {
         if let Some(v) = budgets.remove(&key) {
             tracing::error!(
                 "Refusing prompt budget, keeping the compiled default: \
                  [context.prompt_budgets] {key} = {v} is not a whole number"
             );
+            dropped.push(format!(
+                "[context.prompt_budgets] {key} = {v}: not a whole number; keeps its default"
+            ));
         }
     }
+    dropped
 }
 
 /// Get the default config file path.
@@ -874,5 +892,57 @@ prompt_budgets = 6000
             config.context.prompt_budgets,
             openfang_types::config::PromptBudgetsConfig::DEFAULT
         );
+    }
+
+    // `openfang doctor` relies on these two: a config the lenient passes can
+    // repair is Ok with every repair listed; one they can't is Err.
+    #[test]
+    fn test_load_config_checked_lists_what_it_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+log_level = "debug"
+
+[context.prompt_budgets]
+user_md = "6000"
+
+[[bindings]]
+agent = "bad"
+match_rule = { channel = "discord", chanel_id = "1" }
+"#,
+        )
+        .unwrap();
+
+        let report = load_config_checked(&path).expect("lenient passes repair it");
+        assert_eq!(report.config.log_level, "debug");
+        assert_eq!(report.dropped.len(), 2, "{:?}", report.dropped);
+        assert!(report.dropped.iter().any(|d| d.contains("user_md")));
+        assert!(report.dropped.iter().any(|d| d.contains("agent='bad'")));
+    }
+
+    #[test]
+    fn test_load_config_checked_errs_where_load_config_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "log_level = 5\n").unwrap();
+
+        let err = load_config_checked(&path).expect_err("wrong type outside the lenient sections");
+        assert!(err.contains("log_level"), "{err}");
+        assert_eq!(
+            load_config(Some(&path)).log_level,
+            KernelConfig::default().log_level
+        );
+    }
+
+    #[test]
+    fn test_load_config_checked_clean_config_drops_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "log_level = \"debug\"\n").unwrap();
+
+        let report = load_config_checked(&path).unwrap();
+        assert!(report.dropped.is_empty(), "{:?}", report.dropped);
     }
 }
