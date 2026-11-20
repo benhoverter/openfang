@@ -158,9 +158,10 @@ impl Default for ContextConfig {
 /// Per-row recall budgets are deliberately not here; they belong to the
 /// memory subsystem's ranking policy.
 ///
-/// A value outside [`Self::MIN`]..=[`Self::MAX`] is refused for that field
-/// only: the compiled default stays live and boot logs an error. Refused
-/// rather than clamped, on the same terms as `working_set_ratio`.
+/// A value below that field's [`Self::MINIMUM`] or above [`Self::MAX`] is
+/// refused for that field only: the compiled default stays live and boot logs
+/// an error. Refused rather than clamped, on the same terms as
+/// `working_set_ratio`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PromptBudgetsConfig {
@@ -211,47 +212,57 @@ impl PromptBudgetsConfig {
         canonical_context: 12_000,
     };
 
-    /// Smallest accepted cap. `0` would empty the section while still
-    /// printing a truncation marker, which is never what an operator means.
-    pub const MIN: usize = 1;
+    /// Smallest accepted cap per field: half the compiled default, so a cap
+    /// can be tightened but not set low enough to gut a section. `rules_md`
+    /// cannot go below its default at all: a cut there drops operating rules
+    /// from every agent at once, and RULES.md already sits near 14 K.
+    pub const MINIMUM: Self = Self {
+        agents_md: Self::DEFAULT.agents_md / 2,
+        rules_md: Self::DEFAULT.rules_md,
+        soul_md: Self::DEFAULT.soul_md / 2,
+        identity_md: Self::DEFAULT.identity_md / 2,
+        user_md: Self::DEFAULT.user_md / 2,
+        memory_md: Self::DEFAULT.memory_md / 2,
+        bootstrap_md: Self::DEFAULT.bootstrap_md / 2,
+        heartbeat_md: Self::DEFAULT.heartbeat_md / 2,
+        context_md: Self::DEFAULT.context_md / 2,
+        workspace_context: Self::DEFAULT.workspace_context / 2,
+        skill_prompt_context: Self::DEFAULT.skill_prompt_context / 2,
+        canonical_context: Self::DEFAULT.canonical_context / 2,
+    };
 
     /// Largest accepted cap: the kernel's 1 MiB read ceiling for these files.
     /// A character cap above it can never bite, so it is a typo, not a policy.
     pub const MAX: usize = 1024 * 1024;
 
-    /// `(name, configured, default)` for every field, in declaration order.
-    fn fields(&self) -> [(&'static str, usize, usize); 12] {
-        let d = Self::DEFAULT;
+    /// The field values in declaration order, paired with their names.
+    fn values(&self) -> [(&'static str, usize); 12] {
         [
-            ("agents_md", self.agents_md, d.agents_md),
-            ("rules_md", self.rules_md, d.rules_md),
-            ("soul_md", self.soul_md, d.soul_md),
-            ("identity_md", self.identity_md, d.identity_md),
-            ("user_md", self.user_md, d.user_md),
-            ("memory_md", self.memory_md, d.memory_md),
-            ("bootstrap_md", self.bootstrap_md, d.bootstrap_md),
-            ("heartbeat_md", self.heartbeat_md, d.heartbeat_md),
-            ("context_md", self.context_md, d.context_md),
-            (
-                "workspace_context",
-                self.workspace_context,
-                d.workspace_context,
-            ),
-            (
-                "skill_prompt_context",
-                self.skill_prompt_context,
-                d.skill_prompt_context,
-            ),
-            (
-                "canonical_context",
-                self.canonical_context,
-                d.canonical_context,
-            ),
+            ("agents_md", self.agents_md),
+            ("rules_md", self.rules_md),
+            ("soul_md", self.soul_md),
+            ("identity_md", self.identity_md),
+            ("user_md", self.user_md),
+            ("memory_md", self.memory_md),
+            ("bootstrap_md", self.bootstrap_md),
+            ("heartbeat_md", self.heartbeat_md),
+            ("context_md", self.context_md),
+            ("workspace_context", self.workspace_context),
+            ("skill_prompt_context", self.skill_prompt_context),
+            ("canonical_context", self.canonical_context),
         ]
     }
 
-    fn in_range(v: usize) -> bool {
-        (Self::MIN..=Self::MAX).contains(&v)
+    /// `(name, configured, default, minimum)` for every field, in
+    /// declaration order.
+    fn fields(&self) -> [(&'static str, usize, usize, usize); 12] {
+        let (d, m) = (Self::DEFAULT.values(), Self::MINIMUM.values());
+        let v = self.values();
+        std::array::from_fn(|i| (v[i].0, v[i].1, d[i].1, m[i].1))
+    }
+
+    fn in_range(v: usize, min: usize) -> bool {
+        (min..=Self::MAX).contains(&v)
     }
 
     /// One message per refused field, for the boot log. Empty when every
@@ -259,12 +270,12 @@ impl PromptBudgetsConfig {
     pub fn errors(&self) -> Vec<String> {
         self.fields()
             .into_iter()
-            .filter(|(_, v, _)| !Self::in_range(*v))
-            .map(|(name, v, d)| {
+            .filter(|(_, v, _, m)| !Self::in_range(*v, *m))
+            .map(|(name, v, d, m)| {
                 format!(
                     "[context.prompt_budgets] {name} = {v} is outside {}..={}; \
                      keeping the default {d}",
-                    Self::MIN,
+                    m,
                     Self::MAX
                 )
             })
@@ -276,29 +287,41 @@ impl PromptBudgetsConfig {
         self.effective()
             .fields()
             .into_iter()
-            .filter(|(_, v, d)| v != d)
-            .map(|(name, v, _)| (name, v))
+            .filter(|(_, v, d, _)| v != d)
+            .map(|(name, v, _, _)| (name, v))
             .collect()
     }
 
     /// The budgets the prompt builder should use: each refused field replaced
     /// by its compiled default, every other field as configured.
     pub fn effective(&self) -> Self {
-        let pick = |v: usize, d: usize| if Self::in_range(v) { v } else { d };
-        let d = Self::DEFAULT;
+        let (d, m) = (Self::DEFAULT, Self::MINIMUM);
+        let pick = |v: usize, d: usize, m: usize| if Self::in_range(v, m) { v } else { d };
         Self {
-            agents_md: pick(self.agents_md, d.agents_md),
-            rules_md: pick(self.rules_md, d.rules_md),
-            soul_md: pick(self.soul_md, d.soul_md),
-            identity_md: pick(self.identity_md, d.identity_md),
-            user_md: pick(self.user_md, d.user_md),
-            memory_md: pick(self.memory_md, d.memory_md),
-            bootstrap_md: pick(self.bootstrap_md, d.bootstrap_md),
-            heartbeat_md: pick(self.heartbeat_md, d.heartbeat_md),
-            context_md: pick(self.context_md, d.context_md),
-            workspace_context: pick(self.workspace_context, d.workspace_context),
-            skill_prompt_context: pick(self.skill_prompt_context, d.skill_prompt_context),
-            canonical_context: pick(self.canonical_context, d.canonical_context),
+            agents_md: pick(self.agents_md, d.agents_md, m.agents_md),
+            rules_md: pick(self.rules_md, d.rules_md, m.rules_md),
+            soul_md: pick(self.soul_md, d.soul_md, m.soul_md),
+            identity_md: pick(self.identity_md, d.identity_md, m.identity_md),
+            user_md: pick(self.user_md, d.user_md, m.user_md),
+            memory_md: pick(self.memory_md, d.memory_md, m.memory_md),
+            bootstrap_md: pick(self.bootstrap_md, d.bootstrap_md, m.bootstrap_md),
+            heartbeat_md: pick(self.heartbeat_md, d.heartbeat_md, m.heartbeat_md),
+            context_md: pick(self.context_md, d.context_md, m.context_md),
+            workspace_context: pick(
+                self.workspace_context,
+                d.workspace_context,
+                m.workspace_context,
+            ),
+            skill_prompt_context: pick(
+                self.skill_prompt_context,
+                d.skill_prompt_context,
+                m.skill_prompt_context,
+            ),
+            canonical_context: pick(
+                self.canonical_context,
+                d.canonical_context,
+                m.canonical_context,
+            ),
         }
     }
 }
@@ -6376,12 +6399,55 @@ mod tests {
     #[test]
     fn prompt_budget_bounds_are_inclusive() {
         let b = PromptBudgetsConfig {
-            user_md: PromptBudgetsConfig::MIN,
+            user_md: PromptBudgetsConfig::MINIMUM.user_md,
             agents_md: PromptBudgetsConfig::MAX,
             ..PromptBudgetsConfig::DEFAULT
         };
         assert!(b.errors().is_empty());
         assert_eq!(b.effective(), b);
+    }
+
+    #[test]
+    fn prompt_budget_below_its_minimum_is_refused_and_falls_back() {
+        let b = PromptBudgetsConfig {
+            user_md: PromptBudgetsConfig::MINIMUM.user_md - 1,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(b.effective().user_md, PromptBudgetsConfig::DEFAULT.user_md);
+        let errs = b.errors();
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].contains("user_md = 1499 is outside 1500.."),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn rules_md_cannot_be_lowered_below_its_default() {
+        let d = PromptBudgetsConfig::DEFAULT.rules_md;
+        let lowered = PromptBudgetsConfig {
+            rules_md: d - 1,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(lowered.effective().rules_md, d);
+        assert_eq!(lowered.errors().len(), 1);
+        let raised = PromptBudgetsConfig {
+            rules_md: d + 1,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(raised.effective().rules_md, d + 1);
+        assert!(raised.errors().is_empty());
+    }
+
+    #[test]
+    fn every_minimum_is_positive_and_at_most_its_default() {
+        let (d, m) = (
+            PromptBudgetsConfig::DEFAULT.values(),
+            PromptBudgetsConfig::MINIMUM.values(),
+        );
+        for i in 0..d.len() {
+            assert!(m[i].1 > 0 && m[i].1 <= d[i].1, "{}", d[i].0);
+        }
     }
 
     // -- [recall] kind-aware ranking (ANAI-233)
