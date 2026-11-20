@@ -125,6 +125,11 @@ pub struct ContextConfig {
     /// would silently outrank a deliberately-set root one.
     #[serde(default)]
     pub turn_context: Option<TurnContextConfig>,
+
+    /// `[context.prompt_budgets]` — character caps for the prompt files and
+    /// sections the prompt builder truncates. See [`PromptBudgetsConfig`].
+    #[serde(default)]
+    pub prompt_budgets: PromptBudgetsConfig,
 }
 
 impl Default for ContextConfig {
@@ -133,7 +138,174 @@ impl Default for ContextConfig {
             working_set_ratio: 0.70,
             count_trigger_min_token_ratio: 0.25,
             turn_context: None,
+            prompt_budgets: PromptBudgetsConfig::DEFAULT,
         }
+    }
+}
+
+/// Character caps for the prompt files and sections, exposed as
+/// `[context.prompt_budgets]`.
+///
+/// Units are characters, not bytes or tokens. A section over its cap keeps its
+/// head, gets a marker that says where the rest is, and logs a warning (see
+/// `prompt_builder::cap_section`). Every field is optional: an empty or absent
+/// section is exactly the compiled defaults below.
+///
+/// Fleet-wide, not per-agent, and applied on every turn of every agent: a
+/// raised cap costs prompt tokens only for agents whose file is actually that
+/// long, but it costs them on every turn.
+///
+/// Per-row recall budgets are deliberately not here; they belong to the
+/// memory subsystem's ranking policy.
+///
+/// A value outside [`Self::MIN`]..=[`Self::MAX`] is refused for that field
+/// only: the compiled default stays live and boot logs an error. Refused
+/// rather than clamped, on the same terms as `working_set_ratio`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptBudgetsConfig {
+    /// AGENTS.md. Sized 2026-10-18 from 86 workspaces; largest was 14.2 K.
+    pub agents_md: usize,
+    /// `~/.openfang/RULES.md`, shared by every agent. A cut here drops a rule
+    /// from the whole fleet at once, so treat this as a guard, not a target.
+    pub rules_md: usize,
+    /// SOUL.md. Largest was 14.3 K on 2026-10-18.
+    pub soul_md: usize,
+    /// IDENTITY.md. Largest was 1.9 K on 2026-10-18.
+    pub identity_md: usize,
+    /// USER.md. Largest was 2.9 K on 2026-11-20.
+    pub user_md: usize,
+    /// MEMORY.md. The managed block is kept whole and the prose absorbs the
+    /// cut (ANAI-303). Largest was 29.7 K on 2026-10-18.
+    pub memory_md: usize,
+    /// BOOTSTRAP.md. Largest was 2.5 K on 2026-10-18.
+    pub bootstrap_md: usize,
+    /// HEARTBEAT.md, the autonomous checklist.
+    pub heartbeat_md: usize,
+    /// `context.md`, re-read every turn.
+    pub context_md: usize,
+    /// The workspace context section (project type, context files).
+    pub workspace_context: usize,
+    /// Prompt context contributed by prompt-only skills, all skills together.
+    pub skill_prompt_context: usize,
+    /// Cross-channel canonical summary. Changes every turn and caches poorly,
+    /// so keep headroom modest. Max stored was 8,869 on 2026-10-19.
+    pub canonical_context: usize,
+}
+
+impl PromptBudgetsConfig {
+    /// The compiled defaults. `const` so tests and callers can read a single
+    /// default without building the whole struct.
+    pub const DEFAULT: Self = Self {
+        agents_md: 16_000,
+        rules_md: 20_000,
+        soul_md: 16_000,
+        identity_md: 2_500,
+        user_md: 3_000,
+        memory_md: 32_000,
+        bootstrap_md: 3_000,
+        heartbeat_md: 1_000,
+        context_md: 8_000,
+        workspace_context: 1_000,
+        skill_prompt_context: 2_000,
+        canonical_context: 12_000,
+    };
+
+    /// Smallest accepted cap. `0` would empty the section while still
+    /// printing a truncation marker, which is never what an operator means.
+    pub const MIN: usize = 1;
+
+    /// Largest accepted cap: the kernel's 1 MiB read ceiling for these files.
+    /// A character cap above it can never bite, so it is a typo, not a policy.
+    pub const MAX: usize = 1024 * 1024;
+
+    /// `(name, configured, default)` for every field, in declaration order.
+    fn fields(&self) -> [(&'static str, usize, usize); 12] {
+        let d = Self::DEFAULT;
+        [
+            ("agents_md", self.agents_md, d.agents_md),
+            ("rules_md", self.rules_md, d.rules_md),
+            ("soul_md", self.soul_md, d.soul_md),
+            ("identity_md", self.identity_md, d.identity_md),
+            ("user_md", self.user_md, d.user_md),
+            ("memory_md", self.memory_md, d.memory_md),
+            ("bootstrap_md", self.bootstrap_md, d.bootstrap_md),
+            ("heartbeat_md", self.heartbeat_md, d.heartbeat_md),
+            ("context_md", self.context_md, d.context_md),
+            (
+                "workspace_context",
+                self.workspace_context,
+                d.workspace_context,
+            ),
+            (
+                "skill_prompt_context",
+                self.skill_prompt_context,
+                d.skill_prompt_context,
+            ),
+            (
+                "canonical_context",
+                self.canonical_context,
+                d.canonical_context,
+            ),
+        ]
+    }
+
+    fn in_range(v: usize) -> bool {
+        (Self::MIN..=Self::MAX).contains(&v)
+    }
+
+    /// One message per refused field, for the boot log. Empty when every
+    /// field is usable.
+    pub fn errors(&self) -> Vec<String> {
+        self.fields()
+            .into_iter()
+            .filter(|(_, v, _)| !Self::in_range(*v))
+            .map(|(name, v, d)| {
+                format!(
+                    "[context.prompt_budgets] {name} = {v} is outside {}..={}; \
+                     keeping the default {d}",
+                    Self::MIN,
+                    Self::MAX
+                )
+            })
+            .collect()
+    }
+
+    /// Fields that differ from the compiled default, for the boot log.
+    pub fn overrides(&self) -> Vec<(&'static str, usize)> {
+        self.effective()
+            .fields()
+            .into_iter()
+            .filter(|(_, v, d)| v != d)
+            .map(|(name, v, _)| (name, v))
+            .collect()
+    }
+
+    /// The budgets the prompt builder should use: each refused field replaced
+    /// by its compiled default, every other field as configured.
+    pub fn effective(&self) -> Self {
+        let pick = |v: usize, d: usize| if Self::in_range(v) { v } else { d };
+        let d = Self::DEFAULT;
+        Self {
+            agents_md: pick(self.agents_md, d.agents_md),
+            rules_md: pick(self.rules_md, d.rules_md),
+            soul_md: pick(self.soul_md, d.soul_md),
+            identity_md: pick(self.identity_md, d.identity_md),
+            user_md: pick(self.user_md, d.user_md),
+            memory_md: pick(self.memory_md, d.memory_md),
+            bootstrap_md: pick(self.bootstrap_md, d.bootstrap_md),
+            heartbeat_md: pick(self.heartbeat_md, d.heartbeat_md),
+            context_md: pick(self.context_md, d.context_md),
+            workspace_context: pick(self.workspace_context, d.workspace_context),
+            skill_prompt_context: pick(self.skill_prompt_context, d.skill_prompt_context),
+            canonical_context: pick(self.canonical_context, d.canonical_context),
+        }
+    }
+}
+
+impl Default for PromptBudgetsConfig {
+    fn default() -> Self {
+        Self::DEFAULT
     }
 }
 
@@ -6136,6 +6308,80 @@ mod tests {
         "#;
         let c: KernelConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(c.context.working_set_ratio, 0.40);
+    }
+
+    // -- [context.prompt_budgets]
+
+    #[test]
+    fn prompt_budgets_absent_are_the_compiled_defaults() {
+        let c: KernelConfig = toml::from_str("").unwrap();
+        assert_eq!(c.context.prompt_budgets, PromptBudgetsConfig::DEFAULT);
+        assert!(c.context.prompt_budgets.errors().is_empty());
+        assert!(c.context.prompt_budgets.overrides().is_empty());
+    }
+
+    #[test]
+    fn prompt_budgets_override_one_field_and_keep_the_rest() {
+        let c: KernelConfig = toml::from_str(
+            r#"
+            [context.prompt_budgets]
+            user_md = 6000
+        "#,
+        )
+        .unwrap();
+        let b = c.context.prompt_budgets.effective();
+        assert_eq!(b.user_md, 6000);
+        assert_eq!(
+            PromptBudgetsConfig {
+                user_md: PromptBudgetsConfig::DEFAULT.user_md,
+                ..b
+            },
+            PromptBudgetsConfig::DEFAULT
+        );
+        assert_eq!(
+            c.context.prompt_budgets.overrides(),
+            vec![("user_md", 6000)]
+        );
+        // The other [context] keys are untouched by the nested table.
+        assert_eq!(c.context.working_set_ratio, 0.70);
+    }
+
+    #[test]
+    fn prompt_budget_zero_is_refused_and_falls_back() {
+        let b = PromptBudgetsConfig {
+            soul_md: 0,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(b.effective().soul_md, PromptBudgetsConfig::DEFAULT.soul_md);
+        let errs = b.errors();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("soul_md = 0"), "{errs:?}");
+        assert!(b.overrides().is_empty());
+    }
+
+    #[test]
+    fn prompt_budget_above_the_read_ceiling_is_refused_and_falls_back() {
+        let over = PromptBudgetsConfig::MAX + 1;
+        let b = PromptBudgetsConfig {
+            memory_md: over,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert_eq!(
+            b.effective().memory_md,
+            PromptBudgetsConfig::DEFAULT.memory_md
+        );
+        assert_eq!(b.errors().len(), 1);
+    }
+
+    #[test]
+    fn prompt_budget_bounds_are_inclusive() {
+        let b = PromptBudgetsConfig {
+            user_md: PromptBudgetsConfig::MIN,
+            agents_md: PromptBudgetsConfig::MAX,
+            ..PromptBudgetsConfig::DEFAULT
+        };
+        assert!(b.errors().is_empty());
+        assert_eq!(b.effective(), b);
     }
 
     // -- [recall] kind-aware ranking (ANAI-233)

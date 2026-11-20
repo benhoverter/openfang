@@ -3231,6 +3231,7 @@ impl OpenFangKernel {
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
+                budgets: self.config.context.prompt_budgets.effective(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -3956,6 +3957,7 @@ impl OpenFangKernel {
                 context_md: manifest.workspace.as_ref().and_then(|w| {
                     openfang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
+                budgets: self.config.context.prompt_budgets.effective(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -6208,6 +6210,23 @@ impl OpenFangKernel {
                 fallback = openfang_runtime::compactor::DEFAULT_TOKEN_THRESHOLD_RATIO,
                 "Refusing [context] working_set_ratio, keeping the compiled default: {e}"
             ),
+        }
+
+        // [context.prompt_budgets]: nothing to install, since each turn reads
+        // `effective()` straight off the config. Log refusals and overrides once
+        // here, so a typo'd cap is loud at boot rather than silent per turn.
+        {
+            let budgets = &self.config.context.prompt_budgets;
+            for e in budgets.errors() {
+                error!("Refusing prompt budget, keeping the compiled default: {e}");
+            }
+            let overrides = budgets.overrides();
+            if !overrides.is_empty() {
+                info!(
+                    ?overrides,
+                    "Prompt budgets overridden by [context.prompt_budgets]"
+                );
+            }
         }
 
         // Install the operator-configured count-trigger floor ([context]

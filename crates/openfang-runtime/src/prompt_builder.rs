@@ -6,6 +6,7 @@
 
 use crate::str_utils::safe_truncate_str;
 use openfang_memory::{episode, fact};
+use openfang_types::config::PromptBudgetsConfig;
 
 /// `kind` value for a deliberate agent-authored note (`memory_note`).
 ///
@@ -107,37 +108,16 @@ impl RecalledMemory {
 // ---------------------------------------------------------------------------
 // Prompt section character budgets
 //
+// The per-file caps live in `PromptBudgetsConfig` (`[context.prompt_budgets]`)
+// and reach the builder as `PromptContext::budgets`. Only the per-row recall
+// budgets remain here.
+//
 // Every capped section gets a named budget so the sizes are auditable in one
 // place instead of being scattered magic numbers at the call sites (ANAI-167).
 // Truncation is reported via `cap_str` — it logs and leaves a visible marker,
 // so a section silently losing 87% of its content can't happen unnoticed again.
 // ---------------------------------------------------------------------------
 
-/// AGENTS.md — behavioral guidance. Was 2000, which cut 44 of 86 files; the
-/// largest is 14.2 K.
-///
-/// Sized 2026-10-18 from measured fleet usage (86 workspaces): budget = largest
-/// live file plus ~10-25% headroom. Re-measure with
-/// openfang-alpha/scripts/2026-10-18-promptfile-sizes.py before changing.
-const BUDGET_AGENTS_MD: usize = 16_000;
-/// `~/.openfang/RULES.md` — the fleet-wide operating rules, one file shared by
-/// every agent. 11.6 K on 2026-11-02; the budget leaves room for growth but is
-/// a guard, not a target: a cut here drops a rule from every agent at once.
-const BUDGET_RULES_MD: usize = 20_000;
-/// HEARTBEAT.md — autonomous checklist.
-const BUDGET_HEARTBEAT_MD: usize = 1000;
-/// BOOTSTRAP.md — first-run ritual. Was 1500 (4 cut); largest is 2.5 K.
-const BUDGET_BOOTSTRAP_MD: usize = 3_000;
-/// Workspace context section (project type, context files).
-const BUDGET_WORKSPACE_CONTEXT: usize = 1000;
-/// `context.md` — live per-turn context.
-const BUDGET_CONTEXT_MD: usize = 8000;
-/// Cross-channel canonical conversation summary. Sized 2026-10-19 from the
-/// live fleet: 89 of 103 stored summaries exceeded the old 500 cap; max 8,869,
-/// p90 ~7K (the text-fallback compactor holds itself to ~4K; LLM summaries
-/// run larger). This message changes every turn and caches poorly, so keep
-/// the headroom modest rather than generous.
-const BUDGET_CANONICAL_CONTEXT: usize = 12_000;
 /// A single recalled memory row, by `kind` (ANAI-231).
 ///
 /// A flat 500 was correct when every row was a raw captured turn. Consolidation
@@ -219,26 +199,6 @@ fn provenance_tag(mem: &RecalledMemory) -> String {
         format!("[{}] ", parts.join(" · "))
     }
 }
-/// Prompt context contributed by prompt-only skills.
-const BUDGET_SKILL_PROMPT_CONTEXT: usize = 2000;
-/// IDENTITY.md — personality frontmatter. Was 500 (35 cut); largest is 1.9 K.
-const BUDGET_IDENTITY_MD: usize = 2_500;
-/// SOUL.md — persona. Was 1000 (42 cut); largest is 14.3 K.
-const BUDGET_SOUL_MD: usize = 16_000;
-/// USER.md — user context. Was 500 (38 cut); largest is 2.0 K.
-const BUDGET_USER_MD: usize = 3_000;
-/// MEMORY.md — curated long-term memory index.
-///
-/// Raised from 500 (ANAI-167): the scaffold OpenFang writes at agent creation
-/// is already ~4 KB, so the old budget discarded ~87% of the file before the
-/// model ever saw it. 8 KB fits the scaffold plus room for curated growth.
-///
-/// Raised to 24 000 (ANAI-303), together with the managed block's own budget
-/// (12 000), and enforced by [`cap_memory_md`] so the block is kept whole and
-/// the hand-written prose around it absorbs the cut.
-///
-/// Raised to 32 000 (2026-10-18): `assistant`'s file is 29.7 K.
-const BUDGET_MEMORY_MD: usize = 32_000;
 
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
@@ -335,6 +295,10 @@ pub struct PromptContext {
     /// Read per-turn by the kernel so external writers (cron jobs, integrations)
     /// are reflected in the next LLM call. See issue #843.
     pub context_md: Option<String>,
+    /// Character caps for the capped sections (`[context.prompt_budgets]`).
+    /// `Default` is the compiled defaults, so a context built without config
+    /// behaves exactly as before.
+    pub budgets: PromptBudgetsConfig,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -365,7 +329,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 let path = identity_path(ctx.state_dir.as_deref(), "AGENTS.md");
                 sections.push(cap_section(
                     agents,
-                    BUDGET_AGENTS_MD,
+                    ctx.budgets.agents_md,
                     "AGENTS.md",
                     Recover::FileLine(&path),
                 ));
@@ -381,7 +345,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                 let path = identity_path(ctx.home_dir.as_deref(), "RULES.md");
                 sections.push(cap_section(
                     rules.trim_end(),
-                    BUDGET_RULES_MD,
+                    ctx.budgets.rules_md,
                     "RULES.md",
                     Recover::FileLine(&path),
                 ));
@@ -404,6 +368,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         sections.push(build_skills_section(
             &ctx.skill_summary,
             &ctx.skill_prompt_context,
+            &ctx.budgets,
         ));
     }
 
@@ -421,6 +386,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             ctx.memory_md.as_deref(),
             ctx.workspace_path.as_deref(),
             ctx.state_dir.as_deref(),
+            &ctx.budgets,
         );
         if !persona.is_empty() {
             sections.push(persona);
@@ -436,7 +402,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                     "## Heartbeat Checklist\n{}",
                     cap_section(
                         heartbeat,
-                        BUDGET_HEARTBEAT_MD,
+                        ctx.budgets.heartbeat_md,
                         "HEARTBEAT.md",
                         Recover::FileLine(&path)
                     )
@@ -508,7 +474,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
                         "## First-Run Protocol\n{}",
                         cap_section(
                             bootstrap,
-                            BUDGET_BOOTSTRAP_MD,
+                            ctx.budgets.bootstrap_md,
                             "BOOTSTRAP.md",
                             Recover::FileLine(&path)
                         )
@@ -524,7 +490,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             if !ws_ctx.trim().is_empty() {
                 sections.push(cap_str(
                     ws_ctx,
-                    BUDGET_WORKSPACE_CONTEXT,
+                    ctx.budgets.workspace_context,
                     "workspace context",
                 ));
             }
@@ -542,7 +508,7 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
             let path = identity_path(ctx.workspace_path.as_deref(), "context.md");
             sections.push(format!(
                 "## Live Context\nThe following context is refreshed from `context.md` each turn and may change between messages.\n\n{}",
-                cap_section(body, BUDGET_CONTEXT_MD, "context.md", Recover::FileLine(&path))
+                cap_section(body, ctx.budgets.context_md, "context.md", Recover::FileLine(&path))
             ));
         }
     }
@@ -630,7 +596,7 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
         .map(|c| {
             format!(
                 "[Previous conversation context]\n{}",
-                cap_str(c, BUDGET_CANONICAL_CONTEXT, "canonical context")
+                cap_str(c, ctx.budgets.canonical_context, "canonical context")
             )
         });
 
@@ -835,7 +801,11 @@ pub fn build_memory_section(memories: &[RecalledMemory], granted_tools: &[String
     out
 }
 
-fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
+fn build_skills_section(
+    skill_summary: &str,
+    prompt_context: &str,
+    budgets: &PromptBudgetsConfig,
+) -> String {
     let mut out = String::from("## Skills\n");
     if !skill_summary.is_empty() {
         out.push_str(
@@ -847,7 +817,7 @@ fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
         out.push('\n');
         out.push_str(&cap_str(
             prompt_context,
-            BUDGET_SKILL_PROMPT_CONTEXT,
+            budgets.skill_prompt_context,
             "skill prompt context",
         ));
     }
@@ -865,6 +835,7 @@ fn build_persona_section(
     memory_md: Option<&str>,
     workspace_path: Option<&str>,
     state_dir: Option<&str>,
+    budgets: &PromptBudgetsConfig,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
 
@@ -880,7 +851,7 @@ fn build_persona_section(
                 "## Identity\n{}",
                 cap_section(
                     identity,
-                    BUDGET_IDENTITY_MD,
+                    budgets.identity_md,
                     "IDENTITY.md",
                     Recover::FileLine(&path)
                 )
@@ -896,7 +867,7 @@ fn build_persona_section(
             let path = identity_path(state_dir, "SOUL.md");
             parts.push(format!(
                 "## Persona\nEmbody this identity in your tone and communication style. Be natural, not stiff or generic.\n{}",
-                cap_section(&sanitized, BUDGET_SOUL_MD, "SOUL.md", Recover::File(&path))
+                cap_section(&sanitized, budgets.soul_md, "SOUL.md", Recover::File(&path))
             ));
         }
     }
@@ -906,7 +877,7 @@ fn build_persona_section(
             let path = identity_path(state_dir, "USER.md");
             parts.push(format!(
                 "## User Context\n{}",
-                cap_section(user, BUDGET_USER_MD, "USER.md", Recover::FileLine(&path))
+                cap_section(user, budgets.user_md, "USER.md", Recover::FileLine(&path))
             ));
         }
     }
@@ -916,7 +887,7 @@ fn build_persona_section(
             let path = identity_path(state_dir, "MEMORY.md");
             parts.push(format!(
                 "## Long-Term Memory\n{}",
-                cap_memory_md(memory, BUDGET_MEMORY_MD, Recover::FileLine(&path))
+                cap_memory_md(memory, budgets.memory_md, Recover::FileLine(&path))
             ));
         }
     }
@@ -1415,6 +1386,12 @@ fn capitalize(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const D: PromptBudgetsConfig = PromptBudgetsConfig::DEFAULT;
+    const BUDGET_RULES_MD: usize = D.rules_md;
+    const BUDGET_SOUL_MD: usize = D.soul_md;
+    const BUDGET_MEMORY_MD: usize = D.memory_md;
+    const BUDGET_CONTEXT_MD: usize = D.context_md;
 
     fn basic_ctx() -> PromptContext {
         PromptContext {
@@ -2181,7 +2158,7 @@ mod tests {
     #[test]
     fn test_persona_soul_capped_at_budget() {
         let long_soul = "x".repeat(BUDGET_SOUL_MD * 2);
-        let section = build_persona_section(None, Some(&long_soul), None, None, None, None);
+        let section = build_persona_section(None, Some(&long_soul), None, None, None, None, &D);
         assert!(section.contains("SOUL.md truncated"));
         assert!(section.contains(&format!(
             "{BUDGET_SOUL_MD} of {} chars shown, {BUDGET_SOUL_MD} omitted",
@@ -2195,7 +2172,7 @@ mod tests {
     #[test]
     fn test_memory_md_scaffold_not_truncated() {
         let scaffold = "m".repeat(4096);
-        let section = build_persona_section(None, None, None, Some(&scaffold), None, None);
+        let section = build_persona_section(None, None, None, Some(&scaffold), None, None, &D);
         assert!(section.contains("## Long-Term Memory"));
         assert!(section.contains(&scaffold));
         assert!(!section.contains("MEMORY.md truncated"));
@@ -2205,12 +2182,39 @@ mod tests {
     #[test]
     fn test_memory_md_truncates_past_budget_with_marker() {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
-        let section = build_persona_section(None, None, None, Some(&huge), None, None);
+        let section = build_persona_section(None, None, None, Some(&huge), None, None, &D);
         assert!(section.contains("MEMORY.md truncated"));
         assert!(section.contains(&format!(
             "{BUDGET_MEMORY_MD} of {} chars shown, 1 omitted",
             BUDGET_MEMORY_MD + 1
         )));
+    }
+
+    /// `[context.prompt_budgets]`: the context's budgets, not a constant,
+    /// decide where USER.md is cut. Same file, two budgets, two outcomes.
+    #[test]
+    fn configured_user_md_budget_moves_the_cut() {
+        let user = "u".repeat(D.user_md + 500);
+        let mut ctx = basic_ctx();
+        ctx.user_md = Some(user.clone());
+
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("USER.md truncated"));
+
+        ctx.budgets.user_md = D.user_md + 500;
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("USER.md truncated"));
+        assert!(prompt.contains(&user));
+    }
+
+    /// A smaller budget bites too, and the marker reports the configured size.
+    #[test]
+    fn configured_rules_md_budget_is_the_one_in_the_marker() {
+        let mut ctx = basic_ctx();
+        ctx.rules_md = Some("r".repeat(200));
+        ctx.budgets.rules_md = 50;
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("RULES.md truncated: 50 of 200 chars shown"));
     }
 
     fn managed(body: &str) -> String {
@@ -2341,8 +2345,15 @@ mod tests {
     #[test]
     fn test_persona_markers_name_the_state_dir_path() {
         let huge = "m".repeat(BUDGET_MEMORY_MD + 1);
-        let section =
-            build_persona_section(None, None, None, Some(&huge), None, Some("/state/agent"));
+        let section = build_persona_section(
+            None,
+            None,
+            None,
+            Some(&huge),
+            None,
+            Some("/state/agent"),
+            &D,
+        );
         let expected = std::path::Path::new("/state/agent").join("MEMORY.md");
         assert!(section.contains(&format!("file_read `{}` with offset=1", expected.display())));
     }
