@@ -2552,21 +2552,23 @@ mod tests {
         // `DEFAULT_ALLOWED` moves too, 27 -> 28.
         // file_upload: 37 -> 38. Privileged-deny, so `PRIVILEGED_DEFAULT_DENY`
         // goes 9 -> 10 and `DEFAULT_ALLOWED` stays at 28.
-        assert_eq!(ALLOWED_TOOLS.len(), 38, "ALLOWED_TOOLS surface cardinality");
+        // video_digest: 38 -> 39. Privileged-deny, so `PRIVILEGED_DEFAULT_DENY`
+        // goes 10 -> 11 and `DEFAULT_ALLOWED` stays at 28.
+        assert_eq!(ALLOWED_TOOLS.len(), 39, "ALLOWED_TOOLS surface cardinality");
         assert_eq!(
             built_in_tools().len(),
-            38,
+            39,
             "built_in_tools() advertise surface cardinality"
         );
         assert_eq!(
             PRIVILEGED_DEFAULT_DENY.len(),
-            10,
-            "PRIVILEGED_DEFAULT_DENY cardinality (agent lifecycle x4 + browser click/type/screenshot/run_js/back + file_upload)"
+            11,
+            "PRIVILEGED_DEFAULT_DENY cardinality (agent lifecycle x4 + browser click/type/screenshot/run_js/back + file_upload + video_digest)"
         );
         assert_eq!(
             DEFAULT_ALLOWED.len(),
             28,
-            "DEFAULT_ALLOWED bridge-default cardinality (38 − 10 privileged)"
+            "DEFAULT_ALLOWED bridge-default cardinality (39 − 11 privileged)"
         );
     }
 
