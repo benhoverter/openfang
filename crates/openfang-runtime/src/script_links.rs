@@ -1455,7 +1455,10 @@ mod tests {
     }
 
     /// Latency guard: a script just under the scan cap must not stall the
-    /// gate. Generous bound so a loaded debug build does not flake.
+    /// gate. Measured 2026-11-25 on a ~1 MiB body: 0.46 s in release (what
+    /// the daemon runs), 4-5.3 s in debug, almost all of it the per-line
+    /// shell predicates in `BodyScan::of`. The cost is linear, so the debug
+    /// bound only has to catch a blow-up, not a 2x drift under load.
     #[tokio::test]
     async fn a_near_cap_scan_stays_fast() {
         let (d, p) = ws("cost");
@@ -1467,7 +1470,8 @@ mod tests {
         let took = t.elapsed();
         eprintln!("near-cap scan took {took:?}");
         assert_eq!(b.status, ScriptBodyStatus::Scanned);
-        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+        let bound = if cfg!(debug_assertions) { 20 } else { 2 };
+        assert!(took < std::time::Duration::from_secs(bound), "{took:?}");
     }
 
     #[test]
