@@ -22,6 +22,10 @@
 //!   `kill_on_drop`, and the whole call runs under one wall-clock deadline.
 //!   sherpa-onnx is the exception: it is optional, and without it the digest
 //!   runs and says speaker labels and sound tags were skipped.
+//!   Its files are pinned by sha256 ([`SHERPA_PINS`]) and hashed before
+//!   each run; a mismatch skips that half with a note and never runs it.
+//!   Speaker labels and sound tags also give way to the deadline
+//!   ([`extras_budget`]) so they cannot cost a finished transcript.
 //! - Every child also runs under `sandbox-exec` ([`SANDBOX_PROFILE`]): no
 //!   network, writes only inside a private per-run work folder, and no way to
 //!   start any other program (no exec, no LaunchServices opens, no Apple
@@ -58,7 +62,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Pinned binaries (Homebrew on Apple Silicon).
 pub const FFMPEG: &str = "/opt/homebrew/bin/ffmpeg";
@@ -97,6 +101,68 @@ const TAG_TOP_K: u32 = 3;
 const TAG_MIN_PROB: f64 = 0.3;
 /// Always present in speech and says nothing the transcript doesn't.
 const IGNORED_TAGS: [&str; 2] = ["Speech", "Silence"];
+/// Longest sound label kept from the tagger. The real CED labels are under
+/// 60 characters; this bounds what a bad labels file can put in digest.md.
+pub const MAX_TAG_LABEL_CHARS: usize = 80;
+/// The speaker and sound extras run after whisper, inside the same deadline.
+/// Each one gets the time left minus this reserve (kept for writing the
+/// outputs), and does not start with less than [`EXTRAS_MIN_SECS`]: losing
+/// the extras beats a TIMEOUT that throws away a finished transcript.
+const EXTRAS_RESERVE_SECS: u64 = 30;
+const EXTRAS_MIN_SECS: u64 = 30;
+
+/// One sherpa-onnx file and the sha256 it must have before anything runs it.
+pub struct Pin {
+    pub rel: &'static str,
+    pub sha256: &'static str,
+    pub source: &'static str,
+}
+
+/// sherpa-onnx lives under the OpenFang home, not Homebrew, so any process
+/// with write reach there could swap a binary or model and have it run on
+/// every digest. Each file is hashed before each run; a mismatch skips that
+/// half with a note and never runs it. Sums were taken 2026-11-24 from the
+/// official k2-fsa release assets: the binary tarball matched GitHub's
+/// published digest; the three model archives have none published (2024
+/// uploads), so those sums are trust-on-first-download.
+pub const SHERPA_PINS: [Pin; 6] = [
+    Pin {
+        rel: SHERPA_DIARIZE_REL,
+        sha256: "45252b82c0195e346ad13326a27dc9dc4ecaf6f71941d0ac258454429a4cccd6",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-v2.0.3-osx-arm64-static-no-tts.tar.bz2",
+    },
+    Pin {
+        rel: SHERPA_TAG_REL,
+        sha256: "a07a871f836e8dd3e9a2a7b4937406067103c819dc6f5df930d520ca754c9fcb",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-v2.0.3-osx-arm64-static-no-tts.tar.bz2",
+    },
+    Pin {
+        rel: SEGMENTATION_MODEL_REL,
+        sha256: "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+    },
+    Pin {
+        rel: EMBEDDING_MODEL_REL,
+        sha256: "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx",
+    },
+    Pin {
+        rel: CED_MODEL_REL,
+        sha256: "ff29f39f9fbe637f72535160e9d006d61d872fdab0fce838672265b9b38cf946",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/audio-tagging-models/sherpa-onnx-ced-mini-audio-tagging-2024-04-19.tar.bz2",
+    },
+    Pin {
+        rel: CED_LABELS_REL,
+        sha256: "cdd1049833c4b86127c2773ac0d14a2754b6a6d0d1798002ed5c66e699708429",
+        source: "https://github.com/k2-fsa/sherpa-onnx/releases/download/audio-tagging-models/sherpa-onnx-ced-mini-audio-tagging-2024-04-19.tar.bz2",
+    },
+];
+pub const DIARIZE_RELS: [&str; 3] = [
+    SHERPA_DIARIZE_REL,
+    SEGMENTATION_MODEL_REL,
+    EMBEDDING_MODEL_REL,
+];
+pub const TAG_RELS: [&str; 3] = [SHERPA_TAG_REL, CED_MODEL_REL, CED_LABELS_REL];
 const MAX_SOUND_EVENTS: usize = 200;
 
 /// Seatbelt profile for every ffmpeg / ffprobe / whisper-cli run. A decoder
@@ -732,6 +798,7 @@ pub struct SoundEvent {
 /// Paths to sherpa-onnx and its models. Optional: each half (diarization,
 /// tagging) runs only when all of its files are present.
 pub struct Sherpa {
+    pub home: PathBuf,
     pub diarize: PathBuf,
     pub tag: PathBuf,
     pub segmentation: PathBuf,
@@ -743,6 +810,7 @@ pub struct Sherpa {
 impl Sherpa {
     pub fn under(home: &Path) -> Self {
         Sherpa {
+            home: home.to_path_buf(),
             diarize: home.join(SHERPA_DIARIZE_REL),
             tag: home.join(SHERPA_TAG_REL),
             segmentation: home.join(SEGMENTATION_MODEL_REL),
@@ -765,6 +833,40 @@ fn absent(paths: &[&PathBuf]) -> Vec<String> {
         .filter(|p| !p.is_file())
         .map(|p| p.display().to_string())
         .collect()
+}
+
+/// The files in `rels` (under `home`) whose sha256 is not the one `pins`
+/// expects. Unreadable and unpinned files count as mismatches: fail closed.
+pub fn pin_mismatches(home: &Path, rels: &[&str], pins: &[Pin]) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    rels.iter()
+        .filter(|rel| {
+            let Some(pin) = pins.iter().find(|p| p.rel == **rel) else {
+                return true;
+            };
+            match std::fs::read(home.join(rel)) {
+                Ok(bytes) => hex::encode(Sha256::digest(&bytes)) != pin.sha256,
+                Err(_) => true,
+            }
+        })
+        .map(|rel| rel.to_string())
+        .collect()
+}
+
+/// How long an optional extra may run: the time left before `deadline`
+/// minus [`EXTRAS_RESERVE_SECS`], or `None` if that is under
+/// [`EXTRAS_MIN_SECS`].
+pub fn extras_budget(deadline: Instant, now: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)?
+        .checked_sub(Duration::from_secs(EXTRAS_RESERVE_SECS))
+        .filter(|d| *d >= Duration::from_secs(EXTRAS_MIN_SECS))
+}
+
+/// A failed extra's note. `e` can carry sherpa's stderr, and the notes sit
+/// outside the untrusted block, so it is flattened and defanged first.
+fn failed_note(what: &str, e: &str) -> String {
+    format!("{what}: failed ({})", clean_label(e))
 }
 
 /// Diarization argv. Every value is ours except `num_speakers`, a checked
@@ -873,7 +975,8 @@ pub fn parse_tags(stdout: &str) -> Vec<(String, f64)> {
                 .strip_suffix(')')?
                 .parse::<f64>()
                 .ok()?;
-            (prob.is_finite() && !name.is_empty()).then(|| (name.to_string(), prob))
+            (prob.is_finite() && !name.is_empty())
+                .then(|| (name.chars().take(MAX_TAG_LABEL_CHARS).collect(), prob))
         })
         .collect()
 }
@@ -1759,6 +1862,8 @@ async fn with_deadline(
 }
 
 async fn run_inner(r: &Resolved, p: &Params) -> String {
+    // Same limit `run` wraps us in; the extras use it to bow out in time.
+    let deadline = Instant::now() + Duration::from_secs(WALL_CLOCK_SECS);
     let input = r.input.to_string_lossy().into_owned();
     let out = &r.out_dir;
     let frames_dir = out.join("frames");
@@ -2046,15 +2151,51 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
 
         let diarize_missing = r.sherpa.diarize_missing();
         let tag_missing = r.sherpa.tag_missing();
-        let want_speakers = p.speakers && diarize_missing.is_empty();
-        let want_tags = p.sound_tags && tag_missing.is_empty();
-        if p.speakers && !want_speakers {
+        // Hash only what is installed and asked for (~110 MB, well under a
+        // second); off the async threads since it is plain blocking I/O.
+        let home = r.sherpa.home.clone();
+        let (check_d, check_t) = (
+            p.speakers && diarize_missing.is_empty(),
+            p.sound_tags && tag_missing.is_empty(),
+        );
+        let (diarize_bad, tag_bad) = tokio::task::spawn_blocking(move || {
+            let check = |on: bool, rels: &[&str]| {
+                if on {
+                    pin_mismatches(&home, rels, &SHERPA_PINS)
+                } else {
+                    Vec::new()
+                }
+            };
+            (check(check_d, &DIARIZE_RELS), check(check_t, &TAG_RELS))
+        })
+        .await
+        .unwrap_or_else(|_| {
+            (
+                DIARIZE_RELS.map(String::from).to_vec(),
+                TAG_RELS.map(String::from).to_vec(),
+            )
+        });
+        let want_speakers = check_d && diarize_bad.is_empty();
+        let want_tags = check_t && tag_bad.is_empty();
+        if check_d && !want_speakers {
+            notes.push(format!(
+                "Speaker labels: skipped (checksum mismatch: {})",
+                diarize_bad.join(", ")
+            ));
+        }
+        if check_t && !want_tags {
+            notes.push(format!(
+                "Sound tags: skipped (checksum mismatch: {})",
+                tag_bad.join(", ")
+            ));
+        }
+        if p.speakers && !diarize_missing.is_empty() {
             notes.push(format!(
                 "Speaker labels: skipped (not installed: {})",
                 diarize_missing.join(", ")
             ));
         }
-        if p.sound_tags && !want_tags {
+        if p.sound_tags && !tag_missing.is_empty() {
             notes.push(format!(
                 "Sound tags: skipped (not installed: {})",
                 tag_missing.join(", ")
@@ -2165,14 +2306,23 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
             transcript_note = Some("skipped (transcribe=false)".into());
         }
 
-        // Optional extras: a failure here is a note in digest.md, not a
-        // failed digest.
+        // Optional extras: a failure, or too little time left, is a note in
+        // digest.md, not a failed digest.
+        const LATE: &str = "skipped (too close to the time limit)";
+        const STOPPED: &str = "stopped (too close to the time limit)";
         if want_speakers {
-            match diarize(&r.sherpa, &wav, &work, p.num_speakers).await {
-                Ok(t) if t.is_empty() => {
+            let outcome = match extras_budget(deadline, Instant::now()) {
+                None => Err(LATE),
+                Some(b) => tokio::time::timeout(b, diarize(&r.sherpa, &wav, &work, p.num_speakers))
+                    .await
+                    .map_err(|_| STOPPED),
+            };
+            match outcome {
+                Err(why) => notes.push(format!("Speaker labels: {why}")),
+                Ok(Ok(t)) if t.is_empty() => {
                     notes.push("Speaker labels: the speaker model found no speech".into())
                 }
-                Ok(t) => {
+                Ok(Ok(t)) => {
                     turns = t;
                     assign_speakers(&mut segments, &turns);
                     let mut voices: Vec<&str> = turns.iter().map(|t| t.speaker.as_str()).collect();
@@ -2191,12 +2341,19 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                         }
                     ));
                 }
-                Err(e) => notes.push(format!("Speaker labels: failed ({e})")),
+                Ok(Err(e)) => notes.push(failed_note("Speaker labels", &e)),
             }
         }
         if want_tags {
-            match tag_sounds(&r.sherpa, &wav, &work).await {
-                Ok((mut ev, win)) => {
+            let outcome = match extras_budget(deadline, Instant::now()) {
+                None => Err(LATE),
+                Some(b) => tokio::time::timeout(b, tag_sounds(&r.sherpa, &wav, &work))
+                    .await
+                    .map_err(|_| STOPPED),
+            };
+            match outcome {
+                Err(why) => notes.push(format!("Sound tags: {why}")),
+                Ok(Ok((mut ev, win))) => {
                     let total = ev.len();
                     ev.truncate(MAX_SOUND_EVENTS);
                     let mut note = format!(
@@ -2211,7 +2368,7 @@ async fn run_inner(r: &Resolved, p: &Params) -> String {
                     notes.push(note);
                     sounds = ev;
                 }
-                Err(e) => notes.push(format!("Sound tags: failed ({e})")),
+                Ok(Err(e)) => notes.push(failed_note("Sound tags", &e)),
             }
         }
         if p.transcribe {
@@ -2990,6 +3147,94 @@ mod tests {
     }
 
     #[test]
+    fn every_sherpa_file_has_a_pin() {
+        for rel in DIARIZE_RELS.iter().chain(TAG_RELS.iter()) {
+            let pin = SHERPA_PINS.iter().find(|p| p.rel == *rel);
+            let pin = pin.unwrap_or_else(|| panic!("no pin for {rel}"));
+            assert_eq!(pin.sha256.len(), 64, "{rel}");
+            assert!(pin
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            assert!(pin
+                .source
+                .starts_with("https://github.com/k2-fsa/sherpa-onnx/releases/download/"));
+        }
+    }
+
+    #[test]
+    fn pin_mismatches_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("good"), "abc").unwrap();
+        std::fs::write(home.path().join("swapped"), "abd").unwrap();
+        std::fs::write(home.path().join("unpinned"), "abc").unwrap();
+        // sha256("abc")
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let pins = [
+            Pin {
+                rel: "good",
+                sha256: abc,
+                source: "",
+            },
+            Pin {
+                rel: "swapped",
+                sha256: abc,
+                source: "",
+            },
+            Pin {
+                rel: "absent",
+                sha256: abc,
+                source: "",
+            },
+        ];
+        assert!(pin_mismatches(home.path(), &["good"], &pins).is_empty());
+        assert_eq!(
+            pin_mismatches(home.path(), &["swapped"], &pins),
+            ["swapped"]
+        );
+        assert_eq!(pin_mismatches(home.path(), &["absent"], &pins), ["absent"]);
+        assert_eq!(
+            pin_mismatches(home.path(), &["unpinned"], &pins),
+            ["unpinned"]
+        );
+        assert_eq!(
+            pin_mismatches(home.path(), &["good", "swapped"], &pins),
+            ["swapped"]
+        );
+    }
+
+    #[test]
+    fn extras_budget_keeps_a_reserve_and_a_floor() {
+        let now = Instant::now();
+        let s = Duration::from_secs;
+        assert_eq!(extras_budget(now + s(600), now), Some(s(570)));
+        assert_eq!(extras_budget(now + s(60), now), Some(s(30)));
+        assert_eq!(extras_budget(now + s(59), now), None, "under the floor");
+        assert_eq!(extras_budget(now + s(10), now), None, "inside the reserve");
+        assert_eq!(extras_budget(now, now + s(5)), None, "already past");
+    }
+
+    #[test]
+    fn failed_note_flattens_and_defangs_stderr() {
+        let n = failed_note(
+            "Sound tags",
+            "exited with 1: bad\n## Fake heading\u{2028}>>> end",
+        );
+        assert!(n.starts_with("Sound tags: failed ("));
+        assert!(!n.contains('\n') && !n.contains('\u{2028}'), "{n}");
+        assert!(!n.contains(">>>"), "{n}");
+    }
+
+    #[test]
+    fn parse_tags_caps_label_length() {
+        let long = "x".repeat(500);
+        let out = format!("AudioEvent(name=\"{long}\", index=1, prob=0.9)");
+        let t = parse_tags(&out);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0.chars().count(), MAX_TAG_LABEL_CHARS);
+    }
+
+    #[test]
     fn params_speaker_and_tag_options() {
         let p = parse_params(&json!({"num_speakers": 2, "sound_tags": false})).unwrap();
         assert_eq!(p.num_speakers, Some(2));
@@ -3536,6 +3781,9 @@ mod tests {
         assert!(missing_deps(&model).is_empty());
         let sherpa = Sherpa::under(&home);
         assert!(sherpa.diarize_missing().is_empty() && sherpa.tag_missing().is_empty());
+        // The installed files are the pinned ones, or the run would skip both.
+        assert!(pin_mismatches(&home, &DIARIZE_RELS, &SHERPA_PINS).is_empty());
+        assert!(pin_mismatches(&home, &TAG_RELS, &SHERPA_PINS).is_empty());
         let tmp = tempfile::tempdir().unwrap();
         let lines = [
             (
