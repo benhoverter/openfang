@@ -125,6 +125,11 @@ pub struct Pin {
 /// official k2-fsa release assets: the binary tarball matched GitHub's
 /// published digest; the three model archives have none published (2024
 /// uploads), so those sums are trust-on-first-download.
+///
+/// Each `sha256` is of the installed file itself, not of `source`. Where
+/// `source` is an archive (both binaries, the segmentation model, the CED
+/// model and labels), extract it and hash the file at `rel`; hashing the
+/// archive will never match.
 pub const SHERPA_PINS: [Pin; 6] = [
     Pin {
         rel: SHERPA_DIARIZE_REL,
@@ -837,15 +842,22 @@ fn absent(paths: &[&PathBuf]) -> Vec<String> {
 
 /// The files in `rels` (under `home`) whose sha256 is not the one `pins`
 /// expects. Unreadable and unpinned files count as mismatches: fail closed.
+/// Files are streamed through the hasher, so memory stays flat (~110 MB total).
 pub fn pin_mismatches(home: &Path, rels: &[&str], pins: &[Pin]) -> Vec<String> {
     use sha2::{Digest, Sha256};
+    let hash_file = |path: &Path| -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(hex::encode(hasher.finalize()))
+    };
     rels.iter()
         .filter(|rel| {
             let Some(pin) = pins.iter().find(|p| p.rel == **rel) else {
                 return true;
             };
-            match std::fs::read(home.join(rel)) {
-                Ok(bytes) => hex::encode(Sha256::digest(&bytes)) != pin.sha256,
+            match hash_file(&home.join(rel)) {
+                Ok(sum) => sum != pin.sha256,
                 Err(_) => true,
             }
         })
@@ -3163,11 +3175,29 @@ mod tests {
     }
 
     #[test]
+    fn pin_hash_streams_large_files() {
+        use sha2::{Digest, Sha256};
+        let home = tempfile::tempdir().unwrap();
+        // Several io::copy buffers' worth, with a length that isn't a multiple of one.
+        let bytes: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(home.path().join("big"), &bytes).unwrap();
+        let sum = hex::encode(Sha256::digest(&bytes));
+        let pins = [Pin {
+            rel: "big",
+            sha256: Box::leak(sum.into_boxed_str()),
+            source: "",
+        }];
+        assert!(pin_mismatches(home.path(), &["big"], &pins).is_empty());
+    }
+
+    #[test]
     fn pin_mismatches_fails_closed() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("good"), "abc").unwrap();
         std::fs::write(home.path().join("swapped"), "abd").unwrap();
         std::fs::write(home.path().join("unpinned"), "abc").unwrap();
+        // Opens fine on unix but cannot be read: must still fail closed.
+        std::fs::create_dir(home.path().join("dir")).unwrap();
         // sha256("abc")
         let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         let pins = [
@@ -3186,8 +3216,14 @@ mod tests {
                 sha256: abc,
                 source: "",
             },
+            Pin {
+                rel: "dir",
+                sha256: abc,
+                source: "",
+            },
         ];
         assert!(pin_mismatches(home.path(), &["good"], &pins).is_empty());
+        assert_eq!(pin_mismatches(home.path(), &["dir"], &pins), ["dir"]);
         assert_eq!(
             pin_mismatches(home.path(), &["swapped"], &pins),
             ["swapped"]
